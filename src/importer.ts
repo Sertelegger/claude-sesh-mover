@@ -195,93 +195,125 @@ export async function importSession(
   );
   mkdirSync(targetProjectDir, { recursive: true });
 
-  for (const session of targetSessions) {
-    const newSessionId = sessionIdMap.get(session.sessionId)!;
+  // Helper: remove only the files written by this import (targeted rollback)
+  const rollbackImportedFiles = () => {
+    for (const [, newId] of sessionIdMap) {
+      // Remove new session JSONL file
+      const jsonlFile = join(targetProjectDir, `${newId}.jsonl`);
+      if (existsSync(jsonlFile)) rmSync(jsonlFile, { force: true });
+      // Remove new session subdirectory (subagents, tool-results)
+      const sessionSubDir = join(targetProjectDir, newId);
+      if (existsSync(sessionSubDir))
+        rmSync(sessionSubDir, { recursive: true, force: true });
+      // Remove new file-history directory
+      const fhDir = join(targetConfigDir, "file-history", newId);
+      if (existsSync(fhDir)) rmSync(fhDir, { recursive: true, force: true });
+    }
+  };
 
-    // Rewrite and write JSONL
-    const jsonlPath = join(
-      exportPath,
-      "sessions",
-      `${session.sessionId}.jsonl`
-    );
-    if (existsSync(jsonlPath)) {
-      const jsonlContent = readFileSync(jsonlPath, "utf-8");
+  try {
+    for (const session of targetSessions) {
+      const newSessionId = sessionIdMap.get(session.sessionId)!;
 
-      // Apply version adapters
-      let processedContent = jsonlContent;
-      if (adapters.length > 0) {
-        const lines = jsonlContent.trim().split("\n").filter(Boolean);
-        const adaptedLines = lines.map((line) => {
-          try {
-            const entry = JSON.parse(line);
-            const { entry: adapted, applied } = applyAdapters(entry, adapters);
-            versionAdaptations.push(...applied);
-            return JSON.stringify(adapted);
-          } catch {
-            return line;
-          }
-        });
-        processedContent = adaptedLines.join("\n") + "\n";
+      // Rewrite and write JSONL
+      const jsonlPath = join(
+        exportPath,
+        "sessions",
+        `${session.sessionId}.jsonl`
+      );
+      if (existsSync(jsonlPath)) {
+        const jsonlContent = readFileSync(jsonlPath, "utf-8");
+
+        // Apply version adapters
+        let processedContent = jsonlContent;
+        if (adapters.length > 0) {
+          const lines = jsonlContent.trim().split("\n").filter(Boolean);
+          const adaptedLines = lines.map((line) => {
+            try {
+              const entry = JSON.parse(line);
+              const { entry: adapted, applied } = applyAdapters(entry, adapters);
+              versionAdaptations.push(...applied);
+              return JSON.stringify(adapted);
+            } catch {
+              return line;
+            }
+          });
+          processedContent = adaptedLines.join("\n") + "\n";
+        }
+
+        const { rewritten } = rewriteJsonl(processedContent, mappings, newSessionId);
+        writeFileSync(join(targetProjectDir, `${newSessionId}.jsonl`), rewritten);
       }
 
-      const { rewritten } = rewriteJsonl(processedContent, mappings, newSessionId);
-      writeFileSync(join(targetProjectDir, `${newSessionId}.jsonl`), rewritten);
-    }
+      // Copy subagents
+      const subagentsDir = join(
+        exportPath,
+        "sessions",
+        session.sessionId,
+        "subagents"
+      );
+      if (existsSync(subagentsDir)) {
+        const targetSubDir = join(targetProjectDir, newSessionId, "subagents");
+        mkdirSync(targetSubDir, { recursive: true });
+        for (const file of readdirSync(subagentsDir)) {
+          if (file.endsWith(".jsonl")) {
+            // Rewrite subagent JSONL too
+            const content = readFileSync(join(subagentsDir, file), "utf-8");
+            const { rewritten } = rewriteJsonl(content, mappings, newSessionId);
+            writeFileSync(join(targetSubDir, file), rewritten);
+          } else {
+            copyFileSync(join(subagentsDir, file), join(targetSubDir, file));
+          }
+        }
+      }
 
-    // Copy subagents
-    const subagentsDir = join(
-      exportPath,
-      "sessions",
-      session.sessionId,
-      "subagents"
-    );
-    if (existsSync(subagentsDir)) {
-      const targetSubDir = join(targetProjectDir, newSessionId, "subagents");
-      mkdirSync(targetSubDir, { recursive: true });
-      for (const file of readdirSync(subagentsDir)) {
-        if (file.endsWith(".jsonl")) {
-          // Rewrite subagent JSONL too
-          const content = readFileSync(join(subagentsDir, file), "utf-8");
-          const { rewritten } = rewriteJsonl(content, mappings, newSessionId);
-          writeFileSync(join(targetSubDir, file), rewritten);
-        } else {
-          copyFileSync(join(subagentsDir, file), join(targetSubDir, file));
+      // Copy tool results
+      const toolResultsDir = join(
+        exportPath,
+        "sessions",
+        session.sessionId,
+        "tool-results"
+      );
+      if (existsSync(toolResultsDir)) {
+        const targetTrDir = join(
+          targetProjectDir,
+          newSessionId,
+          "tool-results"
+        );
+        mkdirSync(targetTrDir, { recursive: true });
+        for (const file of readdirSync(toolResultsDir)) {
+          copyFileSync(join(toolResultsDir, file), join(targetTrDir, file));
+        }
+      }
+
+      // Copy file history
+      const fileHistoryDir = join(
+        exportPath,
+        "file-history",
+        session.sessionId
+      );
+      if (existsSync(fileHistoryDir)) {
+        const targetFhDir = join(targetConfigDir, "file-history", newSessionId);
+        mkdirSync(targetFhDir, { recursive: true });
+        for (const file of readdirSync(fileHistoryDir)) {
+          copyFileSync(join(fileHistoryDir, file), join(targetFhDir, file));
         }
       }
     }
-
-    // Copy tool results
-    const toolResultsDir = join(
-      exportPath,
-      "sessions",
-      session.sessionId,
-      "tool-results"
-    );
-    if (existsSync(toolResultsDir)) {
-      const targetTrDir = join(
-        targetProjectDir,
-        newSessionId,
-        "tool-results"
-      );
-      mkdirSync(targetTrDir, { recursive: true });
-      for (const file of readdirSync(toolResultsDir)) {
-        copyFileSync(join(toolResultsDir, file), join(targetTrDir, file));
-      }
+  } catch (writeErr) {
+    // Mid-write failure: roll back only what this import created
+    try {
+      rollbackImportedFiles();
+    } catch {
+      /* best effort cleanup */
     }
-
-    // Copy file history
-    const fileHistoryDir = join(
-      exportPath,
-      "file-history",
-      session.sessionId
-    );
-    if (existsSync(fileHistoryDir)) {
-      const targetFhDir = join(targetConfigDir, "file-history", newSessionId);
-      mkdirSync(targetFhDir, { recursive: true });
-      for (const file of readdirSync(fileHistoryDir)) {
-        copyFileSync(join(fileHistoryDir, file), join(targetFhDir, file));
-      }
-    }
+    return {
+      success: false as const,
+      command: "import",
+      error: `Import write failed: ${(writeErr as Error).message}`,
+      details: "Partially written files have been cleaned up. No indexes were modified.",
+      suggestion: "Check available disk space or file permissions and retry.",
+    };
   }
 
   // Step 5: Merge memory files, tracking conflicts for user resolution
@@ -353,14 +385,9 @@ export async function importSession(
         JSON.parse(line);
       }
     } catch (e) {
-      // Rollback: clean up all written files for this import
+      // Rollback: clean up only files written by this import
       try {
-        rmSync(targetProjectDir, { recursive: true, force: true });
-        for (const s of targetSessions) {
-          const nid = sessionIdMap.get(s.sessionId)!;
-          const fhDir = join(targetConfigDir, "file-history", nid);
-          if (existsSync(fhDir)) rmSync(fhDir, { recursive: true, force: true });
-        }
+        rollbackImportedFiles();
       } catch {
         /* best effort cleanup */
       }
