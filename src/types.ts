@@ -244,6 +244,7 @@ export interface ErrorResult {
 export type CliResult =
   | ExportResult
   | ImportResult
+  | DryRunResult
   | MigrateResult
   | BrowseResult
   | ConfigureResult

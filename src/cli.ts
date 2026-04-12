@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolveConfigDir, detectPlatform } from "./platform.js";
 import {
@@ -45,9 +45,9 @@ program
 program
   .command("export")
   .description("Export session(s) from the current project")
-  .option("--scope <scope>", "current or all", "current")
-  .option("--storage <storage>", "user or project", "user")
-  .option("--format <format>", "dir, archive, or zstd", "dir")
+  .option("--scope <scope>", "current or all")
+  .option("--storage <storage>", "user or project")
+  .option("--format <format>", "dir, archive, or zstd")
   .option("--exclude <layers...>", "Layers to exclude")
   .option("--source-config-dir <path>", "Override Claude config dir")
   .option("--session-id <id>", "Export specific session by ID")
@@ -163,17 +163,16 @@ program
   .option("--no-register", "Skip session index registration")
   .option("--force", "Skip confirmation")
   .action(async (opts) => {
+    let tempExtractDir: string | undefined;
     try {
       let fromPath = opts.from;
 
       // If archive, extract first
       const archiveFormat = detectArchiveFormat(fromPath);
       if (archiveFormat) {
-        const { mkdtempSync } = await import("node:fs");
-        const { tmpdir } = await import("node:os");
-        const extractDir = mkdtempSync(join(tmpdir(), "sesh-mover-extract-"));
-        await extractArchive(fromPath, extractDir);
-        fromPath = extractDir;
+        tempExtractDir = mkdtempSync(join(tmpdir(), "sesh-mover-extract-"));
+        await extractArchive(fromPath, tempExtractDir);
+        fromPath = tempExtractDir;
       }
 
       const targetConfigDir = resolveConfigDir(opts.targetConfigDir);
@@ -192,6 +191,8 @@ program
       output(result);
     } catch (e) {
       outputError("import", e as Error);
+    } finally {
+      if (tempExtractDir) rmSync(tempExtractDir, { recursive: true, force: true });
     }
   });
 
@@ -200,7 +201,8 @@ program
   .command("migrate")
   .description("Move session(s) to a new path (same machine)")
   .requiredOption("--target-project-path <path>", "Destination project path")
-  .option("--scope <scope>", "current or all", "current")
+  .option("--scope <scope>", "current or all")
+  .option("--source-project-path <path>", "Source project path (default: cwd)")
   .option("--source-config-dir <path>", "Source Claude config dir")
   .option("--target-config-dir <path>", "Target Claude config dir")
   .option("--exclude <layers...>", "Layers to exclude")
@@ -212,15 +214,16 @@ program
       const targetConfigDir = resolveConfigDir(opts.targetConfigDir);
       const claudeVersion = getClaudeVersion();
 
-      // Source project path is the current working directory
-      const sourceProjectPath = process.cwd();
+      const sourceProjectPath = opts.sourceProjectPath ?? process.cwd();
+      const config = loadEffectiveConfig(sourceConfigDir, sourceProjectPath);
+      const scope = (opts.scope ?? config.migrate.scope) as SessionScope;
 
       const result = await migrateSession({
         sourceConfigDir,
         targetConfigDir,
         sourceProjectPath,
         targetProjectPath: opts.targetProjectPath,
-        scope: opts.scope as SessionScope,
+        scope,
         sessionId: opts.sessionId,
         excludeLayers: (opts.exclude ?? []) as ExportLayer[],
         claudeVersion,
@@ -306,14 +309,9 @@ program
         }
       }
 
-      // Handle --prune: output exports with a prunable flag for the skill to act on
-      if (opts.prune) {
-        // In non-interactive mode, list exports that can be pruned
-        // The skill will present options and invoke delete via rm
-        for (const exp of exports) {
-          (exp as any).prunable = true;
-        }
-      }
+      // Note: --prune is a signal for the skill layer to handle interactively.
+      // The skill prompts the user and runs `rm -rf <path>` after confirmation.
+      // The CLI just lists exports with their paths; no extra marking needed here.
 
       const result: BrowseResult = {
         success: true,
