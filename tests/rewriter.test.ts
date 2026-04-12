@@ -223,6 +223,27 @@ describe("rewriter", () => {
     });
   });
 
+  describe("buildPathMappings ordering", () => {
+    it("handles overlapping path prefixes correctly", async () => {
+      const { buildPathMappings } = await import("../src/rewriter.js");
+      const mappings = buildPathMappings(
+        "darwin",
+        "darwin",
+        "/home/user/project",
+        "/new/project",
+        "/home/user/.claude",
+        "/new/.claude",
+        "user",
+        "user"
+      );
+      // Config dir mapping should fire before home dir mapping
+      // (This test verifies longest-first ordering)
+      expect(mappings[0].from.length).toBeGreaterThanOrEqual(
+        mappings[mappings.length - 1].from.length
+      );
+    });
+  });
+
   describe("rewriteJsonl", () => {
     it("rewrites all entries in a JSONL string", async () => {
       const { rewriteJsonl, buildPathMappings } = await import(

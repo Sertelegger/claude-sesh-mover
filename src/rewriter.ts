@@ -56,6 +56,9 @@ export function buildPathMappings(
     }
   }
 
+  // Sort longest-from first to prevent prefix collisions
+  mappings.sort((a, b) => b.from.length - a.from.length);
+
   return mappings;
 }
 
