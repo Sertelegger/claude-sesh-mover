@@ -1,0 +1,17 @@
+{
+  "name": "sesh-mover",
+  "description": "Export, import, and migrate Claude Code sessions between machines, platforms, config directories, and project paths",
+  "version": "0.1.0",
+  "author": {
+    "name": "sascha"
+  },
+  "license": "MIT",
+  "keywords": ["session", "migration", "export", "import", "wsl"],
+  "commands": [
+    "./commands/export.md",
+    "./commands/import.md",
+    "./commands/migrate.md",
+    "./commands/browse.md",
+    "./commands/configure.md"
+  ]
+}
