@@ -145,7 +145,7 @@ export function rewriteJsonl(
       const rewrittenStr = JSON.stringify(rewritten);
       if (rewrittenStr !== original) {
         entriesRewritten++;
-        // Count changed top-level fields
+        // Count changed top-level fields (nested changes are attributed to their parent key)
         for (const key of Object.keys(entry)) {
           if (
             JSON.stringify(entry[key]) !==

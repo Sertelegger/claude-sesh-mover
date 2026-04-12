@@ -4,7 +4,7 @@ import { Command } from "commander";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { resolveConfigDir, detectPlatform } from "./platform.js";
 import {
   getDefaultConfig,
@@ -473,7 +473,7 @@ function generateExportName(configDir: string, sessionId?: string): string {
 
 function getClaudeVersion(): string {
   try {
-    const version = execSync("claude --version", {
+    const version = execFileSync("claude", ["--version"], {
       encoding: "utf-8",
       timeout: 5000,
     }).trim();
