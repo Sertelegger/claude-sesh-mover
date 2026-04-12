@@ -12,6 +12,8 @@ import { encodeProjectPath } from "./platform.js";
 import type {
   MigrateResult,
   ErrorResult,
+  ExportResult,
+  ImportResult,
   ExportLayer,
   SessionScope,
 } from "./types.js";
@@ -68,7 +70,8 @@ export async function migrateSession(
       return exportResult as ErrorResult;
     }
 
-    const exportPath = (exportResult as any).exportPath;
+    const exported = exportResult as ExportResult;
+    const exportPath = exported.exportPath;
 
     // Step 2: Import to target (or dry-run)
     const importResult = await importSession({
@@ -83,17 +86,19 @@ export async function migrateSession(
       return importResult as ErrorResult;
     }
 
+    const imported = importResult as ImportResult;
+
     // If dry-run, return preview without cleanup
     if (dryRun) {
       return {
         success: true,
         command: "migrate",
-        importedSessions: (importResult as any).importedSessions,
+        importedSessions: imported.importedSessions,
         cleanedUp: false,
         sourcePath: sourceProjectPath,
         targetPath: targetProjectPath,
         warnings: [
-          ...(importResult as any).warnings,
+          ...imported.warnings,
           "DRY RUN: no files were modified or deleted",
         ],
       };
@@ -146,11 +151,11 @@ export async function migrateSession(
     return {
       success: true,
       command: "migrate",
-      importedSessions: (importResult as any).importedSessions,
+      importedSessions: imported.importedSessions,
       cleanedUp,
       sourcePath: sourceProjectPath,
       targetPath: targetProjectPath,
-      warnings: (importResult as any).warnings || [],
+      warnings: imported.warnings,
     };
   } finally {
     // Clean up temp export
