@@ -3,6 +3,9 @@ import {
   readFileSync,
   existsSync,
   statSync,
+  openSync,
+  readSync,
+  closeSync,
 } from "node:fs";
 import { join } from "node:path";
 import { encodeProjectPath } from "./platform.js";
@@ -113,16 +116,15 @@ export function listAllProjects(
  */
 function readProjectPathFromJsonl(jsonlPath: string): string | null {
   try {
-    const raw = readFileSync(jsonlPath, "utf-8");
-    const lines = raw.trim().split("\n").filter(Boolean);
-    for (const line of lines) {
-      const entry = JSON.parse(line);
-      if (entry.cwd) return entry.cwd;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+    const fd = openSync(jsonlPath, 'r');
+    const buf = Buffer.alloc(4096); // first 4KB should contain the first line
+    const bytesRead = readSync(fd, buf, 0, 4096, 0);
+    closeSync(fd);
+    const firstLine = buf.toString('utf-8', 0, bytesRead).split('\n')[0];
+    if (!firstLine) return null;
+    const entry = JSON.parse(firstLine);
+    return entry.cwd ?? null;
+  } catch { return null; }
 }
 
 function parseSessionJsonl(

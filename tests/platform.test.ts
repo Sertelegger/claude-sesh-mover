@@ -20,6 +20,12 @@ describe("platform detection", () => {
         expect(detectPlatform()).toBe("win32");
       }
     });
+
+    it("returns a valid Platform value", async () => {
+      const { detectPlatform } = await import("../src/platform.js");
+      const result = detectPlatform();
+      expect(["darwin", "linux", "wsl1", "wsl2", "win32"]).toContain(result);
+    });
   });
 
   describe("translatePath", () => {

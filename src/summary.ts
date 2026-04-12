@@ -42,14 +42,14 @@ export function extractSummary(
 
 export function extractFirstExchanges(
   entries: Array<Record<string, unknown>>,
-  maxExchanges: number
+  maxEntries: number
 ): Array<Record<string, unknown>> {
   const result: Array<Record<string, unknown>> = [];
 
   for (const entry of entries) {
     if (entry.type === "user" || entry.type === "assistant") {
       result.push(entry);
-      if (result.length >= maxExchanges) break;
+      if (result.length >= maxEntries) break;
     }
   }
 
