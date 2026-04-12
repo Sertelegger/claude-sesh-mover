@@ -1,4 +1,4 @@
-import { readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { basename, dirname, resolve } from "node:path";
 import * as tar from "tar";
@@ -93,9 +93,12 @@ async function createZstdArchive(
     },
     [basename(sourceDir)]
   );
-  // Use execFileSync to avoid shell injection
-  execFileSync("zstd", ["-f", tarPath, "-o", archivePath], { stdio: "ignore" });
-  unlinkSync(tarPath);
+  try {
+    // Use execFileSync to avoid shell injection
+    execFileSync("zstd", ["-f", tarPath, "-o", archivePath], { stdio: "ignore" });
+  } finally {
+    if (existsSync(tarPath)) unlinkSync(tarPath);
+  }
 }
 
 async function extractZstdArchive(
@@ -103,12 +106,15 @@ async function extractZstdArchive(
   targetDir: string
 ): Promise<void> {
   const tarPath = archivePath.replace(/\.zst$/, ".tar");
-  // Use execFileSync to avoid shell injection
-  execFileSync("zstd", ["-d", archivePath, "-o", tarPath], { stdio: "ignore" });
-  await tar.extract({
-    file: tarPath,
-    cwd: targetDir,
-    strip: 1,
-  });
-  unlinkSync(tarPath);
+  try {
+    // Use execFileSync to avoid shell injection
+    execFileSync("zstd", ["-d", archivePath, "-o", tarPath], { stdio: "ignore" });
+    await tar.extract({
+      file: tarPath,
+      cwd: targetDir,
+      strip: 1,
+    });
+  } finally {
+    if (existsSync(tarPath)) unlinkSync(tarPath);
+  }
 }
