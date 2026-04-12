@@ -68,8 +68,8 @@ export function applyAdapters(
 
   for (const adapter of adapters) {
     try {
-      if (adapter.applies(current as any)) {
-        current = adapter.transform(current as any) as Record<string, unknown>;
+      if (adapter.applies(current as unknown as import("./types.js").JsonlEntry)) {
+        current = adapter.transform(current as unknown as import("./types.js").JsonlEntry) as unknown as Record<string, unknown>;
         applied.push(adapter.description);
       }
     } catch {

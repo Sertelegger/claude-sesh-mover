@@ -31,7 +31,7 @@ export function readConfig(configDir: string): SeshMoverConfig {
   try {
     const raw = readFileSync(configPath, "utf-8");
     const partial = JSON.parse(raw);
-    return deepMerge(defaults, partial) as SeshMoverConfig;
+    return deepMerge(defaults as unknown as Record<string, unknown>, partial) as unknown as SeshMoverConfig;
   } catch {
     return defaults;
   }
@@ -53,9 +53,9 @@ export function mergeConfigs(
   projectConfig: SeshMoverConfig,
   cliOverrides?: Partial<Record<string, unknown>>
 ): SeshMoverConfig {
-  let merged = deepMerge(userConfig, projectConfig) as SeshMoverConfig;
+  let merged = deepMerge(userConfig as unknown as Record<string, unknown>, projectConfig as unknown as Record<string, unknown>) as unknown as SeshMoverConfig;
   if (cliOverrides) {
-    merged = deepMerge(merged, cliOverrides) as SeshMoverConfig;
+    merged = deepMerge(merged as unknown as Record<string, unknown>, cliOverrides) as unknown as SeshMoverConfig;
   }
   return merged;
 }
@@ -68,7 +68,7 @@ export function setConfigValue(
   const parts = dotPath.split(".");
   const result = structuredClone(config);
 
-  let current: Record<string, unknown> = result as Record<string, unknown>;
+  let current: Record<string, unknown> = result as unknown as Record<string, unknown>;
   for (let i = 0; i < parts.length - 1; i++) {
     if (!(parts[i] in current) || typeof current[parts[i]] !== "object") {
       throw new Error(`Invalid config path: ${dotPath}`);
