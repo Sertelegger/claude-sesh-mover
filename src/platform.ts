@@ -26,7 +26,7 @@ export function detectPlatform(): Platform {
         }
       }
       if (existsSync("/proc/sys/fs/binfmt_misc/WSLInterop")) {
-        return "wsl2"; // WSLInterop exists primarily in WSL2
+        return "wsl2"; // WSLInterop fallback — unreachable in practice since /proc/version check fires first on any WSL system
       }
     } catch {
       // If we can't read proc, assume standard Linux
@@ -37,6 +37,7 @@ export function detectPlatform(): Platform {
   return "linux"; // fallback
 }
 
+// Note: darwin↔linux cross-platform translation is intentionally not handled here. Callers always provide sourceProjectPath/targetProjectPath for those cases, which triggers same-platform substitution.
 export function translatePath(
   inputPath: string,
   sourcePlatform: Platform,
@@ -56,6 +57,7 @@ export function translatePath(
       return targetProjectPath + inputPath.slice(sourceProjectPath.length);
     }
     // Also handle username-only changes
+    // Intentionally rewrites usernames in ALL paths (not just under sourceProjectPath) since JSONL entries contain paths outside the project (e.g., config dirs, tool paths).
     if (sourceUser !== targetUser) {
       return inputPath.replace(
         new RegExp(`(^|/)${escapeRegex(sourceUser)}(/|$)`),
@@ -72,7 +74,10 @@ export function translatePath(
 
   // WSL/Linux -> Windows
   if ((sourceIsWsl || sourcePlatform === "linux") && targetIsWin) {
-    // /tmp/... -> C:\Users\<user>\AppData\Local\Temp\...
+    // /tmp (exact) or /tmp/... -> C:\Users\<user>\AppData\Local\Temp\...
+    if (inputPath === "/tmp") {
+      return `C:\\Users\\${targetUser}\\AppData\\Local\\Temp`;
+    }
     if (inputPath.startsWith("/tmp/")) {
       const rest = inputPath.slice(5);
       return `C:\\Users\\${targetUser}\\AppData\\Local\\Temp\\${rest}`.replace(
@@ -87,7 +92,11 @@ export function translatePath(
       const rest = mntMatch[2];
       return `${drive}:\\${rest.replace(/\//g, "\\")}`;
     }
-    // /home/<user>/... -> C:\Users\<user>\...
+    // /home/<user> (exact) -> C:\Users\<targetUser>
+    if (inputPath.match(/^\/home\/[^/]+$/)) {
+      return `C:\\Users\\${targetUser}`;
+    }
+    // /home/<user>/... -> C:\Users\<targetUser>\...
     const homeMatch = inputPath.match(/^\/home\/([^/]+)\/(.*)/);
     if (homeMatch) {
       const rest = homeMatch[2];
@@ -100,7 +109,11 @@ export function translatePath(
   if (sourceIsWin && (targetIsWsl || targetPlatform === "linux")) {
     // Normalize backslashes
     const normalized = inputPath.replace(/\\/g, "/");
-    // C:\Users\<user>\... -> /home/<user>/...
+    // C:\Users\<user> (exact, no subpath) -> /home/<targetUser>
+    if (normalized.match(/^[A-Za-z]:\/Users\/[^/]+$/)) {
+      return `/home/${targetUser}`;
+    }
+    // C:\Users\<user>\... -> /home/<targetUser>/...
     const userMatch = normalized.match(
       /^([A-Za-z]):\/Users\/([^/]+)\/(.*)/
     );

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import type { Platform } from "../src/types.js";
 
 // We'll test the exported functions after creating them
