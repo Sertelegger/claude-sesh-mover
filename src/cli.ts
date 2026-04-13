@@ -55,7 +55,7 @@ program
   .option("--name <name>", "Export name")
   .option("--output <path>", "Override output path")
   .option("--project-path <path>", "Override project path (default: cwd)")
-  .option("--no-summary", "Skip Claude-generated summary")
+  .option("--no-summary", "Skip Claude-generated summary (reserved for future use — currently summaries always use fallback extraction)")
   .option("--overwrite", "Overwrite existing export")
   .option("--suffix", "Auto-suffix on name collision")
   .action(async (opts) => {

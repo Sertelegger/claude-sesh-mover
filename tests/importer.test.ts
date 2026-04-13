@@ -9,6 +9,7 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
+import type { ExportResult, ImportResult, DryRunResult } from "../src/types.js";
 
 describe("importer", () => {
   let tempDir: string;
@@ -38,7 +39,7 @@ describe("importer", () => {
     });
 
     if (!result.success) throw new Error("Export failed in test setup");
-    exportPath = (result as any).exportPath;
+    exportPath = (result as ExportResult).exportPath;
 
     // Create empty target config dir
     targetConfigDir = join(tempDir, "target-claude");
@@ -95,6 +96,7 @@ describe("importer", () => {
       });
 
       expect(result.success).toBe(true);
+      expect((result as DryRunResult).dryRun).toBe(true);
       // Verify nothing was written
       const encoded = "-Users-newuser-Projects-newproject";
       expect(
