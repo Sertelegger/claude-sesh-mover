@@ -10,29 +10,31 @@ You are running the sesh-mover import command. Follow these steps:
    node "PLUGIN_ROOT/dist/cli.js" browse --storage all --json
    ```
 
-2. Present the list to the user with: date, name, summary, source platform, source project path, session count. Format as a numbered table.
+2. If no exports found, respond with just: "No exported sessions found." Do NOT elaborate unless asked.
 
-3. Ask which export to import.
+3. Present the list to the user with: date, name, summary, source platform, source project path, session count. Format as a numbered table.
 
-4. If the chosen export contains multiple sessions, present the individual sessions (ID, summary, date, message count) and ask:
-   - Import all sessions?
-   - Import specific ones? (let user pick by number)
+4. Use AskUserQuestion to let the user pick which export to import (present each as a selectable option with the name and summary).
 
-5. Run a dry-run first:
+5. If the chosen export contains multiple sessions, use AskUserQuestion to ask:
+   - "Import all sessions" (recommended)
+   - "Pick specific sessions" — then present individual sessions as selectable options
+
+6. Run a dry-run first:
    ```bash
    node "PLUGIN_ROOT/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>" --dry-run
    ```
 
-6. Present the dry-run results: path rewrites that will be applied, version adaptations, integrity status, any warnings.
+7. Present the dry-run results: path rewrites that will be applied, version adaptations, integrity status, any warnings.
 
-7. Ask the user to confirm.
+8. Use AskUserQuestion to confirm: "Proceed with import" (recommended) / "Cancel".
 
-8. Execute the import:
+9. Execute the import:
    ```bash
    node "PLUGIN_ROOT/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>"
    ```
 
-9. Report the result. If `resumable` is true, tell the user they can continue the session with `claude --resume <newSessionId>`. If not resumable, offer to read the imported JSONL and inject it as context into the current conversation.
+10. Report the result. If `resumable` is true, tell the user they can continue the session with `claude --resume <newSessionId>`. If not resumable, offer to read the imported JSONL and inject it as context into the current conversation.
 
 To find the plugin root, search for the sesh-mover plugin directory by running:
 ```bash
