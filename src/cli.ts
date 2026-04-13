@@ -26,6 +26,7 @@ import {
 import { discoverSessionById } from "./discovery.js";
 import type {
   ExportLayer,
+  ExportResult,
   SessionScope,
   StorageScope,
   ExportFormat,
@@ -131,18 +132,19 @@ program
 
       // Handle archive
       if (result.success && (format === "archive" || format === "zstd")) {
+        const exportResult = result as ExportResult;
         let compression: "gzip" | "zstd" = format === "zstd" ? "zstd" : "gzip";
         if (compression === "zstd" && !(await isZstdAvailable())) {
-          (result as any).warnings.push(
+          exportResult.warnings.push(
             "zstd not found on system, falling back to gzip"
           );
           compression = "gzip";
-          (result as any).actualFormat = "archive"; // signal fallback to skill
+          exportResult.actualFormat = "archive"; // signal fallback to skill
         }
         const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
-        const archivePath = (result as any).exportPath + ext;
-        await createArchive((result as any).exportPath, archivePath, compression);
-        (result as any).archivePath = archivePath;
+        const archivePath = exportResult.exportPath + ext;
+        await createArchive(exportResult.exportPath, archivePath, compression);
+        exportResult.archivePath = archivePath;
       }
 
       output(result);
@@ -359,8 +361,17 @@ program
       }
 
       if (opts.set) {
-        const [key, value] = opts.set.split("=");
-        if (!key || value === undefined) {
+        const eqIndex = opts.set.indexOf("=");
+        if (eqIndex === -1) {
+          outputError(
+            "configure",
+            new Error("--set requires key=value format")
+          );
+          return;
+        }
+        const key = opts.set.slice(0, eqIndex);
+        const value = opts.set.slice(eqIndex + 1);
+        if (!key) {
           outputError(
             "configure",
             new Error("--set requires key=value format")

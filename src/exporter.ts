@@ -221,7 +221,7 @@ async function exportSessions(
       }
     }
 
-    // Generate summary
+    // Content already in memory from the write above — parsing here is for summary extraction
     const entries = jsonlContent
       .trim()
       .split("\n")

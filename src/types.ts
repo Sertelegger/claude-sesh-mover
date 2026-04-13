@@ -175,6 +175,7 @@ export interface ExportResult {
 export interface ImportResult {
   success: true;
   command: "import";
+  dryRun?: false;
   importedSessions: Array<{
     originalId: string;
     newId: string;
@@ -183,6 +184,7 @@ export interface ImportResult {
   }>;
   warnings: string[];
   resumable: boolean;
+  versionAdaptations?: string[];
   memoryConflicts?: Array<{
     filename: string;
     existingHash: string;
@@ -193,6 +195,7 @@ export interface ImportResult {
 export interface DryRunResult {
   success: true;
   command: "import";
+  dryRun: true;
   importedSessions: ImportResult["importedSessions"];
   warnings: string[];
   resumable: boolean;
