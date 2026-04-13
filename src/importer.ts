@@ -178,6 +178,7 @@ export async function importSession(
     return {
       success: true,
       command: "import",
+      dryRun: true,
       importedSessions,
       warnings,
       resumable: true,
@@ -425,6 +426,7 @@ export async function importSession(
     importedSessions,
     warnings,
     resumable: !noRegister,
+    versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
     memoryConflicts: memoryConflicts.length > 0 ? memoryConflicts : undefined,
   } satisfies ImportResult;
 }

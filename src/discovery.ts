@@ -118,8 +118,12 @@ function readProjectPathFromJsonl(jsonlPath: string): string | null {
   try {
     const fd = openSync(jsonlPath, 'r');
     const buf = Buffer.alloc(4096); // first 4KB should contain the first line
-    const bytesRead = readSync(fd, buf, 0, 4096, 0);
-    closeSync(fd);
+    let bytesRead: number;
+    try {
+      bytesRead = readSync(fd, buf, 0, 4096, 0);
+    } finally {
+      closeSync(fd);
+    }
     const firstLine = buf.toString('utf-8', 0, bytesRead).split('\n')[0];
     if (!firstLine) return null;
     const entry = JSON.parse(firstLine);
@@ -135,6 +139,8 @@ function parseSessionJsonl(
   configDir: string
 ): DiscoveredSession | null {
   try {
+    // Performance note: reads entire file. For very large sessions (100MB+),
+    // consider streaming approach that reads first line, counts newlines, reads last line.
     const raw = readFileSync(jsonlPath, "utf-8");
     const lines = raw.trim().split("\n").filter(Boolean);
     if (lines.length === 0) return null;
