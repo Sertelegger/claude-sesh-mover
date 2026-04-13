@@ -9,6 +9,7 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
+import type { ExportResult, ImportResult } from "../src/types.js";
 
 describe("integration: full export/import cycle", () => {
   let tempDir: string;
@@ -45,7 +46,7 @@ describe("integration: full export/import cycle", () => {
       claudeVersion: "2.1.81",
     });
     expect(exportResult.success).toBe(true);
-    const exportPath = (exportResult as any).exportPath;
+    const exportPath = (exportResult as ExportResult).exportPath;
 
     // 2. Archive
     const archivePath = join(tempDir, "integration-test.tar.gz");
@@ -70,7 +71,7 @@ describe("integration: full export/import cycle", () => {
       dryRun: false,
     });
     expect(importResult.success).toBe(true);
-    const imported = (importResult as any).importedSessions[0];
+    const imported = (importResult as ImportResult).importedSessions[0];
     expect(imported.originalId).toBe(sessionId);
     expect(imported.newId).not.toBe(sessionId);
 
@@ -144,7 +145,7 @@ describe("integration: full export/import cycle", () => {
     mkdirSync(join(targetConfigDir, "projects"), { recursive: true });
 
     const importResult = await importSession({
-      exportPath: (exportResult as any).exportPath,
+      exportPath: (exportResult as ExportResult).exportPath,
       targetConfigDir,
       targetProjectPath: "/home/devuser/projects/testproject",
       targetClaudeVersion: "2.1.81",
@@ -152,7 +153,7 @@ describe("integration: full export/import cycle", () => {
     });
 
     expect(importResult.success).toBe(true);
-    const imported = (importResult as any).importedSessions[0];
+    const imported = (importResult as ImportResult).importedSessions[0];
 
     // Verify tool result paths were rewritten
     const targetEncoded = "-home-devuser-projects-testproject";
