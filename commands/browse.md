@@ -10,7 +10,7 @@ You are running the sesh-mover browse command. Follow these steps:
    node "PLUGIN_ROOT/dist/cli.js" browse --storage all --json
    ```
 
-2. If the result has zero exports, respond with just: "No exported sessions found." Do NOT explain where you checked or how the system works unless the user specifically asks.
+2. If the result has zero exports, respond with just: "No exported sessions found." Do NOT explain where you checked unless the user specifically asks. The CLI already scans ~/.claude-sesh-mover/, <cwd>/.claude-sesh-mover/, and the current directory for export bundles and archives.
 
 3. If exports exist, present the results as a formatted table:
    ```

@@ -290,7 +290,7 @@ program
         }
       }
 
-      // Also look for archives
+      // Also look for archives in the search dirs
       for (const { dir, storage } of searchDirs) {
         const entries = readdirSync(dir);
         for (const entry of entries) {
@@ -307,6 +307,54 @@ program
               sessions: [],
               storage,
             });
+          }
+        }
+      }
+
+      // Also scan cwd for export bundles and archives that aren't inside .claude-sesh-mover/
+      // This catches exports dropped directly in the project root (e.g., received via file transfer)
+      if (opts.storage === "project" || opts.storage === "all") {
+        const cwd = process.cwd();
+        const cwdEntries = readdirSync(cwd);
+        for (const entry of cwdEntries) {
+          if (entry === ".claude-sesh-mover") continue; // already scanned above
+          const entryPath = join(cwd, entry);
+          // Check for export directories with manifest.json
+          const manifestPath = join(entryPath, "manifest.json");
+          if (existsSync(manifestPath)) {
+            try {
+              const manifest = readManifest(entryPath);
+              if (manifest.plugin === "sesh-mover") {
+                exports.push({
+                  name: entry,
+                  path: entryPath,
+                  exportedAt: manifest.exportedAt,
+                  sourcePlatform: manifest.sourcePlatform,
+                  sourceProjectPath: manifest.sourceProjectPath,
+                  sessionCount: manifest.sessions.length,
+                  sessions: manifest.sessions,
+                  storage: "project",
+                });
+              }
+            } catch {
+              // Not a sesh-mover export, skip
+            }
+          }
+          // Check for archive files
+          if (entry.endsWith(".tar.gz") || entry.endsWith(".tar.zst")) {
+            // Only include if filename looks like a sesh-mover export (date prefix pattern)
+            if (/^\d{4}-\d{2}-\d{2}-/.test(entry)) {
+              exports.push({
+                name: entry,
+                path: entryPath,
+                exportedAt: "",
+                sourcePlatform: detectPlatform(),
+                sourceProjectPath: "",
+                sessionCount: 0,
+                sessions: [],
+                storage: "project",
+              });
+            }
           }
         }
       }
