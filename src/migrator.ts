@@ -3,8 +3,9 @@ import {
   existsSync,
   readdirSync,
   mkdtempSync,
+  renameSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
@@ -29,6 +30,7 @@ export interface MigrateOptions {
   excludeLayers: ExportLayer[];
   claudeVersion: string;
   dryRun?: boolean;
+  renameDir?: boolean;
 }
 
 export async function migrateSession(
@@ -44,6 +46,7 @@ export async function migrateSession(
     excludeLayers,
     claudeVersion,
     dryRun,
+    renameDir,
   } = options;
 
   // Create temp directory for the intermediate export
@@ -95,6 +98,7 @@ export async function migrateSession(
         command: "migrate",
         importedSessions: dryResult.importedSessions,
         cleanedUp: false,
+        directoryRenamed: false,
         sourcePath: sourceProjectPath,
         targetPath: targetProjectPath,
         warnings: [
@@ -150,11 +154,41 @@ export async function migrateSession(
       }
     }
 
+    // Step 4: Optionally rename the actual project directory
+    let directoryRenamed = false;
+    if (renameDir && sourceProjectPath !== targetProjectPath) {
+      if (existsSync(sourceProjectPath) && !existsSync(targetProjectPath)) {
+        try {
+          // Ensure parent directory of target exists
+          const targetParent = dirname(targetProjectPath);
+          if (!existsSync(targetParent)) {
+            const { mkdirSync } = await import("node:fs");
+            mkdirSync(targetParent, { recursive: true });
+          }
+          renameSync(sourceProjectPath, targetProjectPath);
+          directoryRenamed = true;
+        } catch (e) {
+          imported.warnings.push(
+            `Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${(e as Error).message}. You may need to rename it manually.`
+          );
+        }
+      } else if (!existsSync(sourceProjectPath)) {
+        imported.warnings.push(
+          `Source directory ${sourceProjectPath} does not exist — cannot rename. It may have already been moved.`
+        );
+      } else if (existsSync(targetProjectPath)) {
+        imported.warnings.push(
+          `Target directory ${targetProjectPath} already exists — skipping rename to avoid overwriting. Move files manually if needed.`
+        );
+      }
+    }
+
     return {
       success: true,
       command: "migrate",
       importedSessions: imported.importedSessions,
       cleanedUp,
+      directoryRenamed,
       sourcePath: sourceProjectPath,
       targetPath: targetProjectPath,
       warnings: imported.warnings,

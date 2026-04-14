@@ -208,6 +208,7 @@ export interface MigrateResult {
   command: "migrate";
   importedSessions: ImportResult["importedSessions"];
   cleanedUp: boolean;
+  directoryRenamed: boolean;
   sourcePath: string;
   targetPath: string;
   warnings: string[];
