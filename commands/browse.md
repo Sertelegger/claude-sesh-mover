@@ -1,6 +1,6 @@
 ---
 name: browse
-description: List all exported sessions with identifying information
+description: Browse exported sessions — view, import, or delete
 ---
 
 You are running the sesh-mover browse command. Follow these steps:
@@ -10,7 +10,7 @@ You are running the sesh-mover browse command. Follow these steps:
    node "PLUGIN_ROOT/dist/cli.js" browse --storage all --json
    ```
 
-2. If the result has zero exports, respond with just: "No exported sessions found." Do NOT explain where you checked unless the user specifically asks. The CLI already scans ~/.claude-sesh-mover/, <cwd>/.claude-sesh-mover/, and the current directory for export bundles and archives.
+2. If the result has zero exports, respond with just: "No exported sessions found." Do NOT explain where you checked unless the user specifically asks.
 
 3. If exports exist, present the results as a formatted table:
    ```
@@ -19,11 +19,14 @@ You are running the sesh-mover browse command. Follow these steps:
    2  2026-04-09  fix-auth-middleware     Debugging JWT token expiry in auth middleware    wsl2      3         project
    ```
 
-4. If the user asks about a specific export, read its manifest for more details (individual sessions, layers, source info).
+4. Use AskUserQuestion to let the user pick an export (each as a selectable option with name + summary), plus a "Cancel" option.
 
-5. If the user wants to import one, invoke the import command flow.
+5. Once an export is selected, use AskUserQuestion to ask what to do:
+   - "Import to current project" — proceed with the import flow (dry-run, confirm, execute, report)
+   - "View details" — show the full manifest: individual sessions (ID, summary, date, message count), included layers, source platform, source path, Claude version, integrity hashes
+   - "Delete" — confirm with AskUserQuestion ("Yes, delete" / "Cancel"), then delete the export directory or archive
 
-6. If the user wants to delete old exports, confirm which one, then delete the directory directly.
+6. After completing an action, if the user chose "View details", offer the import/delete options again for the same export.
 
 To find the plugin root, search for the sesh-mover plugin directory by running:
 ```bash
