@@ -10,11 +10,16 @@ You are running the sesh-mover import command. Follow these steps:
    node "PLUGIN_ROOT/dist/cli.js" browse --storage all --json
    ```
 
-2. If no exports found, respond with just: "No exported sessions found." Do NOT elaborate unless asked.
+2. If no exports found, use AskUserQuestion to offer:
+   - "Specify a file path" — ask the user for the path to an export directory or archive
+   - "Cancel"
+   Do NOT give a verbose explanation of where you searched unless the user asks.
 
-3. Present the list to the user with: date, name, summary, source platform, source project path, session count. Format as a numbered table.
+3. If exports exist, present the list with: date, name, summary, source platform, source project path, session count. Format as a numbered table.
 
-4. Use AskUserQuestion to let the user pick which export to import (present each as a selectable option with the name and summary).
+4. Use AskUserQuestion to let the user pick which export to import. Always include an extra option:
+   - Each found export as a selectable option (name + summary)
+   - "Specify a different file path" — for exports not in the standard locations
 
 5. If the chosen export contains multiple sessions, use AskUserQuestion to ask:
    - "Import all sessions" (recommended)
