@@ -1,0 +1,27 @@
+{
+  "name": "claude-sesh-mover",
+  "owner": {
+    "name": "Sascha Sertel",
+    "email": "sascha@needforgeek.com"
+  },
+  "metadata": {
+    "description": "Single-plugin marketplace for claude-sesh-mover",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "sesh-mover",
+      "source": "./",
+      "description": "Export, import, and migrate Claude Code sessions across machines, platforms, config directories, and project paths.",
+      "author": {
+        "name": "Sascha Sertel",
+        "email": "sascha@needforgeek.com"
+      },
+      "homepage": "https://github.com/Sertelegger/claude-sesh-mover",
+      "repository": "https://github.com/Sertelegger/claude-sesh-mover",
+      "license": "MIT",
+      "keywords": ["claude-code", "session", "migration", "export", "import", "wsl"],
+      "category": "productivity"
+    }
+  ]
+}

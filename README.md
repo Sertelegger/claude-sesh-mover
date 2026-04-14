@@ -27,7 +27,7 @@ Add the marketplace:
 Install the plugin:
 
 ```text
-/plugin install sesh-mover@sertelegger-claude-sesh-mover
+/plugin install sesh-mover@claude-sesh-mover
 ```
 
 If the slash commands (`/sesh-mover:export` etc.) don't show up right away, reload:
