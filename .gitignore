@@ -2,3 +2,4 @@ node_modules/
 *.tsbuildinfo
 .claude-sesh-mover/
 .envrc
+docs/
