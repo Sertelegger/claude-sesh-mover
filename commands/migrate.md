@@ -5,41 +5,48 @@ description: Move session(s) to a new project path or config directory (same mac
 
 You are running the sesh-mover migrate command. This is a same-machine operation that moves sessions (export + import + cleanup). Follow these steps:
 
-1. Ask the user for the target project path (use AskUserQuestion if there are obvious candidates, otherwise ask as a free-text question).
+1. Determine the source project path. Use AskUserQuestion with options:
+   - "Current directory (<cwd>)" (default, only if cwd has sessions in the config dir)
+   - "A different path" (free-text follow-up for the absolute source path)
 
-2. If applicable, ask for the target config directory.
+   **Self-migration warning:** If the resolved source path equals the current session's cwd, warn the user that this session is actively writing to the source JSONL — the migration takes a snapshot, but new messages after the migrate run go to the now-deleted source file, and the shell's cwd is pulled out from under subsequent tool calls if `--rename-dir` is used. Recommend they exit this session and re-run migrate from a stable outer path (e.g., `~/Projects/` or `~`). Offer to proceed anyway if they insist, or cancel.
 
-3. Use AskUserQuestion to ask scope:
-   - "This session only" (recommended)
+2. Ask the user for the target project path (use AskUserQuestion if there are obvious candidates, otherwise ask as a free-text question).
+
+3. If applicable, ask for the source and/or target config directory (each defaults to the resolved config dir — `CLAUDE_CONFIG_DIR` or `~/.claude/`). Only prompt when the user is migrating across config dirs.
+
+4. Use AskUserQuestion to ask scope:
+   - "This session only" (recommended when source = cwd)
    - "All sessions for this project"
 
-4. If the source and target project paths differ and the source directory exists, use AskUserQuestion to ask:
+5. If the source and target project paths differ and the source directory exists on disk, use AskUserQuestion to ask:
    - "Yes, also rename the project directory" (recommended) — the CLI will `mv` the source directory to the target path
    - "No, only migrate session data" — the user will rename the directory themselves
 
-5. Detect the current platform. If WSL is involved (source or target paths suggest it), auto-detect the path translation and present the mapping for the user to confirm before proceeding.
+6. Detect the current platform. If WSL is involved (source or target paths suggest it), auto-detect the path translation and present the mapping for the user to confirm before proceeding.
 
-6. Run a dry-run:
+7. Run a dry-run (always pass `--source-project-path` explicitly, even when it equals cwd — this makes the command self-documenting and future-proofs it against cwd changes mid-run):
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" migrate --target-project-path "<path>" [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] --dry-run
+   node "PLUGIN_ROOT/dist/cli.js" migrate --source-project-path "<source>" --target-project-path "<target>" [--source-config-dir "<path>"] [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir] --dry-run
    ```
+   Include `--rename-dir` in the dry-run too so the preview reflects the real plan.
 
-7. Present what will happen:
+8. Present what will happen:
    - Sessions that will be moved
    - Path translations that will be applied
    - Source files that will be cleaned up after successful import
    - Whether the project directory will be renamed (if user chose that option)
    - Any warnings
 
-8. Use AskUserQuestion to confirm: "Proceed with migration" / "Cancel". Emphasize that this will delete the source session files after import, and rename the directory if that option was selected.
+9. Use AskUserQuestion to confirm: "Proceed with migration" / "Cancel". Emphasize that this will delete the source session files after import, and rename the directory if that option was selected.
 
-9. Execute:
-   ```bash
-   node "PLUGIN_ROOT/dist/cli.js" migrate --target-project-path "<path>" [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir]
-   ```
-   Include `--rename-dir` only if the user chose to rename the directory in step 4.
+10. Execute:
+    ```bash
+    node "PLUGIN_ROOT/dist/cli.js" migrate --source-project-path "<source>" --target-project-path "<target>" [--source-config-dir "<path>"] [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir]
+    ```
+    Include `--rename-dir` only if the user chose to rename the directory in step 5.
 
-10. Report: sessions moved, new session IDs, whether cleanup succeeded, whether directory was renamed.
+11. Report: sessions moved, new session IDs, whether cleanup succeeded, whether directory was renamed.
 
 To find the plugin root, search for the sesh-mover plugin directory by running:
 ```bash

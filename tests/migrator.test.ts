@@ -126,5 +126,93 @@ describe("migrator", () => {
       if (!result.success) return;
       expect(result.cleanedUp).toBe(true);
     });
+
+    it("emits a self-migration warning when currentCwd equals the source path", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        dryRun: true,
+        currentCwd: "/Users/testuser/Projects/testproject",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(
+        result.warnings.some((w) => w.includes("Self-migration detected"))
+      ).toBe(true);
+    });
+
+    it("emits a self-migration warning when currentCwd is inside the source path", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        dryRun: true,
+        currentCwd: "/Users/testuser/Projects/testproject/src",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(
+        result.warnings.some((w) => w.includes("Self-migration detected"))
+      ).toBe(true);
+    });
+
+    it("does not emit a self-migration warning when currentCwd is outside the source path", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        dryRun: true,
+        currentCwd: "/Users/testuser",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(
+        result.warnings.every((w) => !w.includes("Self-migration detected"))
+      ).toBe(true);
+    });
+
+    it("does not emit a self-migration warning when currentCwd has a prefix match but is a sibling", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        dryRun: true,
+        currentCwd: "/Users/testuser/Projects/testproject-sibling",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(
+        result.warnings.every((w) => !w.includes("Self-migration detected"))
+      ).toBe(true);
+    });
   });
 });

@@ -5,7 +5,7 @@ import {
   mkdtempSync,
   renameSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, relative, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
@@ -31,6 +31,14 @@ export interface MigrateOptions {
   claudeVersion: string;
   dryRun?: boolean;
   renameDir?: boolean;
+  /** When set, a warning is emitted if this path is inside `sourceProjectPath`
+   *  (self-migration: the caller is running inside the directory being moved). */
+  currentCwd?: string;
+}
+
+function isWithin(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 export async function migrateSession(
@@ -47,7 +55,17 @@ export async function migrateSession(
     claudeVersion,
     dryRun,
     renameDir,
+    currentCwd,
   } = options;
+
+  const selfMigrationWarnings: string[] = [];
+  if (currentCwd && isWithin(currentCwd, sourceProjectPath)) {
+    selfMigrationWarnings.push(
+      currentCwd === sourceProjectPath
+        ? `Self-migration detected: current working directory matches source path (${sourceProjectPath}). If this is the running Claude Code session, its JSONL is being actively written — the migration takes a snapshot, but new messages after this run go to the deleted source file. Exit this session and re-run migrate from an outer directory for a clean handoff.`
+        : `Self-migration detected: current working directory (${currentCwd}) is inside source path (${sourceProjectPath}). ${renameDir ? "It will cease to exist after --rename-dir is applied." : "The session and shell may misbehave after cleanup."} Consider running migrate from an outer directory.`
+    );
+  }
 
   // Create temp directory for the intermediate export
   const tempExportDir = mkdtempSync(
@@ -102,6 +120,7 @@ export async function migrateSession(
         sourcePath: sourceProjectPath,
         targetPath: targetProjectPath,
         warnings: [
+          ...selfMigrationWarnings,
           ...dryResult.warnings,
           "DRY RUN: no files were modified or deleted",
         ],
@@ -191,7 +210,7 @@ export async function migrateSession(
       directoryRenamed,
       sourcePath: sourceProjectPath,
       targetPath: targetProjectPath,
-      warnings: imported.warnings,
+      warnings: [...selfMigrationWarnings, ...imported.warnings],
     };
   } finally {
     // Clean up temp export

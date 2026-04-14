@@ -1,5 +1,5 @@
 {
-  "name": "sesh-mover",
+  "name": "claude-sesh-mover",
   "version": "0.1.0",
   "description": "Claude Code plugin for migrating sessions between machines, platforms, config directories, and project paths",
   "main": "dist/cli.js",
