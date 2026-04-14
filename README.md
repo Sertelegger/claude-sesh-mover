@@ -18,9 +18,22 @@ It adds five slash commands to Claude Code:
 
 ### Recommended: via the Claude Code plugin marketplace
 
+Add the marketplace:
+
 ```text
 /plugin marketplace add sertelegger/claude-sesh-mover
+```
+
+Install the plugin:
+
+```text
 /plugin install sesh-mover@sertelegger-claude-sesh-mover
+```
+
+If the slash commands (`/sesh-mover:export` etc.) don't show up right away, reload:
+
+```text
+/reload-plugins
 ```
 
 Or run `/plugin`, go to the **Discover** tab, and install interactively.
