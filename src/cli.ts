@@ -232,6 +232,7 @@ program
         claudeVersion,
         dryRun: !!opts.dryRun,
         renameDir: !!opts.renameDir,
+        currentCwd: process.cwd(),
       });
 
       output(result);
