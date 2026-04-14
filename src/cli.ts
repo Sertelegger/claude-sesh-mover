@@ -210,6 +210,7 @@ program
   .option("--exclude <layers...>", "Layers to exclude")
   .option("--session-id <id>", "Migrate specific session")
   .option("--dry-run", "Show changes without applying")
+  .option("--rename-dir", "Also rename the actual project directory to the target path")
   .action(async (opts) => {
     try {
       const sourceConfigDir = resolveConfigDir(opts.sourceConfigDir);
@@ -230,6 +231,7 @@ program
         excludeLayers: (opts.exclude ?? []) as ExportLayer[],
         claudeVersion,
         dryRun: !!opts.dryRun,
+        renameDir: !!opts.renameDir,
       });
 
       output(result);

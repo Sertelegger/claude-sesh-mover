@@ -61,6 +61,51 @@ describe("migrator", () => {
       ).toBe(true);
     });
 
+    it("renames the project directory when renameDir is true", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+
+      // The fixture sessions are for "/Users/testuser/Projects/testproject"
+      // which doesn't exist on disk, so rename will warn but not fail.
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        renameDir: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // Directory doesn't exist on disk, so rename is skipped with a warning
+      expect(result.directoryRenamed).toBe(false);
+      expect(result.warnings.some(w => w.includes("does not exist"))).toBe(true);
+    });
+
+    it("does not rename directory when renameDir is false", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.directoryRenamed).toBe(false);
+      // No rename warning since we didn't ask for it
+      expect(result.warnings.every(w => !w.includes("does not exist"))).toBe(true);
+    });
+
     it("migrates between config directories", async () => {
       const { migrateSession } = await import("../src/migrator.js");
       const targetConfig = join(tempDir, "other-claude");

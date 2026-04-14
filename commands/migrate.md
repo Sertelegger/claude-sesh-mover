@@ -13,27 +13,33 @@ You are running the sesh-mover migrate command. This is a same-machine operation
    - "This session only" (recommended)
    - "All sessions for this project"
 
-4. Detect the current platform. If WSL is involved (source or target paths suggest it), auto-detect the path translation and present the mapping for the user to confirm before proceeding.
+4. If the source and target project paths differ and the source directory exists, use AskUserQuestion to ask:
+   - "Yes, also rename the project directory" (recommended) — the CLI will `mv` the source directory to the target path
+   - "No, only migrate session data" — the user will rename the directory themselves
 
-5. Run a dry-run:
+5. Detect the current platform. If WSL is involved (source or target paths suggest it), auto-detect the path translation and present the mapping for the user to confirm before proceeding.
+
+6. Run a dry-run:
    ```bash
    node "PLUGIN_ROOT/dist/cli.js" migrate --target-project-path "<path>" [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] --dry-run
    ```
 
-6. Present what will happen:
+7. Present what will happen:
    - Sessions that will be moved
    - Path translations that will be applied
    - Source files that will be cleaned up after successful import
+   - Whether the project directory will be renamed (if user chose that option)
    - Any warnings
 
-7. Use AskUserQuestion to confirm: "Proceed with migration (will delete source files)" / "Cancel". Emphasize that this will delete the source session files after import.
+8. Use AskUserQuestion to confirm: "Proceed with migration" / "Cancel". Emphasize that this will delete the source session files after import, and rename the directory if that option was selected.
 
-8. Execute:
+9. Execute:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" migrate --target-project-path "<path>" [--target-config-dir "<path>"] --scope <scope> [--session-id <id>]
+   node "PLUGIN_ROOT/dist/cli.js" migrate --target-project-path "<path>" [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir]
    ```
+   Include `--rename-dir` only if the user chose to rename the directory in step 4.
 
-9. Report: sessions moved, new session IDs, whether cleanup succeeded.
+10. Report: sessions moved, new session IDs, whether cleanup succeeded, whether directory was renamed.
 
 To find the plugin root, search for the sesh-mover plugin directory by running:
 ```bash
