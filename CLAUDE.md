@@ -50,10 +50,10 @@ Exports land in `<homedir>/.claude-sesh-mover/<name>/` (user scope) or `<cwd>/.c
 
 `migrate` = export + import + cleanup + optional `--rename-dir`. Because it deletes source session files and may `mv` the source project directory, running it from inside the session being migrated is unsafe:
 
-- The running Claude Code session holds the source JSONL open and keeps appending to it; anything said after the migrate snapshot goes to the now-deleted source path.
+- The running Claude Code session holds the source JSONL open and keeps appending to it; anything said after the migrate snapshot goes to the now-deleted source path and Claude Code recreates the file, orphaning the session with a stale `cwd`.
 - If `--rename-dir` is passed, the shell's cwd disappears under subsequent tool calls.
 
-The `commands/migrate.md` slash command prompts for `--source-project-path` explicitly, defaulting to cwd but letting the user override when running from an outer directory. `migrator.ts` emits a warning whenever `currentCwd` is inside `sourceProjectPath`. The recommended flow for self-migration is: exit the session, `cd` to a stable outer path (`~` or similar), start a new Claude Code session there, then run `/sesh-mover:migrate`.
+`migrator.ts` **blocks actual self-migration runs by default** (returns `ErrorResult` with a recovery-step `suggestion`) whenever `currentCwd` is inside `sourceProjectPath`. Dry-run still previews (with a warning), and `--force` overrides the block for advanced use. The recommended flow for moving the active session is: exit Claude Code, `cd` to a stable outer path (`~` or similar), start a new Claude Code session there, then run `/sesh-mover:migrate`. Merging into a target project dir that already has sessions is supported, so the recovery flow is safe even when target sessions are already in place.
 
 ### Testing conventions
 

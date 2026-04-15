@@ -211,6 +211,7 @@ program
   .option("--session-id <id>", "Migrate specific session")
   .option("--dry-run", "Show changes without applying")
   .option("--rename-dir", "Also rename the actual project directory to the target path")
+  .option("--force", "Override the self-migration safety block (unsafe — only use when the active Claude Code session is NOT in the source path)")
   .action(async (opts) => {
     try {
       const sourceConfigDir = resolveConfigDir(opts.sourceConfigDir);
@@ -233,6 +234,7 @@ program
         dryRun: !!opts.dryRun,
         renameDir: !!opts.renameDir,
         currentCwd: process.cwd(),
+        force: !!opts.force,
       });
 
       output(result);
