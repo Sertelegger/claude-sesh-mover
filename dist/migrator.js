@@ -12,12 +12,23 @@ function isWithin(child, parent) {
     return rel === "" || (!rel.startsWith("..") && !(0, node_path_1.isAbsolute)(rel));
 }
 async function migrateSession(options) {
-    const { sourceConfigDir, targetConfigDir, sourceProjectPath, targetProjectPath, scope, sessionId, excludeLayers, claudeVersion, dryRun, renameDir, currentCwd, } = options;
+    const { sourceConfigDir, targetConfigDir, sourceProjectPath, targetProjectPath, scope, sessionId, excludeLayers, claudeVersion, dryRun, renameDir, currentCwd, force, } = options;
+    const isSelfMigration = !!currentCwd && isWithin(currentCwd, sourceProjectPath);
     const selfMigrationWarnings = [];
-    if (currentCwd && isWithin(currentCwd, sourceProjectPath)) {
+    if (isSelfMigration) {
         selfMigrationWarnings.push(currentCwd === sourceProjectPath
             ? `Self-migration detected: current working directory matches source path (${sourceProjectPath}). If this is the running Claude Code session, its JSONL is being actively written — the migration takes a snapshot, but new messages after this run go to the deleted source file. Exit this session and re-run migrate from an outer directory for a clean handoff.`
             : `Self-migration detected: current working directory (${currentCwd}) is inside source path (${sourceProjectPath}). ${renameDir ? "It will cease to exist after --rename-dir is applied." : "The session and shell may misbehave after cleanup."} Consider running migrate from an outer directory.`);
+    }
+    // Block actual self-migration runs unless the caller explicitly forces.
+    // Dry-run is allowed through so the user can still preview the plan.
+    if (isSelfMigration && !dryRun && !force) {
+        return {
+            success: false,
+            command: "migrate",
+            error: `Refusing self-migration: current working directory (${currentCwd}) is inside the source project path (${sourceProjectPath}). This Claude Code session is actively writing to a JSONL in the source; after cleanup, Claude Code recreates it at the old path and the session is orphaned with a stale cwd.`,
+            suggestion: "Exit this Claude Code session, `cd` to an outer directory (e.g. ~/ or the parent of the project), start a fresh Claude Code session there, then re-run /sesh-mover:migrate. Override (unsafe): pass --force only if you are certain the active session is NOT in the source path.",
+        };
     }
     // Create temp directory for the intermediate export
     const tempExportDir = (0, node_fs_1.mkdtempSync)((0, node_path_1.join)((0, node_os_1.tmpdir)(), "sesh-mover-migrate-"));

@@ -4,6 +4,8 @@ import {
   rmSync,
   existsSync,
   mkdirSync,
+  writeFileSync,
+  readdirSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -212,6 +214,149 @@ describe("migrator", () => {
       if (!result.success) return;
       expect(
         result.warnings.every((w) => !w.includes("Self-migration detected"))
+      ).toBe(true);
+    });
+
+    it("refuses to run an actual self-migration without --force", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser/Projects/testproject",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.command).toBe("migrate");
+      expect(result.error).toMatch(/self-migration/i);
+      // Source files must NOT have been touched
+      const sourceEncoded = "-Users-testuser-Projects-testproject";
+      expect(
+        existsSync(
+          join(configDir, "projects", sourceEncoded, `${sessionId}.jsonl`)
+        )
+      ).toBe(true);
+      // Suggestion should mention the recovery path (exit + outer dir)
+      expect(result.suggestion ?? "").toMatch(/outer|exit|cd/i);
+    });
+
+    it("refuses self-migration for scope=all without --force", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "all",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser/Projects/testproject/src",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error).toMatch(/self-migration/i);
+    });
+
+    it("allows self-migration with force=true and still emits a warning", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser/Projects/testproject",
+        force: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(
+        result.warnings.some((w) => w.includes("Self-migration detected"))
+      ).toBe(true);
+    });
+
+    it("merges into a target project dir that already has sessions", async () => {
+      // Orphan-recovery scenario: after a botched self-migration, the source
+      // project dir still has one stray session and the target already holds
+      // the successfully-migrated sessions. Running migrate from an outer dir
+      // must merge the orphan in without disturbing the existing sessions.
+      const { migrateSession } = await import("../src/migrator.js");
+
+      // Pre-populate the target project dir with an unrelated session
+      const targetEncoded = "-Users-testuser-Projects-newproject";
+      const targetProjectDir = join(configDir, "projects", targetEncoded);
+      mkdirSync(targetProjectDir, { recursive: true });
+      const preExistingId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+      writeFileSync(
+        join(targetProjectDir, `${preExistingId}.jsonl`),
+        JSON.stringify({
+          uuid: "pre-1",
+          timestamp: "2026-04-14T10:00:00Z",
+          sessionId: preExistingId,
+          cwd: "/Users/testuser/Projects/newproject",
+          version: "2.1.81",
+          type: "user",
+          message: { role: "user", content: "pre-existing" },
+        }) + "\n"
+      );
+
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser", // outer dir — not self-migration
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // Pre-existing session must still be there
+      expect(
+        existsSync(join(targetProjectDir, `${preExistingId}.jsonl`))
+      ).toBe(true);
+
+      // New session was imported alongside it
+      const jsonls = readdirSync(targetProjectDir).filter((f) =>
+        f.endsWith(".jsonl")
+      );
+      expect(jsonls.length).toBe(2);
+    });
+
+    it("still allows dry-run self-migration without --force (preview only)", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        dryRun: true,
+        currentCwd: "/Users/testuser/Projects/testproject",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(
+        result.warnings.some((w) => w.includes("Self-migration detected"))
       ).toBe(true);
     });
   });
