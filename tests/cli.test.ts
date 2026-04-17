@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
@@ -39,6 +39,21 @@ describe("cli", () => {
       const result = JSON.parse(output);
       expect(result.success).toBe(true);
       expect(result.command).toBe("export");
+    });
+
+    it("removes staging directory when format is archive", () => {
+      const outputDir = join(tempDir, "cli-archive");
+      mkdirSync(outputDir, { recursive: true });
+      const output = runCli(
+        `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format archive --name archive-test --output "${outputDir}"`
+      );
+      const result = JSON.parse(output);
+      expect(result.success).toBe(true);
+      expect(result.archivePath).toMatch(/\.tar\.gz$/);
+      expect(existsSync(result.archivePath)).toBe(true);
+      const stagingDir = join(outputDir, "archive-test");
+      expect(existsSync(stagingDir)).toBe(false);
+      expect(result.exportPath).toBe(result.archivePath);
     });
   });
 

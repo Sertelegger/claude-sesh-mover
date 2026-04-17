@@ -46,7 +46,7 @@ You are running the sesh-mover export command. Follow these steps:
    - "Overwrite existing export"
    - "Cancel"
 
-6. If archive was requested and the result has `archivePath`, report both the directory and archive locations.
+6. If archive was requested, the result's `archivePath` is the single artifact — the staging directory is removed automatically. Report `archivePath` as the destination; do not mention a separate directory.
 
 7. Report what was exported: session name, summary, layers included, destination path.
 
