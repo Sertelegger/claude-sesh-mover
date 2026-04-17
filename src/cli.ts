@@ -40,7 +40,7 @@ const program = new Command();
 program
   .name("sesh-mover")
   .description("Export, import, and migrate Claude Code sessions")
-  .version("0.1.0");
+  .version("0.1.2");
 
 // --- Export ---
 program
@@ -143,8 +143,11 @@ program
         }
         const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
         const archivePath = exportResult.exportPath + ext;
-        await createArchive(exportResult.exportPath, archivePath, compression);
+        const stagingDir = exportResult.exportPath;
+        await createArchive(stagingDir, archivePath, compression);
+        rmSync(stagingDir, { recursive: true, force: true });
         exportResult.archivePath = archivePath;
+        exportResult.exportPath = archivePath;
       }
 
       output(result);

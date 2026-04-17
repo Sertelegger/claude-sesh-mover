@@ -1,7 +1,7 @@
 {
   "name": "sesh-mover",
   "description": "Export, import, and migrate Claude Code sessions between machines, platforms, config directories, and project paths",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": {
     "name": "sascha"
   },

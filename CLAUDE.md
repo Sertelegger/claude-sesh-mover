@@ -44,7 +44,7 @@ The design is **hybrid: deterministic Node.js core + conversational skill layer.
 
 ### Export storage layout
 
-Exports land in `<homedir>/.claude-sesh-mover/<name>/` (user scope) or `<cwd>/.claude-sesh-mover/<name>/` (project scope). Each export is a directory with `manifest.json` + session JSONL + referenced layer files; archives are the same directory tarred to `<name>.tar.gz` or `<name>.tar.zst` as a sibling. `browse` scans both user and project directories.
+Exports land in `<homedir>/.claude-sesh-mover/<name>/` (user scope) or `<cwd>/.claude-sesh-mover/<name>/` (project scope). A directory export is `<name>/` with `manifest.json` + session JSONL + referenced layer files. For `--format archive`/`zstd`, the exporter writes that directory as a staging area, tars it to `<name>.tar.gz` or `<name>.tar.zst` in the parent, then removes the staging directory; the archive is the sole artifact, and `ExportResult.exportPath` is set to the archive path (equal to `archivePath`). `browse` scans both user and project directories.
 
 ### Migrate flow (self-migration hazard)
 
