@@ -27,7 +27,7 @@ You are running the sesh-mover migrate command. This is a same-machine operation
 
 7. Run a dry-run (always pass `--source-project-path` explicitly, even when it equals cwd — this makes the command self-documenting and future-proofs it against cwd changes mid-run):
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" migrate --source-project-path "<source>" --target-project-path "<target>" [--source-config-dir "<path>"] [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir] --dry-run
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" migrate --source-project-path "<source>" --target-project-path "<target>" [--source-config-dir "<path>"] [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir] --dry-run
    ```
    Include `--rename-dir` in the dry-run too so the preview reflects the real plan.
 
@@ -42,7 +42,7 @@ You are running the sesh-mover migrate command. This is a same-machine operation
 
 10. Execute:
     ```bash
-    node "PLUGIN_ROOT/dist/cli.js" migrate --source-project-path "<source>" --target-project-path "<target>" [--source-config-dir "<path>"] [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir]
+    node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" migrate --source-project-path "<source>" --target-project-path "<target>" [--source-config-dir "<path>"] [--target-config-dir "<path>"] --scope <scope> [--session-id <id>] [--rename-dir]
     ```
     Include `--rename-dir` only if the user chose to rename the directory in step 5.
 
@@ -50,8 +50,4 @@ You are running the sesh-mover migrate command. This is a same-machine operation
 
 11. Report: sessions moved, new session IDs, whether cleanup succeeded, whether directory was renamed.
 
-To find the plugin root, search for the sesh-mover plugin directory by running:
-```bash
-find ~/.claude-tzun/plugins/cache ~/.claude/plugins/cache -name "plugin.json" -path "*/sesh-mover/*" 2>/dev/null | head -1 | xargs dirname | xargs dirname
-```
-Or check common locations: `~/.claude-tzun/plugins/cache/*/sesh-mover/*/` or `~/.claude/plugins/cache/*/sesh-mover/*/`. Cache the path for the duration of the conversation.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional/retry branches, e.g. `--force` for the self-migration override path described in step 10) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

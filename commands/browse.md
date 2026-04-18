@@ -7,7 +7,7 @@ You are running the sesh-mover browse command. Follow these steps:
 
 1. List all exports:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" browse --storage all --json
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" browse --storage all --json
    ```
 
 2. If the result has zero exports, respond with just: "No exported sessions found." Do NOT explain where you checked unless the user specifically asks.
@@ -28,8 +28,4 @@ You are running the sesh-mover browse command. Follow these steps:
 
 6. After completing an action, if the user chose "View details", offer the import/delete options again for the same export.
 
-To find the plugin root, search for the sesh-mover plugin directory by running:
-```bash
-find ~/.claude-tzun/plugins/cache ~/.claude/plugins/cache -name "plugin.json" -path "*/sesh-mover/*" 2>/dev/null | head -1 | xargs dirname | xargs dirname
-```
-Or check common locations: `~/.claude-tzun/plugins/cache/*/sesh-mover/*/` or `~/.claude/plugins/cache/*/sesh-mover/*/`. Cache the path for the duration of the conversation.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocation above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and any conditional branches) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.
