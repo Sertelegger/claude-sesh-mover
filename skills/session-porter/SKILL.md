@@ -9,16 +9,17 @@ This skill provides background knowledge for all sesh-mover slash commands. It i
 
 ## CLI Location
 
-The sesh-mover CLI is at `PLUGIN_ROOT/dist/cli.js`. To find PLUGIN_ROOT, run:
+The sesh-mover CLI is at `${CLAUDE_PLUGIN_ROOT}/dist/cli.js`. Claude Code sets `CLAUDE_PLUGIN_ROOT` automatically inside plugin command execution, so **no plugin-cache discovery is needed** — invoke directly:
 ```bash
-find ~/.claude-tzun/plugins/cache ~/.claude/plugins/cache -name "plugin.json" -path "*/sesh-mover/*" 2>/dev/null | head -1 | xargs dirname | xargs dirname
+node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" <command> [options]
 ```
-Cache this path for the duration of the conversation. Then invoke:
-```bash
-node "<PLUGIN_ROOT>/dist/cli.js" <command> [options]
-```
+Do not run `find` over `~/.claude*/plugins/cache` to locate the plugin; the env var is authoritative.
 
 All commands output structured JSON to stdout. Parse it with JSON.parse().
+
+## Do Not Probe the CLI
+
+Each command file (`commands/*.md`) lists the exact CLI invocation it should produce, with every flag spelled out. **Do not run the CLI with `--help`, with no arguments, or with `-h` to discover its surface** — the command file is the authoritative reference. If a flag you need isn't listed there, the command file is wrong; fix it rather than working around it at runtime.
 
 ## Sensitive Data Warning
 
@@ -32,7 +33,7 @@ Exported sessions may contain API keys, tokens, passwords, or other sensitive da
 The current session ID can be found by:
 1. Looking at the `sessionId` field in any JSONL entry visible in the conversation
 2. Checking `~/.claude/history.jsonl` for the most recent entry matching the current project path
-3. Running: `node "PLUGIN_ROOT/dist/cli.js" browse --json` and finding the session for the current path
+3. Running: `node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" browse --json` and finding the session for the current path
 
 ## Config Directory Detection
 

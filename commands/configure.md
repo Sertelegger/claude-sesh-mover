@@ -7,7 +7,7 @@ You are running the sesh-mover configure command. Follow these steps:
 
 1. Show current effective config:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" configure --show --json
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" configure --show --json
    ```
 
 2. Present the current settings grouped by command:
@@ -19,7 +19,7 @@ You are running the sesh-mover configure command. Follow these steps:
 
 4. For each change, apply it:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" configure --scope <user|project> --set "<key>=<value>"
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" configure --scope <user|project> --set "<key>=<value>"
    ```
 
 5. Confirm what was saved and at which scope level.
@@ -33,8 +33,4 @@ Configurable keys:
 - `import.dryRunFirst` — true or false
 - `migrate.scope` — "current" or "all"
 
-To find the plugin root, search for the sesh-mover plugin directory by running:
-```bash
-find ~/.claude-tzun/plugins/cache ~/.claude/plugins/cache -name "plugin.json" -path "*/sesh-mover/*" 2>/dev/null | head -1 | xargs dirname | xargs dirname
-```
-Or check common locations: `~/.claude-tzun/plugins/cache/*/sesh-mover/*/` or `~/.claude/plugins/cache/*/sesh-mover/*/`. Cache the path for the duration of the conversation.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional branches) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

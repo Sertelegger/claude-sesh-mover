@@ -28,7 +28,8 @@ The design is **hybrid: deterministic Node.js core + conversational skill layer.
 
 - `src/` compiles to `dist/cli.js`, a Commander-based CLI with five subcommands: `export`, `import`, `migrate`, `browse`, `configure`. Every command returns structured JSON keyed by `success` and `command` (see `src/types.ts` for result shapes — `ExportResult`, `ImportResult`, `MigrateResult`, `BrowseResult`, `ConfigureResult`, `ErrorResult`).
 - `commands/*.md` + `skills/session-porter/SKILL.md` are markdown-based slash commands loaded by Claude Code when the plugin is installed. They shell out to the CLI, parse the JSON, and drive UX (confirmations, path-collision handling, prune prompts, registration fallback when Claude Code rejects an imported session).
-- `.claude-plugin/plugin.json` is the plugin manifest consumed by Claude Code's plugin cache.
+- `.claude-plugin/plugin.json` is the plugin manifest consumed by Claude Code's plugin cache; `.claude-plugin/marketplace.json` sits alongside it for marketplace listing.
+- `src/index.ts` is the library entrypoint — it re-exports every core module so the package can also be consumed programmatically. It deliberately does **not** export a `decodeProjectPath`: project-folder encoding (`-` for path separators) is lossy for hyphenated paths and cannot be reliably reversed. Read `cwd` from JSONL entries, or use `readProjectPathFromJsonl` in `discovery.ts`, instead of trying to decode the folder name.
 
 ### Core module responsibilities
 

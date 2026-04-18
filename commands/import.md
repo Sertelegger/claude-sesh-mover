@@ -7,7 +7,7 @@ You are running the sesh-mover import command. Follow these steps:
 
 1. List available exports:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" browse --storage all --json
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" browse --storage all --json
    ```
 
 2. If no exports found, use AskUserQuestion to offer:
@@ -27,7 +27,7 @@ You are running the sesh-mover import command. Follow these steps:
 
 6. Run a dry-run first:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>" --dry-run
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>" --dry-run
    ```
 
 7. Present the dry-run results: path rewrites that will be applied, version adaptations, integrity status, any warnings.
@@ -36,13 +36,12 @@ You are running the sesh-mover import command. Follow these steps:
 
 9. Execute the import:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>"
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>"
    ```
 
-10. Report the result. If `resumable` is true, tell the user they can continue the session with `claude --resume <newSessionId>`. If not resumable, offer to read the imported JSONL and inject it as context into the current conversation.
+10. Report the result.
+    - If `resumable` is true: tell the user they can continue the session with `claude --resume <newSessionId>`.
+    - If not resumable because of a version-mismatch or "session validation failed" error: offer to retry the step 9 invocation with `--no-register` appended. That imports the session content but skips the registry entry — the user won't get a `claude --resume` slot, but the JSONL is on disk.
+    - If the `--no-register` retry also fails, or if the user prefers: offer to read the imported JSONL and inject it as context into the current conversation.
 
-To find the plugin root, search for the sesh-mover plugin directory by running:
-```bash
-find ~/.claude-tzun/plugins/cache ~/.claude/plugins/cache -name "plugin.json" -path "*/sesh-mover/*" 2>/dev/null | head -1 | xargs dirname | xargs dirname
-```
-Or check common locations: `~/.claude-tzun/plugins/cache/*/sesh-mover/*/` or `~/.claude/plugins/cache/*/sesh-mover/*/`. Cache the path for the duration of the conversation.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional/retry branches, e.g. `--no-register` for the version-mismatch fallback) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

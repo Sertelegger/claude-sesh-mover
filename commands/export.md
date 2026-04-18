@@ -38,20 +38,16 @@ You are running the sesh-mover export command. Follow these steps:
 
 4. Run the CLI command:
    ```bash
-   node "PLUGIN_ROOT/dist/cli.js" export --scope <scope> --session-id <id> --storage <storage> --format <format> [--exclude <layers>] --name "<name>" --source-config-dir "<config-dir>"
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" export --scope <scope> --session-id <id> --storage <storage> --format <format> [--exclude <layers>] --name "<name>" --source-config-dir "<config-dir>"
    ```
 
-5. Parse the JSON output. If `collision` is true, use AskUserQuestion with options:
-   - "Keep both (append suffix)"
-   - "Overwrite existing export"
-   - "Cancel"
+5. Parse the JSON output. If `collision` is true, use AskUserQuestion with options, then re-run the step 4 invocation with the corresponding flag appended:
+   - "Keep both (append suffix)" — append `--suffix` and re-run
+   - "Overwrite existing export" — append `--overwrite` and re-run
+   - "Cancel" — stop, do not re-run
 
 6. If archive was requested, the result's `archivePath` is the single artifact — the staging directory is removed automatically. Report `archivePath` as the destination; do not mention a separate directory.
 
 7. Report what was exported: session name, summary, layers included, destination path.
 
-To find the plugin root, search for the sesh-mover plugin directory by running:
-```bash
-find ~/.claude-tzun/plugins/cache ~/.claude/plugins/cache -name "plugin.json" -path "*/sesh-mover/*" 2>/dev/null | head -1 | xargs dirname | xargs dirname
-```
-Or check common locations: `~/.claude-tzun/plugins/cache/*/sesh-mover/*/` or `~/.claude/plugins/cache/*/sesh-mover/*/`. Cache the path for the duration of the conversation.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and any conditional/retry branches, e.g. `--suffix`/`--overwrite` for collision handling) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.
