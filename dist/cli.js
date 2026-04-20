@@ -18,7 +18,7 @@ const program = new commander_1.Command();
 program
     .name("sesh-mover")
     .description("Export, import, and migrate Claude Code sessions")
-    .version("0.1.3");
+    .version("0.1.4");
 // --- Export ---
 program
     .command("export")
@@ -39,9 +39,9 @@ program
     try {
         const configDir = (0, platform_js_1.resolveConfigDir)(opts.sourceConfigDir);
         const config = loadEffectiveConfig(configDir, process.cwd());
-        const scope = (opts.scope ?? config.export.scope);
-        const storage = (opts.storage ?? config.export.storage);
-        const format = (opts.format ?? config.export.format);
+        const scope = parseScope(opts.scope ?? config.export.scope, "export");
+        const storage = parseStorage(opts.storage ?? config.export.storage);
+        const format = parseFormat(opts.format ?? config.export.format);
         const excludeLayers = (opts.exclude ?? config.export.exclude);
         const claudeVersion = getClaudeVersion();
         // Determine output directory
@@ -173,7 +173,7 @@ program
         const claudeVersion = getClaudeVersion();
         const sourceProjectPath = opts.sourceProjectPath ?? process.cwd();
         const config = loadEffectiveConfig(sourceConfigDir, sourceProjectPath);
-        const scope = (opts.scope ?? config.migrate.scope);
+        const scope = parseScope(opts.scope ?? config.migrate.scope, "migrate");
         const result = await (0, migrator_js_1.migrateSession)({
             sourceConfigDir,
             targetConfigDir,
@@ -435,6 +435,34 @@ async function doExport(configDir, scope, sessionId, outputDir, name, excludeLay
         excludeLayers,
         claudeVersion,
     });
+}
+function parseScope(value, command) {
+    if (value === "current" || value === "all")
+        return value;
+    throw new Error(`Invalid --scope value for ${command}: "${value}". Valid: current, all.`);
+}
+function parseStorage(value) {
+    if (value === "user" || value === "project")
+        return value;
+    throw new Error(`Invalid --storage value: "${value}". Valid: user, project.`);
+}
+function parseFormat(value) {
+    switch (value) {
+        case "dir":
+        case "archive":
+        case "zstd":
+            return value;
+        case "tar.gz":
+        case "gzip":
+        case "gz":
+            return "archive";
+        case "tar.zst":
+        case "tar.zstd":
+        case "zst":
+            return "zstd";
+        default:
+            throw new Error(`Invalid --format value: "${value}". Valid: dir, archive (tar.gz), zstd (tar.zst).`);
+    }
 }
 function loadEffectiveConfig(configDir, projectDir) {
     const userConfigDir = (0, node_path_1.join)((0, node_os_1.homedir)(), ".claude-sesh-mover");

@@ -31,9 +31,10 @@ Exported sessions may contain API keys, tokens, passwords, or other sensitive da
 ## Detecting the Current Session
 
 The current session ID can be found by:
-1. Looking at the `sessionId` field in any JSONL entry visible in the conversation
-2. Checking `~/.claude/history.jsonl` for the most recent entry matching the current project path
-3. Running: `node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" browse --json` and finding the session for the current path
+1. Looking at the `sessionId` field in any recent tool result in the current conversation (fastest; always available mid-session)
+2. Listing `<configDir>/projects/<encoded-project-path>/*.jsonl` — each filename (minus `.jsonl`) is a session ID for that project
+
+Do **not** use `sesh-mover browse` to find live session IDs — `browse` only lists previously-exported bundles, not live sessions. There is no `--project` flag on `browse`.
 
 ## Config Directory Detection
 
