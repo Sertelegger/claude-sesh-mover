@@ -40,7 +40,7 @@ const program = new Command();
 program
   .name("sesh-mover")
   .description("Export, import, and migrate Claude Code sessions")
-  .version("0.1.3");
+  .version("0.1.4");
 
 // --- Export ---
 program
@@ -62,9 +62,9 @@ program
     try {
       const configDir = resolveConfigDir(opts.sourceConfigDir);
       const config = loadEffectiveConfig(configDir, process.cwd());
-      const scope = (opts.scope ?? config.export.scope) as SessionScope;
-      const storage = (opts.storage ?? config.export.storage) as StorageScope;
-      const format = (opts.format ?? config.export.format) as ExportFormat;
+      const scope = parseScope(opts.scope ?? config.export.scope, "export");
+      const storage = parseStorage(opts.storage ?? config.export.storage);
+      const format = parseFormat(opts.format ?? config.export.format);
       const excludeLayers = (opts.exclude ?? config.export.exclude) as ExportLayer[];
       const claudeVersion = getClaudeVersion();
 
@@ -223,7 +223,7 @@ program
 
       const sourceProjectPath = opts.sourceProjectPath ?? process.cwd();
       const config = loadEffectiveConfig(sourceConfigDir, sourceProjectPath);
-      const scope = (opts.scope ?? config.migrate.scope) as SessionScope;
+      const scope = parseScope(opts.scope ?? config.migrate.scope, "migrate");
 
       const result = await migrateSession({
         sourceConfigDir,
@@ -517,6 +517,41 @@ async function doExport(
     excludeLayers,
     claudeVersion,
   });
+}
+
+function parseScope(value: string, command: string): SessionScope {
+  if (value === "current" || value === "all") return value;
+  throw new Error(
+    `Invalid --scope value for ${command}: "${value}". Valid: current, all.`
+  );
+}
+
+function parseStorage(value: string): StorageScope {
+  if (value === "user" || value === "project") return value;
+  throw new Error(
+    `Invalid --storage value: "${value}". Valid: user, project.`
+  );
+}
+
+function parseFormat(value: string): ExportFormat {
+  switch (value) {
+    case "dir":
+    case "archive":
+    case "zstd":
+      return value;
+    case "tar.gz":
+    case "gzip":
+    case "gz":
+      return "archive";
+    case "tar.zst":
+    case "tar.zstd":
+    case "zst":
+      return "zstd";
+    default:
+      throw new Error(
+        `Invalid --format value: "${value}". Valid: dir, archive (tar.gz), zstd (tar.zst).`
+      );
+  }
 }
 
 function loadEffectiveConfig(configDir: string, projectDir: string) {

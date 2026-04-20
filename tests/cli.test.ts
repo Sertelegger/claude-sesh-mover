@@ -55,6 +55,94 @@ describe("cli", () => {
       expect(existsSync(stagingDir)).toBe(false);
       expect(result.exportPath).toBe(result.archivePath);
     });
+
+    it("accepts --format tar.gz as alias for archive", () => {
+      const outputDir = join(tempDir, "cli-targz");
+      mkdirSync(outputDir, { recursive: true });
+      const output = runCli(
+        `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format tar.gz --name targz-test --output "${outputDir}"`
+      );
+      const result = JSON.parse(output);
+      expect(result.success).toBe(true);
+      expect(result.archivePath).toMatch(/\.tar\.gz$/);
+      expect(existsSync(result.archivePath)).toBe(true);
+      expect(existsSync(join(outputDir, "targz-test"))).toBe(false);
+    });
+
+    it("accepts --format tar.zst as alias for zstd", () => {
+      const outputDir = join(tempDir, "cli-tarzst");
+      mkdirSync(outputDir, { recursive: true });
+      const output = runCli(
+        `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format tar.zst --name tarzst-test --output "${outputDir}"`
+      );
+      const result = JSON.parse(output);
+      expect(result.success).toBe(true);
+      // If zstd is not available it falls back to gzip and warns; either way archivePath must exist.
+      expect(result.archivePath).toMatch(/\.tar\.(zst|gz)$/);
+      expect(existsSync(result.archivePath)).toBe(true);
+      expect(existsSync(join(outputDir, "tarzst-test"))).toBe(false);
+    });
+
+    it("rejects invalid --format values with an error", () => {
+      const outputDir = join(tempDir, "cli-badfmt");
+      mkdirSync(outputDir, { recursive: true });
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(
+          `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format bogus --name bad-test --output "${outputDir}"`
+        );
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = {
+          stdout: err.stdout ? err.stdout.toString() : "",
+          status: err.status ?? 0,
+        };
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.command).toBe("export");
+      expect(result.error).toMatch(/format/i);
+    });
+
+    it("rejects invalid --scope values with an error", () => {
+      const outputDir = join(tempDir, "cli-badscope");
+      mkdirSync(outputDir, { recursive: true });
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(
+          `export --scope project --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name bad-scope --output "${outputDir}"`
+        );
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = {
+          stdout: err.stdout ? err.stdout.toString() : "",
+          status: err.status ?? 0,
+        };
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/scope/i);
+    });
+
+    it("records sessionScope=all in manifest when --scope all", () => {
+      const outputDir = join(tempDir, "cli-scope-all");
+      mkdirSync(outputDir, { recursive: true });
+      const output = runCli(
+        `export --scope all --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name scope-all-test --output "${outputDir}"`
+      );
+      const result = JSON.parse(output);
+      expect(result.success).toBe(true);
+      const manifestPath = join(outputDir, "scope-all-test", "manifest.json");
+      expect(existsSync(manifestPath)).toBe(true);
+      const manifest = JSON.parse(
+        require("node:fs").readFileSync(manifestPath, "utf-8")
+      );
+      expect(manifest.sessionScope).toBe("all");
+    });
   });
 
   describe("browse command", () => {
