@@ -210,4 +210,164 @@ describe("integration: full export/import cycle", () => {
       )
     ).toBe(true);
   });
+
+  it("round-trip: A full export → B import → B continues session → B incremental export → A import with continuation", async () => {
+    const { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync } =
+      await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { exportAllSessions } = await import("../src/exporter.js");
+    const { importSession } = await import("../src/importer.js");
+    const { readSyncState } = await import("../src/sync-state.js");
+    const { createFixtureTree } = await import("./fixtures/create-fixtures.js");
+
+    const homeA = mkdtempSync(join(tmpdir(), "rt-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "rt-homeB-"));
+    const origHome = process.env.HOME;
+
+    const workspaceA = mkdtempSync(join(tmpdir(), "rt-wsA-"));
+    const workspaceB = mkdtempSync(join(tmpdir(), "rt-wsB-"));
+
+    try {
+      // --- A: initial full (incremental-from-empty) export ---
+      process.env.HOME = homeA;
+      const fxA = createFixtureTree(workspaceA);
+      const exportsA = join(workspaceA, "exports");
+      mkdirSync(exportsA, { recursive: true });
+
+      const { loadOrCreateMachineId: loadA } = await import("../src/machine.js");
+      const machineA = loadA();
+
+      const fullA = await exportAllSessions({
+        configDir: fxA.configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir: exportsA,
+        name: "initial-full",
+        excludeLayers: [],
+        claudeVersion: "2.1.114",
+        incremental: {
+          sourceMachineId: machineA.id,
+          sourceMachineName: "A",
+          targetMachineId: "machine-B",
+          targetMachineName: "B",
+          peerSent: {},
+        },
+      });
+      expect(fullA.success).toBe(true);
+
+      // --- B: import the full bundle ---
+      process.env.HOME = homeB;
+      const targetB = join(workspaceB, ".claude");
+      mkdirSync(join(targetB, "projects"), { recursive: true });
+
+      const bImport = await importSession({
+        exportPath: (fullA as { exportPath: string }).exportPath,
+        targetConfigDir: targetB,
+        targetProjectPath: "/Users/b/Projects/testproject",
+        targetClaudeVersion: "2.1.114",
+        dryRun: false,
+        noRegister: false,
+      });
+      expect(bImport.success).toBe(true);
+
+      // --- B: append 2 new entries to the imported session JSONL ---
+      const imported = (bImport as { importedSessions: Array<{ newId: string }> }).importedSessions[0];
+      const bJsonlPath = join(
+        targetB,
+        "projects",
+        "-Users-b-Projects-testproject",
+        `${imported.newId}.jsonl`
+      );
+      const bEntriesNew = [
+        {
+          uuid: "b-new-1",
+          timestamp: "2026-04-21T09:00:00Z",
+          sessionId: imported.newId,
+          cwd: "/Users/b/Projects/testproject",
+          version: "2.1.114",
+          type: "user",
+          message: { role: "user", content: "extend on B" },
+        },
+        {
+          uuid: "b-new-2",
+          timestamp: "2026-04-21T09:00:05Z",
+          sessionId: imported.newId,
+          cwd: "/Users/b/Projects/testproject",
+          version: "2.1.114",
+          type: "assistant",
+          message: { model: "x", id: "m", content: [{ type: "text", text: "ok" }] },
+        },
+      ];
+      appendFileSync(
+        bJsonlPath,
+        bEntriesNew.map((e) => JSON.stringify(e)).join("\n") + "\n",
+        "utf-8"
+      );
+
+      // --- B: incremental export back to A ---
+      const exportsB = join(workspaceB, "exports");
+      mkdirSync(exportsB, { recursive: true });
+
+      const stateB2 = readSyncState("/Users/b/Projects/testproject");
+      const sentToA = stateB2.peers[machineA.id]?.sent ?? {};
+
+      const { loadOrCreateMachineId: loadB } = await import("../src/machine.js");
+      const machineB = loadB();
+
+      const incB = await exportAllSessions({
+        configDir: targetB,
+        projectPath: "/Users/b/Projects/testproject",
+        outputDir: exportsB,
+        name: "incremental-b-to-a",
+        excludeLayers: [],
+        claudeVersion: "2.1.114",
+        incremental: {
+          sourceMachineId: machineB.id,
+          sourceMachineName: "B",
+          targetMachineId: machineA.id,
+          targetMachineName: "A",
+          peerSent: sentToA,
+        },
+      });
+      expect(incB.success).toBe(true);
+      const incManifest = JSON.parse(
+        readFileSync(
+          join((incB as { exportPath: string }).exportPath, "manifest.json"),
+          "utf-8"
+        )
+      );
+      const continuations = incManifest.sessions.filter(
+        (s: { type: string }) => s.type === "continuation"
+      );
+      expect(continuations.length).toBe(1);
+
+      // --- A: import the incremental bundle ---
+      process.env.HOME = homeA;
+      const aImport = await importSession({
+        exportPath: (incB as { exportPath: string }).exportPath,
+        targetConfigDir: fxA.configDir,
+        targetProjectPath: "/Users/testuser/Projects/testproject",
+        targetClaudeVersion: "2.1.114",
+        dryRun: false,
+        noRegister: false,
+      });
+      expect(aImport.success).toBe(true);
+
+      // A should now have 2 sessions: the original + the continuation
+      const aProjectDir = join(
+        fxA.configDir,
+        "projects",
+        "-Users-testuser-Projects-testproject"
+      );
+      const jsonlFiles = readdirSync(aProjectDir).filter((f) => f.endsWith(".jsonl"));
+      expect(jsonlFiles.length).toBe(2);
+    } finally {
+      if (origHome !== undefined) process.env.HOME = origHome;
+      else delete process.env.HOME;
+      rmSync(homeA, { recursive: true, force: true });
+      rmSync(homeB, { recursive: true, force: true });
+      rmSync(workspaceA, { recursive: true, force: true });
+      rmSync(workspaceB, { recursive: true, force: true });
+    }
+  });
 });
