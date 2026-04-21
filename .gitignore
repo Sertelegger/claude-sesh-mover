@@ -3,3 +3,4 @@ node_modules/
 .claude-sesh-mover/
 .envrc
 docs/
+.worktrees/
