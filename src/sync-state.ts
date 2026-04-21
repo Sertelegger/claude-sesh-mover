@@ -39,7 +39,13 @@ export function readSyncState(projectPath: string): SyncState {
   }
   try {
     const parsed = JSON.parse(raw) as SyncState;
-    if (parsed.schemaVersion !== 1 || typeof parsed.peers !== "object") {
+    if (
+      parsed.schemaVersion !== 1 ||
+      parsed.peers === null ||
+      typeof parsed.peers !== "object" ||
+      parsed.lineage === null ||
+      typeof parsed.lineage !== "object"
+    ) {
       throw new Error("schema mismatch");
     }
     return parsed;

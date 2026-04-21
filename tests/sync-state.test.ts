@@ -67,6 +67,21 @@ describe("sync-state", () => {
     expect(existsSync(p + ".tmp")).toBe(false);
   });
 
+  it("readSyncState rejects a file with null peers and recovers to default", async () => {
+    const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
+    const p = syncStatePath("/Users/sascha/Projects/foo");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(tempHome, ".claude-sesh-mover", "sync-state"), { recursive: true });
+    writeFileSync(
+      p,
+      JSON.stringify({ projectPath: "/Users/sascha/Projects/foo", schemaVersion: 1, peers: null, lineage: {} }),
+      "utf-8"
+    );
+    const state = readSyncState("/Users/sascha/Projects/foo");
+    expect(state.peers).toEqual({});
+    expect(existsSync(p)).toBe(false); // renamed aside
+  });
+
   it("readSyncState recovers from a corrupt file by renaming and returning default", async () => {
     const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
     const p = syncStatePath("/Users/sascha/Projects/foo");
