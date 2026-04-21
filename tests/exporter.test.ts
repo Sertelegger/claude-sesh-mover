@@ -135,4 +135,113 @@ describe("exporter", () => {
       expect(result.sessions.length).toBeGreaterThanOrEqual(1);
     });
   });
+
+  it("incremental export emits continuation session for a session with new entries", async () => {
+    const { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { exportAllSessions } = await import("../src/exporter.js");
+    const { readManifest } = await import("../src/manifest.js");
+    const { createFixtureTree } = await import("./fixtures/create-fixtures.js");
+
+    const tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-inc-export-"));
+    try {
+      const fx = createFixtureTree(tempDir);
+      const outputDir = join(tempDir, "exports");
+      mkdirSync(outputDir, { recursive: true });
+
+      const result = await exportAllSessions({
+        configDir: fx.configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir,
+        name: "inc-test",
+        excludeLayers: [],
+        claudeVersion: "2.1.114",
+        incremental: {
+          sourceMachineId: "machine-A",
+          sourceMachineName: "A",
+          targetMachineId: "machine-B",
+          targetMachineName: "B",
+          peerSent: {
+            [fx.sessionId]: {
+              headEntryUuid: "entry-2",
+              messageCount: 2,
+              sentAsType: "full",
+              sentAsSessionId: fx.sessionId,
+            },
+          },
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const manifest = readManifest((result as { exportPath: string }).exportPath);
+      expect(manifest.incremental).toBe(true);
+      expect(manifest.sourceMachineId).toBe("machine-A");
+      expect(manifest.baseline?.targetMachineId).toBe("machine-B");
+      expect(manifest.sessions.length).toBe(1);
+      const s = manifest.sessions[0];
+      expect(s.type).toBe("continuation");
+      expect(s.continuation?.fromEntryIndex).toBe(2);
+      expect(s.continuation?.fromEntryUuid).toBe("entry-3");
+      expect(s.continuation?.continuesLocalSessionId).toBe(fx.sessionId);
+
+      const jsonlPath = join(
+        (result as { exportPath: string }).exportPath,
+        "sessions",
+        `${s.sessionId}.jsonl`
+      );
+      expect(existsSync(jsonlPath)).toBe(true);
+      const firstLine = JSON.parse(
+        readFileSync(jsonlPath, "utf-8").split("\n")[0]
+      );
+      expect(firstLine.message.content).toContain("[sesh-mover continuation]");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("incremental export skips unchanged sessions", async () => {
+    const { mkdtempSync, rmSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { exportAllSessions } = await import("../src/exporter.js");
+    const { readManifest } = await import("../src/manifest.js");
+    const { createFixtureTree } = await import("./fixtures/create-fixtures.js");
+
+    const tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-inc-unchanged-"));
+    try {
+      const fx = createFixtureTree(tempDir);
+      const outputDir = join(tempDir, "exports");
+      mkdirSync(outputDir, { recursive: true });
+
+      const result = await exportAllSessions({
+        configDir: fx.configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir,
+        name: "inc-unchanged",
+        excludeLayers: [],
+        claudeVersion: "2.1.114",
+        incremental: {
+          sourceMachineId: "machine-A",
+          sourceMachineName: "A",
+          targetMachineId: "machine-B",
+          targetMachineName: "B",
+          peerSent: {
+            [fx.sessionId]: {
+              headEntryUuid: "entry-3",
+              messageCount: 3,
+              sentAsType: "full",
+              sentAsSessionId: fx.sessionId,
+            },
+          },
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const manifest = readManifest((result as { exportPath: string }).exportPath);
+      expect(manifest.sessions.length).toBe(0);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
