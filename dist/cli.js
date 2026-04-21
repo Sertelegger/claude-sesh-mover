@@ -12,6 +12,8 @@ const exporter_js_1 = require("./exporter.js");
 const importer_js_1 = require("./importer.js");
 const migrator_js_1 = require("./migrator.js");
 const manifest_js_1 = require("./manifest.js");
+const machine_js_1 = require("./machine.js");
+const sync_state_js_1 = require("./sync-state.js");
 const archiver_js_1 = require("./archiver.js");
 const discovery_js_1 = require("./discovery.js");
 const program = new commander_1.Command();
@@ -35,6 +37,9 @@ program
     .option("--no-summary", "Skip Claude-generated summary (reserved for future use — currently summaries always use fallback extraction)")
     .option("--overwrite", "Overwrite existing export")
     .option("--suffix", "Auto-suffix on name collision")
+    .option("--incremental", "Produce an incremental export (requires --to or --since)")
+    .option("--to <peer>", "Target peer machine id or name (incremental)")
+    .option("--since <path>", "Diff against a previous export at <path> (incremental)")
     .action(async (opts) => {
     try {
         const configDir = (0, platform_js_1.resolveConfigDir)(opts.sourceConfigDir);
@@ -44,6 +49,19 @@ program
         const format = parseFormat(opts.format ?? config.export.format);
         const excludeLayers = (opts.exclude ?? config.export.exclude);
         const claudeVersion = getClaudeVersion();
+        let incremental;
+        try {
+            incremental = resolveIncrementalOptions({
+                incremental: opts.incremental,
+                to: opts.to,
+                since: opts.since,
+                projectPath: opts.projectPath,
+            });
+        }
+        catch (e) {
+            outputError("export", e);
+            return;
+        }
         // Determine output directory
         let outputDir;
         if (opts.output) {
@@ -68,7 +86,7 @@ program
                     suffix++;
                 }
                 const suffixedName = `${name}-${suffix}`;
-                const result = await doExport(configDir, scope, opts.sessionId, outputDir, suffixedName, excludeLayers, claudeVersion, opts.projectPath);
+                const result = await doExport(configDir, scope, opts.sessionId, outputDir, suffixedName, excludeLayers, claudeVersion, opts.projectPath, incremental);
                 output(result);
                 return;
             }
@@ -85,7 +103,13 @@ program
             });
             return;
         }
-        const result = await doExport(configDir, scope, opts.sessionId, outputDir, name, excludeLayers, claudeVersion, opts.projectPath);
+        const result = await doExport(configDir, scope, opts.sessionId, outputDir, name, excludeLayers, claudeVersion, opts.projectPath, incremental);
+        // Capture the bundle dir before archive cleanup destroys the staging tree.
+        // At this point result.exportPath is still the directory path (not the .tar.gz),
+        // so we can read the manifest from disk before archive packaging + rm happens.
+        const preArchiveBundleDir = result.success && incremental?.targetMachineId
+            ? result.exportPath
+            : null;
         // Handle archive
         if (result.success && (format === "archive" || format === "zstd")) {
             const exportResult = result;
@@ -98,10 +122,16 @@ program
             const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
             const archivePath = exportResult.exportPath + ext;
             const stagingDir = exportResult.exportPath;
+            if (preArchiveBundleDir) {
+                updateSyncStateAfterExport(configDir, opts.projectPath ?? process.cwd(), incremental, stagingDir);
+            }
             await (0, archiver_js_1.createArchive)(stagingDir, archivePath, compression);
             (0, node_fs_1.rmSync)(stagingDir, { recursive: true, force: true });
             exportResult.archivePath = archivePath;
             exportResult.exportPath = archivePath;
+        }
+        else if (preArchiveBundleDir) {
+            updateSyncStateAfterExport(configDir, opts.projectPath ?? process.cwd(), incremental, preArchiveBundleDir);
         }
         output(result);
     }
@@ -413,7 +443,7 @@ program
     }
 });
 // --- Helpers ---
-async function doExport(configDir, scope, sessionId, outputDir, name, excludeLayers, claudeVersion, projectPathOverride) {
+async function doExport(configDir, scope, sessionId, outputDir, name, excludeLayers, claudeVersion, projectPathOverride, incremental) {
     // Detect project path from cwd or override
     const projectPath = projectPathOverride ?? process.cwd();
     if (scope === "all") {
@@ -424,6 +454,7 @@ async function doExport(configDir, scope, sessionId, outputDir, name, excludeLay
             name,
             excludeLayers,
             claudeVersion,
+            incremental,
         });
     }
     return (0, exporter_js_1.exportSession)({
@@ -434,7 +465,119 @@ async function doExport(configDir, scope, sessionId, outputDir, name, excludeLay
         name,
         excludeLayers,
         claudeVersion,
+        incremental,
     });
+}
+function readLastEntryUuid(jsonlPath) {
+    if (!(0, node_fs_1.existsSync)(jsonlPath))
+        return null;
+    const content = (0, node_fs_1.readFileSync)(jsonlPath, "utf-8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    if (lines.length === 0)
+        return null;
+    try {
+        return (JSON.parse(lines[lines.length - 1]).uuid ?? null);
+    }
+    catch {
+        return null;
+    }
+}
+function readLastEntryUuidInExport(exportPath, sessionId) {
+    return readLastEntryUuid((0, node_path_1.join)(exportPath, "sessions", `${sessionId}.jsonl`));
+}
+function resolvePeer(state, needle) {
+    if (state.peers[needle])
+        return { id: needle };
+    const byName = Object.entries(state.peers).find(([, p]) => p.name === needle);
+    if (byName)
+        return { id: byName[0] };
+    return null;
+}
+function readReferenceManifest(path) {
+    const manifestPath = (0, node_path_1.join)(path, "manifest.json");
+    if (!(0, node_fs_1.existsSync)(manifestPath)) {
+        throw new Error(`--since ${path} does not contain a manifest.json (archive --since is a phase-2 feature).`);
+    }
+    return JSON.parse((0, node_fs_1.readFileSync)(manifestPath, "utf-8"));
+}
+function resolveIncrementalOptions(opts) {
+    if (!opts.incremental)
+        return undefined;
+    if (!opts.to && !opts.since) {
+        throw new Error("Invalid --incremental usage: provide either --to <peer> or --since <path>.");
+    }
+    if (opts.to && opts.since) {
+        throw new Error("Invalid --incremental usage: --to and --since are mutually exclusive.");
+    }
+    const machine = (0, machine_js_1.loadOrCreateMachineId)();
+    const projectPath = opts.projectPath ?? process.cwd();
+    if (opts.to) {
+        const state = (0, sync_state_js_1.readSyncState)(projectPath);
+        const match = resolvePeer(state, opts.to);
+        if (!match) {
+            throw new Error(`No sync history with peer "${opts.to}". Run a full export to this peer first, or use --since <path>.`);
+        }
+        return {
+            sourceMachineId: machine.id,
+            sourceMachineName: machine.name,
+            targetMachineId: match.id,
+            targetMachineName: state.peers[match.id].name,
+            peerSent: state.peers[match.id].sent,
+            lastSyncAt: state.peers[match.id].lastSentAt ?? undefined,
+        };
+    }
+    const refManifest = readReferenceManifest(opts.since);
+    const peerSent = {};
+    for (const s of refManifest.sessions) {
+        peerSent[s.sessionId] = {
+            headEntryUuid: readLastEntryUuidInExport(opts.since, s.sessionId) ?? "",
+            messageCount: s.messageCount,
+            sentAsType: s.type === "continuation" ? "continuation" : "full",
+            sentAsSessionId: s.sessionId,
+        };
+    }
+    return {
+        sourceMachineId: machine.id,
+        sourceMachineName: machine.name,
+        targetMachineId: refManifest.baseline?.targetMachineId,
+        targetMachineName: refManifest.baseline?.targetMachineName,
+        referenceExport: opts.since,
+        peerSent,
+    };
+}
+function updateSyncStateAfterExport(configDir, projectPath, incremental, bundleDir) {
+    if (!incremental.targetMachineId)
+        return;
+    const state = (0, sync_state_js_1.readSyncState)(projectPath);
+    const peerId = incremental.targetMachineId;
+    if (!state.peers[peerId]) {
+        state.peers[peerId] = {
+            name: incremental.targetMachineName ?? peerId,
+            lastSentAt: null,
+            lastReceivedAt: null,
+            sent: {},
+            received: {},
+        };
+    }
+    state.peers[peerId].lastSentAt = new Date().toISOString();
+    state.peers[peerId].name =
+        incremental.targetMachineName ?? state.peers[peerId].name;
+    const manifest = (0, manifest_js_1.readManifest)(bundleDir);
+    const sourceProjectsDir = (0, node_path_1.join)(configDir, "projects", (0, platform_js_1.encodeProjectPath)(projectPath));
+    for (const s of manifest.sessions) {
+        const localSessionId = s.type === "continuation" && s.continuation
+            ? s.continuation.continuesLocalSessionId
+            : s.sessionId;
+        const localJsonl = (0, node_path_1.join)(sourceProjectsDir, `${localSessionId}.jsonl`);
+        const headUuid = readLastEntryUuid(localJsonl) ?? s.continuation?.fromEntryUuid ?? "";
+        state.peers[peerId].sent[localSessionId] = {
+            headEntryUuid: headUuid,
+            messageCount: s.messageCount,
+            sentAsType: s.type === "continuation" ? "continuation" : "full",
+            sentAsSessionId: s.sessionId,
+        };
+    }
+    (0, sync_state_js_1.writeSyncState)(state);
 }
 function parseScope(value, command) {
     if (value === "current" || value === "all")
