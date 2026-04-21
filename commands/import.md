@@ -43,5 +43,9 @@ You are running the sesh-mover import command. Follow these steps:
     - If `resumable` is true: tell the user they can continue the session with `claude --resume <newSessionId>`.
     - If not resumable because of a version-mismatch or "session validation failed" error: offer to retry the step 9 invocation with `--no-register` appended. That imports the session content but skips the registry entry — the user won't get a `claude --resume` slot, but the JSONL is on disk.
     - If the `--no-register` retry also fails, or if the user prefers: offer to read the imported JSONL and inject it as context into the current conversation.
+    - If `manifest.incremental === true`, also include in the report:
+      - Source machine: `<manifest.sourceMachineName>` (`<manifest.sourceMachineId>`)
+      - Imported: N full sessions, M continuation sessions (for each continuation session, note "continues `<slug>`")
+      - Duplicates skipped: K (count `result.warnings` entries containing "already received")
 
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional/retry branches, e.g. `--no-register` for the version-mismatch fallback) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

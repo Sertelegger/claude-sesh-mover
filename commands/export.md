@@ -32,6 +32,17 @@ You are running the sesh-mover export command. Follow these steps:
    - "Exclude tool-results" → add `tool-results` to `--exclude`
    - "Exclude memory/plans/subagents" → add `memory plans subagents` to `--exclude`
 
+   **Question 5 — Mode (only if prior peers exist for this project):**
+   Read `~/.claude-sesh-mover/sync-state/<encoded-project-path>.json` if present. If the file is missing or `peers` is empty, skip this question entirely.
+
+   If peers exist, ask with AskUserQuestion (≤4 options):
+   - Slot 1: "Full export (every session)" → omit `--incremental`
+   - Slots 2–3: one slot per known peer, up to two peers — "Incremental for peer `<name>`" → `--incremental --to <peer-id>`
+   - Slot 4 (when peers.length ≤ 2): "Incremental since another export…" → prompt for path, add `--incremental --since <path>`
+   - Slot 4 (when peers.length > 2): "Other…" → follow-up question listing the remaining peers and the `--since` option.
+
+   Incremental composes with --scope. Default --scope to `all` when --incremental is selected unless the user picks "This session only".
+
    Only ask for individual exclusion of memory, plans, or subagents if the user explicitly requests that granularity after seeing the grouped option.
 
 3. Generate a one-line summary of the session by reading the first few exchanges, then describe it in ~100 characters.
