@@ -86,4 +86,47 @@ describe("manifest", () => {
       expect(verifyIntegrity(["line1\n"], "sha256:wrong")).toBe(false);
     });
   });
+
+  it("readManifest tolerates older manifests without sourceMachineId / incremental", async () => {
+    const { readManifest } = await import("../src/manifest.js");
+    const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "sesh-mover-manifest-compat-"));
+    try {
+      writeFileSync(
+        join(dir, "manifest.json"),
+        JSON.stringify({
+          version: 1,
+          plugin: "sesh-mover",
+          exportedAt: "2026-04-19T00:00:00Z",
+          sourcePlatform: "darwin",
+          sourceProjectPath: "/p",
+          sourceConfigDir: "/c",
+          sourceClaudeVersion: "2.1.114",
+          sessionScope: "current",
+          includedLayers: ["jsonl"],
+          sessions: [
+            {
+              sessionId: "s1",
+              slug: "s",
+              summary: "",
+              createdAt: "",
+              lastActiveAt: "",
+              messageCount: 1,
+              gitBranch: "",
+              entrypoint: "cli",
+              integrityHash: "sha256:abc",
+            },
+          ],
+        })
+      );
+      const m = readManifest(dir);
+      expect(m.sourceMachineId).toBeUndefined();
+      expect(m.incremental).toBeUndefined();
+      expect(m.sessions[0].type).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
