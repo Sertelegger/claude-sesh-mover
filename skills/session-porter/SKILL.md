@@ -67,3 +67,15 @@ When import registration fails (session not resumable):
 - Linux paths: `/home/user/...`
 
 The CLI auto-detects the current platform and translates paths during import. For WSL <-> Windows, it shows the mapping and asks for confirmation.
+
+## Incremental Sync
+
+sesh-mover supports incremental export/import between machines. Key concepts:
+
+- **Machine identity:** each machine has a persistent ID in `~/.claude-sesh-mover/machine-id.json`, auto-created on first incremental op. The human-readable name defaults to the hostname and can be overridden with `sesh-mover configure --set machine.name=<label>`.
+- **Per-project sync state:** `~/.claude-sesh-mover/sync-state/<encoded-project-path>.json` tracks, per peer machine, what's been sent and received.
+- **Incremental export:** `export --incremental --to <peer>` emits only new sessions + continuation sessions for sessions with new messages since the last sync. `--since <path>` is a stateless fallback when no peer state exists (e.g. the user received an export bundle from a new machine).
+- **Continuation session:** a new session whose first entry is a synthetic user message explaining the lineage. The body is the sliced remainder of the source session. This avoids merge conflicts entirely and lets Claude see the lineage directly in the transcript.
+- **Idempotent import:** re-importing the same bundle is safe — already-received sessions are skipped with a warning.
+
+When users ask "why are there two sessions that look like the same conversation?" — check `~/.claude-sesh-mover/sync-state/<encoded>.json`'s `lineage` map. The continuation header in the JSONL also spells out the origin session.
