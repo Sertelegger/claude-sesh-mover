@@ -169,4 +169,49 @@ describe("cli", () => {
       expect(result.config.export.storage).toBe("user");
     });
   });
+
+  describe("export incremental", () => {
+    it("errors when --incremental is used without --to or --since", () => {
+      const outputDir = join(tempDir, "cli-inc-missing");
+      mkdirSync(outputDir, { recursive: true });
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(
+          `export --scope all --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name inc-missing --output "${outputDir}" --incremental`
+        );
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = {
+          stdout: err.stdout ? err.stdout.toString() : "",
+          status: err.status ?? 0,
+        };
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/--to|--since/);
+    });
+
+    it("errors when --to names an unknown peer", () => {
+      const outputDir = join(tempDir, "cli-inc-unknown");
+      mkdirSync(outputDir, { recursive: true });
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(
+          `export --scope all --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name inc-unknown --output "${outputDir}" --incremental --to nonexistent-peer`
+        );
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = {
+          stdout: err.stdout ? err.stdout.toString() : "",
+          status: err.status ?? 0,
+        };
+      }
+      expect(caught).not.toBeNull();
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/no sync history|unknown peer/i);
+    });
+  });
 });
