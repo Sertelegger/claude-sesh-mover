@@ -109,6 +109,18 @@ export type SessionScope = "current" | "all";
 export type StorageScope = "user" | "project";
 export type ExportFormat = "dir" | "archive" | "zstd";
 
+export interface SessionContinuation {
+  continuesLocalSessionId: string;
+  continuesPeerSessionId?: string;
+  fromEntryIndex: number;
+  fromEntryUuid: string;
+}
+
+export interface SessionLineage {
+  sourceMachineId: string;
+  sourceSessionId: string;
+}
+
 export interface SessionManifest {
   sessionId: string;
   slug: string;
@@ -118,7 +130,17 @@ export interface SessionManifest {
   messageCount: number;
   gitBranch: string;
   entrypoint: string;
-  integrityHash: string; // per-session sha256 hash of JSONL content
+  integrityHash: string;
+  type?: "full" | "continuation";
+  lineage?: SessionLineage;
+  continuation?: SessionContinuation;
+}
+
+export interface ExportBaseline {
+  targetMachineId: string;
+  targetMachineName?: string;
+  lastSyncAt?: string;
+  referenceExport?: string;
 }
 
 export interface ExportManifest {
@@ -132,6 +154,10 @@ export interface ExportManifest {
   sessionScope: SessionScope;
   includedLayers: ExportLayer[];
   sessions: SessionManifest[];
+  sourceMachineId?: string;
+  sourceMachineName?: string;
+  incremental?: boolean;
+  baseline?: ExportBaseline;
 }
 
 // --- Config ---
@@ -295,4 +321,48 @@ export interface DiscoveredSession {
   hasSubagents: boolean;
   hasToolResults: boolean;
   hasFileHistory: boolean;
+}
+
+// --- Incremental sync types ---
+
+export interface MachineIdentity {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
+export interface SyncStateSessionSent {
+  headEntryUuid: string;
+  messageCount: number;
+  sentAsType: "full" | "continuation";
+  sentAsSessionId: string;
+}
+
+export interface SyncStateSessionReceived {
+  localSessionId: string;
+  type: "full" | "continuation";
+  importedAt: string;
+}
+
+export interface SyncStatePeer {
+  name: string;
+  lastSentAt: string | null;
+  lastReceivedAt: string | null;
+  sent: Record<string, SyncStateSessionSent>;
+  received: Record<string, SyncStateSessionReceived>;
+}
+
+export interface SyncStateLineage {
+  sourceMachineId: string;
+  sourceSessionId: string;
+  importedAt: string;
+  type: "full" | "continuation";
+  continuationOf?: string;
+}
+
+export interface SyncState {
+  projectPath: string;
+  schemaVersion: 1;
+  peers: Record<string, SyncStatePeer>;
+  lineage: Record<string, SyncStateLineage>;
 }
