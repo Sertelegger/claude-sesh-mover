@@ -168,6 +168,20 @@ describe("cli", () => {
       expect(result.success).toBe(true);
       expect(result.config.export.storage).toBe("user");
     });
+
+    it("sets machine.name via --set", () => {
+      const prevHome = process.env.HOME;
+      process.env.HOME = tempDir;
+      try {
+        const output = runCli(`configure --scope user --set machine.name=my-laptop --json`);
+        const result = JSON.parse(output);
+        expect(result.success).toBe(true);
+        expect(result.message).toMatch(/machine\.name\s*=\s*my-laptop/);
+      } finally {
+        if (prevHome !== undefined) process.env.HOME = prevHome;
+        else delete process.env.HOME;
+      }
+    });
   });
 
   describe("export incremental", () => {

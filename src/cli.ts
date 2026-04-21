@@ -477,6 +477,19 @@ program
           );
           return;
         }
+        if (key === "machine.name") {
+          const { setMachineName } = await import("./machine.js");
+          const identity = setMachineName(value);
+          const result: ConfigureResult = {
+            success: true,
+            command: "configure",
+            config: readConfig(configDir),
+            scope: opts.scope as StorageScope,
+            message: `Set machine.name = ${identity.name}`,
+          };
+          output(result);
+          return;
+        }
         let config = readConfig(configDir);
         // Parse value
         let parsedValue: unknown = value;
