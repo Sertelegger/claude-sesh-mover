@@ -8,6 +8,7 @@ const manifest_js_1 = require("./manifest.js");
 const rewriter_js_1 = require("./rewriter.js");
 const platform_js_1 = require("./platform.js");
 const version_adapters_js_1 = require("./version-adapters.js");
+const sync_state_js_1 = require("./sync-state.js");
 async function importSession(options) {
     const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, } = options;
     const warnings = [];
@@ -24,7 +25,7 @@ async function importSession(options) {
         };
     }
     // Filter sessions if specific IDs requested
-    const targetSessions = sessionIds
+    let targetSessions = sessionIds
         ? manifest.sessions.filter((s) => sessionIds.includes(s.sessionId))
         : manifest.sessions;
     if (targetSessions.length === 0) {
@@ -32,6 +33,31 @@ async function importSession(options) {
             success: false,
             command: "import",
             error: "No matching sessions found in export",
+        };
+    }
+    let skippedAlreadyReceived = 0;
+    if (manifest.sourceMachineId) {
+        const priorState = (0, sync_state_js_1.readSyncState)(targetProjectPath);
+        const peer = priorState.peers[manifest.sourceMachineId];
+        if (peer) {
+            const before = targetSessions.length;
+            targetSessions = targetSessions.filter((session) => {
+                const prior = peer.received[session.sessionId];
+                return !prior;
+            });
+            skippedAlreadyReceived = before - targetSessions.length;
+            if (skippedAlreadyReceived > 0) {
+                warnings.push(`${skippedAlreadyReceived} session(s) already received from ${manifest.sourceMachineName ?? manifest.sourceMachineId} — skipped (idempotent).`);
+            }
+        }
+    }
+    if (targetSessions.length === 0) {
+        return {
+            success: true,
+            command: "import",
+            importedSessions: [],
+            warnings,
+            resumable: true,
         };
     }
     // Step 1.5: Version reconciliation
@@ -284,6 +310,51 @@ async function importSession(options) {
             (0, node_fs_1.appendFileSync)(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
         }
     }
+    if (manifest.sourceMachineId) {
+        const state = (0, sync_state_js_1.readSyncState)(targetProjectPath);
+        const peerId = manifest.sourceMachineId;
+        const peerName = manifest.sourceMachineName ?? "unknown";
+        if (!state.peers[peerId]) {
+            state.peers[peerId] = {
+                name: peerName,
+                lastSentAt: null,
+                lastReceivedAt: null,
+                sent: {},
+                received: {},
+            };
+        }
+        const peer = state.peers[peerId];
+        peer.name = peerName;
+        peer.lastReceivedAt = new Date().toISOString();
+        for (const session of targetSessions) {
+            const newId = sessionIdMap.get(session.sessionId);
+            const type = session.type === "continuation" ? "continuation" : "full";
+            const received = {
+                localSessionId: newId,
+                type,
+                importedAt: new Date().toISOString(),
+            };
+            peer.received[session.sessionId] = received;
+            const lineage = {
+                sourceMachineId: peerId,
+                sourceSessionId: session.sessionId,
+                importedAt: received.importedAt,
+                type,
+                continuationOf: session.continuation
+                    ? peer.received[session.continuation.continuesPeerSessionId ?? ""]?.localSessionId
+                    : undefined,
+            };
+            state.lineage[newId] = lineage;
+            const sent = {
+                headEntryUuid: readLastEntryUuid((0, node_path_1.join)(targetProjectDir, `${newId}.jsonl`)) ?? "",
+                messageCount: session.messageCount,
+                sentAsType: type,
+                sentAsSessionId: session.sessionId,
+            };
+            peer.sent[newId] = sent;
+        }
+        (0, sync_state_js_1.writeSyncState)(state);
+    }
     return {
         success: true,
         command: "import",
@@ -293,5 +364,18 @@ async function importSession(options) {
         versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
         memoryConflicts: memoryConflicts.length > 0 ? memoryConflicts : undefined,
     };
+}
+function readLastEntryUuid(jsonlPath) {
+    try {
+        const content = (0, node_fs_1.readFileSync)(jsonlPath, "utf-8");
+        const lines = content.trim().split("\n").filter(Boolean);
+        if (lines.length === 0)
+            return null;
+        const last = JSON.parse(lines[lines.length - 1]);
+        return last.uuid ?? null;
+    }
+    catch {
+        return null;
+    }
 }
 //# sourceMappingURL=importer.js.map
