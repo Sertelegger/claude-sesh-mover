@@ -394,6 +394,19 @@ program
                 outputError("configure", new Error("--set requires key=value format"));
                 return;
             }
+            if (key === "machine.name") {
+                const { setMachineName } = await import("./machine.js");
+                const identity = setMachineName(value);
+                const result = {
+                    success: true,
+                    command: "configure",
+                    config: (0, config_js_1.readConfig)(configDir),
+                    scope: opts.scope,
+                    message: `Set machine.name = ${identity.name}`,
+                };
+                output(result);
+                return;
+            }
             let config = (0, config_js_1.readConfig)(configDir);
             // Parse value
             let parsedValue = value;
