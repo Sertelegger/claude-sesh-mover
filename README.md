@@ -1,6 +1,6 @@
 # claude-sesh-mover
 
-> Export, import, and migrate Claude Code sessions across machines, operating systems, config directories, and project paths.
+> Export, import, and migrate Claude Code sessions across machines, operating systems, config directories, and project paths — including **incremental round-trips** between two machines.
 
 Claude Code stores each conversation as a JSONL file keyed to an absolute filesystem path on the machine that created it. That makes sessions **machine-local**: you can't easily continue a session after switching laptops, moving the project to a new directory, renaming your home folder, switching between `~/.claude` and an alternate config dir, or crossing the Windows ↔ WSL boundary. `claude-sesh-mover` rewrites the path-dependent bits of a session so it can be resumed anywhere.
 
@@ -8,11 +8,11 @@ It adds five slash commands to Claude Code:
 
 | Command | What it does |
 |---|---|
-| `/sesh-mover:export` | Bundle one or all sessions for the current project into a portable directory or `.tar.gz` / `.tar.zst` archive. |
-| `/sesh-mover:import` | Unpack an export on the target machine, rewrite paths for the new location, and register the session so it shows up in `claude --resume`. |
+| `/sesh-mover:export` | Bundle one or all sessions for the current project into a portable directory or `.tar.gz` / `.tar.zst` archive. Supports **incremental mode** — emit only sessions/messages new since the last sync to a given peer machine. |
+| `/sesh-mover:import` | Unpack an export on the target machine, rewrite paths for the new location, and register the session so it shows up in `claude --resume`. Recognises incremental bundles and handles continuation sessions transparently; re-importing the same bundle is idempotent. |
 | `/sesh-mover:migrate` | Same-machine move: export + import + delete source. Can also rename the project directory with `--rename-dir`. |
 | `/sesh-mover:browse` | List exports (user-level and project-level), view manifests, import, or delete. |
-| `/sesh-mover:configure` | Set user- or project-level defaults for scope, storage, format, and excluded layers. |
+| `/sesh-mover:configure` | Set user- or project-level defaults for scope, storage, format, and excluded layers. Also sets the machine's human-readable name via `--set machine.name=<label>`. |
 
 ## Install
 
@@ -87,6 +87,29 @@ Prompts for source and target project paths, scope, and whether to also rename t
 ```
 
 Lists all exports (user and project scope), lets you view full manifests, trigger import, or delete old bundles.
+
+### Incremental sync between two machines
+
+Once you've done at least one export → import round-trip between machine **A** and machine **B**, subsequent exports can be incremental — only sessions that are new on the source + continuation sessions carrying new messages for sessions that already exist on the peer.
+
+```text
+/sesh-mover:export
+```
+
+When prior peers exist for the current project, the export flow adds a **Mode** question offering "Full export" or "Incremental for peer `<name>`" options. Pick the peer you're sending to; the CLI figures out the delta from its own sync-state bookkeeping.
+
+**How it works:**
+
+- Each machine has a persistent identity at `~/.claude-sesh-mover/machine-id.json` (auto-created on first incremental op). The human-readable `name` defaults to your hostname — rename it with `/sesh-mover:configure --set machine.name=<label>`.
+- Per-project sync state lives at `~/.claude-sesh-mover/sync-state/<encoded-project-path>.json`. It records, per peer machine, which session versions have been sent and received.
+- **New sessions** on the source (no record on the peer) are bundled whole.
+- **Existing sessions with new messages** are bundled as **continuation sessions**: a new session on the target whose first entry is a synthetic `user` message explaining the lineage, followed by the slice of messages appended since the last sync. This avoids merge-conflict logic entirely — each sync produces independent, auditable artifacts rather than mutating existing history.
+- **Unchanged sessions** are skipped.
+- Re-importing the same bundle is idempotent — already-received sessions are skipped with a warning.
+
+**Stateless fallback:** if you received an export bundle from a machine you've never synced with (or the sync-state file was lost), use `/sesh-mover:export --incremental --since <path-to-previous-export>`. The CLI diffs against the referenced export's manifest directly.
+
+**Soft assumption:** don't append to the same session on two machines in parallel. The "continuation session" model treats each machine's edits as a linear extension — parallel edits produce two independent continuation sessions rather than a merged view. Stick to a push/pull discipline (work on one machine at a time).
 
 ## Security notes
 
