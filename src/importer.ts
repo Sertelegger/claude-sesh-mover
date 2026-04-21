@@ -438,6 +438,22 @@ export async function importSession(
     }
   }
 
+  // Step 7: Register in indexes (only after successful validation)
+  if (!noRegister) {
+    const historyPath = join(targetConfigDir, "history.jsonl");
+    for (const session of targetSessions) {
+      const newSessionId = sessionIdMap.get(session.sessionId)!;
+      const historyEntry = {
+        display: session.summary || session.slug,
+        pastedContents: {},
+        timestamp: Date.now(),
+        project: targetProjectPath,
+        sessionId: newSessionId,
+      };
+      appendFileSync(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
+    }
+  }
+
   if (manifest.sourceMachineId) {
     const state = readSyncState(targetProjectPath);
     const peerId = manifest.sourceMachineId;
@@ -487,22 +503,6 @@ export async function importSession(
       peer.sent[newId] = sent;
     }
     writeSyncState(state);
-  }
-
-  // Step 7: Register in indexes (only after successful validation)
-  if (!noRegister) {
-    const historyPath = join(targetConfigDir, "history.jsonl");
-    for (const session of targetSessions) {
-      const newSessionId = sessionIdMap.get(session.sessionId)!;
-      const historyEntry = {
-        display: session.summary || session.slug,
-        pastedContents: {},
-        timestamp: Date.now(),
-        project: targetProjectPath,
-        sessionId: newSessionId,
-      };
-      appendFileSync(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
-    }
   }
 
   return {
