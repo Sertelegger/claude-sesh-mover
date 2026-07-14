@@ -12,7 +12,7 @@ Claude Code sessions are JSONL files keyed to an absolute path on the machine th
 | `/sesh-mover:browse` | List exports, view manifests, import, or delete. |
 | `/sesh-mover:configure` | Set defaults (scope, storage, format, layers) and the machine's name (`--set machine.name=<label>`). |
 
-Where this is heading — a cross-machine session index with remote pull ("the hub"), and later other agentic CLIs — is tracked in [ROADMAP.md](./ROADMAP.md).
+Where this is heading — a cross-machine session index with remote pull ("the hub"), and later other agentic CLIs — is tracked in [ROADMAP.md](./ROADMAP.md). Release history: [CHANGELOG.md](./CHANGELOG.md).
 
 ## Install
 

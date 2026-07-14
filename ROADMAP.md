@@ -1,30 +1,8 @@
 # Roadmap
 
 Where claude-sesh-mover is heading beyond one-shot session export/import. Items are ordered,
-not scheduled — each stage gets its own design pass before implementation.
-
-## 0.3.0 — Hardening pass (this release)
-
-Fixes from a full adversarial review of 0.2.0, shipped as one milestone:
-
-- **Unified path rewriter** — two-stage pipeline (exact project/config/home mappings with
-  separator normalization, then cross-family token translation) so WSL ↔ Windows ↔ macOS ↔
-  Linux imports rewrite `/mnt/<drive>`, `/tmp`, and home paths correctly, including inside
-  tool output and array-form tool results.
-- **Archiver safety** — zstd intermediate files isolated in private temp dirs (never
-  clobbering or deleting user files); tar entries validated *before* extraction (absolute
-  paths, `..` traversal, symlink/hardlink entries rejected).
-- **Idempotent imports** — a per-project content-hash registry skips already-imported
-  sessions; `--allow-duplicates` overrides; structured `skippedSessions` reporting.
-- **Migrate safety** — `--scope current` requires `--session-id` (no more silent
-  migrate-and-delete-everything); cleanup deletes only confirmed-moved sessions.
-- **Incremental-sync correctness** — sync-state head UUIDs recorded from the export snapshot
-  (not the live, still-growing JSONL); continuation bundles carry subagents/tool-results/
-  file-history layers; the `--suffix` collision path archives and records state like every
-  other path.
-- **Privacy & robustness** — `--no-summary` actually implemented (slug-only manifests);
-  bounded-memory discovery/export (O(max single session), not O(all sessions));
-  prototype-pollution-safe config; pre-extraction validation of untrusted bundles.
+not scheduled — each stage gets its own design pass before implementation. Shipped releases
+are documented in [CHANGELOG.md](./CHANGELOG.md).
 
 ## 0.3.1 — Hardening follow-ups (queued)
 
