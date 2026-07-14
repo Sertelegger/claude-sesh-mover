@@ -681,4 +681,50 @@ describe("rewriter", () => {
       expect(rewriteString("read D:\\data\\f.txt", ctx)).toBe("read /mnt/d/data/f.txt");
     });
   });
+
+  describe("transformLine", () => {
+    it("rewrites a parseable line and reports field changes", async () => {
+      const { transformLine } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const line = JSON.stringify({
+        type: "user", cwd: "/mnt/e/GitHub/proj",
+        message: { role: "user", content: "hi" },
+      });
+      const r = transformLine(line, ctx, { newSessionId: "new-id" });
+      expect(r.parseFailed).toBe(false);
+      expect(r.changed).toBe(true);
+      const parsed = JSON.parse(r.line);
+      expect(parsed.cwd).toBe("E:\\GitHub\\proj");
+      expect(parsed.sessionId).toBe("new-id");
+      expect(r.fieldsChanged).toBeGreaterThanOrEqual(1);
+    });
+
+    it("applies version adapters before rewriting", async () => {
+      const { transformLine } = await import("../src/rewriter.js");
+      const ctx = await winToWslCtx();
+      const adapter = {
+        fromVersion: "2.0.0", toVersion: "2.1.0",
+        description: "rename oldField to newField",
+        applies: (e: Record<string, unknown>) => "oldField" in e,
+        transform: (e: Record<string, unknown>) => {
+          const { oldField, ...rest } = e as { oldField: unknown };
+          return { ...rest, newField: oldField };
+        },
+      };
+      const line = JSON.stringify({ type: "user", oldField: 1, message: { role: "user", content: "x" } });
+      const r = transformLine(line, ctx, { adapters: [adapter as never] });
+      expect(r.adaptationsApplied).toEqual(["rename oldField to newField"]);
+      expect(JSON.parse(r.line).newField).toBe(1);
+    });
+
+    it("returns the input verbatim with parseFailed on bad JSON", async () => {
+      const { transformLine } = await import("../src/rewriter.js");
+      const ctx = await winToWslCtx();
+      const r = transformLine("{not json", ctx);
+      expect(r.parseFailed).toBe(true);
+      expect(r.line).toBe("{not json");
+      expect(r.parseError).toBeTruthy();
+      expect(r.changed).toBe(false);
+    });
+  });
 });

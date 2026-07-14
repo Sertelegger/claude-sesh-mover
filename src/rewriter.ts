@@ -1,4 +1,5 @@
-import type { PathMapping, RewriteReport, Platform } from "./types.js";
+import { applyAdapters } from "./version-adapters.js";
+import type { PathMapping, RewriteReport, Platform, VersionAdapter } from "./types.js";
 import { samePlatformFamily, translatePath } from "./platform.js";
 
 export interface RewriteContext {
@@ -227,6 +228,75 @@ export function rewriteEntry(
   return result;
 }
 
+export interface TransformLineOptions {
+  adapters?: VersionAdapter[];
+  newSessionId?: string;
+}
+
+export interface TransformLineResult {
+  line: string;
+  changed: boolean;
+  fieldsChanged: number;
+  adaptationsApplied: string[];
+  parseFailed: boolean;
+  parseError?: string;
+}
+
+// The single per-line transform both the string API (rewriteJsonl) and the
+// streaming API (rewriteJsonlStream) are built on: parse once, apply version
+// adapters, rewrite, stringify. Replaces the importer's old double-parse
+// (adapter pass + rewrite pass).
+export function transformLine(
+  line: string,
+  ctx: RewriteContext,
+  opts: TransformLineOptions = {}
+): TransformLineResult {
+  let entry: Record<string, unknown>;
+  try {
+    entry = JSON.parse(line) as Record<string, unknown>;
+  } catch (e) {
+    return {
+      line,
+      changed: false,
+      fieldsChanged: 0,
+      adaptationsApplied: [],
+      parseFailed: true,
+      parseError: (e as Error).message,
+    };
+  }
+
+  let adaptationsApplied: string[] = [];
+  if (opts.adapters && opts.adapters.length > 0) {
+    const { entry: adapted, applied } = applyAdapters(entry, opts.adapters);
+    entry = adapted;
+    adaptationsApplied = applied;
+  }
+
+  const original = JSON.stringify(entry);
+  const rewritten = rewriteEntry(entry, ctx, opts.newSessionId);
+  const rewrittenStr = JSON.stringify(rewritten);
+
+  let fieldsChanged = 0;
+  if (rewrittenStr !== original) {
+    for (const key of Object.keys(entry)) {
+      if (
+        JSON.stringify(entry[key]) !==
+        JSON.stringify((rewritten as Record<string, unknown>)[key])
+      ) {
+        fieldsChanged++;
+      }
+    }
+  }
+
+  return {
+    line: rewrittenStr,
+    changed: rewrittenStr !== original,
+    fieldsChanged,
+    adaptationsApplied,
+    parseFailed: false,
+  };
+}
+
 export function rewriteJsonl(
   jsonlContent: string,
   ctx: RewriteContext,
@@ -238,37 +308,20 @@ export function rewriteJsonl(
   const warnings: string[] = [];
 
   const rewrittenLines = lines.map((line) => {
-    try {
-      const entry = JSON.parse(line) as Record<string, unknown>;
-      const original = JSON.stringify(entry);
-      const rewritten = rewriteEntry(entry, ctx, newSessionId);
-      const rewrittenStr = JSON.stringify(rewritten);
-      if (rewrittenStr !== original) {
-        entriesRewritten++;
-        // Count changed top-level fields (nested changes are attributed to their parent key)
-        for (const key of Object.keys(entry)) {
-          if (
-            JSON.stringify(entry[key]) !==
-            JSON.stringify((rewritten as Record<string, unknown>)[key])
-          ) {
-            fieldsRewritten++;
-          }
-        }
-      }
-      return rewrittenStr;
-    } catch (e) {
-      warnings.push(`Failed to parse JSONL line: ${(e as Error).message}`);
+    const r = transformLine(line, ctx, { newSessionId });
+    if (r.parseFailed) {
+      warnings.push(`Failed to parse JSONL line: ${r.parseError}`);
       return line; // preserve unparseable lines
     }
+    if (r.changed) {
+      entriesRewritten++;
+      fieldsRewritten += r.fieldsChanged;
+    }
+    return r.line;
   });
 
   return {
     rewritten: rewrittenLines.join("\n") + "\n",
-    report: {
-      mappings: ctx.mappings,
-      entriesRewritten,
-      fieldsRewritten,
-      warnings,
-    },
+    report: { mappings: ctx.mappings, entriesRewritten, fieldsRewritten, warnings },
   };
 }

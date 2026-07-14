@@ -4,7 +4,9 @@ exports.rewriteString = rewriteString;
 exports.rewriteWholePath = rewriteWholePath;
 exports.buildPathMappings = buildPathMappings;
 exports.rewriteEntry = rewriteEntry;
+exports.transformLine = transformLine;
 exports.rewriteJsonl = rewriteJsonl;
+const version_adapters_js_1 = require("./version-adapters.js");
 const platform_js_1 = require("./platform.js");
 // Characters that terminate a path token embedded in free text.
 // (?<!\/) — a token immediately preceded by "/" is URL-context
@@ -181,42 +183,71 @@ function rewriteEntry(entry, ctx, newSessionId) {
     }
     return result;
 }
+// The single per-line transform both the string API (rewriteJsonl) and the
+// streaming API (rewriteJsonlStream) are built on: parse once, apply version
+// adapters, rewrite, stringify. Replaces the importer's old double-parse
+// (adapter pass + rewrite pass).
+function transformLine(line, ctx, opts = {}) {
+    let entry;
+    try {
+        entry = JSON.parse(line);
+    }
+    catch (e) {
+        return {
+            line,
+            changed: false,
+            fieldsChanged: 0,
+            adaptationsApplied: [],
+            parseFailed: true,
+            parseError: e.message,
+        };
+    }
+    let adaptationsApplied = [];
+    if (opts.adapters && opts.adapters.length > 0) {
+        const { entry: adapted, applied } = (0, version_adapters_js_1.applyAdapters)(entry, opts.adapters);
+        entry = adapted;
+        adaptationsApplied = applied;
+    }
+    const original = JSON.stringify(entry);
+    const rewritten = rewriteEntry(entry, ctx, opts.newSessionId);
+    const rewrittenStr = JSON.stringify(rewritten);
+    let fieldsChanged = 0;
+    if (rewrittenStr !== original) {
+        for (const key of Object.keys(entry)) {
+            if (JSON.stringify(entry[key]) !==
+                JSON.stringify(rewritten[key])) {
+                fieldsChanged++;
+            }
+        }
+    }
+    return {
+        line: rewrittenStr,
+        changed: rewrittenStr !== original,
+        fieldsChanged,
+        adaptationsApplied,
+        parseFailed: false,
+    };
+}
 function rewriteJsonl(jsonlContent, ctx, newSessionId) {
     const lines = jsonlContent.trim().split("\n").filter(Boolean);
     let entriesRewritten = 0;
     let fieldsRewritten = 0;
     const warnings = [];
     const rewrittenLines = lines.map((line) => {
-        try {
-            const entry = JSON.parse(line);
-            const original = JSON.stringify(entry);
-            const rewritten = rewriteEntry(entry, ctx, newSessionId);
-            const rewrittenStr = JSON.stringify(rewritten);
-            if (rewrittenStr !== original) {
-                entriesRewritten++;
-                // Count changed top-level fields (nested changes are attributed to their parent key)
-                for (const key of Object.keys(entry)) {
-                    if (JSON.stringify(entry[key]) !==
-                        JSON.stringify(rewritten[key])) {
-                        fieldsRewritten++;
-                    }
-                }
-            }
-            return rewrittenStr;
-        }
-        catch (e) {
-            warnings.push(`Failed to parse JSONL line: ${e.message}`);
+        const r = transformLine(line, ctx, { newSessionId });
+        if (r.parseFailed) {
+            warnings.push(`Failed to parse JSONL line: ${r.parseError}`);
             return line; // preserve unparseable lines
         }
+        if (r.changed) {
+            entriesRewritten++;
+            fieldsRewritten += r.fieldsChanged;
+        }
+        return r.line;
     });
     return {
         rewritten: rewrittenLines.join("\n") + "\n",
-        report: {
-            mappings: ctx.mappings,
-            entriesRewritten,
-            fieldsRewritten,
-            warnings,
-        },
+        report: { mappings: ctx.mappings, entriesRewritten, fieldsRewritten, warnings },
     };
 }
 //# sourceMappingURL=rewriter.js.map
