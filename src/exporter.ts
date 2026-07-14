@@ -24,6 +24,14 @@ import type {
   SyncStateSessionSent,
 } from "./types.js";
 
+function copyDirIfExists(srcDir: string, destDir: string): void {
+  if (!existsSync(srcDir)) return;
+  mkdirSync(destDir, { recursive: true });
+  for (const file of readdirSync(srcDir)) {
+    copyFileSync(join(srcDir, file), join(destDir, file));
+  }
+}
+
 export interface IncrementalExportOptions {
   sourceMachineId: string;
   sourceMachineName: string;
@@ -206,67 +214,15 @@ async function exportSessions(
       jsonlContent
     );
 
+    const sessionBase = join(configDir, "projects", session.encodedProjectDir, session.sessionId);
     if (includedLayers.includes("subagents")) {
-      const subagentsDir = join(
-        configDir,
-        "projects",
-        session.encodedProjectDir,
-        session.sessionId,
-        "subagents"
-      );
-      if (existsSync(subagentsDir)) {
-        const targetSubDir = join(
-          exportPath,
-          "sessions",
-          session.sessionId,
-          "subagents"
-        );
-        mkdirSync(targetSubDir, { recursive: true });
-        for (const file of readdirSync(subagentsDir)) {
-          copyFileSync(join(subagentsDir, file), join(targetSubDir, file));
-        }
-      }
+      copyDirIfExists(join(sessionBase, "subagents"), join(exportPath, "sessions", session.sessionId, "subagents"));
     }
-
     if (includedLayers.includes("tool-results")) {
-      const toolResultsDir = join(
-        configDir,
-        "projects",
-        session.encodedProjectDir,
-        session.sessionId,
-        "tool-results"
-      );
-      if (existsSync(toolResultsDir)) {
-        const targetTrDir = join(
-          exportPath,
-          "sessions",
-          session.sessionId,
-          "tool-results"
-        );
-        mkdirSync(targetTrDir, { recursive: true });
-        for (const file of readdirSync(toolResultsDir)) {
-          copyFileSync(join(toolResultsDir, file), join(targetTrDir, file));
-        }
-      }
+      copyDirIfExists(join(sessionBase, "tool-results"), join(exportPath, "sessions", session.sessionId, "tool-results"));
     }
-
     if (includedLayers.includes("file-history")) {
-      const fileHistoryDir = join(
-        configDir,
-        "file-history",
-        session.sessionId
-      );
-      if (existsSync(fileHistoryDir)) {
-        const targetFhDir = join(
-          exportPath,
-          "file-history",
-          session.sessionId
-        );
-        mkdirSync(targetFhDir, { recursive: true });
-        for (const file of readdirSync(fileHistoryDir)) {
-          copyFileSync(join(fileHistoryDir, file), join(targetFhDir, file));
-        }
-      }
+      copyDirIfExists(join(configDir, "file-history", session.sessionId), join(exportPath, "file-history", session.sessionId));
     }
 
     const entries = jsonlContent
@@ -321,6 +277,17 @@ async function exportSessions(
       continuationJsonl
     );
 
+    const contBase = join(configDir, "projects", item.session.encodedProjectDir, item.session.sessionId);
+    if (includedLayers.includes("subagents")) {
+      copyDirIfExists(join(contBase, "subagents"), join(exportPath, "sessions", newSessionId, "subagents"));
+    }
+    if (includedLayers.includes("tool-results")) {
+      copyDirIfExists(join(contBase, "tool-results"), join(exportPath, "sessions", newSessionId, "tool-results"));
+    }
+    if (includedLayers.includes("file-history")) {
+      copyDirIfExists(join(configDir, "file-history", item.session.sessionId), join(exportPath, "file-history", newSessionId));
+    }
+
     const sessionHash = computeIntegrityHash([continuationJsonl]);
     const newEntryCount = continuationJsonl.trim().split("\n").filter(Boolean).length;
 
@@ -348,13 +315,7 @@ async function exportSessions(
     if (includedLayers.includes("memory") && sessions.length > 0) {
       const encoded = sessions[0].encodedProjectDir;
       const memoryDir = join(configDir, "projects", encoded, "memory");
-      if (existsSync(memoryDir)) {
-        const targetMemDir = join(exportPath, "memory");
-        mkdirSync(targetMemDir, { recursive: true });
-        for (const file of readdirSync(memoryDir)) {
-          copyFileSync(join(memoryDir, file), join(targetMemDir, file));
-        }
-      }
+      copyDirIfExists(memoryDir, join(exportPath, "memory"));
     }
     if (includedLayers.includes("plans")) {
       const plansDir = join(configDir, "plans");

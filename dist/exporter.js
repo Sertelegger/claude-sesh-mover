@@ -11,6 +11,14 @@ const platform_js_1 = require("./platform.js");
 const summary_js_1 = require("./summary.js");
 const continuation_js_1 = require("./continuation.js");
 const diff_js_1 = require("./diff.js");
+function copyDirIfExists(srcDir, destDir) {
+    if (!(0, node_fs_1.existsSync)(srcDir))
+        return;
+    (0, node_fs_1.mkdirSync)(destDir, { recursive: true });
+    for (const file of (0, node_fs_1.readdirSync)(srcDir)) {
+        (0, node_fs_1.copyFileSync)((0, node_path_1.join)(srcDir, file), (0, node_path_1.join)(destDir, file));
+    }
+}
 async function exportSession(options) {
     const { configDir, projectPath, sessionId, outputDir, name, excludeLayers, claudeVersion, collisionCheck, summaryOverrides, incremental, } = options;
     const exportPath = (0, node_path_1.join)(outputDir, name);
@@ -90,35 +98,15 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
     for (const session of toFull) {
         const jsonlContent = jsonlBySession.get(session.sessionId);
         (0, node_fs_1.writeFileSync)((0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`), jsonlContent);
+        const sessionBase = (0, node_path_1.join)(configDir, "projects", session.encodedProjectDir, session.sessionId);
         if (includedLayers.includes("subagents")) {
-            const subagentsDir = (0, node_path_1.join)(configDir, "projects", session.encodedProjectDir, session.sessionId, "subagents");
-            if ((0, node_fs_1.existsSync)(subagentsDir)) {
-                const targetSubDir = (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "subagents");
-                (0, node_fs_1.mkdirSync)(targetSubDir, { recursive: true });
-                for (const file of (0, node_fs_1.readdirSync)(subagentsDir)) {
-                    (0, node_fs_1.copyFileSync)((0, node_path_1.join)(subagentsDir, file), (0, node_path_1.join)(targetSubDir, file));
-                }
-            }
+            copyDirIfExists((0, node_path_1.join)(sessionBase, "subagents"), (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "subagents"));
         }
         if (includedLayers.includes("tool-results")) {
-            const toolResultsDir = (0, node_path_1.join)(configDir, "projects", session.encodedProjectDir, session.sessionId, "tool-results");
-            if ((0, node_fs_1.existsSync)(toolResultsDir)) {
-                const targetTrDir = (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "tool-results");
-                (0, node_fs_1.mkdirSync)(targetTrDir, { recursive: true });
-                for (const file of (0, node_fs_1.readdirSync)(toolResultsDir)) {
-                    (0, node_fs_1.copyFileSync)((0, node_path_1.join)(toolResultsDir, file), (0, node_path_1.join)(targetTrDir, file));
-                }
-            }
+            copyDirIfExists((0, node_path_1.join)(sessionBase, "tool-results"), (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "tool-results"));
         }
         if (includedLayers.includes("file-history")) {
-            const fileHistoryDir = (0, node_path_1.join)(configDir, "file-history", session.sessionId);
-            if ((0, node_fs_1.existsSync)(fileHistoryDir)) {
-                const targetFhDir = (0, node_path_1.join)(exportPath, "file-history", session.sessionId);
-                (0, node_fs_1.mkdirSync)(targetFhDir, { recursive: true });
-                for (const file of (0, node_fs_1.readdirSync)(fileHistoryDir)) {
-                    (0, node_fs_1.copyFileSync)((0, node_path_1.join)(fileHistoryDir, file), (0, node_path_1.join)(targetFhDir, file));
-                }
-            }
+            copyDirIfExists((0, node_path_1.join)(configDir, "file-history", session.sessionId), (0, node_path_1.join)(exportPath, "file-history", session.sessionId));
         }
         const entries = jsonlContent
             .trim()
@@ -165,6 +153,16 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             claudeVersion,
         });
         (0, node_fs_1.writeFileSync)((0, node_path_1.join)(exportPath, "sessions", `${newSessionId}.jsonl`), continuationJsonl);
+        const contBase = (0, node_path_1.join)(configDir, "projects", item.session.encodedProjectDir, item.session.sessionId);
+        if (includedLayers.includes("subagents")) {
+            copyDirIfExists((0, node_path_1.join)(contBase, "subagents"), (0, node_path_1.join)(exportPath, "sessions", newSessionId, "subagents"));
+        }
+        if (includedLayers.includes("tool-results")) {
+            copyDirIfExists((0, node_path_1.join)(contBase, "tool-results"), (0, node_path_1.join)(exportPath, "sessions", newSessionId, "tool-results"));
+        }
+        if (includedLayers.includes("file-history")) {
+            copyDirIfExists((0, node_path_1.join)(configDir, "file-history", item.session.sessionId), (0, node_path_1.join)(exportPath, "file-history", newSessionId));
+        }
         const sessionHash = (0, manifest_js_1.computeIntegrityHash)([continuationJsonl]);
         const newEntryCount = continuationJsonl.trim().split("\n").filter(Boolean).length;
         sessionManifests.push({
@@ -190,13 +188,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         if (includedLayers.includes("memory") && sessions.length > 0) {
             const encoded = sessions[0].encodedProjectDir;
             const memoryDir = (0, node_path_1.join)(configDir, "projects", encoded, "memory");
-            if ((0, node_fs_1.existsSync)(memoryDir)) {
-                const targetMemDir = (0, node_path_1.join)(exportPath, "memory");
-                (0, node_fs_1.mkdirSync)(targetMemDir, { recursive: true });
-                for (const file of (0, node_fs_1.readdirSync)(memoryDir)) {
-                    (0, node_fs_1.copyFileSync)((0, node_path_1.join)(memoryDir, file), (0, node_path_1.join)(targetMemDir, file));
-                }
-            }
+            copyDirIfExists(memoryDir, (0, node_path_1.join)(exportPath, "memory"));
         }
         if (includedLayers.includes("plans")) {
             const plansDir = (0, node_path_1.join)(configDir, "plans");

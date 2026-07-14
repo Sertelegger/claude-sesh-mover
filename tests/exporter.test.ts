@@ -244,4 +244,61 @@ describe("exporter", () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("incremental continuation export includes subagents, tool-results, and file-history layers", async () => {
+    const { mkdtempSync, rmSync, existsSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { exportAllSessions } = await import("../src/exporter.js");
+    const { readManifest } = await import("../src/manifest.js");
+    const { createFixtureTree } = await import("./fixtures/create-fixtures.js");
+
+    const tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-cont-layers-"));
+    try {
+      const fx = createFixtureTree(tempDir);
+      const outputDir = join(tempDir, "exports");
+      mkdirSync(outputDir, { recursive: true });
+
+      const result = await exportAllSessions({
+        configDir: fx.configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir,
+        name: "cont-layers",
+        excludeLayers: [],
+        claudeVersion: "2.1.114",
+        incremental: {
+          sourceMachineId: "machine-A",
+          sourceMachineName: "A",
+          targetMachineId: "machine-B",
+          targetMachineName: "B",
+          peerSent: {
+            [fx.sessionId]: {
+              headEntryUuid: "entry-2",
+              messageCount: 2,
+              sentAsType: "full",
+              sentAsSessionId: fx.sessionId,
+            },
+          },
+        },
+      });
+      expect(result.success).toBe(true);
+      const exportPath = (result as { exportPath: string }).exportPath;
+      const manifest = readManifest(exportPath);
+      const cont = manifest.sessions.find((s) => s.type === "continuation")!;
+      expect(cont).toBeDefined();
+
+      // Fixture has all three layers populated for the source session.
+      expect(
+        existsSync(join(exportPath, "sessions", cont.sessionId, "subagents", "agent-sub1.jsonl"))
+      ).toBe(true);
+      expect(
+        existsSync(join(exportPath, "sessions", cont.sessionId, "tool-results", "toolu_test.txt"))
+      ).toBe(true);
+      expect(
+        existsSync(join(exportPath, "file-history", cont.sessionId, "abc123@v1"))
+      ).toBe(true);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
