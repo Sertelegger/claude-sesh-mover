@@ -2,6 +2,18 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.3.2] — 2026-07-14
+
+### Security
+- Import now rejects manifests whose session ids contain path separators or `..`
+  — a crafted bundle could previously make the importer read files outside the
+  bundle and copy them into the session store (path traversal → exfiltration).
+  Affects 0.1.0–0.3.1 (#13).
+
+### Fixed
+- Path rewriting no longer rewrites sibling paths that merely share a mapped
+  prefix (e.g. `app` vs `app-backup`) (#14).
+
 ## [0.3.1] — 2026-07-14
 
 Hardening follow-ups surfaced by the 0.3.0 final review.

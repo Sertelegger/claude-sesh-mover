@@ -43,7 +43,7 @@ const program = new Command();
 program
   .name("sesh-mover")
   .description("Export, import, and migrate Claude Code sessions")
-  .version("0.3.1");
+  .version("0.3.2");
 
 // --- Export ---
 program

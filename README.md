@@ -57,7 +57,7 @@ After one full export → import round-trip, exports to that peer can be increme
 
 ## Security notes
 
-Exports are faithful copies of your conversation — they can contain API keys, pasted secrets, and environment dumps. Treat them like `~/.claude/projects/` itself:
+Exports are faithful copies of your conversation — they can contain API keys, pasted secrets, and environment dumps. Treat them like `~/.claude/projects/` itself. As of 0.3.2, imported bundles are validated to reject session ids that would enable path traversal outside the bundle.
 
 - Prefer user-level storage, or add `.claude-sesh-mover/` to the project's `.gitignore`.
 - An archive on a cloud drive or in Slack is a copy of your conversation history. Move it like a secret.
