@@ -14,6 +14,9 @@ It adds five slash commands to Claude Code:
 | `/sesh-mover:browse` | List exports (user-level and project-level), view manifests, import, or delete. |
 | `/sesh-mover:configure` | Set user- or project-level defaults for scope, storage, format, and excluded layers. Also sets the machine's human-readable name via `--set machine.name=<label>`. |
 
+Where this is heading — a cross-machine session index with remote pull ("the hub") and,
+longer term, support for other agentic CLIs — is tracked in [ROADMAP.md](./ROADMAP.md).
+
 ## Install
 
 ### Recommended: via the Claude Code plugin marketplace
