@@ -52,6 +52,9 @@ export function readSyncState(projectPath: string): SyncState {
       throw new Error("schema mismatch");
     }
     parsed.imported = parsed.imported ?? {};
+    for (const entry of Object.values(parsed.imported)) {
+      if (typeof entry.registered !== "boolean") entry.registered = true;
+    }
     return parsed;
   } catch {
     const aside = `${p}.corrupt.${Date.now()}`;

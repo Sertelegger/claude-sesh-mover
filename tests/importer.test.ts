@@ -419,6 +419,49 @@ describe("importer", () => {
     expect(second.warnings.some((w) => /already imported/i.test(w))).toBe(true);
   });
 
+  it("a registered import proceeds over a prior --no-register copy", async () => {
+    const { importSession } = await import("../src/importer.js");
+    const opts = {
+      exportPath,
+      targetConfigDir,
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    };
+    const first = await importSession({ ...opts, noRegister: true });
+    expect(first.success).toBe(true);
+
+    const second = await importSession(opts); // registered run
+    expect(second.success).toBe(true);
+    if (!second.success) return;
+    expect(second.importedSessions).toHaveLength(1);
+    expect(second.resumable).toBe(true);
+    expect(second.warnings.some((w) => /unregistered/i.test(w))).toBe(true);
+
+    const third = await importSession(opts); // now a registered copy exists
+    expect(third.success).toBe(true);
+    if (!third.success) return;
+    expect(third.importedSessions).toHaveLength(0);
+    expect((third as any).skippedSessions[0].reason).toBe("duplicate");
+  });
+
+  it("a --no-register re-import of an unregistered copy is still skipped", async () => {
+    const { importSession } = await import("../src/importer.js");
+    const opts = {
+      exportPath,
+      targetConfigDir,
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+      noRegister: true,
+    };
+    await importSession(opts);
+    const second = await importSession(opts);
+    expect(second.success).toBe(true);
+    if (!second.success) return;
+    expect(second.importedSessions).toHaveLength(0);
+  });
+
   it("--allow-duplicates re-imports an already-present bundle", async () => {
     const { importSession } = await import("../src/importer.js");
     const opts = {

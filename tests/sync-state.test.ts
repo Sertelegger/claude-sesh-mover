@@ -50,6 +50,26 @@ describe("sync-state", () => {
     expect(state.imported).toEqual({});
   });
 
+  it("readSyncState defaults legacy imported entries to registered: true", async () => {
+    const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const p = syncStatePath("/Users/sascha/Projects/foo");
+    mkdirSync(join(tempHome, ".claude-sesh-mover", "sync-state"), { recursive: true });
+    writeFileSync(
+      p,
+      JSON.stringify({
+        projectPath: "/Users/sascha/Projects/foo",
+        schemaVersion: 1,
+        peers: {},
+        lineage: {},
+        imported: { "sha256:legacy": { localSessionId: "x", importedAt: "2026-07-13T00:00:00Z" } },
+      }),
+      "utf-8"
+    );
+    const state = readSyncState("/Users/sascha/Projects/foo");
+    expect(state.imported["sha256:legacy"].registered).toBe(true);
+  });
+
   it("writeSyncState + readSyncState round-trip", async () => {
     const { readSyncState, writeSyncState } = await import("../src/sync-state.js");
     const state = readSyncState("/Users/sascha/Projects/foo");

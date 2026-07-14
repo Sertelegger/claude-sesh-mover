@@ -373,6 +373,7 @@ export interface SyncStateLineage {
 export interface SyncStateImported {
   localSessionId: string;
   importedAt: string;
+  registered: boolean;
 }
 
 export interface SyncState {

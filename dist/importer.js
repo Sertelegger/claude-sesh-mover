@@ -70,13 +70,17 @@ async function importSession(options) {
         const before = targetSessions.length;
         targetSessions = targetSessions.filter((session) => {
             const prior = state.imported[session.integrityHash];
-            if (prior &&
-                (0, node_fs_1.existsSync)((0, node_path_1.join)(targetProjectDir, `${prior.localSessionId}.jsonl`))) {
+            const priorFileExists = !!prior &&
+                (0, node_fs_1.existsSync)((0, node_path_1.join)(targetProjectDir, `${prior.localSessionId}.jsonl`));
+            if (priorFileExists && (prior.registered || noRegister)) {
                 skippedSessions.push({
                     originalId: session.sessionId,
                     reason: "duplicate",
                 });
                 return false;
+            }
+            if (priorFileExists && prior && !prior.registered && !noRegister) {
+                warnings.push(`Session "${session.slug}" was previously imported with --no-register; importing a registered copy (the older unregistered copy remains on disk as ${prior.localSessionId}).`);
             }
             return true;
         });
@@ -370,6 +374,7 @@ async function importSession(options) {
         state.imported[session.integrityHash] = {
             localSessionId: newId,
             importedAt: new Date().toISOString(),
+            registered: !noRegister,
         };
     }
     if (manifest.sourceMachineId) {
