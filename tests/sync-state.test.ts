@@ -93,4 +93,107 @@ describe("sync-state", () => {
     const renamed = existsSync(p) ? false : true;
     expect(renamed).toBe(true);
   });
+
+  it("recordSentFromBundle records head uuids from the bundle snapshot, not the live file", async () => {
+    const { recordSentFromBundle, readSyncState } = await import("../src/sync-state.js");
+    const { writeManifest } = await import("../src/manifest.js");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+
+    const bundleDir = join(tempHome, "bundle");
+    mkdirSync(join(bundleDir, "sessions"), { recursive: true });
+    writeFileSync(
+      join(bundleDir, "sessions", "sess-1.jsonl"),
+      '{"uuid":"snap-head"}\n'
+    );
+    writeManifest(bundleDir, {
+      version: 1,
+      plugin: "sesh-mover",
+      exportedAt: "2026-07-13T00:00:00Z",
+      sourcePlatform: "linux",
+      sourceProjectPath: "/p",
+      sourceConfigDir: "/c",
+      sourceClaudeVersion: "2.1.114",
+      sessionScope: "all",
+      includedLayers: ["jsonl"],
+      sessions: [
+        {
+          sessionId: "sess-1",
+          slug: "s",
+          summary: "",
+          createdAt: "",
+          lastActiveAt: "",
+          messageCount: 1,
+          gitBranch: "",
+          entrypoint: "cli",
+          integrityHash: "sha256:x",
+          type: "full",
+        },
+      ],
+      sourceMachineId: "me",
+      sourceMachineName: "me-name",
+      incremental: true,
+      baseline: { targetMachineId: "peer-1", targetMachineName: "peer-one" },
+    });
+
+    // Simulate the live session having grown AFTER the snapshot was taken:
+    // recordSentFromBundle must NOT see this (old code read the live file).
+    recordSentFromBundle("/p", { id: "peer-1", name: "peer-one" }, bundleDir);
+
+    const state = readSyncState("/p");
+    expect(state.peers["peer-1"].sent["sess-1"].headEntryUuid).toBe("snap-head");
+    expect(state.peers["peer-1"].sent["sess-1"].sentAsSessionId).toBe("sess-1");
+    expect(state.peers["peer-1"].lastSentAt).not.toBeNull();
+  });
+
+  it("recordSentFromBundle maps continuation entries back to the local session id", async () => {
+    const { recordSentFromBundle, readSyncState } = await import("../src/sync-state.js");
+    const { writeManifest } = await import("../src/manifest.js");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+
+    const bundleDir = join(tempHome, "bundle-cont");
+    mkdirSync(join(bundleDir, "sessions"), { recursive: true });
+    writeFileSync(
+      join(bundleDir, "sessions", "cont-9.jsonl"),
+      '{"uuid":"header"}\n{"uuid":"tail-uuid"}\n'
+    );
+    writeManifest(bundleDir, {
+      version: 1,
+      plugin: "sesh-mover",
+      exportedAt: "2026-07-13T00:00:00Z",
+      sourcePlatform: "linux",
+      sourceProjectPath: "/p",
+      sourceConfigDir: "/c",
+      sourceClaudeVersion: "2.1.114",
+      sessionScope: "all",
+      includedLayers: ["jsonl"],
+      sessions: [
+        {
+          sessionId: "cont-9",
+          slug: "s",
+          summary: "continuation of s",
+          createdAt: "",
+          lastActiveAt: "",
+          messageCount: 2,
+          gitBranch: "",
+          entrypoint: "cli",
+          integrityHash: "sha256:y",
+          type: "continuation",
+          continuation: {
+            continuesLocalSessionId: "local-orig",
+            fromEntryIndex: 5,
+            fromEntryUuid: "tail-uuid",
+          },
+        },
+      ],
+      sourceMachineId: "me",
+      incremental: true,
+      baseline: { targetMachineId: "peer-1" },
+    });
+
+    recordSentFromBundle("/p", { id: "peer-1" }, bundleDir);
+    const state = readSyncState("/p");
+    // Keyed by the LOCAL session id, sentAs the bundle's continuation id
+    expect(state.peers["peer-1"].sent["local-orig"].sentAsSessionId).toBe("cont-9");
+    expect(state.peers["peer-1"].sent["local-orig"].headEntryUuid).toBe("tail-uuid");
+  });
 });

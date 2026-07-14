@@ -8,6 +8,8 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { encodeProjectPath } from "./platform.js";
+import { readManifest } from "./manifest.js";
+import { readLastEntryUuid } from "./jsonl.js";
 import type { SyncState } from "./types.js";
 
 export function syncStatePath(projectPath: string): string {
@@ -66,4 +68,43 @@ export function writeSyncState(state: SyncState): void {
   const tmp = `${p}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
   renameSync(tmp, p);
+}
+
+export function recordSentFromBundle(
+  projectPath: string,
+  peer: { id: string; name?: string },
+  bundleDir: string
+): void {
+  const state = readSyncState(projectPath);
+  if (!state.peers[peer.id]) {
+    state.peers[peer.id] = {
+      name: peer.name ?? peer.id,
+      lastSentAt: null,
+      lastReceivedAt: null,
+      sent: {},
+      received: {},
+    };
+  }
+  const p = state.peers[peer.id];
+  p.lastSentAt = new Date().toISOString();
+  if (peer.name) p.name = peer.name;
+
+  const manifest = readManifest(bundleDir);
+  for (const s of manifest.sessions) {
+    const localSessionId =
+      s.type === "continuation" && s.continuation
+        ? s.continuation.continuesLocalSessionId
+        : s.sessionId;
+    // Head uuid comes from the BUNDLE's snapshot, never the live JSONL:
+    // entries appended mid-export stay "unsent" and ship next sync.
+    const headUuid =
+      readLastEntryUuid(join(bundleDir, "sessions", `${s.sessionId}.jsonl`)) ?? "";
+    p.sent[localSessionId] = {
+      headEntryUuid: headUuid,
+      messageCount: s.messageCount,
+      sentAsType: s.type === "continuation" ? "continuation" : "full",
+      sentAsSessionId: s.sessionId,
+    };
+  }
+  writeSyncState(state);
 }
