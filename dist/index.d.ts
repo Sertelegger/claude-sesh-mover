@@ -3,6 +3,7 @@ export * from "./platform.js";
 export * from "./config.js";
 export * from "./manifest.js";
 export * from "./discovery.js";
+export * from "./jsonl.js";
 export * from "./summary.js";
 export * from "./rewriter.js";
 export * from "./archiver.js";

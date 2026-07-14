@@ -22,6 +22,7 @@ __exportStar(require("./platform.js"), exports);
 __exportStar(require("./config.js"), exports);
 __exportStar(require("./manifest.js"), exports);
 __exportStar(require("./discovery.js"), exports);
+__exportStar(require("./jsonl.js"), exports);
 __exportStar(require("./summary.js"), exports);
 __exportStar(require("./rewriter.js"), exports);
 __exportStar(require("./archiver.js"), exports);
