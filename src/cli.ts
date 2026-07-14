@@ -452,7 +452,17 @@ program
         let parsedValue: unknown = value;
         if (value === "true") parsedValue = true;
         else if (value === "false") parsedValue = false;
-        else if (value.startsWith("[")) parsedValue = JSON.parse(value);
+        else if (value.startsWith("[")) {
+          try {
+            parsedValue = JSON.parse(value);
+          } catch (parseErr) {
+            outputError(
+              "configure",
+              new Error(`Invalid JSON for ${key}: ${(parseErr as Error).message}`)
+            );
+            return;
+          }
+        }
 
         config = setConfigValue(config, key, parsedValue);
         writeConfig(configDir, config);

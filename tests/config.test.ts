@@ -108,5 +108,13 @@ describe("config", () => {
       const config = getDefaultConfig();
       expect(() => setConfigValue(config, "nonexistent.key", "value")).toThrow();
     });
+
+    it("rejects prototype-polluting path segments", async () => {
+      const { setConfigValue, getDefaultConfig } = await import("../src/config.js");
+      const config = getDefaultConfig();
+      expect(() => setConfigValue(config, "__proto__.polluted", "x")).toThrow(/invalid config path/i);
+      expect(() => setConfigValue(config, "export.__proto__", "x")).toThrow(/invalid config path/i);
+      expect(() => setConfigValue(config, "constructor.prototype.x", "x")).toThrow(/invalid config path/i);
+    });
   });
 });

@@ -65,7 +65,11 @@ export function setConfigValue(
   dotPath: string,
   value: unknown
 ): SeshMoverConfig {
+  const FORBIDDEN_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
   const parts = dotPath.split(".");
+  if (parts.some((p) => FORBIDDEN_SEGMENTS.has(p))) {
+    throw new Error(`Invalid config path: ${dotPath}`);
+  }
   const result = structuredClone(config);
 
   let current: Record<string, unknown> = result as unknown as Record<string, unknown>;

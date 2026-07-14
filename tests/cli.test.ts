@@ -213,6 +213,22 @@ describe("cli", () => {
         else delete process.env.HOME;
       }
     });
+
+    it("returns clean ErrorResult JSON for malformed --set JSON values", () => {
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(`configure --scope user --set 'export.exclude=[unclosed'`);
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = { stdout: err.stdout ? err.stdout.toString() : "", status: err.status ?? 0 };
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.command).toBe("configure");
+      expect(result.error).toMatch(/json/i);
+    });
   });
 
   describe("export incremental", () => {

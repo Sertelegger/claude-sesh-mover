@@ -393,8 +393,15 @@ program
                 parsedValue = true;
             else if (value === "false")
                 parsedValue = false;
-            else if (value.startsWith("["))
-                parsedValue = JSON.parse(value);
+            else if (value.startsWith("[")) {
+                try {
+                    parsedValue = JSON.parse(value);
+                }
+                catch (parseErr) {
+                    outputError("configure", new Error(`Invalid JSON for ${key}: ${parseErr.message}`));
+                    return;
+                }
+            }
             config = (0, config_js_1.setConfigValue)(config, key, parsedValue);
             (0, config_js_1.writeConfig)(configDir, config);
             const result = {

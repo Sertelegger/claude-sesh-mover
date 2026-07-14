@@ -54,7 +54,11 @@ function mergeConfigs(userConfig, projectConfig, cliOverrides) {
     return merged;
 }
 function setConfigValue(config, dotPath, value) {
+    const FORBIDDEN_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
     const parts = dotPath.split(".");
+    if (parts.some((p) => FORBIDDEN_SEGMENTS.has(p))) {
+        throw new Error(`Invalid config path: ${dotPath}`);
+    }
     const result = structuredClone(config);
     let current = result;
     for (let i = 0; i < parts.length - 1; i++) {
