@@ -9,13 +9,11 @@ import {
   readFileSync,
   chmodSync,
 } from "node:fs";
-import { join, delimiter } from "node:path";
-import { tmpdir, platform } from "node:os";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
-import { overrideHome, homeEnv } from "./helpers/env.js";
-
-const isWindows = platform() === "win32";
+import { overrideHome, homeEnv, prependPath } from "./helpers/env.js";
 
 describe("cli", () => {
   let tempDir: string;
@@ -257,38 +255,21 @@ describe("cli", () => {
 
   describe("export incremental archive-first sent-state", () => {
     function installFailingZstdShim(binDir: string): void {
+      // Same technique as tests/archiver.test.ts's installZstdShim (which
+      // already passes on Windows CI): a bare-name POSIX shebang script.
+      // execFileSync("zstd", …) resolves it via PATH the same way on all
+      // three OSes; chmod is a no-op on Windows but harmless.
       mkdirSync(binDir, { recursive: true });
-      // execFileSync("zstd", [...]) resolves the executable via PATH. On
-      // Windows that means a `.cmd` (batch) file — a POSIX shebang script
-      // isn't executable there — and PATH entries are `;`-delimited, not
-      // `:`-delimited, so the shim script itself must be platform-specific
-      // even though the archiver.ts behavior it exercises is not.
-      if (isWindows) {
-        const script = [
-          "@echo off",
-          'if "%~1"=="--version" (',
-          "  echo zstd 1.5.5-fake",
-          "  exit /b 0",
-          ")",
-          'if "%~1"=="-f" (',
-          "  exit /b 1",
-          ")",
-          "exit /b 64",
-          "",
-        ].join("\r\n");
-        writeFileSync(join(binDir, "zstd.cmd"), script);
-      } else {
-        const script = [
-          "#!/bin/sh",
-          'if [ "$1" = "--version" ]; then echo "zstd 1.5.5-fake"; exit 0; fi',
-          'if [ "$1" = "-f" ]; then exit 1; fi',
-          "exit 64",
-          "",
-        ].join("\n");
-        const shimPath = join(binDir, "zstd");
-        writeFileSync(shimPath, script);
-        chmodSync(shimPath, 0o755);
-      }
+      const script = [
+        "#!/bin/sh",
+        'if [ "$1" = "--version" ]; then echo "zstd 1.5.5-fake"; exit 0; fi',
+        'if [ "$1" = "-f" ]; then exit 1; fi',
+        "exit 64",
+        "",
+      ].join("\n");
+      const shimPath = join(binDir, "zstd");
+      writeFileSync(shimPath, script);
+      chmodSync(shimPath, 0o755);
     }
 
     it("does not record sent-state when archive creation fails after recordSentFromBundle would have run", () => {
@@ -343,11 +324,7 @@ describe("cli", () => {
             `node "${cliPath}" export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path ${projectPath} --storage user --format zstd --name inc-zstd-fail --output "${outputDir}" --incremental --to peer-1`,
             {
               encoding: "utf-8",
-              env: {
-                ...process.env,
-                ...homeEnv(tempHome),
-                PATH: `${shimDir}${delimiter}${process.env.PATH}`,
-              },
+              env: prependPath({ ...process.env, ...homeEnv(tempHome) }, shimDir),
             }
           );
         } catch (e) {
