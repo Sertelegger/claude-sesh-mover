@@ -557,15 +557,6 @@ async function finalizeExport(params: {
   const { result, format, incremental, projectPath } = params;
   const bundleDir = result.exportPath;
 
-  // Record sync state from the bundle BEFORE the staging dir is archived away.
-  if (incremental?.targetMachineId) {
-    recordSentFromBundle(
-      projectPath,
-      { id: incremental.targetMachineId, name: incremental.targetMachineName },
-      bundleDir
-    );
-  }
-
   if (format === "archive" || format === "zstd") {
     let compression: "gzip" | "zstd" = format === "zstd" ? "zstd" : "gzip";
     if (compression === "zstd" && !(await isZstdAvailable())) {
@@ -575,10 +566,36 @@ async function finalizeExport(params: {
     }
     const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
     const archivePath = bundleDir + ext;
+    // Archive FIRST. If this throws, the staging dir is left intact and no
+    // sent-state is recorded — a failed export must not advance peer heads
+    // (those entries would never actually ship, and would be silently
+    // skipped on the next incremental export as "already sent").
     await createArchive(bundleDir, archivePath, compression);
+
+    // Record sync state from the bundle now that the archive exists — the
+    // staging dir is still present at this point, so recordSentFromBundle
+    // can still read the session JSONL snapshots out of it.
+    if (incremental?.targetMachineId) {
+      recordSentFromBundle(
+        projectPath,
+        { id: incremental.targetMachineId, name: incremental.targetMachineName },
+        bundleDir
+      );
+    }
+
     rmSync(bundleDir, { recursive: true, force: true });
     result.archivePath = archivePath;
     result.exportPath = archivePath;
+    return;
+  }
+
+  // dir format: no archiving step that can fail, so record immediately.
+  if (incremental?.targetMachineId) {
+    recordSentFromBundle(
+      projectPath,
+      { id: incremental.targetMachineId, name: incremental.targetMachineName },
+      bundleDir
+    );
   }
 }
 

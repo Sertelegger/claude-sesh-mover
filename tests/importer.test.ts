@@ -320,6 +320,83 @@ describe("importer", () => {
     }
   });
 
+  it("re-imports an incremental bundle when the received session's JSONL file is gone even though a peer record exists", async () => {
+    const { mkdtempSync, rmSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { exportAllSessions } = await import("../src/exporter.js");
+    const { importSession } = await import("../src/importer.js");
+    const { createFixtureTree } = await import("./fixtures/create-fixtures.js");
+
+    const tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-import-idem-heal-"));
+    const tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-import-idem-heal-home-"));
+    const origHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      const fx = createFixtureTree(tempDir);
+      const outputDir = join(tempDir, "exports");
+      mkdirSync(outputDir, { recursive: true });
+
+      const exportResult = await exportAllSessions({
+        configDir: fx.configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir,
+        name: "inc-idem-heal",
+        excludeLayers: [],
+        claudeVersion: "2.1.114",
+        incremental: {
+          sourceMachineId: "machine-A",
+          sourceMachineName: "A",
+          targetMachineId: "machine-B",
+          targetMachineName: "B",
+          peerSent: {},
+        },
+      });
+      expect(exportResult.success).toBe(true);
+
+      const targetConfig = join(tempDir, "target-config");
+      mkdirSync(targetConfig, { recursive: true });
+
+      const first = await importSession({
+        exportPath: (exportResult as { exportPath: string }).exportPath,
+        targetConfigDir: targetConfig,
+        targetProjectPath: "/Users/target/Projects/testproject",
+        targetClaudeVersion: "2.1.114",
+        dryRun: false,
+        noRegister: false,
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      const firstNewId = (first as ImportResult).importedSessions[0].newId;
+
+      // Delete the previously-imported JSONL: the sync-state peer record
+      // still references it, but the file itself is gone.
+      const encoded = "-Users-target-Projects-testproject";
+      const priorJsonl = join(targetConfig, "projects", encoded, `${firstNewId}.jsonl`);
+      expect(existsSync(priorJsonl)).toBe(true);
+      rmSync(priorJsonl);
+
+      const second = await importSession({
+        exportPath: (exportResult as { exportPath: string }).exportPath,
+        targetConfigDir: targetConfig,
+        targetProjectPath: "/Users/target/Projects/testproject",
+        targetClaudeVersion: "2.1.114",
+        dryRun: false,
+        noRegister: false,
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect((second as ImportResult).importedSessions).toHaveLength(1);
+      expect((second as ImportResult).skippedSessions).toHaveLength(0);
+    } finally {
+      if (origHome !== undefined) process.env.HOME = origHome;
+      else delete process.env.HOME;
+      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
   it("skips re-import of an identical non-incremental bundle and reports skippedSessions", async () => {
     const { importSession } = await import("../src/importer.js");
     const opts = {
@@ -356,6 +433,54 @@ describe("importer", () => {
     expect(second.success).toBe(true);
     if (!second.success) return;
     expect(second.importedSessions).toHaveLength(1);
+  });
+
+  it("re-imports when the registry hash record exists but the prior JSONL file is gone", async () => {
+    const { importSession } = await import("../src/importer.js");
+    const opts = {
+      exportPath,
+      targetConfigDir,
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    };
+    const first = await importSession(opts);
+    expect(first.success).toBe(true);
+    if (!first.success) return;
+    const firstNewId = (first as ImportResult).importedSessions[0].newId;
+
+    // Simulate data loss: the previously-imported JSONL file disappeared
+    // (e.g. a migrate deleted it), but the registry record still points at it.
+    const encoded = "-Users-newuser-Projects-newproject";
+    const priorJsonl = join(targetConfigDir, "projects", encoded, `${firstNewId}.jsonl`);
+    expect(existsSync(priorJsonl)).toBe(true);
+    rmSync(priorJsonl);
+
+    const second = await importSession(opts);
+    expect(second.success).toBe(true);
+    if (!second.success) return;
+    expect((second as ImportResult).importedSessions).toHaveLength(1);
+    expect((second as ImportResult).skippedSessions).toHaveLength(0);
+  });
+
+  it("dry-run of a fully-duplicate bundle still reports dryRun: true", async () => {
+    const { importSession } = await import("../src/importer.js");
+    const opts = {
+      exportPath,
+      targetConfigDir,
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    };
+    const first = await importSession(opts);
+    expect(first.success).toBe(true);
+
+    const secondDryRun = await importSession({ ...opts, dryRun: true });
+    expect(secondDryRun.success).toBe(true);
+    if (!secondDryRun.success) return;
+    expect((secondDryRun as DryRunResult).dryRun).toBe(true);
+    expect((secondDryRun as DryRunResult).importedSessions).toHaveLength(0);
+    expect((secondDryRun as DryRunResult).skippedSessions).toHaveLength(1);
   });
 
   it("migrate cleans up source sessions that were skipped as duplicates at target", async () => {

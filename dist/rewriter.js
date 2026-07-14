@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.rewriteString = rewriteString;
+exports.rewriteWholePath = rewriteWholePath;
 exports.buildPathMappings = buildPathMappings;
 exports.rewriteEntry = rewriteEntry;
 exports.rewriteJsonl = rewriteJsonl;
@@ -37,6 +38,28 @@ function rewriteString(input, ctx) {
         }));
     }
     return result;
+}
+// Like rewriteString, but for fields that are a path in their entirety (cwd,
+// trackedFileBackups keys) rather than free text that may merely *contain*
+// paths. Stage-1 exact mappings normalize their WHOLE tail (not just up to
+// the first token boundary), so spaces and other non-token characters in the
+// tail still get separator-normalized cross-family. Falls through to the
+// same token-translation engine as rewriteString when no mapping matches.
+function rewriteWholePath(input, ctx) {
+    const crossFamily = !(0, platform_js_1.samePlatformFamily)(ctx.sourcePlatform, ctx.targetPlatform);
+    for (const mapping of ctx.mappings) {
+        if (input.startsWith(mapping.from)) {
+            const tail = input.slice(mapping.from.length);
+            return mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail);
+        }
+    }
+    if (crossFamily) {
+        return (0, platform_js_1.translatePath)(input, ctx.sourcePlatform, ctx.targetPlatform, {
+            sourceUser: ctx.sourceUser,
+            targetUser: ctx.targetUser,
+        });
+    }
+    return input;
 }
 function buildPathMappings(sourcePlatform, targetPlatform, sourceProjectPath, targetProjectPath, sourceConfigDir, targetConfigDir, sourceUser, targetUser) {
     const mappings = [];
@@ -97,9 +120,9 @@ function rewriteEntry(entry, ctx, newSessionId) {
     if (newSessionId) {
         result.sessionId = newSessionId;
     }
-    // Rewrite cwd (always)
+    // Rewrite cwd (always) — whole-path field, not free text.
     if (typeof result.cwd === "string") {
-        result.cwd = rewriteString(result.cwd, ctx);
+        result.cwd = rewriteWholePath(result.cwd, ctx);
     }
     // Rewrite tool_result content and toolUseResult for user entries
     if (result.type === "user" && result.message) {
@@ -139,7 +162,7 @@ function rewriteEntry(entry, ctx, newSessionId) {
             const backups = snapshot.trackedFileBackups;
             const newBackups = {};
             for (const [key, value] of Object.entries(backups)) {
-                const newKey = rewriteString(key, ctx);
+                const newKey = rewriteWholePath(key, ctx);
                 newBackups[newKey] = value;
             }
             snapshot.trackedFileBackups = newBackups;

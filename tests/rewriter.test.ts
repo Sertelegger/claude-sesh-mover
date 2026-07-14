@@ -101,6 +101,138 @@ describe("rewriter", () => {
     });
   });
 
+  describe("rewriteWholePath", () => {
+    it("normalizes separators AND preserves spaces in the tail after an exact mapping fires (win32 -> linux)", async () => {
+      const { rewriteWholePath, buildPathMappings } = await import("../src/rewriter.js");
+      const mappings = buildPathMappings(
+        "win32", "linux",
+        "E:\\GitHub\\proj", "/mnt/e/GitHub/proj",
+        "C:\\Users\\sascha\\.claude", "/home/sascha/.claude",
+        "sascha", "sascha"
+      );
+      const ctx = {
+        mappings,
+        sourcePlatform: "win32" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "sascha",
+        targetUser: "sascha",
+      };
+      expect(
+        rewriteWholePath("E:\\GitHub\\proj\\sub dir\\nested", ctx)
+      ).toBe("/mnt/e/GitHub/proj/sub dir/nested");
+    });
+
+    it("falls back to translatePath when no project mapping matches (darwin -> win32)", async () => {
+      const { rewriteWholePath, buildPathMappings } = await import("../src/rewriter.js");
+      const mappings = buildPathMappings(
+        "darwin", "win32",
+        "/Users/sascha/Projects/other", "C:\\Users\\sascha\\Projects\\other",
+        "/Users/sascha/.claude", "C:\\Users\\sascha\\.claude",
+        "sascha", "sascha"
+      );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "win32" as const,
+        sourceUser: "sascha",
+        targetUser: "sascha",
+      };
+      expect(
+        rewriteWholePath("/Users/sascha/My Documents/notes", ctx)
+      ).toBe("C:\\Users\\sascha\\My Documents\\notes");
+    });
+
+    it("preserves the tail verbatim (no normalization) for same-family transfers", async () => {
+      const { rewriteWholePath, buildPathMappings } = await import("../src/rewriter.js");
+      const mappings = buildPathMappings(
+        "linux", "linux",
+        "/home/a/proj", "/home/a/proj2",
+        "/home/a/.claude", "/home/a/.claude",
+        "a", "a"
+      );
+      const ctx = {
+        mappings,
+        sourcePlatform: "linux" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "a",
+        targetUser: "a",
+      };
+      expect(
+        rewriteWholePath("/home/a/proj/sub dir/nested\\odd", ctx)
+      ).toBe("/home/a/proj2/sub dir/nested\\odd");
+    });
+  });
+
+  describe("rewriteEntry uses rewriteWholePath for cwd and trackedFileBackups keys", () => {
+    it("rewrites a cwd field with spaces in the tail through the full translation path", async () => {
+      const { rewriteEntry, buildPathMappings } = await import("../src/rewriter.js");
+      const mappings = buildPathMappings(
+        "win32", "linux",
+        "E:\\GitHub\\proj", "/mnt/e/GitHub/proj",
+        "C:\\Users\\sascha\\.claude", "/home/sascha/.claude",
+        "sascha", "sascha"
+      );
+      const ctx = {
+        mappings,
+        sourcePlatform: "win32" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "sascha",
+        targetUser: "sascha",
+      };
+      const entry = {
+        uuid: "1",
+        timestamp: "2026-04-11T00:00:00Z",
+        sessionId: "test",
+        cwd: "E:\\GitHub\\proj\\sub dir\\nested",
+        version: "2.1.81",
+        type: "user" as const,
+        message: { role: "user" as const, content: "hello" },
+      };
+      const result = rewriteEntry(entry, ctx);
+      expect(result.cwd).toBe("/mnt/e/GitHub/proj/sub dir/nested");
+    });
+
+    it("rewrites a file-history-snapshot backup key with a space fully", async () => {
+      const { rewriteEntry, buildPathMappings } = await import("../src/rewriter.js");
+      const mappings = buildPathMappings(
+        "win32", "linux",
+        "E:\\GitHub\\proj", "/mnt/e/GitHub/proj",
+        "C:\\Users\\sascha\\.claude", "/home/sascha/.claude",
+        "sascha", "sascha"
+      );
+      const ctx = {
+        mappings,
+        sourcePlatform: "win32" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "sascha",
+        targetUser: "sascha",
+      };
+      const entry = {
+        uuid: "2",
+        timestamp: "2026-04-11T00:00:00Z",
+        sessionId: "test",
+        cwd: "E:\\GitHub\\proj",
+        version: "2.1.81",
+        type: "file-history-snapshot" as const,
+        messageId: "msg-1",
+        snapshot: {
+          messageId: "msg-1",
+          trackedFileBackups: {
+            "E:\\GitHub\\proj\\sub dir\\file.ts": {
+              backupFileName: "abc@v1",
+              version: 1,
+              backupTime: "2026-04-11T00:00:00Z",
+            },
+          },
+          timestamp: "2026-04-11T00:00:00Z",
+        },
+      };
+      const result = rewriteEntry(entry, ctx);
+      const keys = Object.keys((result as any).snapshot.trackedFileBackups);
+      expect(keys[0]).toBe("/mnt/e/GitHub/proj/sub dir/file.ts");
+    });
+  });
+
   describe("buildPathMappings", () => {
     it("builds WSL-to-Windows mappings", async () => {
       const { buildPathMappings } = await import("../src/rewriter.js");

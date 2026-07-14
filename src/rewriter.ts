@@ -53,6 +53,29 @@ export function rewriteString(input: string, ctx: RewriteContext): string {
   return result;
 }
 
+// Like rewriteString, but for fields that are a path in their entirety (cwd,
+// trackedFileBackups keys) rather than free text that may merely *contain*
+// paths. Stage-1 exact mappings normalize their WHOLE tail (not just up to
+// the first token boundary), so spaces and other non-token characters in the
+// tail still get separator-normalized cross-family. Falls through to the
+// same token-translation engine as rewriteString when no mapping matches.
+export function rewriteWholePath(input: string, ctx: RewriteContext): string {
+  const crossFamily = !samePlatformFamily(ctx.sourcePlatform, ctx.targetPlatform);
+  for (const mapping of ctx.mappings) {
+    if (input.startsWith(mapping.from)) {
+      const tail = input.slice(mapping.from.length);
+      return mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail);
+    }
+  }
+  if (crossFamily) {
+    return translatePath(input, ctx.sourcePlatform, ctx.targetPlatform, {
+      sourceUser: ctx.sourceUser,
+      targetUser: ctx.targetUser,
+    });
+  }
+  return input;
+}
+
 export function buildPathMappings(
   sourcePlatform: Platform,
   targetPlatform: Platform,
@@ -131,9 +154,9 @@ export function rewriteEntry(
     result.sessionId = newSessionId;
   }
 
-  // Rewrite cwd (always)
+  // Rewrite cwd (always) — whole-path field, not free text.
   if (typeof result.cwd === "string") {
-    result.cwd = rewriteString(result.cwd, ctx);
+    result.cwd = rewriteWholePath(result.cwd, ctx);
   }
 
   // Rewrite tool_result content and toolUseResult for user entries
@@ -178,7 +201,7 @@ export function rewriteEntry(
       const backups = snapshot.trackedFileBackups as Record<string, unknown>;
       const newBackups: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(backups)) {
-        const newKey = rewriteString(key, ctx);
+        const newKey = rewriteWholePath(key, ctx);
         newBackups[newKey] = value;
       }
       snapshot.trackedFileBackups = newBackups;

@@ -472,10 +472,6 @@ async function doExport(configDir, scope, sessionId, outputDir, name, excludeLay
 async function finalizeExport(params) {
     const { result, format, incremental, projectPath } = params;
     const bundleDir = result.exportPath;
-    // Record sync state from the bundle BEFORE the staging dir is archived away.
-    if (incremental?.targetMachineId) {
-        (0, sync_state_js_1.recordSentFromBundle)(projectPath, { id: incremental.targetMachineId, name: incremental.targetMachineName }, bundleDir);
-    }
     if (format === "archive" || format === "zstd") {
         let compression = format === "zstd" ? "zstd" : "gzip";
         if (compression === "zstd" && !(await (0, archiver_js_1.isZstdAvailable)())) {
@@ -485,10 +481,25 @@ async function finalizeExport(params) {
         }
         const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
         const archivePath = bundleDir + ext;
+        // Archive FIRST. If this throws, the staging dir is left intact and no
+        // sent-state is recorded — a failed export must not advance peer heads
+        // (those entries would never actually ship, and would be silently
+        // skipped on the next incremental export as "already sent").
         await (0, archiver_js_1.createArchive)(bundleDir, archivePath, compression);
+        // Record sync state from the bundle now that the archive exists — the
+        // staging dir is still present at this point, so recordSentFromBundle
+        // can still read the session JSONL snapshots out of it.
+        if (incremental?.targetMachineId) {
+            (0, sync_state_js_1.recordSentFromBundle)(projectPath, { id: incremental.targetMachineId, name: incremental.targetMachineName }, bundleDir);
+        }
         (0, node_fs_1.rmSync)(bundleDir, { recursive: true, force: true });
         result.archivePath = archivePath;
         result.exportPath = archivePath;
+        return;
+    }
+    // dir format: no archiving step that can fail, so record immediately.
+    if (incremental?.targetMachineId) {
+        (0, sync_state_js_1.recordSentFromBundle)(projectPath, { id: incremental.targetMachineId, name: incremental.targetMachineName }, bundleDir);
     }
 }
 function resolvePeer(state, needle) {

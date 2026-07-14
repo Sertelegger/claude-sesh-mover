@@ -1,9 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  existsSync,
+  writeFileSync,
+  readFileSync,
+  chmodSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
+import { encodeProjectPath } from "../src/platform.js";
 
 describe("cli", () => {
   let tempDir: string;
@@ -228,6 +237,99 @@ describe("cli", () => {
       expect(result.success).toBe(false);
       expect(result.command).toBe("configure");
       expect(result.error).toMatch(/json/i);
+    });
+  });
+
+  describe("export incremental archive-first sent-state", () => {
+    function installFailingZstdShim(binDir: string): void {
+      mkdirSync(binDir, { recursive: true });
+      const script = [
+        "#!/bin/sh",
+        'if [ "$1" = "--version" ]; then echo "zstd 1.5.5-fake"; exit 0; fi',
+        'if [ "$1" = "-f" ]; then exit 1; fi',
+        "exit 64",
+        "",
+      ].join("\n");
+      const shimPath = join(binDir, "zstd");
+      writeFileSync(shimPath, script);
+      chmodSync(shimPath, 0o755);
+    }
+
+    it("does not record sent-state when archive creation fails after recordSentFromBundle would have run", () => {
+      const tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-cli-inc-fail-home-"));
+      const outputDir = join(tempDir, "cli-inc-fail");
+      mkdirSync(outputDir, { recursive: true });
+      const projectPath = "/Users/testuser/Projects/testproject";
+
+      try {
+        // Seed machine identity so loadOrCreateMachineId() picks it up deterministically.
+        const seshDir = join(tempHome, ".claude-sesh-mover");
+        mkdirSync(seshDir, { recursive: true });
+        writeFileSync(
+          join(seshDir, "machine-id.json"),
+          JSON.stringify(
+            { id: "machine-local", name: "local-machine", createdAt: new Date().toISOString() },
+            null,
+            2
+          ) + "\n"
+        );
+
+        // Seed sync-state with a known peer so `--to peer-1` resolves.
+        const syncStateDir = join(seshDir, "sync-state");
+        mkdirSync(syncStateDir, { recursive: true });
+        const syncStatePath = join(syncStateDir, `${encodeProjectPath(projectPath)}.json`);
+        const seededState = {
+          projectPath,
+          schemaVersion: 1,
+          peers: {
+            "peer-1": {
+              name: "peer-machine",
+              lastSentAt: null,
+              lastReceivedAt: null,
+              sent: {},
+              received: {},
+            },
+          },
+          lineage: {},
+          imported: {},
+        };
+        writeFileSync(syncStatePath, JSON.stringify(seededState, null, 2) + "\n");
+
+        // zstd --version succeeds (so isZstdAvailable() is true, no fallback to
+        // gzip) but `-f` (compression) fails, forcing createArchive to throw.
+        const shimDir = join(tempDir, "shim-bin-fail");
+        installFailingZstdShim(shimDir);
+
+        let caught: { stdout: string; status: number } | null = null;
+        try {
+          const cliPath = join(__dirname, "..", "dist", "cli.js");
+          execSync(
+            `node "${cliPath}" export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path ${projectPath} --storage user --format zstd --name inc-zstd-fail --output "${outputDir}" --incremental --to peer-1`,
+            {
+              encoding: "utf-8",
+              env: { ...process.env, HOME: tempHome, PATH: `${shimDir}:${process.env.PATH}` },
+            }
+          );
+        } catch (e) {
+          const err = e as { stdout?: Buffer; status?: number };
+          caught = {
+            stdout: err.stdout ? err.stdout.toString() : "",
+            status: err.status ?? 0,
+          };
+        }
+
+        expect(caught).not.toBeNull();
+        expect(caught!.status).not.toBe(0);
+        const result = JSON.parse(caught!.stdout);
+        expect(result.success).toBe(false);
+
+        // The sync-state peer's sent map must still be empty: recording
+        // must happen AFTER the archive is successfully created, not before.
+        const afterState = JSON.parse(readFileSync(syncStatePath, "utf-8"));
+        expect(afterState.peers["peer-1"].sent).toEqual({});
+      } finally {
+        rmSync(tempHome, { recursive: true, force: true });
+      }
     });
   });
 

@@ -7,6 +7,7 @@ export interface RewriteContext {
     targetUser: string;
 }
 export declare function rewriteString(input: string, ctx: RewriteContext): string;
+export declare function rewriteWholePath(input: string, ctx: RewriteContext): string;
 export declare function buildPathMappings(sourcePlatform: Platform, targetPlatform: Platform, sourceProjectPath: string, targetProjectPath: string, sourceConfigDir: string, targetConfigDir: string, sourceUser: string, targetUser: string): PathMapping[];
 export declare function rewriteEntry(entry: Record<string, unknown>, ctx: RewriteContext, newSessionId?: string): Record<string, unknown>;
 export declare function rewriteJsonl(jsonlContent: string, ctx: RewriteContext, newSessionId?: string): {

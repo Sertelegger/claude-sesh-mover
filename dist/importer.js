@@ -36,6 +36,13 @@ async function importSession(options) {
             error: "No matching sessions found in export",
         };
     }
+    // Compute the target project dir up front — the dedup filters below need
+    // it to verify a prior "imported" record still has a file on disk before
+    // trusting it (see Fix 1: a registry/peer record can outlive the file it
+    // points at, e.g. after a migrate deleted it, and trusting the record
+    // alone would silently drop the session instead of importing it fresh).
+    const encodedTargetPath = (0, platform_js_1.encodeProjectPath)(targetProjectPath);
+    const targetProjectDir = (0, node_path_1.join)(targetConfigDir, "projects", encodedTargetPath);
     const state = (0, sync_state_js_1.readSyncState)(targetProjectPath);
     const skippedSessions = [];
     if (!allowDuplicates && manifest.sourceMachineId) {
@@ -44,7 +51,8 @@ async function importSession(options) {
             const before = targetSessions.length;
             targetSessions = targetSessions.filter((session) => {
                 const prior = peer.received[session.sessionId];
-                if (prior) {
+                if (prior &&
+                    (0, node_fs_1.existsSync)((0, node_path_1.join)(targetProjectDir, `${prior.localSessionId}.jsonl`))) {
                     skippedSessions.push({
                         originalId: session.sessionId,
                         reason: "already-received",
@@ -61,7 +69,9 @@ async function importSession(options) {
     if (!allowDuplicates) {
         const before = targetSessions.length;
         targetSessions = targetSessions.filter((session) => {
-            if (state.imported[session.integrityHash]) {
+            const prior = state.imported[session.integrityHash];
+            if (prior &&
+                (0, node_fs_1.existsSync)((0, node_path_1.join)(targetProjectDir, `${prior.localSessionId}.jsonl`))) {
                 skippedSessions.push({
                     originalId: session.sessionId,
                     reason: "duplicate",
@@ -75,6 +85,17 @@ async function importSession(options) {
         }
     }
     if (targetSessions.length === 0) {
+        if (dryRun) {
+            return {
+                success: true,
+                command: "import",
+                dryRun: true,
+                importedSessions: [],
+                skippedSessions,
+                warnings,
+                resumable: true,
+            };
+        }
         return {
             success: true,
             command: "import",
@@ -150,8 +171,6 @@ async function importSession(options) {
         };
     }
     // Step 4: Write session files
-    const encodedTargetPath = (0, platform_js_1.encodeProjectPath)(targetProjectPath);
-    const targetProjectDir = (0, node_path_1.join)(targetConfigDir, "projects", encodedTargetPath);
     (0, node_fs_1.mkdirSync)(targetProjectDir, { recursive: true });
     // Helper: remove only the files written by this import (targeted rollback)
     const rollbackImportedFiles = () => {
@@ -324,7 +343,7 @@ async function importSession(options) {
                 success: false,
                 command: "import",
                 error: `Import validation failed: ${e.message}`,
-                details: "Written files have been cleaned up. No indexes were modified.",
+                details: "Partially written session files have been cleaned up; merged memory/plan files may remain. No indexes were modified.",
                 suggestion: "Check the export bundle for corruption, or try --no-register to import as read-only.",
             };
         }

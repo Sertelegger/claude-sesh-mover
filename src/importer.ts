@@ -92,6 +92,18 @@ export async function importSession(
     };
   }
 
+  // Compute the target project dir up front — the dedup filters below need
+  // it to verify a prior "imported" record still has a file on disk before
+  // trusting it (see Fix 1: a registry/peer record can outlive the file it
+  // points at, e.g. after a migrate deleted it, and trusting the record
+  // alone would silently drop the session instead of importing it fresh).
+  const encodedTargetPath = encodeProjectPath(targetProjectPath);
+  const targetProjectDir = join(
+    targetConfigDir,
+    "projects",
+    encodedTargetPath
+  );
+
   const state = readSyncState(targetProjectPath);
   const skippedSessions: Array<{
     originalId: string;
@@ -104,7 +116,10 @@ export async function importSession(
       const before = targetSessions.length;
       targetSessions = targetSessions.filter((session) => {
         const prior = peer.received[session.sessionId];
-        if (prior) {
+        if (
+          prior &&
+          existsSync(join(targetProjectDir, `${prior.localSessionId}.jsonl`))
+        ) {
           skippedSessions.push({
             originalId: session.sessionId,
             reason: "already-received",
@@ -124,7 +139,11 @@ export async function importSession(
   if (!allowDuplicates) {
     const before = targetSessions.length;
     targetSessions = targetSessions.filter((session) => {
-      if (state.imported[session.integrityHash]) {
+      const prior = state.imported[session.integrityHash];
+      if (
+        prior &&
+        existsSync(join(targetProjectDir, `${prior.localSessionId}.jsonl`))
+      ) {
         skippedSessions.push({
           originalId: session.sessionId,
           reason: "duplicate",
@@ -141,6 +160,17 @@ export async function importSession(
   }
 
   if (targetSessions.length === 0) {
+    if (dryRun) {
+      return {
+        success: true,
+        command: "import",
+        dryRun: true,
+        importedSessions: [],
+        skippedSessions,
+        warnings,
+        resumable: true,
+      } satisfies DryRunResult;
+    }
     return {
       success: true,
       command: "import",
@@ -264,12 +294,6 @@ export async function importSession(
   }
 
   // Step 4: Write session files
-  const encodedTargetPath = encodeProjectPath(targetProjectPath);
-  const targetProjectDir = join(
-    targetConfigDir,
-    "projects",
-    encodedTargetPath
-  );
   mkdirSync(targetProjectDir, { recursive: true });
 
   // Helper: remove only the files written by this import (targeted rollback)
@@ -476,7 +500,7 @@ export async function importSession(
         command: "import",
         error: `Import validation failed: ${(e as Error).message}`,
         details:
-          "Written files have been cleaned up. No indexes were modified.",
+          "Partially written session files have been cleaned up; merged memory/plan files may remain. No indexes were modified.",
         suggestion:
           "Check the export bundle for corruption, or try --no-register to import as read-only.",
       };

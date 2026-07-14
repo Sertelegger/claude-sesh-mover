@@ -26,6 +26,19 @@ Fixes from a full adversarial review of 0.2.0, shipped as one milestone:
   bounded-memory discovery/export (O(max single session), not O(all sessions));
   prototype-pollution-safe config; pre-extraction validation of untrusted bundles.
 
+## 0.3.1 — Hardening follow-ups (queued)
+
+Smaller items surfaced by the 0.3.0 final review, deferred to keep that milestone shippable:
+
+- Registered-state tracking in the import dedup registry (the `--no-register` escape leaves
+  no record that a copy exists unregistered, so a later normal import can't tell it should
+  register-in-place instead of creating a second copy).
+- Empty-`headEntryUuid` guard in the incremental diff.
+- `skippedSessions` on `MigrateResult`.
+- `--since` continuation keying by local session id.
+- Archive-name collision detection in export.
+- Removal of import's no-op `--force` flag.
+
 ## 0.3.x — Stream-transform rewriting (candidate)
 
 O(1)-per-session memory for the rewrite/import pipeline. Only matters for very large single
