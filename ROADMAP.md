@@ -4,9 +4,10 @@ Where claude-sesh-mover is heading beyond one-shot session export/import. Items 
 not scheduled — each stage gets its own design pass before implementation. Shipped releases
 are documented in [CHANGELOG.md](./CHANGELOG.md).
 
-## 0.3.1 — Hardening follow-ups (queued)
+## Hardening follow-ups (queued)
 
-Smaller items surfaced by the 0.3.0 final review, deferred to keep that milestone shippable:
+Smaller items surfaced by the 0.3.0 final review, deferred to keep that milestone shippable.
+Version numbers are chosen at implementation time; stages here are ordered, not numbered.
 
 - Registered-state tracking in the import dedup registry (the `--no-register` escape leaves
   no record that a copy exists unregistered, so a later normal import can't tell it should
@@ -17,14 +18,14 @@ Smaller items surfaced by the 0.3.0 final review, deferred to keep that mileston
 - Archive-name collision detection in export.
 - Removal of import's no-op `--force` flag.
 
-## 0.3.x — Stream-transform rewriting (candidate)
+## Stream-transform rewriting (candidate)
 
 O(1)-per-session memory for the rewrite/import pipeline. Only matters for very large single
 sessions (hundreds of MB); version number depends on API impact (patch if internal, minor if
 the library API goes async). May instead be absorbed into the hub milestone below, where
 streaming matters most at the transfer boundary.
 
-## 0.4.0 — The Hub: cross-machine session index + remote pull
+## The Hub: cross-machine session index + remote pull
 
 The core problem: working across multiple machines (Windows 11/WSL2, native Linux, macOS),
 you lose track of **which machine has which sessions and where the latest one lives** —
@@ -56,7 +57,7 @@ fragments across four tools — no product does both.
 SessionStart/SessionEnd auto-sync hooks (claude-context-sync), repo-scoped in-project
 bundles for handoff (cctrace), self-hosted E2E-encrypted relay (Happy — later, if ever).
 
-## 0.5.x — Beyond Claude: multi-agent-CLI support
+## Beyond Claude: multi-agent-CLI support
 
 Partial support for other agentic CLIs (Codex, Gemini CLI, opencode, …) — the same
 "which machine has my latest session?" problem exists for all of them, and cross-vendor
