@@ -10,8 +10,14 @@ export interface RewriteContext {
 }
 
 // Characters that terminate a path token embedded in free text.
-const UNIX_TOKEN = /(?:\/[A-Za-z0-9._@+~-]+)+\/?/g;
-const WIN_TOKEN = /[A-Za-z]:\\[^\s"'`)\]}>,;]*/g;
+// (?<!\/) — a token immediately preceded by "/" is URL-context
+// (http://mnt/..., protocol-relative //tmp/..., file:///mnt/...) and is
+// never translated. (?<![A-Za-z0-9.-]) protects paths following domain names
+// (https://example.com/mnt/...). Together these prevent URL corruption while
+// still translating bare filesystem paths. Leaving text unchanged is the
+// preferred failure mode.
+const UNIX_TOKEN = /(?<![A-Za-z0-9.-])(?<!\/)(?:\/[A-Za-z0-9._@+~-]+)+\/?/g;
+const WIN_TOKEN = /(?<![A-Za-z0-9.-])(?<!\/)[A-Za-z]:\\[^\s"'`)\]}>,;]*/g;
 const TAIL = /[^\s"'`)\]}>,;:]*/;
 
 function escapeRegex(str: string): string {

@@ -19,6 +19,25 @@ function wslToWinCtx() {
   })();
 }
 
+function winToWslCtx() {
+  return (async () => {
+    const { buildPathMappings } = await import("../src/rewriter.js");
+    const mappings = buildPathMappings(
+      "win32", "wsl2",
+      "E:\\GitHub\\proj", "/mnt/e/GitHub/proj",
+      "C:\\Users\\sascha\\.claude", "/home/sascha/.claude",
+      "sascha", "sascha"
+    );
+    return {
+      mappings,
+      sourcePlatform: "win32" as const,
+      targetPlatform: "wsl2" as const,
+      sourceUser: "sascha",
+      targetUser: "sascha",
+    };
+  })();
+}
+
 describe("rewriter", () => {
   describe("two-stage rewriteString", () => {
     it("normalizes separators in the tail after an exact mapping fires", async () => {
@@ -602,6 +621,64 @@ describe("rewriter", () => {
       expect(first.cwd).toBe("/Users/new/project");
       expect(first.sessionId).toBe("new-session");
       expect(report.entriesRewritten).toBeGreaterThan(0);
+    });
+  });
+
+  describe("URL guard (#8): tokens preceded by / are not translated", () => {
+    it("leaves http URLs with unix-root hosts untouched", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("fetch http://mnt/e/foo now", ctx)).toBe(
+        "fetch http://mnt/e/foo now"
+      );
+      expect(rewriteString("see http://tmp/abc", ctx)).toBe("see http://tmp/abc");
+    });
+
+    it("leaves protocol-relative //root paths untouched", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("src=//tmp/abc", ctx)).toBe("src=//tmp/abc");
+    });
+
+    it("leaves file:// URLs untouched", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("open file:///mnt/e/foo.txt", ctx)).toBe(
+        "open file:///mnt/e/foo.txt"
+      );
+    });
+
+    it("still translates bare unix paths (guard does not over-block)", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("read /mnt/e/other/file.ts", ctx)).toBe(
+        "read E:\\other\\file.ts"
+      );
+    });
+
+    it("regression: realistic-hostname URLs stay safe", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("https://example.com/mnt/e/data", ctx)).toBe(
+        "https://example.com/mnt/e/data"
+      );
+    });
+
+    it("mixed text: bare path translates, URL twin does not", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("see /tmp/x and http://tmp/y", ctx)).toBe(
+        "see C:\\Users\\sascha\\AppData\\Local\\Temp\\x and http://tmp/y"
+      );
+    });
+
+    it("win32 source: file://C:\\ URLs untouched, bare C:\\ still translates", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await winToWslCtx();
+      expect(rewriteString("open file://C:\\data\\f.txt", ctx)).toBe(
+        "open file://C:\\data\\f.txt"
+      );
+      expect(rewriteString("read D:\\data\\f.txt", ctx)).toBe("read /mnt/d/data/f.txt");
     });
   });
 });
