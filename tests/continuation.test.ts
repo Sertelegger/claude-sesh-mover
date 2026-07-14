@@ -38,6 +38,7 @@ describe("continuation", () => {
     const out = buildContinuationJsonl({
       originalJsonl: ORIGINAL_JSONL,
       fromEntryIndex: 2,
+      fromEntryUuid: "entry-3",
       newSessionId: "new-session",
       sourceSessionId: "orig-session",
       sourceMachineId: "peer-id",
@@ -62,6 +63,7 @@ describe("continuation", () => {
     const out = buildContinuationJsonl({
       originalJsonl: ORIGINAL_JSONL,
       fromEntryIndex: 1,
+      fromEntryUuid: "entry-2",
       newSessionId: "new-session",
       sourceSessionId: "orig-session",
       sourceMachineId: "peer-id",
@@ -79,6 +81,7 @@ describe("continuation", () => {
       buildContinuationJsonl({
         originalJsonl: ORIGINAL_JSONL,
         fromEntryIndex: 99,
+        fromEntryUuid: "entry-1",
         newSessionId: "new-session",
         sourceSessionId: "orig-session",
         sourceMachineId: "peer-id",
@@ -87,5 +90,22 @@ describe("continuation", () => {
         claudeVersion: "2.1.114",
       })
     ).toThrow(/out of range/i);
+  });
+
+  it("throws when fromEntryUuid does not match the entry at fromEntryIndex", async () => {
+    const { buildContinuationJsonl } = await import("../src/continuation.js");
+    expect(() =>
+      buildContinuationJsonl({
+        originalJsonl: ORIGINAL_JSONL,
+        fromEntryIndex: 2,
+        fromEntryUuid: "entry-1", // wrong: index 2 is entry-3
+        newSessionId: "new-session",
+        sourceSessionId: "orig-session",
+        sourceMachineId: "peer-id",
+        sourceMachineName: "peer-name",
+        targetProjectPath: "/Users/a/proj",
+        claudeVersion: "2.1.114",
+      })
+    ).toThrow(/uuid mismatch/i);
   });
 });

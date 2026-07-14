@@ -1,6 +1,7 @@
 export interface ContinuationInput {
     originalJsonl: string;
     fromEntryIndex: number;
+    fromEntryUuid: string;
     newSessionId: string;
     sourceSessionId: string;
     sourceMachineId: string;

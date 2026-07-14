@@ -3,10 +3,20 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildContinuationJsonl = buildContinuationJsonl;
 const node_crypto_1 = require("node:crypto");
 function buildContinuationJsonl(input) {
-    const { originalJsonl, fromEntryIndex, newSessionId, sourceSessionId, sourceMachineId, sourceMachineName, previousLocalSessionId, targetProjectPath, claudeVersion, } = input;
+    const { originalJsonl, fromEntryIndex, fromEntryUuid, newSessionId, sourceSessionId, sourceMachineId, sourceMachineName, previousLocalSessionId, targetProjectPath, claudeVersion, } = input;
     const lines = originalJsonl.trim().split("\n").filter(Boolean);
     if (fromEntryIndex < 0 || fromEntryIndex >= lines.length) {
         throw new Error(`fromEntryIndex ${fromEntryIndex} out of range (session has ${lines.length} entries)`);
+    }
+    let actualUuid;
+    try {
+        actualUuid = JSON.parse(lines[fromEntryIndex]).uuid;
+    }
+    catch {
+        actualUuid = undefined;
+    }
+    if (actualUuid !== fromEntryUuid) {
+        throw new Error(`Continuation uuid mismatch: entry at index ${fromEntryIndex} has uuid ${actualUuid ?? "(unparseable)"}, expected ${fromEntryUuid}. The session file changed between diff and slice.`);
     }
     const sliced = lines.slice(fromEntryIndex);
     const newCount = sliced.length;

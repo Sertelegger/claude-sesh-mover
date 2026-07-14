@@ -144,6 +144,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         const continuationJsonl = (0, continuation_js_1.buildContinuationJsonl)({
             originalJsonl,
             fromEntryIndex: item.fromEntryIndex,
+            fromEntryUuid: item.fromEntryUuid,
             newSessionId,
             sourceSessionId: item.session.sessionId,
             sourceMachineId: incremental.sourceMachineId,

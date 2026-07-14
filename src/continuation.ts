@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 export interface ContinuationInput {
   originalJsonl: string;
   fromEntryIndex: number;
+  fromEntryUuid: string;
   newSessionId: string;
   sourceSessionId: string;
   sourceMachineId: string;
@@ -16,6 +17,7 @@ export function buildContinuationJsonl(input: ContinuationInput): string {
   const {
     originalJsonl,
     fromEntryIndex,
+    fromEntryUuid,
     newSessionId,
     sourceSessionId,
     sourceMachineId,
@@ -29,6 +31,18 @@ export function buildContinuationJsonl(input: ContinuationInput): string {
   if (fromEntryIndex < 0 || fromEntryIndex >= lines.length) {
     throw new Error(
       `fromEntryIndex ${fromEntryIndex} out of range (session has ${lines.length} entries)`
+    );
+  }
+
+  let actualUuid: string | undefined;
+  try {
+    actualUuid = (JSON.parse(lines[fromEntryIndex]) as { uuid?: string }).uuid;
+  } catch {
+    actualUuid = undefined;
+  }
+  if (actualUuid !== fromEntryUuid) {
+    throw new Error(
+      `Continuation uuid mismatch: entry at index ${fromEntryIndex} has uuid ${actualUuid ?? "(unparseable)"}, expected ${fromEntryUuid}. The session file changed between diff and slice.`
     );
   }
 
