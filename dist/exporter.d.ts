@@ -19,6 +19,7 @@ export interface ExportOptions {
     collisionCheck?: boolean;
     summaryOverrides?: Record<string, string>;
     incremental?: IncrementalExportOptions;
+    noSummary?: boolean;
 }
 export declare function exportSession(options: ExportOptions): Promise<ExportResult | ErrorResult>;
 export declare function exportAllSessions(options: Omit<ExportOptions, "sessionId">): Promise<ExportResult | ErrorResult>;

@@ -20,7 +20,7 @@ function copyDirIfExists(srcDir, destDir) {
     }
 }
 async function exportSession(options) {
-    const { configDir, projectPath, sessionId, outputDir, name, excludeLayers, claudeVersion, collisionCheck, summaryOverrides, incremental, } = options;
+    const { configDir, projectPath, sessionId, outputDir, name, excludeLayers, claudeVersion, collisionCheck, summaryOverrides, incremental, noSummary, } = options;
     const exportPath = (0, node_path_1.join)(outputDir, name);
     // Collision check
     if (collisionCheck && (0, node_fs_1.existsSync)(exportPath)) {
@@ -49,10 +49,10 @@ async function exportSession(options) {
                 : "No sessions found for this project",
         };
     }
-    return exportSessions([target], configDir, projectPath, exportPath, excludeLayers, claudeVersion, "current", summaryOverrides, incremental);
+    return exportSessions([target], configDir, projectPath, exportPath, excludeLayers, claudeVersion, "current", summaryOverrides, noSummary, incremental);
 }
 async function exportAllSessions(options) {
-    const { configDir, projectPath, outputDir, name, excludeLayers, claudeVersion, summaryOverrides, incremental, } = options;
+    const { configDir, projectPath, outputDir, name, excludeLayers, claudeVersion, summaryOverrides, incremental, noSummary, } = options;
     const sessions = (0, discovery_js_1.discoverSessions)(configDir, projectPath);
     if (sessions.length === 0) {
         return {
@@ -62,9 +62,9 @@ async function exportAllSessions(options) {
         };
     }
     const exportPath = (0, node_path_1.join)(outputDir, name);
-    return exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, "all", summaryOverrides, incremental);
+    return exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, "all", summaryOverrides, noSummary, incremental);
 }
-async function exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, scope, summaryOverrides, incremental) {
+async function exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, scope, summaryOverrides, noSummary, incremental) {
     const includedLayers = getAllLayers().filter((l) => !excludeLayers.includes(l));
     const warnings = [];
     (0, node_fs_1.mkdirSync)((0, node_path_1.join)(exportPath, "sessions"), { recursive: true });
@@ -104,21 +104,25 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         if (includedLayers.includes("file-history")) {
             copyDirIfExists((0, node_path_1.join)(configDir, "file-history", session.sessionId), (0, node_path_1.join)(exportPath, "file-history", session.sessionId));
         }
-        const entries = jsonlContent
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => {
-            try {
-                return JSON.parse(line);
-            }
-            catch {
-                return null;
-            }
-        })
-            .filter(Boolean);
-        const summary = summaryOverrides?.[session.sessionId] ??
-            (0, summary_js_1.extractSummary)(session.slug, entries);
+        const entries = noSummary
+            ? []
+            : jsonlContent
+                .trim()
+                .split("\n")
+                .filter(Boolean)
+                .map((line) => {
+                try {
+                    return JSON.parse(line);
+                }
+                catch {
+                    return null;
+                }
+            })
+                .filter(Boolean);
+        const summary = noSummary
+            ? session.slug
+            : summaryOverrides?.[session.sessionId] ??
+                (0, summary_js_1.extractSummary)(session.slug, entries);
         const sessionHash = (0, manifest_js_1.computeIntegrityHash)([jsonlContent]);
         sessionManifests.push({
             sessionId: session.sessionId,

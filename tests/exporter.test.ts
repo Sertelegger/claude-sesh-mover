@@ -115,6 +115,43 @@ describe("exporter", () => {
       if (!result.success) return;
       expect(result.collision).toBe(true);
     });
+
+    it("uses slug-only summaries when noSummary is set (generic slug)", async () => {
+      const { exportSession } = await import("../src/exporter.js");
+      const { writeFileSync } = await import("node:fs");
+      const genId = "770e8400-e29b-41d4-a716-446655440000";
+      writeFileSync(
+        join(configDir, "projects", "-Users-testuser-Projects-testproject", `${genId}.jsonl`),
+        JSON.stringify({
+          uuid: "g1",
+          timestamp: "2026-07-13T00:00:00Z",
+          sessionId: genId,
+          cwd: "/Users/testuser/Projects/testproject",
+          version: "2.1.81",
+          slug: "new-session",
+          type: "user",
+          message: { role: "user", content: "SECRET first message" },
+        }) + "\n"
+      );
+      const outputDir = join(tempDir, "export-nosummary");
+      const result = await exportSession({
+        configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        sessionId: genId,
+        outputDir,
+        name: "nosummary",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        noSummary: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const manifest = JSON.parse(
+        readFileSync(join(result.exportPath, "manifest.json"), "utf-8")
+      );
+      expect(manifest.sessions[0].summary).toBe("new-session");
+      expect(JSON.stringify(manifest)).not.toContain("SECRET");
+    });
   });
 
   describe("exportAllSessions", () => {

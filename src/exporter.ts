@@ -53,6 +53,7 @@ export interface ExportOptions {
   collisionCheck?: boolean;
   summaryOverrides?: Record<string, string>; // sessionId -> summary
   incremental?: IncrementalExportOptions;
+  noSummary?: boolean;
 }
 
 export async function exportSession(
@@ -69,6 +70,7 @@ export async function exportSession(
     collisionCheck,
     summaryOverrides,
     incremental,
+    noSummary,
   } = options;
 
   const exportPath = join(outputDir, name);
@@ -112,6 +114,7 @@ export async function exportSession(
     claudeVersion,
     "current",
     summaryOverrides,
+    noSummary,
     incremental
   );
 }
@@ -128,6 +131,7 @@ export async function exportAllSessions(
     claudeVersion,
     summaryOverrides,
     incremental,
+    noSummary,
   } = options;
 
   const sessions = discoverSessions(configDir, projectPath);
@@ -149,6 +153,7 @@ export async function exportAllSessions(
     claudeVersion,
     "all",
     summaryOverrides,
+    noSummary,
     incremental
   );
 }
@@ -162,6 +167,7 @@ async function exportSessions(
   claudeVersion: string,
   scope: "current" | "all",
   summaryOverrides?: Record<string, string>,
+  noSummary?: boolean,
   incremental?: IncrementalExportOptions
 ): Promise<ExportResult | ErrorResult> {
   const includedLayers = getAllLayers().filter((l) => !excludeLayers.includes(l));
@@ -220,22 +226,25 @@ async function exportSessions(
       copyDirIfExists(join(configDir, "file-history", session.sessionId), join(exportPath, "file-history", session.sessionId));
     }
 
-    const entries = jsonlContent
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => {
-        try {
-          return JSON.parse(line);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
+    const entries = noSummary
+      ? []
+      : jsonlContent
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => {
+            try {
+              return JSON.parse(line);
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean);
 
-    const summary =
-      summaryOverrides?.[session.sessionId] ??
-      extractSummary(session.slug, entries);
+    const summary = noSummary
+      ? session.slug
+      : summaryOverrides?.[session.sessionId] ??
+        extractSummary(session.slug, entries);
     const sessionHash = computeIntegrityHash([jsonlContent]);
 
     sessionManifests.push({

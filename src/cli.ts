@@ -58,7 +58,7 @@ program
   .option("--name <name>", "Export name")
   .option("--output <path>", "Override output path")
   .option("--project-path <path>", "Override project path (default: cwd)")
-  .option("--no-summary", "Skip Claude-generated summary (reserved for future use — currently summaries always use fallback extraction)")
+  .option("--no-summary", "Use slug-only summaries; no conversation text is copied into the manifest")
   .option("--overwrite", "Overwrite existing export")
   .option("--suffix", "Auto-suffix on name collision")
   .option("--incremental", "Produce an incremental export (requires --to or --since)")
@@ -124,6 +124,8 @@ program
         finalName = `${name}-${suffix}`;
       }
 
+      const noSummary = opts.summary === false || config.export.noSummary;
+
       const result = await doExport(
         configDir,
         scope,
@@ -133,6 +135,7 @@ program
         excludeLayers,
         claudeVersion,
         opts.projectPath,
+        noSummary,
         incremental
       );
 
@@ -503,6 +506,7 @@ async function doExport(
   excludeLayers: ExportLayer[],
   claudeVersion: string,
   projectPathOverride?: string,
+  noSummary?: boolean,
   incremental?: import("./exporter.js").IncrementalExportOptions
 ) {
   // Detect project path from cwd or override
@@ -516,6 +520,7 @@ async function doExport(
       name,
       excludeLayers,
       claudeVersion,
+      noSummary,
       incremental,
     });
   }
@@ -528,6 +533,7 @@ async function doExport(
     name,
     excludeLayers,
     claudeVersion,
+    noSummary,
     incremental,
   });
 }

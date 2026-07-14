@@ -35,7 +35,7 @@ program
     .option("--name <name>", "Export name")
     .option("--output <path>", "Override output path")
     .option("--project-path <path>", "Override project path (default: cwd)")
-    .option("--no-summary", "Skip Claude-generated summary (reserved for future use — currently summaries always use fallback extraction)")
+    .option("--no-summary", "Use slug-only summaries; no conversation text is copied into the manifest")
     .option("--overwrite", "Overwrite existing export")
     .option("--suffix", "Auto-suffix on name collision")
     .option("--incremental", "Produce an incremental export (requires --to or --since)")
@@ -100,7 +100,8 @@ program
                 suffix++;
             finalName = `${name}-${suffix}`;
         }
-        const result = await doExport(configDir, scope, opts.sessionId, outputDir, finalName, excludeLayers, claudeVersion, opts.projectPath, incremental);
+        const noSummary = opts.summary === false || config.export.noSummary;
+        const result = await doExport(configDir, scope, opts.sessionId, outputDir, finalName, excludeLayers, claudeVersion, opts.projectPath, noSummary, incremental);
         if (result.success) {
             await finalizeExport({
                 result: result,
@@ -434,7 +435,7 @@ program
     }
 });
 // --- Helpers ---
-async function doExport(configDir, scope, sessionId, outputDir, name, excludeLayers, claudeVersion, projectPathOverride, incremental) {
+async function doExport(configDir, scope, sessionId, outputDir, name, excludeLayers, claudeVersion, projectPathOverride, noSummary, incremental) {
     // Detect project path from cwd or override
     const projectPath = projectPathOverride ?? process.cwd();
     if (scope === "all") {
@@ -445,6 +446,7 @@ async function doExport(configDir, scope, sessionId, outputDir, name, excludeLay
             name,
             excludeLayers,
             claudeVersion,
+            noSummary,
             incremental,
         });
     }
@@ -456,6 +458,7 @@ async function doExport(configDir, scope, sessionId, outputDir, name, excludeLay
         name,
         excludeLayers,
         claudeVersion,
+        noSummary,
         incremental,
     });
 }

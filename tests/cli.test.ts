@@ -160,6 +160,20 @@ describe("cli", () => {
       expect(existsSync(result.archivePath)).toBe(true);
       expect(existsSync(join(outputDir, "suffixed-2"))).toBe(false);
     });
+
+    it("--no-summary keeps conversation text out of the manifest", () => {
+      const outputDir = join(tempDir, "cli-nosummary");
+      mkdirSync(outputDir, { recursive: true });
+      const output = runCli(
+        `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name nosum --output "${outputDir}" --no-summary`
+      );
+      const result = JSON.parse(output);
+      expect(result.success).toBe(true);
+      const manifest = JSON.parse(
+        require("node:fs").readFileSync(join(outputDir, "nosum", "manifest.json"), "utf-8")
+      );
+      expect(manifest.sessions[0].summary).toBe("test-session");
+    });
   });
 
   describe("browse command", () => {
