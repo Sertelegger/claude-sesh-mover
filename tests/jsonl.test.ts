@@ -81,4 +81,25 @@ describe("jsonl", () => {
     const bad = write("bad.jsonl", "not json\n");
     expect(readLastEntryUuid(bad)).toBeNull();
   });
+
+  it("readFirstJsonlLine returns null when the first line exceeds 1MB", async () => {
+    const { readFirstJsonlLine } = await import("../src/jsonl.js");
+    const oversized = "x".repeat(1024 * 1024 + 10_000);
+    const p = write("huge-first.jsonl", oversized + '\n{"uuid":"u2"}\n');
+    expect(readFirstJsonlLine(p)).toBeNull();
+  });
+
+  it("readLastJsonlLine returns null when the last line exceeds 1MB", async () => {
+    const { readLastJsonlLine } = await import("../src/jsonl.js");
+    const oversized = "y".repeat(1024 * 1024 + 10_000);
+    const p = write("huge-last.jsonl", '{"uuid":"u1"}\n' + oversized + "\n");
+    expect(readLastJsonlLine(p)).toBeNull();
+  });
+
+  it("readLastJsonlLine returns null for missing and empty files", async () => {
+    const { readLastJsonlLine } = await import("../src/jsonl.js");
+    expect(readLastJsonlLine(join(tempDir, "missing.jsonl"))).toBeNull();
+    const p = write("empty2.jsonl", "");
+    expect(readLastJsonlLine(p)).toBeNull();
+  });
 });

@@ -18,7 +18,9 @@ export function readFirstJsonlLine(path: string): string | null {
       acc = Buffer.concat([acc, chunk.subarray(0, bytes)]);
       pos += bytes;
       const nl = acc.indexOf(0x0a);
-      if (nl !== -1) return acc.subarray(0, nl).toString("utf-8");
+      if (nl !== -1) {
+        return nl > MAX_LINE_BYTES ? null : acc.subarray(0, nl).toString("utf-8");
+      }
       if (acc.length > MAX_LINE_BYTES) return null;
     }
     return acc.length > 0 ? acc.toString("utf-8") : null;
@@ -50,7 +52,10 @@ export function readLastJsonlLine(path: string): string | null {
         else continue; // tail was all newlines; keep reading backwards
       }
       const nl = acc.lastIndexOf(0x0a);
-      if (nl !== -1) return acc.subarray(nl + 1).toString("utf-8");
+      if (nl !== -1) {
+        const line = acc.subarray(nl + 1);
+        return line.length > MAX_LINE_BYTES ? null : line.toString("utf-8");
+      }
       if (acc.length > MAX_LINE_BYTES) return null;
     }
     return acc.length > 0 ? acc.toString("utf-8") : null;
