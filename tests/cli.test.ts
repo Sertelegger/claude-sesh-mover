@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
+import { overrideHome, homeEnv } from "./helpers/env.js";
 
 describe("cli", () => {
   let tempDir: string;
@@ -224,16 +225,14 @@ describe("cli", () => {
     });
 
     it("sets machine.name via --set", () => {
-      const prevHome = process.env.HOME;
-      process.env.HOME = tempDir;
+      const homeOverride = overrideHome(tempDir);
       try {
         const output = runCli(`configure --scope user --set machine.name=my-laptop --json`);
         const result = JSON.parse(output);
         expect(result.success).toBe(true);
         expect(result.message).toMatch(/machine\.name\s*=\s*my-laptop/);
       } finally {
-        if (prevHome !== undefined) process.env.HOME = prevHome;
-        else delete process.env.HOME;
+        homeOverride.restore();
       }
     });
 
@@ -321,7 +320,11 @@ describe("cli", () => {
             `node "${cliPath}" export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path ${projectPath} --storage user --format zstd --name inc-zstd-fail --output "${outputDir}" --incremental --to peer-1`,
             {
               encoding: "utf-8",
-              env: { ...process.env, HOME: tempHome, PATH: `${shimDir}:${process.env.PATH}` },
+              env: {
+                ...process.env,
+                ...homeEnv(tempHome),
+                PATH: `${shimDir}:${process.env.PATH}`,
+              },
             }
           );
         } catch (e) {
@@ -441,7 +444,7 @@ describe("cli", () => {
       mkdirSync(outputDir, { recursive: true });
       const output = runCli(
         `export --scope all --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name since-cont --output "${outputDir}" --incremental --since "${refDir}"`,
-        { HOME: tempDir }
+        homeEnv(tempDir)
       );
       const result = JSON.parse(output);
       expect(result.success).toBe(true);

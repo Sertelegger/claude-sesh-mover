@@ -10,25 +10,24 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
+import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
 describe("migrator", () => {
   let tempDir: string;
   let configDir: string;
   let sessionId: string;
-  let originalHome: string | undefined;
+  let homeOverride: HomeOverrideHandle;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-migrator-test-"));
-    originalHome = process.env.HOME;
-    process.env.HOME = tempDir;
+    homeOverride = overrideHome(tempDir);
     const fixture = createFixtureTree(tempDir);
     configDir = fixture.configDir;
     sessionId = fixture.sessionId;
   });
 
   afterEach(() => {
-    if (originalHome !== undefined) process.env.HOME = originalHome;
-    else delete process.env.HOME;
+    homeOverride.restore();
     rmSync(tempDir, { recursive: true, force: true });
   });
 

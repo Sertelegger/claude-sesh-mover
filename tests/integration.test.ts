@@ -9,26 +9,25 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
+import { overrideHome, setHome, type HomeOverrideHandle } from "./helpers/env.js";
 import type { ExportResult, ImportResult } from "../src/types.js";
 
 describe("integration: full export/import cycle", () => {
   let tempDir: string;
   let sourceConfigDir: string;
   let sessionId: string;
-  let originalHome: string | undefined;
+  let homeOverride: HomeOverrideHandle;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-integration-"));
-    originalHome = process.env.HOME;
-    process.env.HOME = tempDir;
+    homeOverride = overrideHome(tempDir);
     const fixture = createFixtureTree(tempDir);
     sourceConfigDir = fixture.configDir;
     sessionId = fixture.sessionId;
   });
 
   afterEach(() => {
-    if (originalHome !== undefined) process.env.HOME = originalHome;
-    else delete process.env.HOME;
+    homeOverride.restore();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -228,14 +227,16 @@ describe("integration: full export/import cycle", () => {
 
     const homeA = mkdtempSync(join(tmpdir(), "rt-homeA-"));
     const homeB = mkdtempSync(join(tmpdir(), "rt-homeB-"));
-    const origHome = process.env.HOME;
 
     const workspaceA = mkdtempSync(join(tmpdir(), "rt-wsA-"));
     const workspaceB = mkdtempSync(join(tmpdir(), "rt-wsB-"));
 
+    // Capture the pre-test HOME/USERPROFILE once; subsequent switches between
+    // homeA/homeB below use setHome() directly and don't need their own snapshot.
+    const rtHomeOverride = overrideHome(homeA);
+
     try {
       // --- A: initial full (incremental-from-empty) export ---
-      process.env.HOME = homeA;
       const fxA = createFixtureTree(workspaceA);
       const exportsA = join(workspaceA, "exports");
       mkdirSync(exportsA, { recursive: true });
@@ -261,7 +262,7 @@ describe("integration: full export/import cycle", () => {
       expect(fullA.success).toBe(true);
 
       // --- B: import the full bundle ---
-      process.env.HOME = homeB;
+      setHome(homeB);
       const targetB = join(workspaceB, ".claude");
       mkdirSync(join(targetB, "projects"), { recursive: true });
 
@@ -347,7 +348,7 @@ describe("integration: full export/import cycle", () => {
       expect(continuations.length).toBe(1);
 
       // --- A: import the incremental bundle ---
-      process.env.HOME = homeA;
+      setHome(homeA);
       const aImport = await importSession({
         exportPath: (incB as { exportPath: string }).exportPath,
         targetConfigDir: fxA.configDir,
@@ -367,8 +368,7 @@ describe("integration: full export/import cycle", () => {
       const jsonlFiles = readdirSync(aProjectDir).filter((f) => f.endsWith(".jsonl"));
       expect(jsonlFiles.length).toBe(2);
     } finally {
-      if (origHome !== undefined) process.env.HOME = origHome;
-      else delete process.env.HOME;
+      rtHomeOverride.restore();
       rmSync(homeA, { recursive: true, force: true });
       rmSync(homeB, { recursive: true, force: true });
       rmSync(workspaceA, { recursive: true, force: true });

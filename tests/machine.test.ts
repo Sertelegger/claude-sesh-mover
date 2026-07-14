@@ -2,20 +2,19 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
 describe("machine", () => {
   let tempHome: string;
-  let originalHome: string | undefined;
+  let homeOverride: HomeOverrideHandle;
 
   beforeEach(() => {
     tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-machine-test-"));
-    originalHome = process.env.HOME;
-    process.env.HOME = tempHome;
+    homeOverride = overrideHome(tempHome);
   });
 
   afterEach(() => {
-    if (originalHome !== undefined) process.env.HOME = originalHome;
-    else delete process.env.HOME;
+    homeOverride.restore();
     rmSync(tempHome, { recursive: true, force: true });
   });
 

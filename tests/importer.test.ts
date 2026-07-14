@@ -9,6 +9,7 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
+import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 import type { ExportResult, ImportResult, DryRunResult } from "../src/types.js";
 
 describe("importer", () => {
@@ -17,12 +18,11 @@ describe("importer", () => {
   let targetConfigDir: string;
   let sessionId: string;
   let exportPath: string;
-  let originalHome: string | undefined;
+  let homeOverride: HomeOverrideHandle;
 
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-importer-test-"));
-    originalHome = process.env.HOME;
-    process.env.HOME = tempDir;
+    homeOverride = overrideHome(tempDir);
 
     // Create source fixture and export it
     const fixture = createFixtureTree(tempDir);
@@ -50,8 +50,7 @@ describe("importer", () => {
   });
 
   afterEach(() => {
-    if (originalHome !== undefined) process.env.HOME = originalHome;
-    else delete process.env.HOME;
+    homeOverride.restore();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
