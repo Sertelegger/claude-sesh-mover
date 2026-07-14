@@ -2,162 +2,84 @@
 
 > Export, import, and migrate Claude Code sessions across machines, operating systems, config directories, and project paths — including **incremental round-trips** between two machines.
 
-Claude Code stores each conversation as a JSONL file keyed to an absolute filesystem path on the machine that created it. That makes sessions **machine-local**: you can't easily continue a session after switching laptops, moving the project to a new directory, renaming your home folder, switching between `~/.claude` and an alternate config dir, or crossing the Windows ↔ WSL boundary. `claude-sesh-mover` rewrites the path-dependent bits of a session so it can be resumed anywhere.
-
-It adds five slash commands to Claude Code:
+Claude Code sessions are JSONL files keyed to an absolute path on the machine that created them, so they can't follow you to another laptop, directory, or across the Windows ↔ WSL boundary. `claude-sesh-mover` rewrites the path-dependent bits so a session can be resumed anywhere.
 
 | Command | What it does |
 |---|---|
-| `/sesh-mover:export` | Bundle one or all sessions for the current project into a portable directory or `.tar.gz` / `.tar.zst` archive. Supports **incremental mode** — emit only sessions/messages new since the last sync to a given peer machine. |
-| `/sesh-mover:import` | Unpack an export on the target machine, rewrite paths for the new location, and register the session so it shows up in `claude --resume`. Recognises incremental bundles and handles continuation sessions transparently; re-importing the same bundle is idempotent. |
-| `/sesh-mover:migrate` | Same-machine move: export + import + delete source. Can also rename the project directory with `--rename-dir`. |
-| `/sesh-mover:browse` | List exports (user-level and project-level), view manifests, import, or delete. |
-| `/sesh-mover:configure` | Set user- or project-level defaults for scope, storage, format, and excluded layers. Also sets the machine's human-readable name via `--set machine.name=<label>`. |
+| `/sesh-mover:export` | Bundle one or all sessions into a portable directory or `.tar.gz`/`.tar.zst`. Incremental mode sends only what's new since the last sync to a peer. |
+| `/sesh-mover:import` | Unpack on the target machine, rewrite paths, register for `claude --resume`. Idempotent — re-imports are skipped (`--allow-duplicates` overrides). |
+| `/sesh-mover:migrate` | Same-machine move: export + import + delete source. Optionally renames the project directory (`--rename-dir`). |
+| `/sesh-mover:browse` | List exports, view manifests, import, or delete. |
+| `/sesh-mover:configure` | Set defaults (scope, storage, format, layers) and the machine's name (`--set machine.name=<label>`). |
 
-Where this is heading — a cross-machine session index with remote pull ("the hub") and,
-longer term, support for other agentic CLIs — is tracked in [ROADMAP.md](./ROADMAP.md).
+Where this is heading — a cross-machine session index with remote pull ("the hub"), and later other agentic CLIs — is tracked in [ROADMAP.md](./ROADMAP.md).
 
 ## Install
 
-### Recommended: via the Claude Code plugin marketplace
-
-Add the marketplace:
-
 ```text
 /plugin marketplace add sertelegger/claude-sesh-mover
-```
-
-Install the plugin:
-
-```text
 /plugin install sesh-mover@claude-sesh-mover
 ```
 
-If the slash commands (`/sesh-mover:export` etc.) don't show up right away, reload:
+If the slash commands don't appear, run `/reload-plugins`. No build step — the plugin only needs Node.js ≥ 18.17, which Claude Code already requires. Optional: a `zstd` binary for `.tar.zst` archives (falls back to `.tar.gz` automatically).
 
-```text
-/reload-plugins
-```
-
-Or run `/plugin`, go to the **Discover** tab, and install interactively.
-
-The plugin is self-contained: it depends only on Node.js (≥18.17), which Claude Code already requires. No separate install or build step.
-
-### Alternative: clone and load directly
-
-For local development or if you'd rather not add a marketplace:
+For local development, clone and load directly (a pre-built `dist/` ships in the repo):
 
 ```bash
 git clone https://github.com/sertelegger/claude-sesh-mover.git
-cd claude-sesh-mover
-claude --plugin-dir .
+claude --plugin-dir ./claude-sesh-mover
 ```
 
-The repo ships a pre-built `dist/` so the plugin works immediately after clone. If you change anything under `src/`, run `npm install && npm run build` before testing.
+## Quick start
 
-## Usage
+Move a session from machine A to machine B:
 
-### Export a session
+1. On A: `/sesh-mover:export` → pick "this session", archive format. Note the `.tar.gz` path it reports.
+2. Copy the archive to B (scp, cloud drive, whatever you trust — it contains your conversation).
+3. On B, in the project directory: `/sesh-mover:import` → point it at the archive, confirm the dry-run.
+4. `claude --resume` — the imported session is in the list.
 
-```text
-/sesh-mover:export
-```
+## Usage notes
 
-Prompts for scope (this session / all for this project), storage location (user-level `~/.claude-sesh-mover/` or project-level `./.claude-sesh-mover/`), format (directory / `tar.gz` / `tar.zst`), and which layers to include (session JSONL, file-history snapshots, tool-results, memory, plans, subagents). Produces a timestamped bundle you can copy to another machine.
+**Export** prompts for scope (one session / all for the project), storage (`~/.claude-sesh-mover/` or `./.claude-sesh-mover/`), format, and layers (JSONL, file-history, tool-results, memory, plans, subagents). `--no-summary` keeps conversation excerpts out of the manifest and resume listings (the JSONL itself is still exported in full).
 
-### Import on the target machine
+**Import** shows a dry-run of the path rewrites before touching anything. If Claude Code rejects the session over a version mismatch, `--no-register` imports the content without the resume entry. Already-imported sessions are skipped and reported in `skippedSessions`; `--allow-duplicates` forces a re-import.
 
-```text
-/sesh-mover:import --from /path/to/export.tar.gz
-```
-
-Walks you through path translation (including WSL ↔ Windows if relevant), shows a dry-run diff, asks for confirmation, then unpacks and registers the session. If Claude Code rejects the imported session due to a version mismatch, the command offers `--no-register` as a fallback (you get the conversation content without the resume entry).
-
-Import is idempotent by default: a per-project content-hash registry remembers every session that's already been imported into this project, so re-running an import against the same (or overlapping) export bundle skips the sessions it's seen before instead of creating duplicate resume entries. Skipped sessions are reported in the result's `skippedSessions` array (reason `duplicate` for content-hash matches, `already-received` for peer-tracked incremental syncs). Pass `--allow-duplicates` if you actually want to re-import them anyway.
-
-### Migrate a session to a new directory on the same machine
-
-```text
-/sesh-mover:migrate
-```
-
-Prompts for source and target project paths, scope, and whether to also rename the project directory (`--rename-dir`). Useful when you move a repo to a new location, rename your home directory, or switch between config dirs (e.g., `~/.claude` ↔ `~/.claude-tzun`).
-
-**Important:** Don't run `/sesh-mover:migrate` from *inside* the session you're migrating. The CLI emits a warning, and the recommended flow is to exit, start a new Claude Code session from a stable outer directory (e.g., `~/`), and run the migrate from there.
-
-### Browse and manage exports
-
-```text
-/sesh-mover:browse
-```
-
-Lists all exports (user and project scope), lets you view full manifests, trigger import, or delete old bundles.
+**Migrate** is for same-machine moves (repo relocated, home dir renamed, config dir switched). Don't run it from inside the session being migrated — the CLI blocks this; exit, start a fresh session from an outer directory (e.g. `~/`), and run it there. `--scope current` requires `--session-id`.
 
 ### Incremental sync between two machines
 
-Once you've done at least one export → import round-trip between machine **A** and machine **B**, subsequent exports can be incremental — only sessions that are new on the source + continuation sessions carrying new messages for sessions that already exist on the peer.
+After one full export → import round-trip, exports to that peer can be incremental: new sessions ship whole, sessions with new messages ship as **continuation sessions** (a new session that starts with a lineage note, followed by only the messages added since the last sync), unchanged sessions are skipped. The export flow offers this automatically once a peer is known.
 
-```text
-/sesh-mover:export
-```
-
-When prior peers exist for the current project, the export flow adds a **Mode** question offering "Full export" or "Incremental for peer `<name>`" options. Pick the peer you're sending to; the CLI figures out the delta from its own sync-state bookkeeping.
-
-**How it works:**
-
-- Each machine has a persistent identity at `~/.claude-sesh-mover/machine-id.json` (auto-created on first incremental op). The human-readable `name` defaults to your hostname — rename it with `/sesh-mover:configure --set machine.name=<label>`.
-- Per-project sync state lives at `~/.claude-sesh-mover/sync-state/<encoded-project-path>.json`. It records, per peer machine, which session versions have been sent and received.
-- **New sessions** on the source (no record on the peer) are bundled whole.
-- **Existing sessions with new messages** are bundled as **continuation sessions**: a new session on the target whose first entry is a synthetic `user` message explaining the lineage, followed by the slice of messages appended since the last sync. This avoids merge-conflict logic entirely — each sync produces independent, auditable artifacts rather than mutating existing history.
-- **Unchanged sessions** are skipped.
-- Re-importing the same bundle is idempotent — already-received sessions are skipped with a warning.
-
-**Stateless fallback:** if you received an export bundle from a machine you've never synced with (or the sync-state file was lost), use `/sesh-mover:export --incremental --since <path-to-previous-export>`. The CLI diffs against the referenced export's manifest directly.
-
-**Soft assumption:** don't append to the same session on two machines in parallel. The "continuation session" model treats each machine's edits as a linear extension — parallel edits produce two independent continuation sessions rather than a merged view. Stick to a push/pull discipline (work on one machine at a time).
+- Machine identity: `~/.claude-sesh-mover/machine-id.json` (name defaults to hostname). Per-project sync state: `~/.claude-sesh-mover/sync-state/`.
+- No sync state for a peer? `/sesh-mover:export --incremental --since <path-to-previous-export>` diffs against that bundle directly.
+- Work on one machine at a time: parallel edits to the same session produce two independent continuations, not a merge.
 
 ## Security notes
 
-Exported sessions are faithful copies of the original JSONL — they may contain API keys, tokens, pasted secrets, environment variables dumped by tool calls, or any other sensitive data the conversation encountered. Treat an export like you'd treat your `~/.claude/projects/` directory:
+Exports are faithful copies of your conversation — they can contain API keys, pasted secrets, and environment dumps. Treat them like `~/.claude/projects/` itself:
 
-- Prefer **user-level** storage (`~/.claude-sesh-mover/`) over project-level unless you've added `.claude-sesh-mover/` to the project's `.gitignore`.
-- Archives on cloud drives, Slack, or email are copies of your conversation history. Move them like you'd move secrets.
-- The plugin does **not** redact secrets automatically. This is a conscious choice — redaction creates burden for the common single-user case without much payoff. If you're sharing an export with someone else, inspect it first.
-- `--no-summary` (or `export.noSummary` in config) keeps conversation text out of manifests and resume listings — the manifest's `summary` field falls back to the session slug, and no conversation text is parsed or copied into it. This does **not** redact the session JSONL itself, which is still exported in full; use it when you don't want an excerpt surfaced in `browse`/resume listings, not as a substitute for inspecting the export before sharing.
+- Prefer user-level storage, or add `.claude-sesh-mover/` to the project's `.gitignore`.
+- An archive on a cloud drive or in Slack is a copy of your conversation history. Move it like a secret.
+- Nothing is redacted automatically. Inspect before sharing; `--no-summary` hides excerpts from listings but does not redact the JSONL.
 
 ## Platform support
 
-- **macOS** (native).
-- **Linux** (native).
-- **WSL1 / WSL2** — auto-detected; paths translate to/from Windows peers (`/home/user/...` ↔ `C:\Users\user\...`, `/mnt/c/...` ↔ `C:\`).
-- **Windows** — import works; export hasn't been battle-tested on native Windows (PowerShell shell quoting differences). PRs welcome.
-
-Path rewriting is two-stage. Stage 1 replaces the exact project-path/config-dir/home-dir prefixes it knows about (longest-first, so nested paths aren't corrupted). Stage 2 only runs when source and target are in different platform families (e.g. WSL ↔ Windows) and additionally scans tool-result content, `toolUseResult` stdout/stderr, and file-history snapshot keys for path-shaped tokens it recognizes — `/mnt/<drive>/...`, `/tmp`, `/home/<user>/...`, `/Users/<user>/...`, `C:\Users\<user>\...` — translating them even outside the mapped directories.
-
-**Known limitation:** stage 2's token scan stops at the first whitespace, since free text gives it no other way to know where a path ends. A path containing a space (e.g. `/mnt/c/Program Files/...`) only translates reliably when it falls under a stage-1 exact mapping (project path, config dir, or home dir); a stray space-containing path elsewhere in tool output won't be fully rewritten.
-
-Requires **Node.js ≥ 18.17** (already a Claude Code requirement).
-
-## Requirements
-
-- Claude Code 2.x or later.
-- `zstd` binary on the system if you want `.tar.zst` archives. Otherwise the CLI transparently falls back to `.tar.gz` and reports the fallback in `warnings[]`.
+- **macOS, Linux, WSL1/WSL2** — full support; WSL is auto-detected and paths translate to/from Windows peers (`/home/u/...` ↔ `C:\Users\u\...`, `/mnt/c/...` ↔ `C:\...`), including inside tool output.
+- **Windows (native)** — import works; export isn't battle-tested (PowerShell quoting). PRs welcome.
+- Known limitation: in free text, a path containing spaces only translates fully when it's under the project/config/home mappings; structured fields (`cwd`, file-history keys) always translate fully. Details in [`CLAUDE.md`](./CLAUDE.md).
 
 ## Development
 
 ```bash
 npm install
-npm run build       # compile src/ → dist/ (dist/ is committed, rebuild after src/ changes)
+npm run build       # src/ → dist/ (dist/ is committed — rebuild after src/ changes)
 npm test            # vitest run
-npm run test:watch  # vitest watch mode
-npm run lint        # type-check only (tsc --noEmit)
+npm run lint        # tsc --noEmit
 ```
 
-Single-file test: `npx vitest run tests/rewriter.test.ts`.
-Filter by test name: `npx vitest run -t "translates WSL paths"`.
-
-See [`CLAUDE.md`](./CLAUDE.md) for the architecture overview, module responsibilities, and conventions for adding new commands or schema-migrating across Claude Code versions.
+Single file: `npx vitest run tests/rewriter.test.ts` · by name: `npx vitest run -t "translates WSL paths"`. Architecture and conventions: [`CLAUDE.md`](./CLAUDE.md).
 
 ## License
 
-[MIT](./LICENSE). Commercial use is allowed — if this saves you a headache, a ⭐ is appreciated.
+[MIT](./LICENSE). If this saves you a headache, a ⭐ is appreciated.
