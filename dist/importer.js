@@ -73,6 +73,13 @@ async function importSession(options) {
         "unknown";
     const targetUser = (0, platform_js_1.getCurrentUser)();
     const mappings = (0, rewriter_js_1.buildPathMappings)(manifest.sourcePlatform, targetPlatform, manifest.sourceProjectPath, targetProjectPath, manifest.sourceConfigDir, targetConfigDir, sourceUser, targetUser);
+    const ctx = {
+        mappings,
+        sourcePlatform: manifest.sourcePlatform,
+        targetPlatform,
+        sourceUser,
+        targetUser,
+    };
     // Step 3: Verify per-session integrity (before any rewriting)
     const integrityFailedSessions = new Set();
     for (const session of targetSessions) {
@@ -103,7 +110,7 @@ async function importSession(options) {
         const firstJsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${firstSession.sessionId}.jsonl`);
         if ((0, node_fs_1.existsSync)(firstJsonlPath)) {
             const content = (0, node_fs_1.readFileSync)(firstJsonlPath, "utf-8");
-            const { report } = (0, rewriter_js_1.rewriteJsonl)(content, mappings, sessionIdMap.get(firstSession.sessionId));
+            const { report } = (0, rewriter_js_1.rewriteJsonl)(content, ctx, sessionIdMap.get(firstSession.sessionId));
             rewriteReport = report;
         }
         return {
@@ -162,7 +169,7 @@ async function importSession(options) {
                     });
                     processedContent = adaptedLines.join("\n") + "\n";
                 }
-                const { rewritten } = (0, rewriter_js_1.rewriteJsonl)(processedContent, mappings, newSessionId);
+                const { rewritten } = (0, rewriter_js_1.rewriteJsonl)(processedContent, ctx, newSessionId);
                 (0, node_fs_1.writeFileSync)((0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`), rewritten);
             }
             // Copy subagents
@@ -174,7 +181,7 @@ async function importSession(options) {
                     if (file.endsWith(".jsonl")) {
                         // Rewrite subagent JSONL too
                         const content = (0, node_fs_1.readFileSync)((0, node_path_1.join)(subagentsDir, file), "utf-8");
-                        const { rewritten } = (0, rewriter_js_1.rewriteJsonl)(content, mappings, newSessionId);
+                        const { rewritten } = (0, rewriter_js_1.rewriteJsonl)(content, ctx, newSessionId);
                         (0, node_fs_1.writeFileSync)((0, node_path_1.join)(targetSubDir, file), rewritten);
                     }
                     else {

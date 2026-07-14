@@ -153,6 +153,14 @@ export async function importSession(
     targetUser
   );
 
+  const ctx = {
+    mappings,
+    sourcePlatform: manifest.sourcePlatform,
+    targetPlatform,
+    sourceUser,
+    targetUser,
+  };
+
   // Step 3: Verify per-session integrity (before any rewriting)
   const integrityFailedSessions = new Set<string>();
   for (const session of targetSessions) {
@@ -203,7 +211,7 @@ export async function importSession(
       const content = readFileSync(firstJsonlPath, "utf-8");
       const { report } = rewriteJsonl(
         content,
-        mappings,
+        ctx,
         sessionIdMap.get(firstSession.sessionId)
       );
       rewriteReport = report;
@@ -276,7 +284,7 @@ export async function importSession(
           processedContent = adaptedLines.join("\n") + "\n";
         }
 
-        const { rewritten } = rewriteJsonl(processedContent, mappings, newSessionId);
+        const { rewritten } = rewriteJsonl(processedContent, ctx, newSessionId);
         writeFileSync(join(targetProjectDir, `${newSessionId}.jsonl`), rewritten);
       }
 
@@ -294,7 +302,7 @@ export async function importSession(
           if (file.endsWith(".jsonl")) {
             // Rewrite subagent JSONL too
             const content = readFileSync(join(subagentsDir, file), "utf-8");
-            const { rewritten } = rewriteJsonl(content, mappings, newSessionId);
+            const { rewritten } = rewriteJsonl(content, ctx, newSessionId);
             writeFileSync(join(targetSubDir, file), rewritten);
           } else {
             copyFileSync(join(subagentsDir, file), join(targetSubDir, file));

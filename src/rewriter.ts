@@ -1,6 +1,57 @@
-import type { PathMapping, RewriteReport } from "./types.js";
-import type { Platform } from "./types.js";
-import { samePlatformFamily } from "./platform.js";
+import type { PathMapping, RewriteReport, Platform } from "./types.js";
+import { samePlatformFamily, translatePath } from "./platform.js";
+
+export interface RewriteContext {
+  mappings: PathMapping[];
+  sourcePlatform: Platform;
+  targetPlatform: Platform;
+  sourceUser: string;
+  targetUser: string;
+}
+
+// Characters that terminate a path token embedded in free text.
+const UNIX_TOKEN = /(?:\/[A-Za-z0-9._@+~-]+)+\/?/g;
+const WIN_TOKEN = /[A-Za-z]:\\[^\s"'`)\]}>,;]*/g;
+const TAIL = /[^\s"'`)\]}>,;:]*/;
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeSeparators(tail: string, targetPlatform: Platform): string {
+  return targetPlatform === "win32"
+    ? tail.replace(/\//g, "\\")
+    : tail.replace(/\\/g, "/");
+}
+
+export function rewriteString(input: string, ctx: RewriteContext): string {
+  const crossFamily = !samePlatformFamily(ctx.sourcePlatform, ctx.targetPlatform);
+  let result = input;
+
+  // Stage 1: exact mappings (project path, config dir, home), longest first.
+  // Cross-family, the tail after the replacement gets its separators
+  // normalized up to a token boundary; same-family tails are left alone.
+  for (const mapping of ctx.mappings) {
+    const re = new RegExp(escapeRegex(mapping.from) + "(" + TAIL.source + ")", "g");
+    result = result.replace(re, (_m, tail: string) =>
+      mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail)
+    );
+  }
+
+  // Stage 2 (cross-family only): translate remaining path-like tokens through
+  // the platform engine (/mnt/<drive>, /tmp, /home, /Users, drive letters).
+  if (crossFamily) {
+    const tokenRe = ctx.sourcePlatform === "win32" ? WIN_TOKEN : UNIX_TOKEN;
+    result = result.replace(tokenRe, (token) =>
+      translatePath(token, ctx.sourcePlatform, ctx.targetPlatform, {
+        sourceUser: ctx.sourceUser,
+        targetUser: ctx.targetUser,
+      })
+    );
+  }
+
+  return result;
+}
 
 export function buildPathMappings(
   sourcePlatform: Platform,
@@ -70,7 +121,7 @@ function getHomePath(platform: Platform, user: string): string {
 
 export function rewriteEntry(
   entry: Record<string, unknown>,
-  mappings: PathMapping[],
+  ctx: RewriteContext,
   newSessionId?: string
 ): Record<string, unknown> {
   const result = structuredClone(entry);
@@ -82,7 +133,7 @@ export function rewriteEntry(
 
   // Rewrite cwd (always)
   if (typeof result.cwd === "string") {
-    result.cwd = applyMappings(result.cwd, mappings);
+    result.cwd = rewriteString(result.cwd, ctx);
   }
 
   // Rewrite tool_result content and toolUseResult for user entries
@@ -91,7 +142,17 @@ export function rewriteEntry(
     if (Array.isArray(msg.content)) {
       msg.content = msg.content.map((item: Record<string, unknown>) => {
         if (item.type === "tool_result" && typeof item.content === "string") {
-          return { ...item, content: applyMappings(item.content, mappings) };
+          return { ...item, content: rewriteString(item.content, ctx) };
+        }
+        if (item.type === "tool_result" && Array.isArray(item.content)) {
+          return {
+            ...item,
+            content: (item.content as Array<Record<string, unknown>>).map((block) =>
+              block?.type === "text" && typeof block.text === "string"
+                ? { ...block, text: rewriteString(block.text as string, ctx) }
+                : block
+            ),
+          };
         }
         return item;
       });
@@ -102,10 +163,10 @@ export function rewriteEntry(
     if (result.toolUseResult) {
       const tr = result.toolUseResult as Record<string, unknown>;
       if (typeof tr.stdout === "string") {
-        tr.stdout = applyMappings(tr.stdout, mappings);
+        tr.stdout = rewriteString(tr.stdout, ctx);
       }
       if (typeof tr.stderr === "string") {
-        tr.stderr = applyMappings(tr.stderr, mappings);
+        tr.stderr = rewriteString(tr.stderr, ctx);
       }
     }
   }
@@ -117,7 +178,7 @@ export function rewriteEntry(
       const backups = snapshot.trackedFileBackups as Record<string, unknown>;
       const newBackups: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(backups)) {
-        const newKey = applyMappings(key, mappings);
+        const newKey = rewriteString(key, ctx);
         newBackups[newKey] = value;
       }
       snapshot.trackedFileBackups = newBackups;
@@ -129,7 +190,7 @@ export function rewriteEntry(
 
 export function rewriteJsonl(
   jsonlContent: string,
-  mappings: PathMapping[],
+  ctx: RewriteContext,
   newSessionId?: string
 ): { rewritten: string; report: RewriteReport } {
   const lines = jsonlContent.trim().split("\n").filter(Boolean);
@@ -141,7 +202,7 @@ export function rewriteJsonl(
     try {
       const entry = JSON.parse(line) as Record<string, unknown>;
       const original = JSON.stringify(entry);
-      const rewritten = rewriteEntry(entry, mappings, newSessionId);
+      const rewritten = rewriteEntry(entry, ctx, newSessionId);
       const rewrittenStr = JSON.stringify(rewritten);
       if (rewrittenStr !== original) {
         entriesRewritten++;
@@ -165,19 +226,10 @@ export function rewriteJsonl(
   return {
     rewritten: rewrittenLines.join("\n") + "\n",
     report: {
-      mappings,
+      mappings: ctx.mappings,
       entriesRewritten,
       fieldsRewritten,
       warnings,
     },
   };
-}
-
-function applyMappings(input: string, mappings: PathMapping[]): string {
-  let result = input;
-  for (const mapping of mappings) {
-    // Use replaceAll to avoid infinite loop when mapping.to contains mapping.from
-    result = result.replaceAll(mapping.from, mapping.to);
-  }
-  return result;
 }

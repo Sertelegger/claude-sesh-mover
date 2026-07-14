@@ -1,6 +1,106 @@
 import { describe, it, expect } from "vitest";
 
+function wslToWinCtx() {
+  return (async () => {
+    const { buildPathMappings } = await import("../src/rewriter.js");
+    const mappings = buildPathMappings(
+      "wsl2", "win32",
+      "/mnt/e/GitHub/proj", "E:\\GitHub\\proj",
+      "/home/sascha/.claude", "C:\\Users\\sascha\\.claude",
+      "sascha", "sascha"
+    );
+    return {
+      mappings,
+      sourcePlatform: "wsl2" as const,
+      targetPlatform: "win32" as const,
+      sourceUser: "sascha",
+      targetUser: "sascha",
+    };
+  })();
+}
+
 describe("rewriter", () => {
+  describe("two-stage rewriteString", () => {
+    it("normalizes separators in the tail after an exact mapping fires", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("/mnt/e/GitHub/proj/src/index.ts", ctx)).toBe(
+        "E:\\GitHub\\proj\\src\\index.ts"
+      );
+    });
+
+    it("translates unmapped /mnt paths via token translation", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("read /mnt/e/other/repo/file.ts now", ctx)).toBe(
+        "read E:\\other\\repo\\file.ts now"
+      );
+    });
+
+    it("translates /tmp paths via token translation", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("see /tmp/scratch.txt", ctx)).toBe(
+        "see C:\\Users\\sascha\\AppData\\Local\\Temp\\scratch.txt"
+      );
+    });
+
+    it("stops path tokens at line-reference colons", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      expect(rewriteString("error at /mnt/e/GitHub/proj/src/a.ts:12:5", ctx)).toBe(
+        "error at E:\\GitHub\\proj\\src\\a.ts:12:5"
+      );
+    });
+
+    it("skips token translation entirely for same-family transfers", async () => {
+      const { rewriteString, buildPathMappings } = await import("../src/rewriter.js");
+      const mappings = buildPathMappings(
+        "linux", "linux",
+        "/home/a/proj", "/home/a/proj2",
+        "/home/a/.claude", "/home/a/.claude",
+        "a", "a"
+      );
+      const ctx = {
+        mappings,
+        sourcePlatform: "linux" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "a",
+        targetUser: "a",
+      };
+      // Generic system path untouched; project path still mapped.
+      expect(rewriteString("/usr/local/bin/tool ran in /home/a/proj/src", ctx)).toBe(
+        "/usr/local/bin/tool ran in /home/a/proj2/src"
+      );
+    });
+
+    it("rewrites array-form tool_result text blocks", async () => {
+      const { rewriteEntry } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const entry = {
+        uuid: "a1",
+        timestamp: "2026-07-13T00:00:00Z",
+        sessionId: "s",
+        cwd: "/mnt/e/GitHub/proj",
+        version: "2.1.114",
+        type: "user" as const,
+        message: {
+          role: "user" as const,
+          content: [
+            {
+              tool_use_id: "t1",
+              type: "tool_result",
+              content: [{ type: "text", text: "path /mnt/e/GitHub/proj/a.ts" }],
+            },
+          ],
+        },
+      };
+      const result = rewriteEntry(entry, ctx);
+      const block = (result.message as any).content[0].content[0];
+      expect(block.text).toBe("path E:\\GitHub\\proj\\a.ts");
+    });
+  });
+
   describe("buildPathMappings", () => {
     it("builds WSL-to-Windows mappings", async () => {
       const { buildPathMappings } = await import("../src/rewriter.js");
@@ -34,6 +134,13 @@ describe("rewriter", () => {
         "old",
         "new"
       );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "darwin" as const,
+        sourceUser: "old",
+        targetUser: "new",
+      };
       const entry = {
         uuid: "1",
         timestamp: "2026-04-11T00:00:00Z",
@@ -43,7 +150,7 @@ describe("rewriter", () => {
         type: "user" as const,
         message: { role: "user" as const, content: "hello" },
       };
-      const result = rewriteEntry(entry, mappings);
+      const result = rewriteEntry(entry, ctx);
       expect(result.cwd).toBe("/Users/new/project");
     });
 
@@ -61,6 +168,13 @@ describe("rewriter", () => {
         "old",
         "new"
       );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "darwin" as const,
+        sourceUser: "old",
+        targetUser: "new",
+      };
       const entry = {
         uuid: "2",
         timestamp: "2026-04-11T00:00:00Z",
@@ -83,7 +197,7 @@ describe("rewriter", () => {
           stderr: "",
         },
       };
-      const result = rewriteEntry(entry, mappings);
+      const result = rewriteEntry(entry, ctx);
       expect(result.toolUseResult?.stdout).toContain("/Users/new/project");
       const content = (result.message as any).content[0].content;
       expect(content).toContain("/Users/new/project");
@@ -103,6 +217,13 @@ describe("rewriter", () => {
         "old",
         "new"
       );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "darwin" as const,
+        sourceUser: "old",
+        targetUser: "new",
+      };
       const entry = {
         uuid: "3",
         timestamp: "2026-04-11T00:00:00Z",
@@ -115,7 +236,7 @@ describe("rewriter", () => {
           content: "please read /Users/old/project/src/index.ts",
         },
       };
-      const result = rewriteEntry(entry, mappings);
+      const result = rewriteEntry(entry, ctx);
       expect((result.message as any).content).toBe(
         "please read /Users/old/project/src/index.ts"
       );
@@ -135,6 +256,13 @@ describe("rewriter", () => {
         "old",
         "new"
       );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "darwin" as const,
+        sourceUser: "old",
+        targetUser: "new",
+      };
       const entry = {
         uuid: "4",
         timestamp: "2026-04-11T00:00:00Z",
@@ -151,7 +279,7 @@ describe("rewriter", () => {
           ],
         },
       };
-      const result = rewriteEntry(entry, mappings);
+      const result = rewriteEntry(entry, ctx);
       const thinking = (result.message as any).content[0].thinking;
       expect(thinking).toContain("/Users/old/project");
     });
@@ -170,6 +298,13 @@ describe("rewriter", () => {
         "old",
         "new"
       );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "darwin" as const,
+        sourceUser: "old",
+        targetUser: "new",
+      };
       const entry = {
         uuid: "5",
         timestamp: "2026-04-11T00:00:00Z",
@@ -190,7 +325,7 @@ describe("rewriter", () => {
           timestamp: "2026-04-11T00:00:00Z",
         },
       };
-      const result = rewriteEntry(entry, mappings);
+      const result = rewriteEntry(entry, ctx);
       const keys = Object.keys((result as any).snapshot.trackedFileBackups);
       expect(keys[0]).toBe("/Users/new/project/src/index.ts");
     });
@@ -209,6 +344,13 @@ describe("rewriter", () => {
         "old",
         "new"
       );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "darwin" as const,
+        sourceUser: "old",
+        targetUser: "new",
+      };
       const entry = {
         uuid: "6",
         timestamp: "2026-04-11T00:00:00Z",
@@ -218,7 +360,7 @@ describe("rewriter", () => {
         type: "user" as const,
         message: { role: "user" as const, content: "hello" },
       };
-      const result = rewriteEntry(entry, mappings, "new-session-id");
+      const result = rewriteEntry(entry, ctx, "new-session-id");
       expect(result.sessionId).toBe("new-session-id");
     });
   });
@@ -259,6 +401,13 @@ describe("rewriter", () => {
         "old",
         "new"
       );
+      const ctx = {
+        mappings,
+        sourcePlatform: "darwin" as const,
+        targetPlatform: "darwin" as const,
+        sourceUser: "old",
+        targetUser: "new",
+      };
       const jsonl = [
         JSON.stringify({
           uuid: "1",
@@ -282,7 +431,7 @@ describe("rewriter", () => {
 
       const { rewritten, report } = rewriteJsonl(
         jsonl,
-        mappings,
+        ctx,
         "new-session"
       );
       const lines = rewritten.trim().split("\n");
