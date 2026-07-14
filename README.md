@@ -1,5 +1,7 @@
 # claude-sesh-mover
 
+[![CI](https://github.com/Sertelegger/claude-sesh-mover/actions/workflows/ci.yml/badge.svg)](https://github.com/Sertelegger/claude-sesh-mover/actions/workflows/ci.yml)
+
 > Export, import, and migrate Claude Code sessions across machines, operating systems, config directories, and project paths — including **incremental round-trips** between two machines.
 
 Claude Code sessions are JSONL files keyed to an absolute path on the machine that created them, so they can't follow you to another laptop, directory, or across the Windows ↔ WSL boundary. `claude-sesh-mover` rewrites the path-dependent bits so a session can be resumed anywhere.
