@@ -320,12 +320,25 @@ describe("cli", () => {
         let caught: { stdout: string; status: number } | null = null;
         try {
           const cliPath = join(__dirname, "..", "dist", "cli.js");
-          execSync(
+          const shimEnv = prependPath({ ...process.env, ...homeEnv(tempHome) }, shimDir);
+          const stdout = execSync(
             `node "${cliPath}" export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path ${projectPath} --storage user --format zstd --name inc-zstd-fail --output "${outputDir}" --incremental --to peer-1`,
             {
               encoding: "utf-8",
-              env: prependPath({ ...process.env, ...homeEnv(tempHome) }, shimDir),
+              env: shimEnv,
             }
+          );
+          // DIAGNOSTIC (temporary): the command was expected to fail (zstd
+          // compression shimmed to exit 1) but didn't — dump what actually
+          // happened so we can see it in CI logs instead of guessing.
+          // eslint-disable-next-line no-console
+          console.error(
+            "DIAGNOSTIC unexpected success:",
+            JSON.stringify({
+              stdout,
+              PATH: shimEnv.PATH ?? shimEnv.Path,
+              shimDirListing: require("node:fs").readdirSync(shimDir),
+            })
           );
         } catch (e) {
           const err = e as { stdout?: Buffer; status?: number };
