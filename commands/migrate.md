@@ -19,6 +19,8 @@ You are running the sesh-mover migrate command. This is a same-machine operation
    - "This session only" (recommended when source = cwd)
    - "All sessions for this project"
 
+   **Note:** "This session only" requires a session ID — the CLI refuses `--scope current` without `--session-id` (it returns an error rather than silently migrating and deleting every session for the project). If the user picks "This session only", make sure you have a session ID (see "Detecting the Current Session" in the skill doc) before running steps 7 and 10, and always pass `--session-id` alongside `--scope current`.
+
 5. If the source and target project paths differ and the source directory exists on disk, use AskUserQuestion to ask:
    - "Yes, also rename the project directory" (recommended) — the CLI will `mv` the source directory to the target path
    - "No, only migrate session data" — the user will rename the directory themselves

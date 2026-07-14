@@ -45,11 +45,13 @@ You are running the sesh-mover export command. Follow these steps:
 
    Only ask for individual exclusion of memory, plans, or subagents if the user explicitly requests that granularity after seeing the grouped option.
 
+   **Privacy option:** If the user mentions privacy, sharing the export with someone else, posting it publicly, or otherwise not wanting conversation text visible in manifests/listings, offer `--no-summary` — this is a functional flag: it makes the manifest's summary fall back to the session slug and skips parsing the JSONL for an excerpt entirely. It does not redact the exported JSONL itself (the full conversation is still copied); mention that distinction if the user's concern is broader than listing text. If selected, add `--no-summary` to the step 4 invocation.
+
 3. Generate a one-line summary of the session by reading the first few exchanges, then describe it in ~100 characters.
 
 4. Run the CLI command, substituting the values mapped in the questions above:
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" export --scope <current|all> --session-id <id> --storage <user|project> --format <dir|archive|zstd> [--exclude <layer1> <layer2> ...] --name "<name>" --source-config-dir "<config-dir>"
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" export --scope <current|all> --session-id <id> --storage <user|project> --format <dir|archive|zstd> [--exclude <layer1> <layer2> ...] --name "<name>" --source-config-dir "<config-dir>" [--no-summary]
    ```
    Never pass user-facing labels (e.g. `tar.zst`, `project`) as flag values — always pass the mapped CLI value (`zstd`, `all`, etc.). The CLI also accepts `tar.gz`/`tar.zst` as aliases for `archive`/`zstd`, but prefer the canonical values.
 

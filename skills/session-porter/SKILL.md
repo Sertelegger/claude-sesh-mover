@@ -55,6 +55,9 @@ When a CLI command returns `{"success": false, ...}`:
   - "Session validation failed" — version mismatch, suggest `--no-register`
   - "Integrity check failed" — data corruption during transfer
 
+Common warnings (result is still `success: true`):
+- Sessions already imported — reported in `skippedSessions` with reason `duplicate` (identical content already in this project) or `already-received` (already synced from this peer), not as an error. `importedSessions` will be empty if every requested session was skipped this way. If the user actually intended a fresh re-import, offer to retry with `--allow-duplicates`.
+
 When import registration fails (session not resumable):
 - Offer to read the imported JSONL and inject the conversation as context into a new session
 - This is the fallback for when Claude Code's internal validation rejects the imported session
@@ -68,6 +71,8 @@ When import registration fails (session not resumable):
 
 The CLI auto-detects the current platform and translates paths during import. For WSL <-> Windows, it shows the mapping and asks for confirmation.
 
+Rewriting is two-stage: stage 1 always replaces the exact project-path/config-dir/home-dir prefixes it's given (longest-first); stage 2 runs only cross-family (e.g. WSL ↔ Windows) and additionally scans tool-result content, `toolUseResult` stdout/stderr, and file-history snapshot keys for other path-shaped tokens (`/mnt/<drive>/...`, `/tmp`, `/home/<user>/...`, `/Users/<user>/...`). `gitBranch` is never rewritten (it's a branch name, not a path), and user text / assistant text and thinking blocks are never rewritten. Stage 2's token scan stops at the first whitespace, so a path containing a space only translates reliably when it falls under one of stage 1's exact mappings.
+
 ## Incremental Sync
 
 sesh-mover supports incremental export/import between machines. Key concepts:
@@ -76,6 +81,6 @@ sesh-mover supports incremental export/import between machines. Key concepts:
 - **Per-project sync state:** `~/.claude-sesh-mover/sync-state/<encoded-project-path>.json` tracks, per peer machine, what's been sent and received.
 - **Incremental export:** `export --incremental --to <peer>` emits only new sessions + continuation sessions for sessions with new messages since the last sync. `--since <path>` is a stateless fallback when no peer state exists (e.g. the user received an export bundle from a new machine).
 - **Continuation session:** a new session whose first entry is a synthetic user message explaining the lineage. The body is the sliced remainder of the source session. This avoids merge conflicts entirely and lets Claude see the lineage directly in the transcript.
-- **Idempotent import:** re-importing the same bundle is safe — already-received sessions are skipped with a warning.
+- **Idempotent import:** import is idempotent by default for every export, not just incremental ones — a per-project content-hash registry recognizes sessions whose exact content was already imported into this project and skips them (`skippedSessions` reason `duplicate`). Peer-tracked incremental syncs additionally skip sessions already recorded as received from that specific peer (reason `already-received`). Pass `--allow-duplicates` to force a re-import.
 
 When users ask "why are there two sessions that look like the same conversation?" — check `~/.claude-sesh-mover/sync-state/<encoded>.json`'s `lineage` map. The continuation header in the JSONL also spells out the origin session.

@@ -3,7 +3,7 @@
 Where claude-sesh-mover is heading beyond one-shot session export/import. Items are ordered,
 not scheduled — each stage gets its own design pass before implementation.
 
-## 0.3.0 — Hardening pass (in progress)
+## 0.3.0 — Hardening pass (this release)
 
 Fixes from a full adversarial review of 0.2.0, shipped as one milestone:
 

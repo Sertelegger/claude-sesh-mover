@@ -29,7 +29,7 @@ Configurable keys:
 - `export.format` — "dir", "archive", or "zstd"
 - `export.exclude` — JSON array like `["file-history","plans"]`
 - `export.scope` — "current" or "all"
-- `export.noSummary` — true or false
+- `export.noSummary` — true or false (functional: when true, exports use a slug-only manifest summary and skip parsing conversation text for it; the exported session JSONL itself is unaffected)
 - `import.dryRunFirst` — true or false
 - `migrate.scope` — "current" or "all"
 

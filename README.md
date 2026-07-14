@@ -73,6 +73,8 @@ Prompts for scope (this session / all for this project), storage location (user-
 
 Walks you through path translation (including WSL ↔ Windows if relevant), shows a dry-run diff, asks for confirmation, then unpacks and registers the session. If Claude Code rejects the imported session due to a version mismatch, the command offers `--no-register` as a fallback (you get the conversation content without the resume entry).
 
+Import is idempotent by default: a per-project content-hash registry remembers every session that's already been imported into this project, so re-running an import against the same (or overlapping) export bundle skips the sessions it's seen before instead of creating duplicate resume entries. Skipped sessions are reported in the result's `skippedSessions` array (reason `duplicate` for content-hash matches, `already-received` for peer-tracked incremental syncs). Pass `--allow-duplicates` if you actually want to re-import them anyway.
+
 ### Migrate a session to a new directory on the same machine
 
 ```text
@@ -121,6 +123,7 @@ Exported sessions are faithful copies of the original JSONL — they may contain
 - Prefer **user-level** storage (`~/.claude-sesh-mover/`) over project-level unless you've added `.claude-sesh-mover/` to the project's `.gitignore`.
 - Archives on cloud drives, Slack, or email are copies of your conversation history. Move them like you'd move secrets.
 - The plugin does **not** redact secrets automatically. This is a conscious choice — redaction creates burden for the common single-user case without much payoff. If you're sharing an export with someone else, inspect it first.
+- `--no-summary` (or `export.noSummary` in config) keeps conversation text out of manifests and resume listings — the manifest's `summary` field falls back to the session slug, and no conversation text is parsed or copied into it. This does **not** redact the session JSONL itself, which is still exported in full; use it when you don't want an excerpt surfaced in `browse`/resume listings, not as a substitute for inspecting the export before sharing.
 
 ## Platform support
 
@@ -128,6 +131,10 @@ Exported sessions are faithful copies of the original JSONL — they may contain
 - **Linux** (native).
 - **WSL1 / WSL2** — auto-detected; paths translate to/from Windows peers (`/home/user/...` ↔ `C:\Users\user\...`, `/mnt/c/...` ↔ `C:\`).
 - **Windows** — import works; export hasn't been battle-tested on native Windows (PowerShell shell quoting differences). PRs welcome.
+
+Path rewriting is two-stage. Stage 1 replaces the exact project-path/config-dir/home-dir prefixes it knows about (longest-first, so nested paths aren't corrupted). Stage 2 only runs when source and target are in different platform families (e.g. WSL ↔ Windows) and additionally scans tool-result content, `toolUseResult` stdout/stderr, and file-history snapshot keys for path-shaped tokens it recognizes — `/mnt/<drive>/...`, `/tmp`, `/home/<user>/...`, `/Users/<user>/...`, `C:\Users\<user>\...` — translating them even outside the mapped directories.
+
+**Known limitation:** stage 2's token scan stops at the first whitespace, since free text gives it no other way to know where a path ends. A path containing a space (e.g. `/mnt/c/Program Files/...`) only translates reliably when it falls under a stage-1 exact mapping (project path, config dir, or home dir); a stray space-containing path elsewhere in tool output won't be fully rewritten.
 
 Requires **Node.js ≥ 18.17** (already a Claude Code requirement).
 
