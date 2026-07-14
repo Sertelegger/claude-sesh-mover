@@ -58,12 +58,24 @@ jobs:
           if ($import.importedSessions.Count -ne 1) { Write-Error "expected 1 imported session: $out2"; exit 1 }
       - name: Round-trip via Git Bash
         shell: bash
+        # Git Bash's MSYS runtime auto-converts any argv string that looks
+        # like a POSIX absolute path (e.g. "/Users/testuser/...") into a
+        # Windows path before exec'ing a non-MSYS binary like node.exe. Our
+        # --project-path here is an opaque identifier (the fixture's
+        # recorded cwd), not a real filesystem path on this runner, and must
+        # reach the CLI byte-for-byte or discovery.ts won't find the
+        # matching project folder. Disable that conversion for this step.
+        env:
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
         run: |
           set -euo pipefail
           config="$RUNNER_TEMP/smoke-config/.claude"
           out=$(node dist/cli.js export --scope all --storage project --format dir --name "smoke export bash" --source-config-dir "$config" --project-path "/Users/testuser/Projects/testproject" --no-summary)
+          echo "$out"
           echo "$out" | jq -e '.success == true' >/dev/null
           export_path=$(echo "$out" | jq -r '.exportPath')
           out2=$(node dist/cli.js import --from "$export_path" --target-project-path "$RUNNER_TEMP/smoke-target-bash" --target-config-dir "$RUNNER_TEMP/smoke-config-bash/.claude")
+          echo "$out2"
           echo "$out2" | jq -e '.success == true' >/dev/null
           echo "$out2" | jq -e '.importedSessions | length == 1' >/dev/null
