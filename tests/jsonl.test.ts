@@ -84,14 +84,14 @@ describe("jsonl", () => {
 
   it("readFirstJsonlLine returns null when the first line exceeds 1MB", async () => {
     const { readFirstJsonlLine } = await import("../src/jsonl.js");
-    const oversized = "x".repeat(1024 * 1024 + 10_000);
+    const oversized = "x".repeat(1024 * 1024 + 100);
     const p = write("huge-first.jsonl", oversized + '\n{"uuid":"u2"}\n');
     expect(readFirstJsonlLine(p)).toBeNull();
   });
 
   it("readLastJsonlLine returns null when the last line exceeds 1MB", async () => {
     const { readLastJsonlLine } = await import("../src/jsonl.js");
-    const oversized = "y".repeat(1024 * 1024 + 10_000);
+    const oversized = "y".repeat(1024 * 1024 + 100);
     const p = write("huge-last.jsonl", '{"uuid":"u1"}\n' + oversized + "\n");
     expect(readLastJsonlLine(p)).toBeNull();
   });
