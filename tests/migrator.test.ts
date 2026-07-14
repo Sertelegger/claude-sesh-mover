@@ -15,15 +15,20 @@ describe("migrator", () => {
   let tempDir: string;
   let configDir: string;
   let sessionId: string;
+  let originalHome: string | undefined;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-migrator-test-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = tempDir;
     const fixture = createFixtureTree(tempDir);
     configDir = fixture.configDir;
     sessionId = fixture.sessionId;
   });
 
   afterEach(() => {
+    if (originalHome !== undefined) process.env.HOME = originalHome;
+    else delete process.env.HOME;
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -358,6 +363,61 @@ describe("migrator", () => {
       expect(
         result.warnings.some((w) => w.includes("Self-migration detected"))
       ).toBe(true);
+    });
+
+    it("refuses scope=current without a sessionId instead of migrating everything", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error).toMatch(/session-id/i);
+      expect(result.suggestion ?? "").toMatch(/--scope all/);
+      // Source untouched
+      const sourceEncoded = "-Users-testuser-Projects-testproject";
+      expect(
+        existsSync(join(configDir, "projects", sourceEncoded, `${sessionId}.jsonl`))
+      ).toBe(true);
+    });
+
+    it("cleanup removes only sessions that were actually imported (scope=all)", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      // Add a second, corrupt session to the source project: export will skip
+      // it (unparseable), so cleanup must leave it in place.
+      const sourceEncoded = "-Users-testuser-Projects-testproject";
+      const strayPath = join(
+        configDir, "projects", sourceEncoded, "not-a-session.jsonl"
+      );
+      writeFileSync(strayPath, "this is not json\n");
+
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "all",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // The good session moved and was cleaned up…
+      expect(
+        existsSync(join(configDir, "projects", sourceEncoded, `${sessionId}.jsonl`))
+      ).toBe(false);
+      // …but the stray file the import never touched must survive.
+      expect(existsSync(strayPath)).toBe(true);
     });
   });
 });

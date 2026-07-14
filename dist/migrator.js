@@ -30,6 +30,14 @@ async function migrateSession(options) {
             suggestion: "Exit this Claude Code session, `cd` to an outer directory (e.g. ~/ or the parent of the project), start a fresh Claude Code session there, then re-run /sesh-mover:migrate. Override (unsafe): pass --force only if you are certain the active session is NOT in the source path.",
         };
     }
+    if (scope === "current" && !sessionId) {
+        return {
+            success: false,
+            command: "migrate",
+            error: "Migrate with --scope current requires --session-id: without it the previous behavior silently migrated and deleted ALL sessions for the project.",
+            suggestion: "Pass --session-id <id> to move one session, or --scope all to intentionally move every session for this project.",
+        };
+    }
     // Create temp directory for the intermediate export
     const tempExportDir = (0, node_fs_1.mkdtempSync)((0, node_path_1.join)((0, node_os_1.tmpdir)(), "sesh-mover-migrate-"));
     try {
@@ -80,41 +88,22 @@ async function migrateSession(options) {
             };
         }
         const imported = importResult;
-        // Step 3: Clean up source
+        // Step 3: Clean up source — only sessions confirmed moved.
+        const movedIds = new Set(imported.importedSessions.map((s) => s.originalId));
         const sourceEncoded = (0, platform_js_1.encodeProjectPath)(sourceProjectPath);
         const sourceProjectDir = (0, node_path_1.join)(sourceConfigDir, "projects", sourceEncoded);
         let cleanedUp = false;
-        if (scope === "current" && sessionId) {
-            // Remove just this session's files
-            const jsonlPath = (0, node_path_1.join)(sourceProjectDir, `${sessionId}.jsonl`);
-            if ((0, node_fs_1.existsSync)(jsonlPath)) {
+        for (const movedId of movedIds) {
+            const jsonlPath = (0, node_path_1.join)(sourceProjectDir, `${movedId}.jsonl`);
+            if ((0, node_fs_1.existsSync)(jsonlPath))
                 (0, node_fs_1.rmSync)(jsonlPath);
-            }
-            // Remove session subdirectory (subagents, tool-results)
-            const sessionSubDir = (0, node_path_1.join)(sourceProjectDir, sessionId);
-            if ((0, node_fs_1.existsSync)(sessionSubDir)) {
+            const sessionSubDir = (0, node_path_1.join)(sourceProjectDir, movedId);
+            if ((0, node_fs_1.existsSync)(sessionSubDir))
                 (0, node_fs_1.rmSync)(sessionSubDir, { recursive: true });
-            }
-            // Remove file history
-            const fileHistoryDir = (0, node_path_1.join)(sourceConfigDir, "file-history", sessionId);
-            if ((0, node_fs_1.existsSync)(fileHistoryDir)) {
+            const fileHistoryDir = (0, node_path_1.join)(sourceConfigDir, "file-history", movedId);
+            if ((0, node_fs_1.existsSync)(fileHistoryDir))
                 (0, node_fs_1.rmSync)(fileHistoryDir, { recursive: true });
-            }
             cleanedUp = true;
-        }
-        else {
-            // Remove all sessions for this project
-            if ((0, node_fs_1.existsSync)(sourceProjectDir)) {
-                // Keep memory directory if target is different project
-                const files = (0, node_fs_1.readdirSync)(sourceProjectDir);
-                for (const file of files) {
-                    const filePath = (0, node_path_1.join)(sourceProjectDir, file);
-                    if (file === "memory")
-                        continue; // memory was merged, keep original
-                    (0, node_fs_1.rmSync)(filePath, { recursive: true });
-                }
-                cleanedUp = true;
-            }
         }
         // Step 4: Optionally rename the actual project directory
         let directoryRenamed = false;

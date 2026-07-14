@@ -86,6 +86,17 @@ export async function migrateSession(
     };
   }
 
+  if (scope === "current" && !sessionId) {
+    return {
+      success: false,
+      command: "migrate",
+      error:
+        "Migrate with --scope current requires --session-id: without it the previous behavior silently migrated and deleted ALL sessions for the project.",
+      suggestion:
+        "Pass --session-id <id> to move one session, or --scope all to intentionally move every session for this project.",
+    };
+  }
+
   // Create temp directory for the intermediate export
   const tempExportDir = mkdtempSync(
     join(tmpdir(), "sesh-mover-migrate-")
@@ -148,48 +159,20 @@ export async function migrateSession(
 
     const imported = importResult as ImportResult;
 
-    // Step 3: Clean up source
+    // Step 3: Clean up source — only sessions confirmed moved.
+    const movedIds = new Set(imported.importedSessions.map((s) => s.originalId));
     const sourceEncoded = encodeProjectPath(sourceProjectPath);
-    const sourceProjectDir = join(
-      sourceConfigDir,
-      "projects",
-      sourceEncoded
-    );
+    const sourceProjectDir = join(sourceConfigDir, "projects", sourceEncoded);
     let cleanedUp = false;
 
-    if (scope === "current" && sessionId) {
-      // Remove just this session's files
-      const jsonlPath = join(sourceProjectDir, `${sessionId}.jsonl`);
-      if (existsSync(jsonlPath)) {
-        rmSync(jsonlPath);
-      }
-      // Remove session subdirectory (subagents, tool-results)
-      const sessionSubDir = join(sourceProjectDir, sessionId);
-      if (existsSync(sessionSubDir)) {
-        rmSync(sessionSubDir, { recursive: true });
-      }
-      // Remove file history
-      const fileHistoryDir = join(
-        sourceConfigDir,
-        "file-history",
-        sessionId
-      );
-      if (existsSync(fileHistoryDir)) {
-        rmSync(fileHistoryDir, { recursive: true });
-      }
+    for (const movedId of movedIds) {
+      const jsonlPath = join(sourceProjectDir, `${movedId}.jsonl`);
+      if (existsSync(jsonlPath)) rmSync(jsonlPath);
+      const sessionSubDir = join(sourceProjectDir, movedId);
+      if (existsSync(sessionSubDir)) rmSync(sessionSubDir, { recursive: true });
+      const fileHistoryDir = join(sourceConfigDir, "file-history", movedId);
+      if (existsSync(fileHistoryDir)) rmSync(fileHistoryDir, { recursive: true });
       cleanedUp = true;
-    } else {
-      // Remove all sessions for this project
-      if (existsSync(sourceProjectDir)) {
-        // Keep memory directory if target is different project
-        const files = readdirSync(sourceProjectDir);
-        for (const file of files) {
-          const filePath = join(sourceProjectDir, file);
-          if (file === "memory") continue; // memory was merged, keep original
-          rmSync(filePath, { recursive: true });
-        }
-        cleanedUp = true;
-      }
     }
 
     // Step 4: Optionally rename the actual project directory
