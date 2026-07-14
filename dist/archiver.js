@@ -35,22 +35,20 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createArchive = createArchive;
 exports.extractArchive = extractArchive;
+exports.assertSafeEntries = assertSafeEntries;
 exports.detectArchiveFormat = detectArchiveFormat;
 exports.isZstdAvailable = isZstdAvailable;
 const node_fs_1 = require("node:fs");
 const node_child_process_1 = require("node:child_process");
 const node_path_1 = require("node:path");
+const node_os_1 = require("node:os");
 const tar = __importStar(require("tar"));
 async function createArchive(sourceDir, archivePath, compression) {
     if (compression === "zstd") {
         await createZstdArchive(sourceDir, archivePath);
     }
     else {
-        await tar.create({
-            gzip: true,
-            file: archivePath,
-            cwd: (0, node_path_1.dirname)(sourceDir),
-        }, [(0, node_path_1.basename)(sourceDir)]);
+        await tar.create({ gzip: true, file: archivePath, cwd: (0, node_path_1.dirname)(sourceDir) }, [(0, node_path_1.basename)(sourceDir)]);
     }
 }
 async function extractArchive(archivePath, targetDir) {
@@ -59,32 +57,43 @@ async function extractArchive(archivePath, targetDir) {
         await extractZstdArchive(archivePath, targetDir);
     }
     else {
-        await tar.extract({
-            file: archivePath,
-            cwd: targetDir,
-            strip: 1, // strip the top-level directory
-        });
+        await assertSafeEntries(archivePath);
+        await tar.extract({ file: archivePath, cwd: targetDir, strip: 1 });
     }
-    // Path traversal protection: verify all extracted files are within targetDir
-    validateExtractedPaths(targetDir);
 }
-function validateExtractedPaths(dir) {
-    const resolvedDir = (0, node_path_1.resolve)(dir);
-    const entries = (0, node_fs_1.readdirSync)(dir, { recursive: true, withFileTypes: true });
-    for (const entry of entries) {
-        const fullPath = (0, node_path_1.resolve)(entry.parentPath ?? entry.path ?? dir, entry.name);
-        if (!fullPath.startsWith(resolvedDir)) {
-            throw new Error(`Path traversal detected: ${fullPath} is outside ${resolvedDir}`);
-        }
+/**
+ * Validate all tar entry metadata BEFORE extraction. node-tar has its own
+ * runtime protections, but we refuse outright: absolute paths, any `..`
+ * segment, and link entries (sesh-mover exports never contain links, so any
+ * link entry is malicious or corrupt).
+ * Works on .tar and .tar.gz inputs (tar.list auto-detects gzip).
+ */
+async function assertSafeEntries(tarFile) {
+    const offenders = [];
+    await tar.list({
+        file: tarFile,
+        onReadEntry: (entry) => {
+            const p = String(entry.path);
+            if (p.startsWith("/") || /^[A-Za-z]:/.test(p)) {
+                offenders.push(`${p} (absolute path)`);
+            }
+            else if (p.split("/").includes("..")) {
+                offenders.push(`${p} (parent traversal)`);
+            }
+            else if (entry.type === "SymbolicLink" || entry.type === "Link") {
+                offenders.push(`${p} (${entry.type})`);
+            }
+        },
+    });
+    if (offenders.length > 0) {
+        throw new Error(`Unsafe archive entries detected: ${offenders.join(", ")}`);
     }
 }
 function detectArchiveFormat(filePath) {
-    if (filePath.endsWith(".tar.gz") || filePath.endsWith(".tgz")) {
+    if (filePath.endsWith(".tar.gz") || filePath.endsWith(".tgz"))
         return "gzip";
-    }
-    if (filePath.endsWith(".tar.zst") || filePath.endsWith(".tar.zstd")) {
+    if (filePath.endsWith(".tar.zst") || filePath.endsWith(".tar.zstd"))
         return "zstd";
-    }
     return null;
 }
 async function isZstdAvailable() {
@@ -97,35 +106,28 @@ async function isZstdAvailable() {
     }
 }
 async function createZstdArchive(sourceDir, archivePath) {
-    // Create tar first, then pipe through zstd
-    const tarPath = archivePath.replace(/\.zst$/, "");
-    await tar.create({
-        file: tarPath,
-        cwd: (0, node_path_1.dirname)(sourceDir),
-    }, [(0, node_path_1.basename)(sourceDir)]);
+    // All intermediate .tar work happens in a private temp dir — never next to
+    // the destination, so we can never clobber or delete a user's file.
+    const workDir = (0, node_fs_1.mkdtempSync)((0, node_path_1.join)((0, node_os_1.tmpdir)(), "sesh-mover-zstd-"));
+    const tarPath = (0, node_path_1.join)(workDir, "bundle.tar");
     try {
-        // Use execFileSync to avoid shell injection
+        await tar.create({ file: tarPath, cwd: (0, node_path_1.dirname)(sourceDir) }, [(0, node_path_1.basename)(sourceDir)]);
         (0, node_child_process_1.execFileSync)("zstd", ["-f", tarPath, "-o", archivePath], { stdio: "ignore" });
     }
     finally {
-        if ((0, node_fs_1.existsSync)(tarPath))
-            (0, node_fs_1.unlinkSync)(tarPath);
+        (0, node_fs_1.rmSync)(workDir, { recursive: true, force: true });
     }
 }
 async function extractZstdArchive(archivePath, targetDir) {
-    const tarPath = archivePath.replace(/\.zst$/, ".tar");
+    const workDir = (0, node_fs_1.mkdtempSync)((0, node_path_1.join)((0, node_os_1.tmpdir)(), "sesh-mover-zstd-"));
+    const tarPath = (0, node_path_1.join)(workDir, "bundle.tar");
     try {
-        // Use execFileSync to avoid shell injection
         (0, node_child_process_1.execFileSync)("zstd", ["-d", archivePath, "-o", tarPath], { stdio: "ignore" });
-        await tar.extract({
-            file: tarPath,
-            cwd: targetDir,
-            strip: 1,
-        });
+        await assertSafeEntries(tarPath);
+        await tar.extract({ file: tarPath, cwd: targetDir, strip: 1 });
     }
     finally {
-        if ((0, node_fs_1.existsSync)(tarPath))
-            (0, node_fs_1.unlinkSync)(tarPath);
+        (0, node_fs_1.rmSync)(workDir, { recursive: true, force: true });
     }
 }
 //# sourceMappingURL=archiver.js.map
