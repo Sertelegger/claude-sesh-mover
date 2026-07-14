@@ -59,8 +59,8 @@ function translatePath(inputPath, sourcePlatform, targetPlatform, options) {
     const targetIsWsl = targetPlatform === "wsl1" || targetPlatform === "wsl2";
     const sourceIsWin = sourcePlatform === "win32";
     const targetIsWin = targetPlatform === "win32";
-    // WSL/Linux -> Windows
-    if ((sourceIsWsl || sourcePlatform === "linux") && targetIsWin) {
+    // Unix-like (WSL/Linux/macOS) -> Windows
+    if ((sourceIsWsl || sourcePlatform === "linux" || sourcePlatform === "darwin") && targetIsWin) {
         // /tmp (exact) or /tmp/... -> C:\Users\<user>\AppData\Local\Temp\...
         if (inputPath === "/tmp") {
             return `C:\\Users\\${targetUser}\\AppData\\Local\\Temp`;
@@ -76,14 +76,14 @@ function translatePath(inputPath, sourcePlatform, targetPlatform, options) {
             const rest = mntMatch[2];
             return `${drive}:\\${rest.replace(/\//g, "\\")}`;
         }
-        // /home/<user> (exact) -> C:\Users\<targetUser>
-        if (inputPath.match(/^\/home\/[^/]+$/)) {
+        // /home/<user> or /Users/<user> (exact) -> C:\Users\<targetUser>
+        if (inputPath.match(/^\/(home|Users)\/[^/]+$/)) {
             return `C:\\Users\\${targetUser}`;
         }
-        // /home/<user>/... -> C:\Users\<targetUser>\...
-        const homeMatch = inputPath.match(/^\/home\/([^/]+)\/(.*)/);
+        // /home/<user>/... or /Users/<user>/... -> C:\Users\<targetUser>\...
+        const homeMatch = inputPath.match(/^\/(home|Users)\/([^/]+)\/(.*)/);
         if (homeMatch) {
-            const rest = homeMatch[2];
+            const rest = homeMatch[3];
             return `C:\\Users\\${targetUser}\\${rest.replace(/\//g, "\\")}`;
         }
         return inputPath;

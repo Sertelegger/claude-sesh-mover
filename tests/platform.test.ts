@@ -46,6 +46,16 @@ describe("platform detection", () => {
       expect(result).toBe("C:\\Users\\sascha\\Projects\\foo");
     });
 
+    it("translates darwin /Users home path to Windows path", () => {
+      const result = translatePath(
+        "/Users/sascha/Projects/foo",
+        "darwin",
+        "win32",
+        { sourceUser: "sascha", targetUser: "sascha" }
+      );
+      expect(result).toBe("C:\\Users\\sascha\\Projects\\foo");
+    });
+
     it("translates WSL /mnt/d/ path to Windows D:\\ path", () => {
       const result = translatePath(
         "/mnt/d/repos/project",
