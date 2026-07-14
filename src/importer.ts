@@ -28,6 +28,7 @@ import {
   classifyVersionDifference,
 } from "./version-adapters.js";
 import { readSyncState, writeSyncState } from "./sync-state.js";
+import { readLastEntryUuid } from "./jsonl.js";
 import type {
   ImportResult,
   DryRunResult,
@@ -47,6 +48,7 @@ export interface ImportOptions {
   dryRun: boolean;
   sessionIds?: string[];
   noRegister?: boolean;
+  allowDuplicates?: boolean;
 }
 
 export async function importSession(
@@ -60,6 +62,7 @@ export async function importSession(
     dryRun,
     sessionIds,
     noRegister,
+    allowDuplicates,
   } = options;
 
   const warnings: string[] = [];
@@ -89,22 +92,51 @@ export async function importSession(
     };
   }
 
-  let skippedAlreadyReceived = 0;
-  if (manifest.sourceMachineId) {
-    const priorState = readSyncState(targetProjectPath);
-    const peer = priorState.peers[manifest.sourceMachineId];
+  const state = readSyncState(targetProjectPath);
+  const skippedSessions: Array<{
+    originalId: string;
+    reason: "duplicate" | "already-received";
+  }> = [];
+
+  if (!allowDuplicates && manifest.sourceMachineId) {
+    const peer = state.peers[manifest.sourceMachineId];
     if (peer) {
       const before = targetSessions.length;
       targetSessions = targetSessions.filter((session) => {
         const prior = peer.received[session.sessionId];
-        return !prior;
+        if (prior) {
+          skippedSessions.push({
+            originalId: session.sessionId,
+            reason: "already-received",
+          });
+          return false;
+        }
+        return true;
       });
-      skippedAlreadyReceived = before - targetSessions.length;
-      if (skippedAlreadyReceived > 0) {
+      if (targetSessions.length < before) {
         warnings.push(
-          `${skippedAlreadyReceived} session(s) already received from ${manifest.sourceMachineName ?? manifest.sourceMachineId} — skipped (idempotent).`
+          `${before - targetSessions.length} session(s) already received from ${manifest.sourceMachineName ?? manifest.sourceMachineId} — skipped (idempotent).`
         );
       }
+    }
+  }
+
+  if (!allowDuplicates) {
+    const before = targetSessions.length;
+    targetSessions = targetSessions.filter((session) => {
+      if (state.imported[session.integrityHash]) {
+        skippedSessions.push({
+          originalId: session.sessionId,
+          reason: "duplicate",
+        });
+        return false;
+      }
+      return true;
+    });
+    if (targetSessions.length < before) {
+      warnings.push(
+        `${before - targetSessions.length} session(s) already imported into this project — skipped (idempotent). Use --allow-duplicates to import anyway.`
+      );
     }
   }
 
@@ -113,6 +145,7 @@ export async function importSession(
       success: true,
       command: "import",
       importedSessions: [],
+      skippedSessions,
       warnings,
       resumable: true,
     } satisfies ImportResult;
@@ -222,6 +255,7 @@ export async function importSession(
       command: "import",
       dryRun: true,
       importedSessions,
+      skippedSessions,
       warnings,
       resumable: true,
       rewriteReport,
@@ -253,6 +287,8 @@ export async function importSession(
       if (existsSync(fhDir)) rmSync(fhDir, { recursive: true, force: true });
     }
   };
+
+  const postRewriteHashes = new Map<string, string>();
 
   try {
     for (const session of targetSessions) {
@@ -286,6 +322,7 @@ export async function importSession(
 
         const { rewritten } = rewriteJsonl(processedContent, ctx, newSessionId);
         writeFileSync(join(targetProjectDir, `${newSessionId}.jsonl`), rewritten);
+        postRewriteHashes.set(session.sessionId, computeIntegrityHash([rewritten]));
       }
 
       // Copy subagents
@@ -462,8 +499,17 @@ export async function importSession(
     }
   }
 
+  // Always record the imported-hash registry entries — machine-id or not —
+  // so a later import of identical content is recognized as a duplicate.
+  for (const session of targetSessions) {
+    const newId = sessionIdMap.get(session.sessionId)!;
+    state.imported[session.integrityHash] = {
+      localSessionId: newId,
+      importedAt: new Date().toISOString(),
+    };
+  }
+
   if (manifest.sourceMachineId) {
-    const state = readSyncState(targetProjectPath);
     const peerId = manifest.sourceMachineId;
     const peerName = manifest.sourceMachineName ?? "unknown";
     if (!state.peers[peerId]) {
@@ -499,6 +545,7 @@ export async function importSession(
         continuationOf: session.continuation
           ? peer.received[session.continuation.continuesPeerSessionId ?? ""]?.localSessionId
           : undefined,
+        postRewriteHash: postRewriteHashes.get(session.sessionId),
       };
       state.lineage[newId] = lineage;
 
@@ -510,28 +557,18 @@ export async function importSession(
       };
       peer.sent[newId] = sent;
     }
-    writeSyncState(state);
   }
+
+  writeSyncState(state);
 
   return {
     success: true,
     command: "import",
     importedSessions,
+    skippedSessions,
     warnings,
     resumable: !noRegister,
     versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
     memoryConflicts: memoryConflicts.length > 0 ? memoryConflicts : undefined,
   } satisfies ImportResult;
-}
-
-function readLastEntryUuid(jsonlPath: string): string | null {
-  try {
-    const content = readFileSync(jsonlPath, "utf-8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    if (lines.length === 0) return null;
-    const last = JSON.parse(lines[lines.length - 1]) as { uuid?: string };
-    return last.uuid ?? null;
-  } catch {
-    return null;
-  }
 }

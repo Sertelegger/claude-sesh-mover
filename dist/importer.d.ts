@@ -7,6 +7,7 @@ export interface ImportOptions {
     dryRun: boolean;
     sessionIds?: string[];
     noRegister?: boolean;
+    allowDuplicates?: boolean;
 }
 export declare function importSession(options: ImportOptions): Promise<ImportResult | DryRunResult | ErrorResult>;
 //# sourceMappingURL=importer.d.ts.map

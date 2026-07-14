@@ -19,6 +19,7 @@ function defaultState(projectPath) {
         schemaVersion: 1,
         peers: {},
         lineage: {},
+        imported: {},
     };
 }
 function readSyncState(projectPath) {
@@ -41,6 +42,7 @@ function readSyncState(projectPath) {
             typeof parsed.lineage !== "object") {
             throw new Error("schema mismatch");
         }
+        parsed.imported = parsed.imported ?? {};
         return parsed;
     }
     catch {

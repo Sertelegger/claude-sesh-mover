@@ -9,8 +9,9 @@ const rewriter_js_1 = require("./rewriter.js");
 const platform_js_1 = require("./platform.js");
 const version_adapters_js_1 = require("./version-adapters.js");
 const sync_state_js_1 = require("./sync-state.js");
+const jsonl_js_1 = require("./jsonl.js");
 async function importSession(options) {
-    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, } = options;
+    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, } = options;
     const warnings = [];
     // Step 1: Read manifest
     let manifest;
@@ -35,20 +36,42 @@ async function importSession(options) {
             error: "No matching sessions found in export",
         };
     }
-    let skippedAlreadyReceived = 0;
-    if (manifest.sourceMachineId) {
-        const priorState = (0, sync_state_js_1.readSyncState)(targetProjectPath);
-        const peer = priorState.peers[manifest.sourceMachineId];
+    const state = (0, sync_state_js_1.readSyncState)(targetProjectPath);
+    const skippedSessions = [];
+    if (!allowDuplicates && manifest.sourceMachineId) {
+        const peer = state.peers[manifest.sourceMachineId];
         if (peer) {
             const before = targetSessions.length;
             targetSessions = targetSessions.filter((session) => {
                 const prior = peer.received[session.sessionId];
-                return !prior;
+                if (prior) {
+                    skippedSessions.push({
+                        originalId: session.sessionId,
+                        reason: "already-received",
+                    });
+                    return false;
+                }
+                return true;
             });
-            skippedAlreadyReceived = before - targetSessions.length;
-            if (skippedAlreadyReceived > 0) {
-                warnings.push(`${skippedAlreadyReceived} session(s) already received from ${manifest.sourceMachineName ?? manifest.sourceMachineId} — skipped (idempotent).`);
+            if (targetSessions.length < before) {
+                warnings.push(`${before - targetSessions.length} session(s) already received from ${manifest.sourceMachineName ?? manifest.sourceMachineId} — skipped (idempotent).`);
             }
+        }
+    }
+    if (!allowDuplicates) {
+        const before = targetSessions.length;
+        targetSessions = targetSessions.filter((session) => {
+            if (state.imported[session.integrityHash]) {
+                skippedSessions.push({
+                    originalId: session.sessionId,
+                    reason: "duplicate",
+                });
+                return false;
+            }
+            return true;
+        });
+        if (targetSessions.length < before) {
+            warnings.push(`${before - targetSessions.length} session(s) already imported into this project — skipped (idempotent). Use --allow-duplicates to import anyway.`);
         }
     }
     if (targetSessions.length === 0) {
@@ -56,6 +79,7 @@ async function importSession(options) {
             success: true,
             command: "import",
             importedSessions: [],
+            skippedSessions,
             warnings,
             resumable: true,
         };
@@ -118,6 +142,7 @@ async function importSession(options) {
             command: "import",
             dryRun: true,
             importedSessions,
+            skippedSessions,
             warnings,
             resumable: true,
             rewriteReport,
@@ -145,6 +170,7 @@ async function importSession(options) {
                 (0, node_fs_1.rmSync)(fhDir, { recursive: true, force: true });
         }
     };
+    const postRewriteHashes = new Map();
     try {
         for (const session of targetSessions) {
             const newSessionId = sessionIdMap.get(session.sessionId);
@@ -171,6 +197,7 @@ async function importSession(options) {
                 }
                 const { rewritten } = (0, rewriter_js_1.rewriteJsonl)(processedContent, ctx, newSessionId);
                 (0, node_fs_1.writeFileSync)((0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`), rewritten);
+                postRewriteHashes.set(session.sessionId, (0, manifest_js_1.computeIntegrityHash)([rewritten]));
             }
             // Copy subagents
             const subagentsDir = (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "subagents");
@@ -317,8 +344,16 @@ async function importSession(options) {
             (0, node_fs_1.appendFileSync)(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
         }
     }
+    // Always record the imported-hash registry entries — machine-id or not —
+    // so a later import of identical content is recognized as a duplicate.
+    for (const session of targetSessions) {
+        const newId = sessionIdMap.get(session.sessionId);
+        state.imported[session.integrityHash] = {
+            localSessionId: newId,
+            importedAt: new Date().toISOString(),
+        };
+    }
     if (manifest.sourceMachineId) {
-        const state = (0, sync_state_js_1.readSyncState)(targetProjectPath);
         const peerId = manifest.sourceMachineId;
         const peerName = manifest.sourceMachineName ?? "unknown";
         if (!state.peers[peerId]) {
@@ -350,39 +385,28 @@ async function importSession(options) {
                 continuationOf: session.continuation
                     ? peer.received[session.continuation.continuesPeerSessionId ?? ""]?.localSessionId
                     : undefined,
+                postRewriteHash: postRewriteHashes.get(session.sessionId),
             };
             state.lineage[newId] = lineage;
             const sent = {
-                headEntryUuid: readLastEntryUuid((0, node_path_1.join)(targetProjectDir, `${newId}.jsonl`)) ?? "",
+                headEntryUuid: (0, jsonl_js_1.readLastEntryUuid)((0, node_path_1.join)(targetProjectDir, `${newId}.jsonl`)) ?? "",
                 messageCount: session.messageCount,
                 sentAsType: type,
                 sentAsSessionId: session.sessionId,
             };
             peer.sent[newId] = sent;
         }
-        (0, sync_state_js_1.writeSyncState)(state);
     }
+    (0, sync_state_js_1.writeSyncState)(state);
     return {
         success: true,
         command: "import",
         importedSessions,
+        skippedSessions,
         warnings,
         resumable: !noRegister,
         versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
         memoryConflicts: memoryConflicts.length > 0 ? memoryConflicts : undefined,
     };
-}
-function readLastEntryUuid(jsonlPath) {
-    try {
-        const content = (0, node_fs_1.readFileSync)(jsonlPath, "utf-8");
-        const lines = content.trim().split("\n").filter(Boolean);
-        if (lines.length === 0)
-            return null;
-        const last = JSON.parse(lines[lines.length - 1]);
-        return last.uuid ?? null;
-    }
-    catch {
-        return null;
-    }
 }
 //# sourceMappingURL=importer.js.map

@@ -159,8 +159,11 @@ export async function migrateSession(
 
     const imported = importResult as ImportResult;
 
-    // Step 3: Clean up source — only sessions confirmed moved.
+    // Step 3: Clean up source — only sessions confirmed moved. Sessions the
+    // import skipped as duplicates still count: identical content already
+    // exists at the target, so migrate semantics (source ends up gone) hold.
     const movedIds = new Set(imported.importedSessions.map((s) => s.originalId));
+    for (const s of imported.skippedSessions ?? []) movedIds.add(s.originalId);
     const sourceEncoded = encodeProjectPath(sourceProjectPath);
     const sourceProjectDir = join(sourceConfigDir, "projects", sourceEncoded);
     let cleanedUp = false;

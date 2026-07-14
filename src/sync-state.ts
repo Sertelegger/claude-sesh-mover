@@ -27,6 +27,7 @@ function defaultState(projectPath: string): SyncState {
     schemaVersion: 1,
     peers: {},
     lineage: {},
+    imported: {},
   };
 }
 
@@ -50,6 +51,7 @@ export function readSyncState(projectPath: string): SyncState {
     ) {
       throw new Error("schema mismatch");
     }
+    parsed.imported = parsed.imported ?? {};
     return parsed;
   } catch {
     const aside = `${p}.corrupt.${Date.now()}`;

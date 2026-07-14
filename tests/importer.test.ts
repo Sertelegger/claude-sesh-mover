@@ -17,9 +17,12 @@ describe("importer", () => {
   let targetConfigDir: string;
   let sessionId: string;
   let exportPath: string;
+  let originalHome: string | undefined;
 
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-importer-test-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = tempDir;
 
     // Create source fixture and export it
     const fixture = createFixtureTree(tempDir);
@@ -47,6 +50,8 @@ describe("importer", () => {
   });
 
   afterEach(() => {
+    if (originalHome !== undefined) process.env.HOME = originalHome;
+    else delete process.env.HOME;
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -233,6 +238,7 @@ describe("importer", () => {
       const [newLocalId] = Object.keys(state.lineage);
       expect(state.lineage[newLocalId].sourceMachineId).toBe("machine-A");
       expect(state.lineage[newLocalId].type).toBe("full");
+      expect(state.lineage[newLocalId].postRewriteHash).toMatch(/^sha256:/);
 
       expect(Object.keys(state.peers["machine-A"].sent).length).toBe(1);
     } finally {
@@ -312,5 +318,79 @@ describe("importer", () => {
       rmSync(tempDir, { recursive: true, force: true });
       rmSync(tempHome, { recursive: true, force: true });
     }
+  });
+
+  it("skips re-import of an identical non-incremental bundle and reports skippedSessions", async () => {
+    const { importSession } = await import("../src/importer.js");
+    const opts = {
+      exportPath,
+      targetConfigDir,
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    };
+    const first = await importSession(opts);
+    expect(first.success).toBe(true);
+
+    const second = await importSession(opts);
+    expect(second.success).toBe(true);
+    if (!second.success) return;
+    expect(second.importedSessions).toHaveLength(0);
+    expect((second as any).skippedSessions).toEqual([
+      { originalId: sessionId, reason: "duplicate" },
+    ]);
+    expect(second.warnings.some((w) => /already imported/i.test(w))).toBe(true);
+  });
+
+  it("--allow-duplicates re-imports an already-present bundle", async () => {
+    const { importSession } = await import("../src/importer.js");
+    const opts = {
+      exportPath,
+      targetConfigDir,
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    };
+    await importSession(opts);
+    const second = await importSession({ ...opts, allowDuplicates: true });
+    expect(second.success).toBe(true);
+    if (!second.success) return;
+    expect(second.importedSessions).toHaveLength(1);
+  });
+
+  it("migrate cleans up source sessions that were skipped as duplicates at target", async () => {
+    const { migrateSession } = await import("../src/migrator.js");
+    const { importSession } = await import("../src/importer.js");
+    // Pre-import the bundle to the migrate target so the migrate's own
+    // import skips everything as duplicate…
+    const pre = await importSession({
+      exportPath,
+      targetConfigDir,
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    });
+    expect(pre.success).toBe(true);
+
+    const result = await migrateSession({
+      sourceConfigDir,
+      targetConfigDir,
+      sourceProjectPath: "/Users/testuser/Projects/testproject",
+      targetProjectPath: "/Users/newuser/Projects/newproject",
+      scope: "current",
+      sessionId,
+      excludeLayers: [],
+      claudeVersion: "2.1.81",
+      currentCwd: "/Users/testuser",
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    // …but the source is still cleaned up: identical content already lives
+    // at the target, so migrate semantics are satisfied.
+    expect(
+      existsSync(
+        join(sourceConfigDir, "projects", "-Users-testuser-Projects-testproject", `${sessionId}.jsonl`)
+      )
+    ).toBe(false);
   });
 });

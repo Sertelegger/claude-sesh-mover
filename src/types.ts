@@ -208,6 +208,10 @@ export interface ImportResult {
     slug: string;
     messageCount: number;
   }>;
+  skippedSessions: Array<{
+    originalId: string;
+    reason: "duplicate" | "already-received";
+  }>;
   warnings: string[];
   resumable: boolean;
   versionAdaptations?: string[];
@@ -223,6 +227,7 @@ export interface DryRunResult {
   command: "import";
   dryRun: true;
   importedSessions: ImportResult["importedSessions"];
+  skippedSessions: ImportResult["skippedSessions"];
   warnings: string[];
   resumable: boolean;
   rewriteReport?: RewriteReport;
@@ -358,6 +363,12 @@ export interface SyncStateLineage {
   importedAt: string;
   type: "full" | "continuation";
   continuationOf?: string;
+  postRewriteHash?: string;
+}
+
+export interface SyncStateImported {
+  localSessionId: string;
+  importedAt: string;
 }
 
 export interface SyncState {
@@ -365,4 +376,5 @@ export interface SyncState {
   schemaVersion: 1;
   peers: Record<string, SyncStatePeer>;
   lineage: Record<string, SyncStateLineage>;
+  imported: Record<string, SyncStateImported>;
 }

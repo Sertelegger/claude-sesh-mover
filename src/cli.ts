@@ -162,6 +162,7 @@ program
   .option("--dry-run", "Show changes without applying")
   .option("--no-register", "Skip session index registration")
   .option("--force", "Skip confirmation")
+  .option("--allow-duplicates", "Re-import sessions even if identical content was imported before")
   .action(async (opts) => {
     let tempExtractDir: string | undefined;
     try {
@@ -186,6 +187,7 @@ program
         dryRun: !!opts.dryRun,
         sessionIds: opts.sessionId,
         noRegister: !opts.register, // Commander.js --no-register sets opts.register to false
+        allowDuplicates: !!opts.allowDuplicates,
       });
 
       output(result);

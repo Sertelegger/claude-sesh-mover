@@ -36,6 +36,20 @@ describe("sync-state", () => {
     expect(state.lineage).toEqual({});
   });
 
+  it("readSyncState defaults a missing imported map to {} (pre-0.3.0 files)", async () => {
+    const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const p = syncStatePath("/Users/sascha/Projects/foo");
+    mkdirSync(join(tempHome, ".claude-sesh-mover", "sync-state"), { recursive: true });
+    writeFileSync(
+      p,
+      JSON.stringify({ projectPath: "/Users/sascha/Projects/foo", schemaVersion: 1, peers: {}, lineage: {} }),
+      "utf-8"
+    );
+    const state = readSyncState("/Users/sascha/Projects/foo");
+    expect(state.imported).toEqual({});
+  });
+
   it("writeSyncState + readSyncState round-trip", async () => {
     const { readSyncState, writeSyncState } = await import("../src/sync-state.js");
     const state = readSyncState("/Users/sascha/Projects/foo");

@@ -15,15 +15,20 @@ describe("integration: full export/import cycle", () => {
   let tempDir: string;
   let sourceConfigDir: string;
   let sessionId: string;
+  let originalHome: string | undefined;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-integration-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = tempDir;
     const fixture = createFixtureTree(tempDir);
     sourceConfigDir = fixture.configDir;
     sessionId = fixture.sessionId;
   });
 
   afterEach(() => {
+    if (originalHome !== undefined) process.env.HOME = originalHome;
+    else delete process.env.HOME;
     rmSync(tempDir, { recursive: true, force: true });
   });
 
