@@ -32,7 +32,13 @@ export function rewriteString(input: string, ctx: RewriteContext): string {
   // Cross-family, the tail after the replacement gets its separators
   // normalized up to a token boundary; same-family tails are left alone.
   for (const mapping of ctx.mappings) {
-    const re = new RegExp(escapeRegex(mapping.from) + "(" + TAIL.source + ")", "g");
+    // Only replace when mapping.from ends at a path-component boundary: the
+    // next char is a separator, or the match ends at a token terminator / EOS.
+    // Prevents `/home/me/app` from rewriting inside `/home/me/app-backup`.
+    const re = new RegExp(
+      escapeRegex(mapping.from) + "(?![^\\s\"'`)\\]}>,;:/\\\\])" + "(" + TAIL.source + ")",
+      "g"
+    );
     result = result.replace(re, (_m, tail: string) =>
       mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail)
     );
@@ -62,7 +68,11 @@ export function rewriteString(input: string, ctx: RewriteContext): string {
 export function rewriteWholePath(input: string, ctx: RewriteContext): string {
   const crossFamily = !samePlatformFamily(ctx.sourcePlatform, ctx.targetPlatform);
   for (const mapping of ctx.mappings) {
-    if (input.startsWith(mapping.from)) {
+    if (
+      input === mapping.from ||
+      input.startsWith(mapping.from + "/") ||
+      input.startsWith(mapping.from + "\\")
+    ) {
       const tail = input.slice(mapping.from.length);
       return mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail);
     }

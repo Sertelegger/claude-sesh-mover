@@ -518,6 +518,36 @@ describe("rewriter", () => {
     });
   });
 
+  describe("stage-1 path-component boundary", () => {
+    function sameFamilyCtx(from: string, to: string) {
+      return {
+        mappings: [{ from, to, description: "" }],
+        sourcePlatform: "linux" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "me",
+        targetUser: "me",
+      };
+    }
+
+    it("does not rewrite a sibling path sharing the mapping prefix (free text)", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = sameFamilyCtx("/home/me/app", "/home/me/app-new");
+      // The mapped path IS rewritten…
+      expect(rewriteString("cd /home/me/app/src", ctx)).toBe("cd /home/me/app-new/src");
+      // …but a sibling sharing the prefix is left alone.
+      expect(rewriteString("cd /home/me/app-backup/x", ctx)).toBe("cd /home/me/app-backup/x");
+      expect(rewriteString("/home/me/app", ctx)).toBe("/home/me/app-new");
+    });
+
+    it("does not rewrite a sibling whole-path sharing the prefix", async () => {
+      const { rewriteWholePath } = await import("../src/rewriter.js");
+      const ctx = sameFamilyCtx("/home/me/app", "/home/me/app-new");
+      expect(rewriteWholePath("/home/me/appstore", ctx)).toBe("/home/me/appstore");
+      expect(rewriteWholePath("/home/me/app", ctx)).toBe("/home/me/app-new");
+      expect(rewriteWholePath("/home/me/app/src", ctx)).toBe("/home/me/app-new/src");
+    });
+  });
+
   describe("rewriteJsonl", () => {
     it("rewrites all entries in a JSONL string", async () => {
       const { rewriteJsonl, buildPathMappings } = await import(
