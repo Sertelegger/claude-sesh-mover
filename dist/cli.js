@@ -81,7 +81,7 @@ program
         // export + finalize tail for every branch (fixes the old --suffix early
         // return that skipped archive packaging and sync-state recording).
         let finalName = name;
-        if ((0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, name)) && !opts.overwrite) {
+        if (exportArtifactExists(outputDir, name) && !opts.overwrite) {
             if (!opts.suffix) {
                 output({
                     success: true,
@@ -96,7 +96,7 @@ program
                 return;
             }
             let suffix = 2;
-            while ((0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, `${name}-${suffix}`)))
+            while (exportArtifactExists(outputDir, `${name}-${suffix}`))
                 suffix++;
             finalName = `${name}-${suffix}`;
         }
@@ -442,6 +442,15 @@ program
     }
 });
 // --- Helpers ---
+// Single predicate for both the collision gate and the --suffix loop, so a
+// plain directory export and an archive/zstd export of the same name can
+// never collide silently (an archive's staging dir is removed after
+// packaging, so only `<name>.tar.gz`/`<name>.tar.zst` remains on disk).
+function exportArtifactExists(outputDir, name) {
+    return ((0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, name)) ||
+        (0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, `${name}.tar.gz`)) ||
+        (0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, `${name}.tar.zst`)));
+}
 async function doExport(configDir, scope, sessionId, outputDir, name, excludeLayers, claudeVersion, projectPathOverride, noSummary, incremental) {
     // Detect project path from cwd or override
     const projectPath = projectPathOverride ?? process.cwd();
@@ -546,7 +555,10 @@ function resolveIncrementalOptions(opts) {
     const refManifest = readReferenceManifest(opts.since);
     const peerSent = {};
     for (const s of refManifest.sessions) {
-        peerSent[s.sessionId] = {
+        const localId = s.type === "continuation" && s.continuation
+            ? s.continuation.continuesLocalSessionId
+            : s.sessionId;
+        peerSent[localId] = {
             headEntryUuid: (0, jsonl_js_1.readLastEntryUuid)((0, node_path_1.join)(opts.since, "sessions", `${s.sessionId}.jsonl`)) ?? "",
             messageCount: s.messageCount,
             sentAsType: s.type === "continuation" ? "continuation" : "full",

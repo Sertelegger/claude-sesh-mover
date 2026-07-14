@@ -105,4 +105,25 @@ describe("diff.computeIncrementalPlan", () => {
     expect(plan.full.map((x) => x.sessionId)).toEqual(["s1"]);
     expect(plan.warnings.some((w) => /head uuid/i.test(w))).toBe(true);
   });
+
+  it("treats an empty recorded head UUID as full, with warning", async () => {
+    const { computeIncrementalPlan } = await import("../src/diff.js");
+    const s = fakeSession("s1", 3);
+    const sent: Record<string, SyncStateSessionSent> = {
+      s1: {
+        headEntryUuid: "",
+        messageCount: 3,
+        sentAsType: "full",
+        sentAsSessionId: "s1",
+      },
+    };
+    // Local entries include an unparseable line mapped to uuid:"" — the old
+    // code would findIndex-match it and produce a bogus slice point.
+    const plan = computeIncrementalPlan([s], sent, () =>
+      entries("u1", "", "u3")
+    );
+    expect(plan.full.map((x) => x.sessionId)).toEqual(["s1"]);
+    expect(plan.continuation).toEqual([]);
+    expect(plan.warnings.some((w) => /empty/i.test(w))).toBe(true);
+  });
 });

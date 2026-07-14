@@ -33,6 +33,14 @@ export function computeIncrementalPlan(
       continue;
     }
 
+    if (!record.headEntryUuid) {
+      plan.warnings.push(
+        `Session ${session.sessionId}: recorded head UUID is empty; sending whole.`
+      );
+      plan.full.push(session);
+      continue;
+    }
+
     const entries = readEntries(session);
 
     if (entries.length < record.messageCount) {

@@ -105,7 +105,7 @@ program
       // export + finalize tail for every branch (fixes the old --suffix early
       // return that skipped archive packaging and sync-state recording).
       let finalName = name;
-      if (existsSync(join(outputDir, name)) && !opts.overwrite) {
+      if (exportArtifactExists(outputDir, name) && !opts.overwrite) {
         if (!opts.suffix) {
           output({
             success: true,
@@ -120,7 +120,7 @@ program
           return;
         }
         let suffix = 2;
-        while (existsSync(join(outputDir, `${name}-${suffix}`))) suffix++;
+        while (exportArtifactExists(outputDir, `${name}-${suffix}`)) suffix++;
         finalName = `${name}-${suffix}`;
       }
 
@@ -507,6 +507,18 @@ program
 
 // --- Helpers ---
 
+// Single predicate for both the collision gate and the --suffix loop, so a
+// plain directory export and an archive/zstd export of the same name can
+// never collide silently (an archive's staging dir is removed after
+// packaging, so only `<name>.tar.gz`/`<name>.tar.zst` remains on disk).
+function exportArtifactExists(outputDir: string, name: string): boolean {
+  return (
+    existsSync(join(outputDir, name)) ||
+    existsSync(join(outputDir, `${name}.tar.gz`)) ||
+    existsSync(join(outputDir, `${name}.tar.zst`))
+  );
+}
+
 async function doExport(
   configDir: string,
   scope: SessionScope,
@@ -666,7 +678,11 @@ function resolveIncrementalOptions(opts: {
     import("./types.js").SyncStateSessionSent
   > = {};
   for (const s of refManifest.sessions) {
-    peerSent[s.sessionId] = {
+    const localId =
+      s.type === "continuation" && s.continuation
+        ? s.continuation.continuesLocalSessionId
+        : s.sessionId;
+    peerSent[localId] = {
       headEntryUuid:
         readLastEntryUuid(join(opts.since!, "sessions", `${s.sessionId}.jsonl`)) ?? "",
       messageCount: s.messageCount,

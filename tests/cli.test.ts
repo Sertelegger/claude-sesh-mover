@@ -30,11 +30,11 @@ describe("cli", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function runCli(args: string): string {
+  function runCli(args: string, envOverrides?: Record<string, string>): string {
     const cliPath = join(__dirname, "..", "dist", "cli.js");
     return execSync(`node "${cliPath}" ${args}`, {
       encoding: "utf-8",
-      env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+      env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...envOverrides },
     });
   }
 
@@ -182,6 +182,20 @@ describe("cli", () => {
         require("node:fs").readFileSync(join(outputDir, "nosum", "manifest.json"), "utf-8")
       );
       expect(manifest.sessions[0].summary).toBe("test-session");
+    });
+
+    it("detects a name collision with an existing archive artifact", () => {
+      const outputDir = join(tempDir, "cli-archive-collision");
+      mkdirSync(outputDir, { recursive: true });
+      const base = `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format archive --name arch-col --output "${outputDir}"`;
+      runCli(base); // creates arch-col.tar.gz; staging dir removed
+      const second = JSON.parse(runCli(base)); // old code silently overwrote
+      expect(second.success).toBe(true);
+      expect(second.collision).toBe(true);
+      // --suffix resolves it
+      const third = JSON.parse(runCli(`${base} --suffix`));
+      expect(third.success).toBe(true);
+      expect(third.archivePath).toMatch(/arch-col-2\.tar\.gz$/);
     });
   });
 
@@ -375,6 +389,72 @@ describe("cli", () => {
       const result = JSON.parse(caught!.stdout);
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/no sync history|unknown peer/i);
+    });
+
+    it("--since keys continuation entries by their local session id", () => {
+      // Build a reference bundle whose manifest carries a continuation entry.
+      const refDir = join(tempDir, "since-ref");
+      mkdirSync(join(refDir, "sessions"), { recursive: true });
+      const contId = "cccccccc-1111-2222-3333-444444444444";
+      writeFileSync(
+        join(refDir, "sessions", `${contId}.jsonl`),
+        '{"uuid":"header"}\n{"uuid":"entry-3"}\n'
+      );
+      writeFileSync(
+        join(refDir, "manifest.json"),
+        JSON.stringify({
+          version: 1,
+          plugin: "sesh-mover",
+          exportedAt: "2026-07-13T00:00:00Z",
+          sourcePlatform: "darwin",
+          sourceProjectPath: "/Users/testuser/Projects/testproject",
+          sourceConfigDir: "/c",
+          sourceClaudeVersion: "2.1.114",
+          sessionScope: "all",
+          includedLayers: ["jsonl"],
+          sessions: [
+            {
+              sessionId: contId,
+              slug: "test-session",
+              summary: "continuation of test-session",
+              createdAt: "",
+              lastActiveAt: "",
+              messageCount: 2,
+              gitBranch: "main",
+              entrypoint: "cli",
+              integrityHash: "sha256:x",
+              type: "continuation",
+              continuation: {
+                continuesLocalSessionId: sessionId,
+                fromEntryIndex: 2,
+                fromEntryUuid: "entry-3",
+              },
+            },
+          ],
+          sourceMachineId: "peer-1",
+          incremental: true,
+          baseline: { targetMachineId: "machine-me" },
+        })
+      );
+
+      const outputDir = join(tempDir, "cli-since-cont");
+      mkdirSync(outputDir, { recursive: true });
+      const output = runCli(
+        `export --scope all --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name since-cont --output "${outputDir}" --incremental --since "${refDir}"`,
+        { HOME: tempDir }
+      );
+      const result = JSON.parse(output);
+      expect(result.success).toBe(true);
+      // The fixture session's last entry IS entry-3 (the ref bundle's head),
+      // so keyed-by-LOCAL-id the diff sees it as unchanged → zero sessions.
+      // The old bundle-id keying found no record and re-exported it whole.
+      const manifest = JSON.parse(
+        require("node:fs").readFileSync(
+          join(outputDir, "since-cont", "manifest.json"),
+          "utf-8"
+        )
+      );
+      expect(manifest.sessions.length).toBe(0);
     });
   });
 });
