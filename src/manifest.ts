@@ -17,7 +17,43 @@ export function readManifest(exportDir: string): ExportManifest {
     throw new Error(`No manifest.json found in ${exportDir}`);
   }
   const raw = readFileSync(manifestPath, "utf-8");
-  return JSON.parse(raw) as ExportManifest;
+  const manifest = JSON.parse(raw) as ExportManifest;
+  assertSafeManifestIds(manifest);
+  return manifest;
+}
+
+// A session id is safe iff it is a non-empty string with no path separators,
+// no NUL byte, and isn't "." or "..". Real Claude session ids are UUIDs, so
+// this accepts them while rejecting anything path-traversal-shaped. Any value
+// containing "/" or "\" already covers "../" and "..\" segments — the bare
+// "."/".." checks cover the separator-less forms.
+export function isSafeSessionId(id: unknown): boolean {
+  if (typeof id !== "string" || id.length === 0) return false;
+  if (id.includes("/") || id.includes("\\") || id.includes("\0")) return false;
+  if (id === "." || id === "..") return false;
+  return true;
+}
+
+// Single chokepoint: every manifest read that will later be used to build a
+// filesystem path (session JSONL, subagents dir, tool-results dir, etc.)
+// must run through this before the manifest is trusted. Guards
+// session.sessionId and both continuation-linkage ids, since all three get
+// interpolated into join() calls downstream (importer.ts, sync-state.ts).
+export function assertSafeManifestIds(manifest: ExportManifest): void {
+  for (const s of manifest.sessions) {
+    const ids = [
+      s.sessionId,
+      s.continuation?.continuesLocalSessionId,
+      s.continuation?.continuesPeerSessionId,
+    ];
+    for (const id of ids) {
+      if (id !== undefined && !isSafeSessionId(id)) {
+        throw new Error(
+          `Unsafe session id in manifest: ${JSON.stringify(id)} (path separators and ".." are not allowed)`
+        );
+      }
+    }
+  }
 }
 
 export function computeIntegrityHash(contents: string[]): string {

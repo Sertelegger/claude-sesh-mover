@@ -523,7 +523,9 @@ function readReferenceManifest(path) {
     if (!(0, node_fs_1.existsSync)(manifestPath)) {
         throw new Error(`--since ${path} does not contain a manifest.json (archive --since is a phase-2 feature).`);
     }
-    return JSON.parse((0, node_fs_1.readFileSync)(manifestPath, "utf-8"));
+    const manifest = JSON.parse((0, node_fs_1.readFileSync)(manifestPath, "utf-8"));
+    (0, manifest_js_1.assertSafeManifestIds)(manifest);
+    return manifest;
 }
 function resolveIncrementalOptions(opts) {
     if (!opts.incremental)

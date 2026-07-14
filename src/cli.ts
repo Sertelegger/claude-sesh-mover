@@ -16,7 +16,7 @@ import {
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
-import { readManifest } from "./manifest.js";
+import { readManifest, assertSafeManifestIds } from "./manifest.js";
 import { loadOrCreateMachineId } from "./machine.js";
 import { readSyncState, recordSentFromBundle } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
@@ -629,7 +629,9 @@ function readReferenceManifest(
       `--since ${path} does not contain a manifest.json (archive --since is a phase-2 feature).`
     );
   }
-  return JSON.parse(readFileSync(manifestPath, "utf-8"));
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as import("./types.js").ExportManifest;
+  assertSafeManifestIds(manifest);
+  return manifest;
 }
 
 function resolveIncrementalOptions(opts: {

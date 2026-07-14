@@ -2,6 +2,8 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.writeManifest = writeManifest;
 exports.readManifest = readManifest;
+exports.isSafeSessionId = isSafeSessionId;
+exports.assertSafeManifestIds = assertSafeManifestIds;
 exports.computeIntegrityHash = computeIntegrityHash;
 exports.verifyIntegrity = verifyIntegrity;
 const node_fs_1 = require("node:fs");
@@ -17,7 +19,42 @@ function readManifest(exportDir) {
         throw new Error(`No manifest.json found in ${exportDir}`);
     }
     const raw = (0, node_fs_1.readFileSync)(manifestPath, "utf-8");
-    return JSON.parse(raw);
+    const manifest = JSON.parse(raw);
+    assertSafeManifestIds(manifest);
+    return manifest;
+}
+// A session id is safe iff it is a non-empty string with no path separators,
+// no NUL byte, and isn't "." or "..". Real Claude session ids are UUIDs, so
+// this accepts them while rejecting anything path-traversal-shaped. Any value
+// containing "/" or "\" already covers "../" and "..\" segments — the bare
+// "."/".." checks cover the separator-less forms.
+function isSafeSessionId(id) {
+    if (typeof id !== "string" || id.length === 0)
+        return false;
+    if (id.includes("/") || id.includes("\\") || id.includes("\0"))
+        return false;
+    if (id === "." || id === "..")
+        return false;
+    return true;
+}
+// Single chokepoint: every manifest read that will later be used to build a
+// filesystem path (session JSONL, subagents dir, tool-results dir, etc.)
+// must run through this before the manifest is trusted. Guards
+// session.sessionId and both continuation-linkage ids, since all three get
+// interpolated into join() calls downstream (importer.ts, sync-state.ts).
+function assertSafeManifestIds(manifest) {
+    for (const s of manifest.sessions) {
+        const ids = [
+            s.sessionId,
+            s.continuation?.continuesLocalSessionId,
+            s.continuation?.continuesPeerSessionId,
+        ];
+        for (const id of ids) {
+            if (id !== undefined && !isSafeSessionId(id)) {
+                throw new Error(`Unsafe session id in manifest: ${JSON.stringify(id)} (path separators and ".." are not allowed)`);
+            }
+        }
+    }
 }
 function computeIntegrityHash(contents) {
     const hash = (0, node_crypto_1.createHash)("sha256");

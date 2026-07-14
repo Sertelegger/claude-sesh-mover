@@ -94,6 +94,9 @@ export function recordSentFromBundle(
   p.lastSentAt = new Date().toISOString();
   if (peer.name) p.name = peer.name;
 
+  // readManifest is the validation chokepoint (assertSafeManifestIds runs
+  // inside it) — session/continuation ids here are already guaranteed safe,
+  // no need to re-validate.
   const manifest = readManifest(bundleDir);
   for (const s of manifest.sessions) {
     const localSessionId =

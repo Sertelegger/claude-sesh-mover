@@ -129,4 +129,91 @@ describe("manifest", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  describe("assertSafeManifestIds / readManifest validation", () => {
+    function manifestWithSessionId(id: string): ExportManifest {
+      return {
+        version: 1,
+        plugin: "sesh-mover",
+        exportedAt: "2026-07-14T00:00:00Z",
+        sourcePlatform: "linux",
+        sourceProjectPath: "/p",
+        sourceConfigDir: "/c",
+        sourceClaudeVersion: "2.1.114",
+        sessionScope: "current",
+        includedLayers: ["jsonl"],
+        sessions: [
+          {
+            sessionId: id,
+            slug: "s",
+            summary: "",
+            createdAt: "",
+            lastActiveAt: "",
+            messageCount: 1,
+            gitBranch: "",
+            entrypoint: "cli",
+            integrityHash: "sha256:x",
+          },
+        ],
+      };
+    }
+
+    it("isSafeSessionId accepts UUIDs, rejects traversal and separators", async () => {
+      const { isSafeSessionId } = await import("../src/manifest.js");
+      expect(isSafeSessionId("550e8400-e29b-41d4-a716-446655440000")).toBe(true);
+      for (const bad of [
+        "../../secret/pwned",
+        "..",
+        ".",
+        "a/b",
+        "a\\b",
+        "..\\..\\x",
+        "foo/../bar",
+        "",
+        "x\0y",
+      ]) {
+        expect(isSafeSessionId(bad)).toBe(false);
+      }
+    });
+
+    it("readManifest throws on a traversal sessionId", async () => {
+      const { readManifest, writeManifest } = await import("../src/manifest.js");
+      const { mkdtempSync, rmSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-mover-mal-manifest-"));
+      try {
+        // write bypasses validation intentionally (raw), so craft the file directly
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(
+          join(dir, "manifest.json"),
+          JSON.stringify(manifestWithSessionId("../../secret/pwned"))
+        );
+        expect(() => readManifest(dir)).toThrow(/unsafe session id/i);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("readManifest throws on a traversal continuesLocalSessionId", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-mover-mal-cont-"));
+      try {
+        const m = manifestWithSessionId("550e8400-e29b-41d4-a716-446655440000");
+        m.sessions[0].type = "continuation";
+        m.sessions[0].continuation = {
+          continuesLocalSessionId: "../../../etc/shadow",
+          fromEntryIndex: 0,
+          fromEntryUuid: "u",
+        };
+        writeFileSync(join(dir, "manifest.json"), JSON.stringify(m));
+        expect(() => readManifest(dir)).toThrow(/unsafe session id/i);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });

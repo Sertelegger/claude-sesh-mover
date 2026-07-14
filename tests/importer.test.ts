@@ -157,6 +157,76 @@ describe("importer", () => {
       expect(existsSync(join(targetMemDir, "MEMORY.md"))).toBe(true);
     });
 
+    it("refuses a bundle whose manifest sessionId escapes the bundle (no file read outside)", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readdirSync } =
+        await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+
+      const root = mkdtempSync(join(tmpdir(), "sesh-mover-exfil-"));
+      try {
+        // A secret two levels above the bundle's sessions/ dir.
+        mkdirSync(join(root, "secret"), { recursive: true });
+        writeFileSync(join(root, "secret", "pwned.jsonl"), "TOP_SECRET_MARKER\n");
+        const bundle = join(root, "bundle");
+        mkdirSync(join(bundle, "sessions"), { recursive: true });
+        writeFileSync(
+          join(bundle, "manifest.json"),
+          JSON.stringify({
+            version: 1,
+            plugin: "sesh-mover",
+            exportedAt: "2026-07-14T00:00:00Z",
+            sourcePlatform: "linux",
+            sourceProjectPath: "/p",
+            sourceConfigDir: "/c",
+            sourceClaudeVersion: "2.1.114",
+            sessionScope: "current",
+            includedLayers: ["jsonl"],
+            sessions: [
+              {
+                sessionId: "../../secret/pwned",
+                slug: "evil",
+                summary: "",
+                createdAt: "",
+                lastActiveAt: "",
+                messageCount: 1,
+                gitBranch: "",
+                entrypoint: "cli",
+                integrityHash: "sha256:x",
+              },
+            ],
+          })
+        );
+        const targetConfig = join(root, "target");
+        mkdirSync(join(targetConfig, "projects"), { recursive: true });
+
+        const result = await importSession({
+          exportPath: bundle,
+          targetConfigDir: targetConfig,
+          targetProjectPath: "/home/victim/proj",
+          targetClaudeVersion: "2.1.114",
+          dryRun: false,
+          noRegister: true,
+        });
+
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        expect(result.error).toMatch(/unsafe session id|manifest/i);
+        // Nothing written; the secret never reached the target store.
+        const projDir = join(targetConfig, "projects", "-home-victim-proj");
+        const leaked =
+          existsSync(projDir) &&
+          readdirSync(projDir).some((f) =>
+            f.endsWith(".jsonl") &&
+            require("node:fs").readFileSync(join(projDir, f), "utf-8").includes("TOP_SECRET_MARKER")
+          );
+        expect(leaked).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it("verifies integrity hash on import", async () => {
       const { importSession } = await import("../src/importer.js");
       // Corrupt the JSONL file in the export
