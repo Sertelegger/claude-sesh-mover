@@ -10,10 +10,12 @@ import {
   chmodSync,
 } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, platform } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { overrideHome, homeEnv, prependPath } from "./helpers/env.js";
+
+const isWindows = platform() === "win32";
 
 describe("cli", () => {
   let tempDir: string;
@@ -272,7 +274,21 @@ describe("cli", () => {
       chmodSync(shimPath, 0o755);
     }
 
-    it("does not record sent-state when archive creation fails after recordSentFromBundle would have run", () => {
+    // Windows: this test forces a synthetic zstd-compression failure by
+    // putting a fake `zstd` shim first on PATH. execFileSync (no shell) only
+    // resolves extensionless PATH entries via a match against PATHEXT
+    // (.EXE/.BAT/.CMD/…), so a bare-name POSIX shebang script is invisible
+    // to it there — and windows-latest runners ship a real `zstd.exe` at
+    // C:\tools\zstd, so the lookup silently falls through to that instead of
+    // our shim and the archive is created for real (confirmed by capturing
+    // the CLI's stdout in CI: `success: true` with a genuine .tar.zst). A
+    // `.cmd`/`.bat` shim doesn't help either — Node's execFileSync refuses
+    // to launch those without `shell: true`, which archiver.ts doesn't pass.
+    // The behavior under test (createArchive rejecting must block
+    // recordSentFromBundle) is plain, platform-independent control flow in
+    // src/cli.ts/exporter.ts; only this fault-injection technique is
+    // unix-only, so skip rather than weaken the assertion.
+    it.skipIf(isWindows)("does not record sent-state when archive creation fails after recordSentFromBundle would have run", () => {
       const tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-cli-inc-fail-home-"));
       const outputDir = join(tempDir, "cli-inc-fail");
       mkdirSync(outputDir, { recursive: true });
@@ -320,25 +336,12 @@ describe("cli", () => {
         let caught: { stdout: string; status: number } | null = null;
         try {
           const cliPath = join(__dirname, "..", "dist", "cli.js");
-          const shimEnv = prependPath({ ...process.env, ...homeEnv(tempHome) }, shimDir);
-          const stdout = execSync(
+          execSync(
             `node "${cliPath}" export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path ${projectPath} --storage user --format zstd --name inc-zstd-fail --output "${outputDir}" --incremental --to peer-1`,
             {
               encoding: "utf-8",
-              env: shimEnv,
+              env: prependPath({ ...process.env, ...homeEnv(tempHome) }, shimDir),
             }
-          );
-          // DIAGNOSTIC (temporary): the command was expected to fail (zstd
-          // compression shimmed to exit 1) but didn't — dump what actually
-          // happened so we can see it in CI logs instead of guessing.
-          // eslint-disable-next-line no-console
-          console.error(
-            "DIAGNOSTIC unexpected success:",
-            JSON.stringify({
-              stdout,
-              PATH: shimEnv.PATH ?? shimEnv.Path,
-              shimDirListing: require("node:fs").readdirSync(shimDir),
-            })
           );
         } catch (e) {
           const err = e as { stdout?: Buffer; status?: number };
