@@ -188,6 +188,10 @@ export interface MigrateResult {
     success: true;
     command: "migrate";
     importedSessions: ImportResult["importedSessions"];
+    skippedSessions: Array<{
+        originalId: string;
+        reason: "duplicate" | "already-received";
+    }>;
     cleanedUp: boolean;
     directoryRenamed: boolean;
     sourcePath: string;

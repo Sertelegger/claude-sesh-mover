@@ -517,5 +517,9 @@ describe("importer", () => {
         join(sourceConfigDir, "projects", "-Users-testuser-Projects-testproject", `${sessionId}.jsonl`)
       )
     ).toBe(false);
+    // Verify skippedSessions are surfaced on MigrateResult
+    expect((result as any).skippedSessions).toEqual([
+      { originalId: sessionId, reason: "duplicate" },
+    ]);
   });
 });

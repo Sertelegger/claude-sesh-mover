@@ -126,7 +126,6 @@ program
     .option("--target-config-dir <path>", "Target Claude config dir")
     .option("--dry-run", "Show changes without applying")
     .option("--no-register", "Skip session index registration")
-    .option("--force", "Skip confirmation")
     .option("--allow-duplicates", "Re-import sessions even if identical content was imported before")
     .action(async (opts) => {
     let tempExtractDir;
