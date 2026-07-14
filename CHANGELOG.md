@@ -2,6 +2,30 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.3.1] — 2026-07-14
+
+Hardening follow-ups surfaced by the 0.3.0 final review.
+
+### Added
+- Import dedup registry now tracks registered state — a `--no-register` import is no longer
+  a dead end: a later normal import of the same bundle automatically imports a registered
+  copy, leaving the earlier unregistered copy on disk (#1).
+- `MigrateResult.skippedSessions` — migrate now surfaces the same duplicate/already-received
+  skip reporting import already had (#3).
+
+### Fixed
+- Incremental diff: a session with an empty recorded head UUID is now sent whole instead of
+  risking a bad diff against it (#2).
+- `--since <path>` fallback keys continuation sessions by their local session id (matching
+  how sync-state records them) instead of the source session id, so re-diffing against a
+  reference bundle correctly recognizes continuations of the same session (#4).
+- Export: archive-name collision detection now also checks for existing `.tar.gz`/`.tar.zst`
+  artifacts, not just a same-named directory — previously a second archive export with the
+  same name could silently overwrite the earlier archive (#5).
+
+### Removed
+- Import's no-op `--force` flag (confirmation was never gated on it) (#6).
+
 ## [0.3.0] — 2026-07-13
 
 Hardening pass: fixes from a full adversarial review of 0.2.0.

@@ -1,22 +1,9 @@
 # Roadmap
 
 Where claude-sesh-mover is heading beyond one-shot session export/import. Items are ordered,
-not scheduled — each stage gets its own design pass before implementation. Shipped releases
-are documented in [CHANGELOG.md](./CHANGELOG.md).
-
-## Hardening follow-ups (queued)
-
-Smaller items surfaced by the 0.3.0 final review, deferred to keep that milestone shippable.
-Version numbers are chosen at implementation time; stages here are ordered, not numbered.
-
-- Registered-state tracking in the import dedup registry (the `--no-register` escape leaves
-  no record that a copy exists unregistered, so a later normal import can't tell it should
-  register-in-place instead of creating a second copy).
-- Empty-`headEntryUuid` guard in the incremental diff.
-- `skippedSessions` on `MigrateResult`.
-- `--since` continuation keying by local session id.
-- Archive-name collision detection in export.
-- Removal of import's no-op `--force` flag.
+not scheduled — each stage gets its own design pass before implementation; version numbers
+are chosen at implementation time. Shipped releases are documented in
+[CHANGELOG.md](./CHANGELOG.md).
 
 ## Stream-transform rewriting (candidate)
 
