@@ -171,11 +171,6 @@ async function exportSessions(
 
   const sessionManifests: SessionManifest[] = [];
 
-  const jsonlBySession = new Map<string, string>();
-  for (const session of sessions) {
-    jsonlBySession.set(session.sessionId, readFileSync(session.jsonlPath, "utf-8"));
-  }
-
   let toFull: DiscoveredSession[] = sessions;
   let toContinuation: Array<{
     session: DiscoveredSession;
@@ -188,7 +183,7 @@ async function exportSessions(
       sessions,
       incremental.peerSent,
       (session) => {
-        const raw = jsonlBySession.get(session.sessionId) ?? "";
+        const raw = readFileSync(session.jsonlPath, "utf-8");
         return raw
           .trim()
           .split("\n")
@@ -208,7 +203,7 @@ async function exportSessions(
   }
 
   for (const session of toFull) {
-    const jsonlContent = jsonlBySession.get(session.sessionId)!;
+    const jsonlContent = readFileSync(session.jsonlPath, "utf-8");
     writeFileSync(
       join(exportPath, "sessions", `${session.sessionId}.jsonl`),
       jsonlContent
@@ -258,7 +253,7 @@ async function exportSessions(
   }
 
   for (const item of toContinuation) {
-    const originalJsonl = jsonlBySession.get(item.session.sessionId)!;
+    const originalJsonl = readFileSync(item.session.jsonlPath, "utf-8");
     const newSessionId = randomUUID();
     const prevLocal = incremental?.peerSent[item.session.sessionId]?.sentAsSessionId;
     const continuationJsonl = buildContinuationJsonl({

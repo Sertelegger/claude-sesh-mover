@@ -69,15 +69,11 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
     const warnings = [];
     (0, node_fs_1.mkdirSync)((0, node_path_1.join)(exportPath, "sessions"), { recursive: true });
     const sessionManifests = [];
-    const jsonlBySession = new Map();
-    for (const session of sessions) {
-        jsonlBySession.set(session.sessionId, (0, node_fs_1.readFileSync)(session.jsonlPath, "utf-8"));
-    }
     let toFull = sessions;
     let toContinuation = [];
     if (incremental) {
         const plan = (0, diff_js_1.computeIncrementalPlan)(sessions, incremental.peerSent, (session) => {
-            const raw = jsonlBySession.get(session.sessionId) ?? "";
+            const raw = (0, node_fs_1.readFileSync)(session.jsonlPath, "utf-8");
             return raw
                 .trim()
                 .split("\n")
@@ -96,7 +92,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         toContinuation = plan.continuation;
     }
     for (const session of toFull) {
-        const jsonlContent = jsonlBySession.get(session.sessionId);
+        const jsonlContent = (0, node_fs_1.readFileSync)(session.jsonlPath, "utf-8");
         (0, node_fs_1.writeFileSync)((0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`), jsonlContent);
         const sessionBase = (0, node_path_1.join)(configDir, "projects", session.encodedProjectDir, session.sessionId);
         if (includedLayers.includes("subagents")) {
@@ -138,7 +134,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         });
     }
     for (const item of toContinuation) {
-        const originalJsonl = jsonlBySession.get(item.session.sessionId);
+        const originalJsonl = (0, node_fs_1.readFileSync)(item.session.jsonlPath, "utf-8");
         const newSessionId = (0, node_crypto_1.randomUUID)();
         const prevLocal = incremental?.peerSent[item.session.sessionId]?.sentAsSessionId;
         const continuationJsonl = (0, continuation_js_1.buildContinuationJsonl)({

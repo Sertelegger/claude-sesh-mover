@@ -41,6 +41,41 @@ describe("discovery", () => {
       const sessions = discoverSessions(configDir, "/nonexistent/path");
       expect(sessions).toHaveLength(0);
     });
+
+    it("parses sessions whose first line exceeds 4KB", async () => {
+      const { discoverSessions } = await import("../src/discovery.js");
+      const { writeFileSync } = await import("node:fs");
+      const bigId = "660e8400-e29b-41d4-a716-446655440000";
+      const bigFirst = JSON.stringify({
+        uuid: "big-1",
+        timestamp: "2026-07-13T00:00:00Z",
+        sessionId: bigId,
+        cwd: "/Users/testuser/Projects/testproject",
+        version: "2.1.114",
+        slug: "big-session",
+        type: "user",
+        message: { role: "user", content: "x".repeat(8000) },
+      });
+      const last = JSON.stringify({
+        uuid: "big-2",
+        timestamp: "2026-07-13T00:01:00Z",
+        sessionId: bigId,
+        cwd: "/Users/testuser/Projects/testproject",
+        version: "2.1.114",
+        type: "assistant",
+        message: { model: "m", id: "1", content: [] },
+      });
+      writeFileSync(
+        join(configDir, "projects", "-Users-testuser-Projects-testproject", `${bigId}.jsonl`),
+        bigFirst + "\n" + last + "\n"
+      );
+      const sessions = discoverSessions(configDir, "/Users/testuser/Projects/testproject");
+      const big = sessions.find((s) => s.sessionId === bigId)!;
+      expect(big).toBeDefined();
+      expect(big.slug).toBe("big-session");
+      expect(big.messageCount).toBe(2);
+      expect(big.lastActiveAt).toBe("2026-07-13T00:01:00Z");
+    });
   });
 
   describe("discoverSessionById", () => {

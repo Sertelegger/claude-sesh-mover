@@ -6,6 +6,7 @@ exports.listAllProjects = listAllProjects;
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const platform_js_1 = require("./platform.js");
+const jsonl_js_1 = require("./jsonl.js");
 function discoverSessions(configDir, projectPath) {
     const encoded = (0, platform_js_1.encodeProjectPath)(projectPath);
     const projectDir = (0, node_path_1.join)(configDir, "projects", encoded);
@@ -69,21 +70,11 @@ function listAllProjects(configDir) {
  * This is necessary because the directory encoding (/ -> -) is lossy for hyphenated paths.
  */
 function readProjectPathFromJsonl(jsonlPath) {
+    const firstLine = (0, jsonl_js_1.readFirstJsonlLine)(jsonlPath);
+    if (!firstLine)
+        return null;
     try {
-        const fd = (0, node_fs_1.openSync)(jsonlPath, 'r');
-        const buf = Buffer.alloc(4096); // first 4KB should contain the first line
-        let bytesRead;
-        try {
-            bytesRead = (0, node_fs_1.readSync)(fd, buf, 0, 4096, 0);
-        }
-        finally {
-            (0, node_fs_1.closeSync)(fd);
-        }
-        const firstLine = buf.toString('utf-8', 0, bytesRead).split('\n')[0];
-        if (!firstLine)
-            return null;
-        const entry = JSON.parse(firstLine);
-        return entry.cwd ?? null;
+        return JSON.parse(firstLine).cwd ?? null;
     }
     catch {
         return null;
@@ -91,15 +82,29 @@ function readProjectPathFromJsonl(jsonlPath) {
 }
 function parseSessionJsonl(jsonlPath, sessionId, projectPath, encodedProjectDir, configDir) {
     try {
-        // Performance note: reads entire file. For very large sessions (100MB+),
-        // consider streaming approach that reads first line, counts newlines, reads last line.
-        const raw = (0, node_fs_1.readFileSync)(jsonlPath, "utf-8");
-        const lines = raw.trim().split("\n").filter(Boolean);
-        if (lines.length === 0)
+        const firstLine = (0, jsonl_js_1.readFirstJsonlLine)(jsonlPath);
+        if (!firstLine)
             return null;
-        const entries = lines.map((line) => JSON.parse(line));
-        const firstEntry = entries[0];
-        const lastEntry = entries[entries.length - 1];
+        let firstEntry;
+        try {
+            firstEntry = JSON.parse(firstLine);
+        }
+        catch {
+            return null;
+        }
+        const lastLine = (0, jsonl_js_1.readLastJsonlLine)(jsonlPath);
+        let lastEntry = firstEntry;
+        if (lastLine) {
+            try {
+                lastEntry = JSON.parse(lastLine);
+            }
+            catch {
+                /* keep firstEntry as fallback */
+            }
+        }
+        const messageCount = (0, jsonl_js_1.countJsonlLines)(jsonlPath);
+        if (messageCount === 0)
+            return null;
         // Check for subagents
         const sessionSubDir = (0, node_path_1.join)(configDir, "projects", encodedProjectDir, sessionId, "subagents");
         const hasSubagents = (0, node_fs_1.existsSync)(sessionSubDir) && (0, node_fs_1.readdirSync)(sessionSubDir).length > 0;
@@ -117,7 +122,7 @@ function parseSessionJsonl(jsonlPath, sessionId, projectPath, encodedProjectDir,
             slug: firstEntry.slug || sessionId,
             createdAt: firstEntry.timestamp,
             lastActiveAt: lastEntry.timestamp,
-            messageCount: entries.length,
+            messageCount,
             gitBranch: firstEntry.gitBranch || "unknown",
             entrypoint: firstEntry.entrypoint || "cli",
             hasSubagents,
