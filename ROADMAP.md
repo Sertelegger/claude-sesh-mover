@@ -16,7 +16,7 @@ Version numbers are chosen at implementation time; stages here are ordered, not 
 - `skippedSessions` on `MigrateResult`.
 - `--since` continuation keying by local session id.
 - Archive-name collision detection in export.
-- Removal of import's no-op `--force` flag.
+- ~~Removal of import's no-op `--force` flag.~~
 
 ## Stream-transform rewriting (candidate)
 
