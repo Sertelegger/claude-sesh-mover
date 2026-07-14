@@ -262,8 +262,7 @@ describe("importer", () => {
 
     const tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-import-inc-"));
     const tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-import-inc-home-"));
-    const origHome = process.env.HOME;
-    process.env.HOME = tempHome;
+    const innerHome = overrideHome(tempHome);
 
     try {
       const fx = createFixtureTree(tempDir);
@@ -311,8 +310,7 @@ describe("importer", () => {
 
       expect(Object.keys(state.peers["machine-A"].sent).length).toBe(1);
     } finally {
-      if (origHome !== undefined) process.env.HOME = origHome;
-      else delete process.env.HOME;
+      innerHome.restore();
       rmSync(tempDir, { recursive: true, force: true });
       rmSync(tempHome, { recursive: true, force: true });
     }
@@ -328,8 +326,7 @@ describe("importer", () => {
 
     const tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-import-idem-"));
     const tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-import-idem-home-"));
-    const origHome = process.env.HOME;
-    process.env.HOME = tempHome;
+    const innerHome = overrideHome(tempHome);
 
     try {
       const fx = createFixtureTree(tempDir);
@@ -382,8 +379,7 @@ describe("importer", () => {
       ).toBe(true);
       expect((second as { importedSessions: unknown[] }).importedSessions.length).toBe(0);
     } finally {
-      if (origHome !== undefined) process.env.HOME = origHome;
-      else delete process.env.HOME;
+      innerHome.restore();
       rmSync(tempDir, { recursive: true, force: true });
       rmSync(tempHome, { recursive: true, force: true });
     }
@@ -399,8 +395,7 @@ describe("importer", () => {
 
     const tempDir = mkdtempSync(join(tmpdir(), "sesh-mover-import-idem-heal-"));
     const tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-import-idem-heal-home-"));
-    const origHome = process.env.HOME;
-    process.env.HOME = tempHome;
+    const innerHome = overrideHome(tempHome);
 
     try {
       const fx = createFixtureTree(tempDir);
@@ -459,8 +454,7 @@ describe("importer", () => {
       expect((second as ImportResult).importedSessions).toHaveLength(1);
       expect((second as ImportResult).skippedSessions).toHaveLength(0);
     } finally {
-      if (origHome !== undefined) process.env.HOME = origHome;
-      else delete process.env.HOME;
+      innerHome.restore();
       rmSync(tempDir, { recursive: true, force: true });
       rmSync(tempHome, { recursive: true, force: true });
     }
