@@ -143,6 +143,23 @@ describe("cli", () => {
       );
       expect(manifest.sessionScope).toBe("all");
     });
+
+    it("suffix collision path still produces an archive", () => {
+      const outputDir = join(tempDir, "cli-suffix-archive");
+      mkdirSync(outputDir, { recursive: true });
+      const base = `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format archive --name suffixed --output "${outputDir}"`;
+      // First export creates suffixed.tar.gz; staging dir "suffixed" is removed,
+      // so create a directory with that name to force the collision branch.
+      runCli(base);
+      mkdirSync(join(outputDir, "suffixed"), { recursive: true });
+      const output = runCli(`${base} --suffix`);
+      const result = JSON.parse(output);
+      expect(result.success).toBe(true);
+      // Old code returned early from the suffix branch and never archived.
+      expect(result.archivePath).toMatch(/suffixed-2\.tar\.gz$/);
+      expect(existsSync(result.archivePath)).toBe(true);
+      expect(existsSync(join(outputDir, "suffixed-2"))).toBe(false);
+    });
   });
 
   describe("browse command", () => {

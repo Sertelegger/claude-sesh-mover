@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { resolveConfigDir, detectPlatform, encodeProjectPath } from "./platform.js";
+import { resolveConfigDir, detectPlatform } from "./platform.js";
 import {
   getDefaultConfig,
   readConfig,
@@ -18,7 +18,8 @@ import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
 import { readManifest } from "./manifest.js";
 import { loadOrCreateMachineId } from "./machine.js";
-import { readSyncState, writeSyncState } from "./sync-state.js";
+import { readSyncState, recordSentFromBundle } from "./sync-state.js";
+import { readLastEntryUuid } from "./jsonl.js";
 import {
   createArchive,
   extractArchive,
@@ -100,42 +101,27 @@ program
       // Generate name
       const name = opts.name ?? generateExportName(configDir, opts.sessionId);
 
-      // Check collision
-      const exportPath = join(outputDir, name);
-      if (existsSync(exportPath) && !opts.overwrite) {
-        if (opts.suffix) {
-          // Find next available suffix
-          let suffix = 2;
-          while (existsSync(join(outputDir, `${name}-${suffix}`))) {
-            suffix++;
-          }
-          const suffixedName = `${name}-${suffix}`;
-          const result = await doExport(
-            configDir,
-            scope,
-            opts.sessionId,
-            outputDir,
-            suffixedName,
-            excludeLayers,
-            claudeVersion,
-            opts.projectPath,
-            incremental
-          );
-          output(result);
+      // Collision handling: resolve the final name first, then run ONE shared
+      // export + finalize tail for every branch (fixes the old --suffix early
+      // return that skipped archive packaging and sync-state recording).
+      let finalName = name;
+      if (existsSync(join(outputDir, name)) && !opts.overwrite) {
+        if (!opts.suffix) {
+          output({
+            success: true,
+            command: "export",
+            exportPath: join(outputDir, name),
+            sessions: [],
+            warnings: [],
+            archivePath: null,
+            collision: true,
+            existingPath: join(outputDir, name),
+          });
           return;
         }
-        // Report collision
-        output({
-          success: true,
-          command: "export",
-          exportPath,
-          sessions: [],
-          warnings: [],
-          archivePath: null,
-          collision: true,
-          existingPath: exportPath,
-        });
-        return;
+        let suffix = 2;
+        while (existsSync(join(outputDir, `${name}-${suffix}`))) suffix++;
+        finalName = `${name}-${suffix}`;
       }
 
       const result = await doExport(
@@ -143,54 +129,20 @@ program
         scope,
         opts.sessionId,
         outputDir,
-        name,
+        finalName,
         excludeLayers,
         claudeVersion,
         opts.projectPath,
         incremental
       );
 
-      // Capture the bundle dir before archive cleanup destroys the staging tree.
-      // At this point result.exportPath is still the directory path (not the .tar.gz),
-      // so we can read the manifest from disk before archive packaging + rm happens.
-      const preArchiveBundleDir =
-        result.success && incremental?.targetMachineId
-          ? (result as ExportResult).exportPath
-          : null;
-
-      // Handle archive
-      if (result.success && (format === "archive" || format === "zstd")) {
-        const exportResult = result as ExportResult;
-        let compression: "gzip" | "zstd" = format === "zstd" ? "zstd" : "gzip";
-        if (compression === "zstd" && !(await isZstdAvailable())) {
-          exportResult.warnings.push(
-            "zstd not found on system, falling back to gzip"
-          );
-          compression = "gzip";
-          exportResult.actualFormat = "archive"; // signal fallback to skill
-        }
-        const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
-        const archivePath = exportResult.exportPath + ext;
-        const stagingDir = exportResult.exportPath;
-        if (preArchiveBundleDir) {
-          updateSyncStateAfterExport(
-            configDir,
-            opts.projectPath ?? process.cwd(),
-            incremental!,
-            stagingDir
-          );
-        }
-        await createArchive(stagingDir, archivePath, compression);
-        rmSync(stagingDir, { recursive: true, force: true });
-        exportResult.archivePath = archivePath;
-        exportResult.exportPath = archivePath;
-      } else if (preArchiveBundleDir) {
-        updateSyncStateAfterExport(
-          configDir,
-          opts.projectPath ?? process.cwd(),
-          incremental!,
-          preArchiveBundleDir
-        );
+      if (result.success) {
+        await finalizeExport({
+          result: result as ExportResult,
+          format,
+          incremental,
+          projectPath: opts.projectPath ?? process.cwd(),
+        });
       }
 
       output(result);
@@ -578,25 +530,38 @@ async function doExport(
   });
 }
 
-function readLastEntryUuid(jsonlPath: string): string | null {
-  if (!existsSync(jsonlPath)) return null;
-  const content = readFileSync(jsonlPath, "utf-8");
-  const lines = content.trim().split("\n").filter(Boolean);
-  if (lines.length === 0) return null;
-  try {
-    return (
-      (JSON.parse(lines[lines.length - 1]) as { uuid?: string }).uuid ?? null
-    );
-  } catch {
-    return null;
-  }
-}
+async function finalizeExport(params: {
+  result: ExportResult;
+  format: ExportFormat;
+  incremental?: import("./exporter.js").IncrementalExportOptions;
+  projectPath: string;
+}): Promise<void> {
+  const { result, format, incremental, projectPath } = params;
+  const bundleDir = result.exportPath;
 
-function readLastEntryUuidInExport(
-  exportPath: string,
-  sessionId: string
-): string | null {
-  return readLastEntryUuid(join(exportPath, "sessions", `${sessionId}.jsonl`));
+  // Record sync state from the bundle BEFORE the staging dir is archived away.
+  if (incremental?.targetMachineId) {
+    recordSentFromBundle(
+      projectPath,
+      { id: incremental.targetMachineId, name: incremental.targetMachineName },
+      bundleDir
+    );
+  }
+
+  if (format === "archive" || format === "zstd") {
+    let compression: "gzip" | "zstd" = format === "zstd" ? "zstd" : "gzip";
+    if (compression === "zstd" && !(await isZstdAvailable())) {
+      result.warnings.push("zstd not found on system, falling back to gzip");
+      compression = "gzip";
+      result.actualFormat = "archive"; // signal fallback to skill
+    }
+    const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
+    const archivePath = bundleDir + ext;
+    await createArchive(bundleDir, archivePath, compression);
+    rmSync(bundleDir, { recursive: true, force: true });
+    result.archivePath = archivePath;
+    result.exportPath = archivePath;
+  }
 }
 
 function resolvePeer(
@@ -667,7 +632,8 @@ function resolveIncrementalOptions(opts: {
   > = {};
   for (const s of refManifest.sessions) {
     peerSent[s.sessionId] = {
-      headEntryUuid: readLastEntryUuidInExport(opts.since!, s.sessionId) ?? "",
+      headEntryUuid:
+        readLastEntryUuid(join(opts.since!, "sessions", `${s.sessionId}.jsonl`)) ?? "",
       messageCount: s.messageCount,
       sentAsType: s.type === "continuation" ? "continuation" : "full",
       sentAsSessionId: s.sessionId,
@@ -682,54 +648,6 @@ function resolveIncrementalOptions(opts: {
     referenceExport: opts.since,
     peerSent,
   };
-}
-
-function updateSyncStateAfterExport(
-  configDir: string,
-  projectPath: string,
-  incremental: import("./exporter.js").IncrementalExportOptions,
-  bundleDir: string
-): void {
-  if (!incremental.targetMachineId) return;
-  const state = readSyncState(projectPath);
-  const peerId = incremental.targetMachineId;
-  if (!state.peers[peerId]) {
-    state.peers[peerId] = {
-      name: incremental.targetMachineName ?? peerId,
-      lastSentAt: null,
-      lastReceivedAt: null,
-      sent: {},
-      received: {},
-    };
-  }
-  state.peers[peerId].lastSentAt = new Date().toISOString();
-  state.peers[peerId].name =
-    incremental.targetMachineName ?? state.peers[peerId].name;
-
-  const manifest = readManifest(bundleDir);
-  const sourceProjectsDir = join(
-    configDir,
-    "projects",
-    encodeProjectPath(projectPath)
-  );
-
-  for (const s of manifest.sessions) {
-    const localSessionId =
-      s.type === "continuation" && s.continuation
-        ? s.continuation.continuesLocalSessionId
-        : s.sessionId;
-    const localJsonl = join(sourceProjectsDir, `${localSessionId}.jsonl`);
-    const headUuid =
-      readLastEntryUuid(localJsonl) ?? s.continuation?.fromEntryUuid ?? "";
-
-    state.peers[peerId].sent[localSessionId] = {
-      headEntryUuid: headUuid,
-      messageCount: s.messageCount,
-      sentAsType: s.type === "continuation" ? "continuation" : "full",
-      sentAsSessionId: s.sessionId,
-    };
-  }
-  writeSyncState(state);
 }
 
 function parseScope(value: string, command: string): SessionScope {
