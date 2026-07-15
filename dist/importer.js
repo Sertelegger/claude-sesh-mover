@@ -134,8 +134,8 @@ async function importSession(options) {
     for (const session of targetSessions) {
         const jsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`);
         if ((0, node_fs_1.existsSync)(jsonlPath)) {
-            const content = (0, node_fs_1.readFileSync)(jsonlPath, "utf-8");
-            if (!(0, manifest_js_1.verifyIntegrity)([content], session.integrityHash)) {
+            const actualHash = await (0, manifest_js_1.computeIntegrityHashFromFile)(jsonlPath);
+            if (actualHash !== session.integrityHash) {
                 integrityFailedSessions.add(session.sessionId);
                 warnings.push(`integrity check failed for session "${session.slug}" (${session.sessionId}): JSONL content doesn't match manifest hash. Data may be corrupted.`);
             }
@@ -158,9 +158,7 @@ async function importSession(options) {
         const firstSession = targetSessions[0];
         const firstJsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${firstSession.sessionId}.jsonl`);
         if ((0, node_fs_1.existsSync)(firstJsonlPath)) {
-            const content = (0, node_fs_1.readFileSync)(firstJsonlPath, "utf-8");
-            const { report } = (0, rewriter_js_1.rewriteJsonl)(content, ctx, sessionIdMap.get(firstSession.sessionId));
-            rewriteReport = report;
+            rewriteReport = await (0, rewriter_js_1.rewriteJsonlStream)(firstJsonlPath, null, ctx, { newSessionId: sessionIdMap.get(firstSession.sessionId) });
         }
         return {
             success: true,
@@ -200,27 +198,29 @@ async function importSession(options) {
             // Rewrite and write JSONL
             const jsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`);
             if ((0, node_fs_1.existsSync)(jsonlPath)) {
-                const jsonlContent = (0, node_fs_1.readFileSync)(jsonlPath, "utf-8");
-                // Apply version adapters
-                let processedContent = jsonlContent;
-                if (adapters.length > 0) {
-                    const lines = jsonlContent.trim().split("\n").filter(Boolean);
-                    const adaptedLines = lines.map((line) => {
-                        try {
-                            const entry = JSON.parse(line);
-                            const { entry: adapted, applied } = (0, version_adapters_js_1.applyAdapters)(entry, adapters);
-                            versionAdaptations.push(...applied);
-                            return JSON.stringify(adapted);
-                        }
-                        catch {
-                            return line;
-                        }
-                    });
-                    processedContent = adaptedLines.join("\n") + "\n";
+                const streamReport = await (0, rewriter_js_1.rewriteJsonlStream)(jsonlPath, (0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`), ctx, { adapters, newSessionId, computeHash: true });
+                versionAdaptations.push(...streamReport.adaptationsApplied);
+                postRewriteHashes.set(session.sessionId, streamReport.outputHash);
+                // Strict-validation semantics (previously a post-write re-read in
+                // Step 6): an unparseable line in a session that PASSED the integrity
+                // check indicates corruption the hash didn't catch or a pipeline bug —
+                // hard-fail and roll back. Known-corrupt sessions already warned.
+                if (streamReport.parseFailures > 0 &&
+                    !integrityFailedSessions.has(session.sessionId)) {
+                    try {
+                        rollbackImportedFiles();
+                    }
+                    catch {
+                        /* best effort cleanup */
+                    }
+                    return {
+                        success: false,
+                        command: "import",
+                        error: `Import validation failed: session "${session.slug}" contains ${streamReport.parseFailures} unparseable JSONL line(s) after rewrite`,
+                        details: "Partially written session files have been cleaned up. No indexes were modified.",
+                        suggestion: "Check the export bundle for corruption, or try --no-register to import as read-only.",
+                    };
                 }
-                const { rewritten } = (0, rewriter_js_1.rewriteJsonl)(processedContent, ctx, newSessionId);
-                (0, node_fs_1.writeFileSync)((0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`), rewritten);
-                postRewriteHashes.set(session.sessionId, (0, manifest_js_1.computeIntegrityHash)([rewritten]));
             }
             // Copy subagents
             const subagentsDir = (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "subagents");
@@ -229,10 +229,8 @@ async function importSession(options) {
                 (0, node_fs_1.mkdirSync)(targetSubDir, { recursive: true });
                 for (const file of (0, node_fs_1.readdirSync)(subagentsDir)) {
                     if (file.endsWith(".jsonl")) {
-                        // Rewrite subagent JSONL too
-                        const content = (0, node_fs_1.readFileSync)((0, node_path_1.join)(subagentsDir, file), "utf-8");
-                        const { rewritten } = (0, rewriter_js_1.rewriteJsonl)(content, ctx, newSessionId);
-                        (0, node_fs_1.writeFileSync)((0, node_path_1.join)(targetSubDir, file), rewritten);
+                        // Rewrite subagent JSONL too (never applies version adapters).
+                        await (0, rewriter_js_1.rewriteJsonlStream)((0, node_path_1.join)(subagentsDir, file), (0, node_path_1.join)(targetSubDir, file), ctx, { newSessionId });
                     }
                     else {
                         (0, node_fs_1.copyFileSync)((0, node_path_1.join)(subagentsDir, file), (0, node_path_1.join)(targetSubDir, file));
@@ -309,47 +307,6 @@ async function importSession(options) {
             if (!(0, node_fs_1.existsSync)(targetFile)) {
                 (0, node_fs_1.copyFileSync)((0, node_path_1.join)(plansDir, file), targetFile);
             }
-        }
-    }
-    // Step 6: Validate written files before registering in index.
-    // Sessions that already failed the integrity check are known-corrupt; we
-    // skip strict JSON validation for them so the import can still succeed with
-    // a warning. We only hard-fail if a session that passed integrity check
-    // produces unparseable output (indicating a rewrite pipeline bug).
-    for (const session of targetSessions) {
-        const newSessionId = sessionIdMap.get(session.sessionId);
-        const writtenJsonlPath = (0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`);
-        if (!(0, node_fs_1.existsSync)(writtenJsonlPath)) {
-            // Session had no JSONL file to write; skip validation for this session
-            continue;
-        }
-        // Skip strict validation for sessions with known integrity failures
-        if (integrityFailedSessions.has(session.sessionId)) {
-            continue;
-        }
-        try {
-            const content = (0, node_fs_1.readFileSync)(writtenJsonlPath, "utf-8");
-            const lines = content.trim().split("\n").filter(Boolean);
-            // Verify each line is valid JSON
-            for (const line of lines) {
-                JSON.parse(line);
-            }
-        }
-        catch (e) {
-            // Rollback: clean up only files written by this import
-            try {
-                rollbackImportedFiles();
-            }
-            catch {
-                /* best effort cleanup */
-            }
-            return {
-                success: false,
-                command: "import",
-                error: `Import validation failed: ${e.message}`,
-                details: "Partially written session files have been cleaned up; merged memory/plan files may remain. No indexes were modified.",
-                suggestion: "Check the export bundle for corruption, or try --no-register to import as read-only.",
-            };
         }
     }
     // Step 7: Register in indexes (only after successful validation)

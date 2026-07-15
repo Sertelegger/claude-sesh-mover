@@ -10,7 +10,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
-import type { ExportResult, ImportResult, DryRunResult } from "../src/types.js";
+import type {
+  ExportResult,
+  ImportResult,
+  DryRunResult,
+  ErrorResult,
+} from "../src/types.js";
 
 describe("importer", () => {
   let tempDir: string;
@@ -248,6 +253,45 @@ describe("importer", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
       expect(result.warnings.some((w) => w.includes("integrity"))).toBe(true);
+    });
+
+    it("fails with rollback when an integrity-passing session contains an unparseable line", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { appendFileSync, readdirSync } = await import("node:fs");
+      const { readManifest, writeManifest, computeIntegrityHash } = await import(
+        "../src/manifest.js"
+      );
+      const { encodeProjectPath } = await import("../src/platform.js");
+
+      // Corrupt the exported JSONL with an unparseable trailing line, then
+      // recompute the manifest's integrityHash from the NEW content so the
+      // integrity check still PASSES — only parseability should fail.
+      const jsonlPath = join(exportPath, "sessions", `${sessionId}.jsonl`);
+      appendFileSync(jsonlPath, "{not json\n");
+      const newContent = readFileSync(jsonlPath, "utf-8");
+
+      const manifest = readManifest(exportPath);
+      const target = manifest.sessions.find((s) => s.sessionId === sessionId)!;
+      target.integrityHash = computeIntegrityHash([newContent]);
+      writeManifest(exportPath, manifest);
+
+      const targetProjectPath = "/Users/newuser/Projects/newproject";
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+
+      expect(result.success).toBe(false);
+      expect((result as ErrorResult).error).toContain("validation failed");
+
+      // Rollback: no session JSONL landed in the target project dir.
+      const written = readdirSync(
+        join(targetConfigDir, "projects", encodeProjectPath(targetProjectPath))
+      ).filter((f) => f.endsWith(".jsonl"));
+      expect(written).toHaveLength(0);
     });
   });
 
