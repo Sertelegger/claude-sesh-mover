@@ -168,6 +168,10 @@ export async function buildContinuationStream(
 
     for await (const line of rl) {
       if (!line) continue;
+      // Pass-1's count is the snapshot: cap here so lines appended to the
+      // live session between passes are never written, keeping header prose,
+      // written tail, entryCount, and hash mutually consistent.
+      if (index >= total) break;
       if (index >= fromEntryIndex) {
         const chunk = line + "\n";
         hash.update(chunk);

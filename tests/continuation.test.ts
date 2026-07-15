@@ -191,6 +191,26 @@ describe("continuation", () => {
       }
     });
 
+    // Pins the error-latch pattern shared with rewriteJsonlStream and
+    // copyFileWithHash: an output-stream open failure must reject, not crash
+    // the process (unhandled 'error' event) or hang on a missed 'drain'.
+    it("rejects (does not crash or hang) when the output stream errors", async () => {
+      const { buildContinuationStream } = await import("../src/continuation.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-cont-"));
+      try {
+        const src = writeSixEntrySource(dir);
+        await expect(
+          buildContinuationStream({
+            ...common,
+            sourceJsonlPath: src,
+            outputPath: join(dir, "no-such-subdir", "cont.jsonl"),
+          })
+        ).rejects.toThrow();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("rejects when fromEntryIndex is out of range", async () => {
       const { buildContinuationStream } = await import("../src/continuation.js");
       const dir = mkdtempSync(join(tmpdir(), "sesh-cont-"));
