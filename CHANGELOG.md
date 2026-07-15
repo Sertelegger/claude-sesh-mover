@@ -2,6 +2,38 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.4.0] — 2026-07-14
+
+First CI-tested release: a 3-OS test matrix, a streaming rewrite/import/export pipeline for
+large sessions, and a URL-safety fix for cross-family path rewriting.
+
+### Added
+- First CI: 3-OS matrix (Linux/macOS/Windows), dist-freshness gate, and a Windows
+  PowerShell/Git-Bash smoke round-trip (#7).
+- `--progress` flag on `export`/`import`/`migrate` — emits NDJSON progress events on
+  stderr; the stdout JSON result contract is unchanged.
+- Library: `transformLine`, `rewriteJsonlStream`, `computeIntegrityHashFromFile`,
+  `buildContinuationStream`, `extractSummaryFromFile`, `readEntryUuids`, `percentThrottle`,
+  `ProgressEvent`.
+
+### Fixed
+- Free-text tokens preceded by `/` are no longer translated — URLs with unix-root hosts
+  (`http://mnt/e/...`, `//tmp/...`, `file:///...`) now survive cross-family import intact,
+  instead of being mangled by token translation (#8). The fix guards on both the preceding
+  `/` and a domain-character class (`[A-Za-z0-9.-]`) immediately before the match — the
+  domain guard is load-bearing, protecting hosts like `https://example.com/mnt/e/data` from
+  being treated as a bare path. Accepted trade-off: POSIX `//net/share` and `file://` URLs
+  no longer translate in free text.
+
+### Changed
+- **Streaming pipeline** — rewrite/import/export is now O(longest-line) memory per session
+  instead of loading whole sessions into memory; hash format and bundle compatibility are
+  unchanged (#11).
+- Import validation failures now abort before the memory/plans merge step (previously the
+  merge ran first).
+- Dry-run `rewriteReport` JSON gains two additive keys: `adaptationsApplied` and
+  `parseFailures`.
+
 ## [0.3.2] — 2026-07-14
 
 ### Security

@@ -24,6 +24,7 @@ __exportStar(require("./manifest.js"), exports);
 __exportStar(require("./discovery.js"), exports);
 __exportStar(require("./jsonl.js"), exports);
 __exportStar(require("./summary.js"), exports);
+__exportStar(require("./continuation.js"), exports);
 __exportStar(require("./rewriter.js"), exports);
 __exportStar(require("./archiver.js"), exports);
 __exportStar(require("./version-adapters.js"), exports);

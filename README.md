@@ -49,6 +49,8 @@ Move a session from machine A to machine B:
 
 **Migrate** is for same-machine moves (repo relocated, home dir renamed, config dir switched). Don't run it from inside the session being migrated — the CLI blocks this; exit, start a fresh session from an outer directory (e.g. `~/`), and run it there. `--scope current` requires `--session-id`.
 
+`export`, `import`, and `migrate` all accept `--progress`, which emits NDJSON progress events on stderr (one JSON object per line) while leaving stdout's JSON result contract unchanged — useful when driving the CLI directly rather than through the slash commands.
+
 ### Incremental sync between two machines
 
 After one full export → import round-trip, exports to that peer can be incremental: new sessions ship whole, sessions with new messages ship as **continuation sessions** (a new session that starts with a lineage note, followed by only the messages added since the last sync), unchanged sessions are skipped. The export flow offers this automatically once a peer is known.
@@ -67,8 +69,7 @@ Exports are faithful copies of your conversation — they can contain API keys, 
 
 ## Platform support
 
-- **macOS, Linux, WSL1/WSL2** — full support; WSL is auto-detected and paths translate to/from Windows peers (`/home/u/...` ↔ `C:\Users\u\...`, `/mnt/c/...` ↔ `C:\...`), including inside tool output.
-- **Windows (native)** — import works; export isn't battle-tested (PowerShell quoting). PRs welcome.
+- **macOS, Linux, WSL1/WSL2, Windows (native)** — full support; CI runs the test suite on all three OSes plus a PowerShell and Git-Bash export/import smoke round-trip on Windows. WSL is auto-detected and paths translate to/from Windows peers (`/home/u/...` ↔ `C:\Users\u\...`, `/mnt/c/...` ↔ `C:\...`), including inside tool output.
 - Known limitation: in free text, a path containing spaces only translates fully when it's under the project/config/home mappings; structured fields (`cwd`, file-history keys) always translate fully. Details in [`CLAUDE.md`](./CLAUDE.md).
 
 ## Development

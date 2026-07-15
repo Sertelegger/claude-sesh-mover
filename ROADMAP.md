@@ -5,13 +5,6 @@ not scheduled — each stage gets its own design pass before implementation; ver
 are chosen at implementation time. Shipped releases are documented in
 [CHANGELOG.md](./CHANGELOG.md).
 
-## Stream-transform rewriting (candidate)
-
-O(1)-per-session memory for the rewrite/import pipeline. Only matters for very large single
-sessions (hundreds of MB); version number depends on API impact (patch if internal, minor if
-the library API goes async). May instead be absorbed into the hub milestone below, where
-streaming matters most at the transfer boundary.
-
 ## The Hub: cross-machine session index + remote pull
 
 The core problem: working across multiple machines (Windows 11/WSL2, native Linux, macOS),

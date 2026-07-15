@@ -8,6 +8,7 @@ export * from "./manifest.js";
 export * from "./discovery.js";
 export * from "./jsonl.js";
 export * from "./summary.js";
+export * from "./continuation.js";
 export * from "./rewriter.js";
 export * from "./archiver.js";
 export * from "./version-adapters.js";
