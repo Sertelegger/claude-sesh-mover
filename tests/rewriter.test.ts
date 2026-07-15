@@ -862,5 +862,30 @@ describe("rewriter", () => {
         rewriteJsonlStream("/definitely/not/a/real/path.jsonl", null, ctx, {})
       ).rejects.toThrow();
     });
+
+    // Pins the error-latch (outErrored promise raced at every await point):
+    // without it, an output-stream open failure either crashes the process
+    // (unhandled 'error' event) or hangs forever (once(out, "drain") misses
+    // an 'error' that fired before the wait began). Collapsing the
+    // Promise.race wrappers or dropping outErrored?.catch(() => {}) must
+    // turn this test red.
+    it("rejects (does not crash or hang) when the output stream errors", async () => {
+      const { rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const dir = mkdtempSync(join(tmpdir(), "sesh-stream-"));
+      try {
+        const input = join(dir, "in.jsonl");
+        writeFileSync(
+          input,
+          JSON.stringify({ type: "user", cwd: "/mnt/e/GitHub/proj", message: { role: "user", content: "x" } }) + "\n",
+          "utf-8"
+        );
+        await expect(
+          rewriteJsonlStream(input, join(dir, "no-such-subdir", "out.jsonl"), ctx, {})
+        ).rejects.toThrow();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
