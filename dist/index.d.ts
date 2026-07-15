@@ -8,6 +8,7 @@ export * from "./summary.js";
 export * from "./rewriter.js";
 export * from "./archiver.js";
 export * from "./version-adapters.js";
+export * from "./progress.js";
 export * from "./exporter.js";
 export * from "./importer.js";
 export * from "./migrator.js";

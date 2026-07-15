@@ -6,6 +6,7 @@ import {
   copyFileSync,
   appendFileSync,
   rmSync,
+  statSync,
 } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -27,6 +28,7 @@ import {
 } from "./version-adapters.js";
 import { readSyncState, writeSyncState } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
+import { percentThrottle } from "./progress.js";
 import type {
   ImportResult,
   DryRunResult,
@@ -36,6 +38,7 @@ import type {
   SyncStateSessionReceived,
   SyncStateSessionSent,
   SyncStateLineage,
+  ProgressEvent,
 } from "./types.js";
 
 export interface ImportOptions {
@@ -47,6 +50,7 @@ export interface ImportOptions {
   sessionIds?: string[];
   noRegister?: boolean;
   allowDuplicates?: boolean;
+  onProgress?: (ev: ProgressEvent) => void;
 }
 
 export async function importSession(
@@ -61,6 +65,7 @@ export async function importSession(
     sessionIds,
     noRegister,
     allowDuplicates,
+    onProgress,
   } = options;
 
   const warnings: string[] = [];
@@ -229,7 +234,13 @@ export async function importSession(
 
   // Step 3: Verify per-session integrity (before any rewriting)
   const integrityFailedSessions = new Set<string>();
-  for (const session of targetSessions) {
+  for (const [sessionIndex, session] of targetSessions.entries()) {
+    onProgress?.({
+      phase: "import-verify",
+      sessionId: session.sessionId,
+      sessionIndex,
+      sessionCount: targetSessions.length,
+    });
     const jsonlPath = join(
       exportPath,
       "sessions",
@@ -317,7 +328,7 @@ export async function importSession(
   const postRewriteHashes = new Map<string, string>();
 
   try {
-    for (const session of targetSessions) {
+    for (const [sessionIndex, session] of targetSessions.entries()) {
       const newSessionId = sessionIdMap.get(session.sessionId)!;
 
       // Rewrite and write JSONL
@@ -327,11 +338,25 @@ export async function importSession(
         `${session.sessionId}.jsonl`
       );
       if (existsSync(jsonlPath)) {
+        const bytesTotal = statSync(jsonlPath).size;
+        const throttled = onProgress
+          ? percentThrottle(bytesTotal, (percent, bytesProcessed) =>
+              onProgress({
+                phase: "import-rewrite",
+                sessionId: session.sessionId,
+                sessionIndex,
+                sessionCount: targetSessions.length,
+                bytesProcessed,
+                bytesTotal,
+                percent,
+              })
+            )
+          : undefined;
         const streamReport = await rewriteJsonlStream(
           jsonlPath,
           join(targetProjectDir, `${newSessionId}.jsonl`),
           ctx,
-          { adapters, newSessionId, computeHash: true }
+          { adapters, newSessionId, computeHash: true, onProgress: throttled }
         );
         versionAdaptations.push(...streamReport.adaptationsApplied);
         postRewriteHashes.set(session.sessionId, streamReport.outputHash!);

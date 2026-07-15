@@ -12,7 +12,7 @@ function isWithin(child, parent) {
     return rel === "" || (!rel.startsWith("..") && !(0, node_path_1.isAbsolute)(rel));
 }
 async function migrateSession(options) {
-    const { sourceConfigDir, targetConfigDir, sourceProjectPath, targetProjectPath, scope, sessionId, excludeLayers, claudeVersion, dryRun, renameDir, currentCwd, force, } = options;
+    const { sourceConfigDir, targetConfigDir, sourceProjectPath, targetProjectPath, scope, sessionId, excludeLayers, claudeVersion, dryRun, renameDir, currentCwd, force, onProgress, } = options;
     const isSelfMigration = !!currentCwd && isWithin(currentCwd, sourceProjectPath);
     const selfMigrationWarnings = [];
     if (isSelfMigration) {
@@ -49,6 +49,7 @@ async function migrateSession(options) {
             name: "migrate-temp",
             excludeLayers,
             claudeVersion,
+            onProgress,
         };
         const exportResult = scope === "current" && sessionId
             ? await (0, exporter_js_1.exportSession)({ ...exportOpts, sessionId })
@@ -65,6 +66,7 @@ async function migrateSession(options) {
             targetProjectPath,
             targetClaudeVersion: claudeVersion,
             dryRun: !!dryRun,
+            onProgress,
         });
         if (!importResult.success) {
             return importResult;

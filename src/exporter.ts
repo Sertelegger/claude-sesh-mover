@@ -5,6 +5,7 @@ import {
   existsSync,
   createReadStream,
   createWriteStream,
+  statSync,
 } from "node:fs";
 import { join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
@@ -17,6 +18,7 @@ import { extractSummaryFromFile } from "./summary.js";
 import { buildContinuationStream } from "./continuation.js";
 import { computeIncrementalPlan } from "./diff.js";
 import { readEntryUuids } from "./jsonl.js";
+import { percentThrottle } from "./progress.js";
 import type {
   ExportManifest,
   ExportLayer,
@@ -25,6 +27,7 @@ import type {
   SessionManifest,
   DiscoveredSession,
   SyncStateSessionSent,
+  ProgressEvent,
 } from "./types.js";
 
 function copyDirIfExists(srcDir: string, destDir: string): void {
@@ -99,6 +102,7 @@ export interface ExportOptions {
   summaryOverrides?: Record<string, string>; // sessionId -> summary
   incremental?: IncrementalExportOptions;
   noSummary?: boolean;
+  onProgress?: (ev: ProgressEvent) => void;
 }
 
 export async function exportSession(
@@ -116,6 +120,7 @@ export async function exportSession(
     summaryOverrides,
     incremental,
     noSummary,
+    onProgress,
   } = options;
 
   const exportPath = join(outputDir, name);
@@ -160,7 +165,8 @@ export async function exportSession(
     "current",
     summaryOverrides,
     noSummary,
-    incremental
+    incremental,
+    onProgress
   );
 }
 
@@ -177,6 +183,7 @@ export async function exportAllSessions(
     summaryOverrides,
     incremental,
     noSummary,
+    onProgress,
   } = options;
 
   const sessions = discoverSessions(configDir, projectPath);
@@ -199,7 +206,8 @@ export async function exportAllSessions(
     "all",
     summaryOverrides,
     noSummary,
-    incremental
+    incremental,
+    onProgress
   );
 }
 
@@ -213,7 +221,8 @@ async function exportSessions(
   scope: "current" | "all",
   summaryOverrides?: Record<string, string>,
   noSummary?: boolean,
-  incremental?: IncrementalExportOptions
+  incremental?: IncrementalExportOptions,
+  onProgress?: (ev: ProgressEvent) => void
 ): Promise<ExportResult | ErrorResult> {
   const includedLayers = getAllLayers().filter((l) => !excludeLayers.includes(l));
   const warnings: string[] = [];
@@ -244,10 +253,24 @@ async function exportSessions(
     toContinuation = plan.continuation;
   }
 
-  for (const session of toFull) {
+  for (const [sessionIndex, session] of toFull.entries()) {
     const destJsonl = join(exportPath, "sessions", `${session.sessionId}.jsonl`);
+    const bytesTotal = statSync(session.jsonlPath).size;
+    const throttled = onProgress
+      ? percentThrottle(bytesTotal, (percent, bytesProcessed) =>
+          onProgress({
+            phase: "export-copy",
+            sessionId: session.sessionId,
+            sessionIndex,
+            sessionCount: toFull.length,
+            bytesProcessed,
+            bytesTotal,
+            percent,
+          })
+        )
+      : undefined;
     // copyFileWithHash returns "sha256:<hex>" — used directly as the manifest hash
-    const sessionHash = await copyFileWithHash(session.jsonlPath, destJsonl);
+    const sessionHash = await copyFileWithHash(session.jsonlPath, destJsonl, throttled);
 
     const sessionBase = join(configDir, "projects", session.encodedProjectDir, session.sessionId);
     if (includedLayers.includes("subagents")) {
@@ -279,8 +302,14 @@ async function exportSessions(
     });
   }
 
-  for (const item of toContinuation) {
+  for (const [contIndex, item] of toContinuation.entries()) {
     const newSessionId = randomUUID();
+    onProgress?.({
+      phase: "export-copy",
+      sessionId: newSessionId,
+      sessionIndex: contIndex,
+      sessionCount: toContinuation.length,
+    });
     const prevLocal = incremental?.peerSent[item.session.sessionId]?.sentAsSessionId;
     const contDest = join(exportPath, "sessions", `${newSessionId}.jsonl`);
     const { entryCount, integrityHash } = await buildContinuationStream({

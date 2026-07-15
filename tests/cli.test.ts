@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   rmSync,
@@ -33,11 +33,32 @@ describe("cli", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function runCli(args: string, envOverrides?: Record<string, string>): string {
+  // String form (existing call sites): shells out via execSync, returns stdout
+  // only — unchanged behavior. Array form (new): uses spawnSync without a
+  // shell so stdout/stderr are captured separately, for tests that need to
+  // assert on stderr (e.g. --progress NDJSON) without polluting the test
+  // runner's own stderr.
+  function runCli(args: string, envOverrides?: Record<string, string>): string;
+  function runCli(
+    args: string[],
+    envOverrides?: Record<string, string>
+  ): { stdout: string; stderr: string };
+  function runCli(
+    args: string | string[],
+    envOverrides?: Record<string, string>
+  ): string | { stdout: string; stderr: string } {
     const cliPath = join(__dirname, "..", "dist", "cli.js");
+    const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...envOverrides };
+    if (Array.isArray(args)) {
+      const result = spawnSync("node", [cliPath, ...args], {
+        encoding: "utf-8",
+        env,
+      });
+      return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    }
     return execSync(`node "${cliPath}" ${args}`, {
       encoding: "utf-8",
-      env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...envOverrides },
+      env,
     });
   }
 
@@ -199,6 +220,66 @@ describe("cli", () => {
       const third = JSON.parse(runCli(`${base} --suffix`));
       expect(third.success).toBe(true);
       expect(third.archivePath).toMatch(/arch-col-2\.tar\.gz$/);
+    });
+  });
+
+  describe("--progress", () => {
+    it("emits NDJSON progress on stderr while stdout stays one JSON object", () => {
+      const outputDir = join(tempDir, "cli-progress");
+      mkdirSync(outputDir, { recursive: true });
+      const { stdout, stderr } = runCli([
+        "export",
+        "--scope",
+        "all",
+        "--format",
+        "dir",
+        "--name",
+        "progress-test",
+        "--source-config-dir",
+        configDir,
+        "--project-path",
+        "/Users/testuser/Projects/testproject",
+        "--output",
+        outputDir,
+        "--no-summary",
+        "--progress",
+      ]);
+      const result = JSON.parse(stdout); // throws if stdout isn't exactly one JSON doc
+      expect(result.success).toBe(true);
+      const events = stderr
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l));
+      expect(events.length).toBeGreaterThan(0);
+      for (const ev of events) {
+        expect(["export-copy", "archive", "extract", "import-rewrite", "import-verify"]).toContain(
+          ev.phase
+        );
+      }
+      expect(events.some((e) => e.phase === "export-copy" && e.percent === 100)).toBe(true);
+    });
+
+    it("stderr is empty without the flag", () => {
+      const outputDir = join(tempDir, "cli-no-progress");
+      mkdirSync(outputDir, { recursive: true });
+      const { stderr } = runCli([
+        "export",
+        "--scope",
+        "all",
+        "--format",
+        "dir",
+        "--name",
+        "no-progress-test",
+        "--source-config-dir",
+        configDir,
+        "--project-path",
+        "/Users/testuser/Projects/testproject",
+        "--output",
+        outputDir,
+        "--no-summary",
+      ]);
+      expect(stderr.trim()).toBe("");
     });
   });
 

@@ -64,8 +64,13 @@ program
   .option("--incremental", "Produce an incremental export (requires --to or --since)")
   .option("--to <peer>", "Target peer machine id or name (incremental)")
   .option("--since <path>", "Diff against a previous export at <path> (incremental)")
+  .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
     try {
+      const onProgress = opts.progress
+        ? (ev: import("./types.js").ProgressEvent) =>
+            process.stderr.write(JSON.stringify(ev) + "\n")
+        : undefined;
       const configDir = resolveConfigDir(opts.sourceConfigDir);
       const config = loadEffectiveConfig(configDir, process.cwd());
       const scope = parseScope(opts.scope ?? config.export.scope, "export");
@@ -136,7 +141,8 @@ program
         claudeVersion,
         opts.projectPath,
         noSummary,
-        incremental
+        incremental,
+        onProgress
       );
 
       if (result.success) {
@@ -145,6 +151,7 @@ program
           format,
           incremental,
           projectPath: opts.projectPath ?? process.cwd(),
+          onProgress,
         });
       }
 
@@ -165,16 +172,23 @@ program
   .option("--dry-run", "Show changes without applying")
   .option("--no-register", "Skip session index registration")
   .option("--allow-duplicates", "Re-import sessions even if identical content was imported before")
+  .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
     let tempExtractDir: string | undefined;
     try {
+      const onProgress = opts.progress
+        ? (ev: import("./types.js").ProgressEvent) =>
+            process.stderr.write(JSON.stringify(ev) + "\n")
+        : undefined;
       let fromPath = opts.from;
 
       // If archive, extract first
       const archiveFormat = detectArchiveFormat(fromPath);
       if (archiveFormat) {
+        onProgress?.({ phase: "extract", percent: 0 });
         tempExtractDir = mkdtempSync(join(tmpdir(), "sesh-mover-extract-"));
         await extractArchive(fromPath, tempExtractDir);
+        onProgress?.({ phase: "extract", percent: 100 });
         fromPath = tempExtractDir;
       }
 
@@ -190,6 +204,7 @@ program
         sessionIds: opts.sessionId,
         noRegister: !opts.register, // Commander.js --no-register sets opts.register to false
         allowDuplicates: !!opts.allowDuplicates,
+        onProgress,
       });
 
       output(result);
@@ -214,8 +229,13 @@ program
   .option("--dry-run", "Show changes without applying")
   .option("--rename-dir", "Also rename the actual project directory to the target path")
   .option("--force", "Override the self-migration safety block (unsafe — only use when the active Claude Code session is NOT in the source path)")
+  .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
     try {
+      const onProgress = opts.progress
+        ? (ev: import("./types.js").ProgressEvent) =>
+            process.stderr.write(JSON.stringify(ev) + "\n")
+        : undefined;
       const sourceConfigDir = resolveConfigDir(opts.sourceConfigDir);
       const targetConfigDir = resolveConfigDir(opts.targetConfigDir);
       const claudeVersion = getClaudeVersion();
@@ -237,6 +257,7 @@ program
         renameDir: !!opts.renameDir,
         currentCwd: process.cwd(),
         force: !!opts.force,
+        onProgress,
       });
 
       output(result);
@@ -528,7 +549,8 @@ async function doExport(
   claudeVersion: string,
   projectPathOverride?: string,
   noSummary?: boolean,
-  incremental?: import("./exporter.js").IncrementalExportOptions
+  incremental?: import("./exporter.js").IncrementalExportOptions,
+  onProgress?: (ev: import("./types.js").ProgressEvent) => void
 ) {
   // Detect project path from cwd or override
   const projectPath = projectPathOverride ?? process.cwd();
@@ -543,6 +565,7 @@ async function doExport(
       claudeVersion,
       noSummary,
       incremental,
+      onProgress,
     });
   }
 
@@ -556,6 +579,7 @@ async function doExport(
     claudeVersion,
     noSummary,
     incremental,
+    onProgress,
   });
 }
 
@@ -564,8 +588,9 @@ async function finalizeExport(params: {
   format: ExportFormat;
   incremental?: import("./exporter.js").IncrementalExportOptions;
   projectPath: string;
+  onProgress?: (ev: import("./types.js").ProgressEvent) => void;
 }): Promise<void> {
-  const { result, format, incremental, projectPath } = params;
+  const { result, format, incremental, projectPath, onProgress } = params;
   const bundleDir = result.exportPath;
 
   if (format === "archive" || format === "zstd") {
@@ -581,7 +606,9 @@ async function finalizeExport(params: {
     // sent-state is recorded — a failed export must not advance peer heads
     // (those entries would never actually ship, and would be silently
     // skipped on the next incremental export as "already sent").
+    onProgress?.({ phase: "archive", percent: 0 });
     await createArchive(bundleDir, archivePath, compression);
+    onProgress?.({ phase: "archive", percent: 100 });
 
     // Record sync state from the bundle now that the archive exists — the
     // staging dir is still present at this point, so recordSentFromBundle

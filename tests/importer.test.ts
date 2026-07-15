@@ -15,6 +15,7 @@ import type {
   ImportResult,
   DryRunResult,
   ErrorResult,
+  ProgressEvent,
 } from "../src/types.js";
 
 describe("importer", () => {
@@ -92,6 +93,28 @@ describe("importer", () => {
       );
       expect(jsonl).toContain("/Users/newuser/Projects/newproject");
       expect(jsonl).not.toContain("/Users/testuser/Projects/testproject");
+    });
+
+    it("emits import-verify and import-rewrite progress with session context", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const events: ProgressEvent[] = [];
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath: "/Users/newuser/Projects/newproject",
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+        onProgress: (ev) => events.push(ev),
+      });
+      expect(result.success).toBe(true);
+      expect(
+        events.some((e) => e.phase === "import-verify" && e.sessionCount === 1)
+      ).toBe(true);
+      const rewrites = events.filter((e) => e.phase === "import-rewrite");
+      expect(rewrites.length).toBeGreaterThan(0);
+      expect(rewrites[rewrites.length - 1].percent).toBe(100);
+      // throttled: no more events than distinct integer percents + phase starts
+      expect(rewrites.length).toBeLessThanOrEqual(101);
     });
 
     it("dry-run returns report without writing", async () => {

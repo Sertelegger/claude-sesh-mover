@@ -245,6 +245,15 @@ export interface RewriteReport {
     fieldsRewritten: number;
     warnings: string[];
 }
+export interface ProgressEvent {
+    phase: "export-copy" | "import-rewrite" | "import-verify" | "archive" | "extract";
+    sessionId?: string;
+    sessionIndex?: number;
+    sessionCount?: number;
+    bytesProcessed?: number;
+    bytesTotal?: number;
+    percent?: number;
+}
 export interface DiscoveredSession {
     sessionId: string;
     projectPath: string;

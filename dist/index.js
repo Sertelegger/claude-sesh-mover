@@ -27,6 +27,7 @@ __exportStar(require("./summary.js"), exports);
 __exportStar(require("./rewriter.js"), exports);
 __exportStar(require("./archiver.js"), exports);
 __exportStar(require("./version-adapters.js"), exports);
+__exportStar(require("./progress.js"), exports);
 __exportStar(require("./exporter.js"), exports);
 __exportStar(require("./importer.js"), exports);
 __exportStar(require("./migrator.js"), exports);

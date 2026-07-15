@@ -1,4 +1,4 @@
-import type { MigrateResult, ErrorResult, ExportLayer, SessionScope } from "./types.js";
+import type { MigrateResult, ErrorResult, ExportLayer, SessionScope, ProgressEvent } from "./types.js";
 export interface MigrateOptions {
     sourceConfigDir: string;
     targetConfigDir: string;
@@ -16,6 +16,7 @@ export interface MigrateOptions {
     /** Override the self-migration safety block. Only set this when the caller has
      *  verified the active Claude Code session is NOT in `sourceProjectPath`. */
     force?: boolean;
+    onProgress?: (ev: ProgressEvent) => void;
 }
 export declare function migrateSession(options: MigrateOptions): Promise<MigrateResult | ErrorResult>;
 //# sourceMappingURL=migrator.d.ts.map

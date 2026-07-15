@@ -314,6 +314,18 @@ export interface RewriteReport {
   warnings: string[];
 }
 
+// --- Progress ---
+
+export interface ProgressEvent {
+  phase: "export-copy" | "import-rewrite" | "import-verify" | "archive" | "extract";
+  sessionId?: string;
+  sessionIndex?: number;
+  sessionCount?: number;
+  bytesProcessed?: number;
+  bytesTotal?: number;
+  percent?: number;
+}
+
 // --- Discovery ---
 
 export interface DiscoveredSession {

@@ -1,4 +1,4 @@
-import type { ExportLayer, ExportResult, ErrorResult, SyncStateSessionSent } from "./types.js";
+import type { ExportLayer, ExportResult, ErrorResult, SyncStateSessionSent, ProgressEvent } from "./types.js";
 export interface IncrementalExportOptions {
     sourceMachineId: string;
     sourceMachineName: string;
@@ -20,6 +20,7 @@ export interface ExportOptions {
     summaryOverrides?: Record<string, string>;
     incremental?: IncrementalExportOptions;
     noSummary?: boolean;
+    onProgress?: (ev: ProgressEvent) => void;
 }
 export declare function exportSession(options: ExportOptions): Promise<ExportResult | ErrorResult>;
 export declare function exportAllSessions(options: Omit<ExportOptions, "sessionId">): Promise<ExportResult | ErrorResult>;

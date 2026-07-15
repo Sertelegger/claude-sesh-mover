@@ -17,6 +17,7 @@ import type {
   DryRunResult,
   ExportLayer,
   SessionScope,
+  ProgressEvent,
 } from "./types.js";
 
 export interface MigrateOptions {
@@ -36,6 +37,7 @@ export interface MigrateOptions {
   /** Override the self-migration safety block. Only set this when the caller has
    *  verified the active Claude Code session is NOT in `sourceProjectPath`. */
   force?: boolean;
+  onProgress?: (ev: ProgressEvent) => void;
 }
 
 function isWithin(child: string, parent: string): boolean {
@@ -59,6 +61,7 @@ export async function migrateSession(
     renameDir,
     currentCwd,
     force,
+    onProgress,
   } = options;
 
   const isSelfMigration =
@@ -110,6 +113,7 @@ export async function migrateSession(
       name: "migrate-temp",
       excludeLayers,
       claudeVersion,
+      onProgress,
     };
 
     const exportResult =
@@ -131,6 +135,7 @@ export async function migrateSession(
       targetProjectPath,
       targetClaudeVersion: claudeVersion,
       dryRun: !!dryRun,
+      onProgress,
     });
 
     if (!importResult.success) {

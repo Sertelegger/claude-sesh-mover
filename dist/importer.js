@@ -10,8 +10,9 @@ const platform_js_1 = require("./platform.js");
 const version_adapters_js_1 = require("./version-adapters.js");
 const sync_state_js_1 = require("./sync-state.js");
 const jsonl_js_1 = require("./jsonl.js");
+const progress_js_1 = require("./progress.js");
 async function importSession(options) {
-    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, } = options;
+    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, onProgress, } = options;
     const warnings = [];
     // Step 1: Read manifest
     let manifest;
@@ -131,7 +132,13 @@ async function importSession(options) {
     };
     // Step 3: Verify per-session integrity (before any rewriting)
     const integrityFailedSessions = new Set();
-    for (const session of targetSessions) {
+    for (const [sessionIndex, session] of targetSessions.entries()) {
+        onProgress?.({
+            phase: "import-verify",
+            sessionId: session.sessionId,
+            sessionIndex,
+            sessionCount: targetSessions.length,
+        });
         const jsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`);
         if ((0, node_fs_1.existsSync)(jsonlPath)) {
             const actualHash = await (0, manifest_js_1.computeIntegrityHashFromFile)(jsonlPath);
@@ -193,12 +200,24 @@ async function importSession(options) {
     };
     const postRewriteHashes = new Map();
     try {
-        for (const session of targetSessions) {
+        for (const [sessionIndex, session] of targetSessions.entries()) {
             const newSessionId = sessionIdMap.get(session.sessionId);
             // Rewrite and write JSONL
             const jsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`);
             if ((0, node_fs_1.existsSync)(jsonlPath)) {
-                const streamReport = await (0, rewriter_js_1.rewriteJsonlStream)(jsonlPath, (0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`), ctx, { adapters, newSessionId, computeHash: true });
+                const bytesTotal = (0, node_fs_1.statSync)(jsonlPath).size;
+                const throttled = onProgress
+                    ? (0, progress_js_1.percentThrottle)(bytesTotal, (percent, bytesProcessed) => onProgress({
+                        phase: "import-rewrite",
+                        sessionId: session.sessionId,
+                        sessionIndex,
+                        sessionCount: targetSessions.length,
+                        bytesProcessed,
+                        bytesTotal,
+                        percent,
+                    }))
+                    : undefined;
+                const streamReport = await (0, rewriter_js_1.rewriteJsonlStream)(jsonlPath, (0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`), ctx, { adapters, newSessionId, computeHash: true, onProgress: throttled });
                 versionAdaptations.push(...streamReport.adaptationsApplied);
                 postRewriteHashes.set(session.sessionId, streamReport.outputHash);
                 // Strict-validation semantics (previously a post-write re-read in
