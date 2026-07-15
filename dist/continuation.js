@@ -1,9 +1,33 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildContinuationJsonl = buildContinuationJsonl;
+exports.buildContinuationStream = buildContinuationStream;
+const node_fs_1 = require("node:fs");
+const node_readline_1 = require("node:readline");
 const node_crypto_1 = require("node:crypto");
+const node_events_1 = require("node:events");
+const promises_1 = require("node:stream/promises");
+// Shared by string and stream builders so header text can never drift.
+function buildContinuationHeader(input, previousCount, newCount) {
+    const priorLocation = input.previousLocalSessionId
+        ? `live in session \`${input.previousLocalSessionId}\` on this machine`
+        : "are not present on this machine; see the originating machine for context";
+    const content = `[sesh-mover continuation]\n` +
+        `This session continues session \`${input.sourceSessionId}\` from machine \`${input.sourceMachineName}\` (\`${input.sourceMachineId}\`). ` +
+        `The earlier ${previousCount} message(s) ${priorLocation}. ` +
+        `The entries below are the ${newCount} new message(s) appended on the other machine since the last sync.`;
+    return {
+        uuid: (0, node_crypto_1.randomUUID)(),
+        timestamp: new Date().toISOString(),
+        sessionId: input.newSessionId,
+        cwd: input.targetProjectPath ?? "",
+        version: input.claudeVersion,
+        type: "user",
+        message: { role: "user", content },
+    };
+}
 function buildContinuationJsonl(input) {
-    const { originalJsonl, fromEntryIndex, fromEntryUuid, newSessionId, sourceSessionId, sourceMachineId, sourceMachineName, previousLocalSessionId, targetProjectPath, claudeVersion, } = input;
+    const { originalJsonl, fromEntryIndex, fromEntryUuid } = input;
     const lines = originalJsonl.trim().split("\n").filter(Boolean);
     if (fromEntryIndex < 0 || fromEntryIndex >= lines.length) {
         throw new Error(`fromEntryIndex ${fromEntryIndex} out of range (session has ${lines.length} entries)`);
@@ -21,22 +45,108 @@ function buildContinuationJsonl(input) {
     const sliced = lines.slice(fromEntryIndex);
     const newCount = sliced.length;
     const previousCount = fromEntryIndex;
-    const priorLocation = previousLocalSessionId
-        ? `live in session \`${previousLocalSessionId}\` on this machine`
-        : "are not present on this machine; see the originating machine for context";
-    const content = `[sesh-mover continuation]\n` +
-        `This session continues session \`${sourceSessionId}\` from machine \`${sourceMachineName}\` (\`${sourceMachineId}\`). ` +
-        `The earlier ${previousCount} message(s) ${priorLocation}. ` +
-        `The entries below are the ${newCount} new message(s) appended on the other machine since the last sync.`;
-    const header = {
-        uuid: (0, node_crypto_1.randomUUID)(),
-        timestamp: new Date().toISOString(),
-        sessionId: newSessionId,
-        cwd: targetProjectPath ?? "",
-        version: claudeVersion,
-        type: "user",
-        message: { role: "user", content },
-    };
+    const header = buildContinuationHeader(input, previousCount, newCount);
     return [JSON.stringify(header), ...sliced].join("\n") + "\n";
+}
+// Two-pass streaming continuation build. Pass 1 counts lines and verifies
+// the uuid at fromEntryIndex (the header text needs the tail count before
+// any tail line is written). Pass 2 writes header + tail, hashing exactly
+// the written bytes. O(longest line) memory.
+async function buildContinuationStream(input) {
+    const { sourceJsonlPath, outputPath, fromEntryIndex, fromEntryUuid } = input;
+    // Pass 1: count + verify
+    let total = 0;
+    let uuidAtIndex;
+    {
+        const src = (0, node_fs_1.createReadStream)(sourceJsonlPath, { encoding: "utf-8" });
+        const rl = (0, node_readline_1.createInterface)({ input: src, crlfDelay: Infinity });
+        try {
+            for await (const line of rl) {
+                if (!line)
+                    continue;
+                if (total === fromEntryIndex) {
+                    try {
+                        uuidAtIndex = JSON.parse(line).uuid;
+                    }
+                    catch {
+                        uuidAtIndex = undefined;
+                    }
+                }
+                total++;
+            }
+        }
+        finally {
+            rl.close();
+            src.destroy();
+        }
+    }
+    if (fromEntryIndex < 0 || fromEntryIndex >= total) {
+        throw new Error(`fromEntryIndex ${fromEntryIndex} out of range (session has ${total} entries)`);
+    }
+    if (uuidAtIndex !== fromEntryUuid) {
+        throw new Error(`Continuation uuid mismatch: entry at index ${fromEntryIndex} has uuid ${uuidAtIndex ?? "(unparseable)"}, expected ${fromEntryUuid}. The session file changed between diff and slice.`);
+    }
+    const newCount = total - fromEntryIndex;
+    const header = buildContinuationHeader(input, fromEntryIndex, newCount);
+    // Pass 2: write header + tail
+    const hash = (0, node_crypto_1.createHash)("sha256");
+    const out = (0, node_fs_1.createWriteStream)(outputPath, { encoding: "utf-8" });
+    const src = (0, node_fs_1.createReadStream)(sourceJsonlPath, { encoding: "utf-8" });
+    const rl = (0, node_readline_1.createInterface)({ input: src, crlfDelay: Infinity });
+    let index = 0;
+    let entryCount = 0;
+    // A write-stream failure (bad output dir, disk full, EACCES) needs three
+    // guards, or it either crashes the process or hangs forever — mirrors
+    // rewriter.ts's rewriteJsonlStream (see the comment there for the full
+    // rationale):
+    // (1) With zero 'error' listeners it's an "unhandled error event" that
+    //     crashes the process outright — out.once("error", reject) below
+    //     doubles as that listener.
+    // (2) once(out, "drain") only reacts to an 'error' that fires *after* we
+    //     start waiting on it — if the stream already errored (and destroyed
+    //     itself, e.g. on open failure) before we reach that await, the wait
+    //     hangs forever. Latching the first 'error' into a promise and racing
+    //     it at every await point fixes this: once rejected, it stays
+    //     rejected, so racing it after the fact still wins instantly.
+    // (3) The promise from (2) is only "consumed" once raced below, which
+    //     can't happen before the first tail line (or the header write) is
+    //     reached. If the output errors first, Node sees a rejected promise
+    //     with no handler yet and crashes with an unhandled-rejection error.
+    //     The no-op catch marks it handled immediately without swallowing the
+    //     rejection for the real race later.
+    const outErrored = new Promise((_, reject) => out.once("error", reject));
+    outErrored.catch(() => { });
+    try {
+        const headerLine = JSON.stringify(header) + "\n";
+        hash.update(headerLine);
+        if (!out.write(headerLine)) {
+            await Promise.race([(0, node_events_1.once)(out, "drain"), outErrored]);
+        }
+        entryCount++;
+        for await (const line of rl) {
+            if (!line)
+                continue;
+            if (index >= fromEntryIndex) {
+                const chunk = line + "\n";
+                hash.update(chunk);
+                if (!out.write(chunk)) {
+                    await Promise.race([(0, node_events_1.once)(out, "drain"), outErrored]);
+                }
+                entryCount++;
+            }
+            index++;
+        }
+        out.end();
+        await Promise.race([(0, promises_1.finished)(out), outErrored]);
+    }
+    catch (e) {
+        out.destroy();
+        throw e;
+    }
+    finally {
+        rl.close();
+        src.destroy();
+    }
+    return { entryCount, integrityHash: `sha256:${hash.digest("hex")}` };
 }
 //# sourceMappingURL=continuation.js.map

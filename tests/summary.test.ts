@@ -1,4 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 describe("summary", () => {
   describe("extractSummary", () => {
@@ -108,6 +111,68 @@ describe("summary", () => {
       ];
       const exchanges = extractFirstExchanges(entries, 2);
       expect(exchanges).toHaveLength(2);
+    });
+  });
+
+  describe("extractSummaryFromFile", () => {
+    it("short-circuits on a meaningful slug without reading the file", async () => {
+      const { extractSummaryFromFile } = await import("../src/summary.js");
+      // nonexistent path proves no read happens
+      expect(await extractSummaryFromFile("real-slug", "/nonexistent/x.jsonl")).toBe(
+        "real-slug"
+      );
+    });
+
+    it("matches extractSummary for generic slugs (first user string message wins)", async () => {
+      const { extractSummary, extractSummaryFromFile } = await import("../src/summary.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-sum-"));
+      try {
+        const entries = [
+          { type: "assistant", message: { content: [{ type: "text", text: "assistant first" }] } },
+          { type: "user", message: { role: "user", content: "the user message" } },
+        ];
+        const file = join(dir, "s.jsonl");
+        writeFileSync(file, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+        expect(await extractSummaryFromFile("new-session", file)).toBe(
+          extractSummary("new-session", entries)
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("falls back to first assistant text, then placeholder", async () => {
+      const { extractSummaryFromFile } = await import("../src/summary.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-sum-"));
+      try {
+        const assistantOnly = [
+          {
+            type: "assistant",
+            message: {
+              model: "claude",
+              id: "1",
+              content: [{ type: "text", text: "Assistant only reply" }],
+            },
+          },
+        ];
+        const assistantFile = join(dir, "assistant-only.jsonl");
+        writeFileSync(
+          assistantFile,
+          assistantOnly.map((e) => JSON.stringify(e)).join("\n") + "\n",
+          "utf-8"
+        );
+        expect(await extractSummaryFromFile("new-session", assistantFile)).toBe(
+          "Assistant only reply"
+        );
+
+        const emptyFile = join(dir, "empty.jsonl");
+        writeFileSync(emptyFile, "", "utf-8");
+        expect(await extractSummaryFromFile("new-session", emptyFile)).toBe(
+          "(no summary available)"
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 });

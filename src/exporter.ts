@@ -1,19 +1,22 @@
 import {
   mkdirSync,
   copyFileSync,
-  readFileSync,
-  writeFileSync,
   readdirSync,
   existsSync,
+  createReadStream,
+  createWriteStream,
 } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { writeManifest, computeIntegrityHash } from "./manifest.js";
+import { randomUUID, createHash } from "node:crypto";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
+import { writeManifest } from "./manifest.js";
 import { discoverSessions } from "./discovery.js";
 import { detectPlatform } from "./platform.js";
-import { extractSummary } from "./summary.js";
-import { buildContinuationJsonl } from "./continuation.js";
+import { extractSummaryFromFile } from "./summary.js";
+import { buildContinuationStream } from "./continuation.js";
 import { computeIncrementalPlan } from "./diff.js";
+import { readEntryUuids } from "./jsonl.js";
 import type {
   ExportManifest,
   ExportLayer,
@@ -30,6 +33,48 @@ function copyDirIfExists(srcDir: string, destDir: string): void {
   for (const file of readdirSync(srcDir)) {
     copyFileSync(join(srcDir, file), join(destDir, file));
   }
+}
+
+// Stream copy with a sha256 tee: the copy and the manifest hash in one pass,
+// O(chunk) memory. onBytes reports cumulative bytes for progress.
+async function copyFileWithHash(
+  src: string,
+  dest: string,
+  onBytes?: (bytesProcessed: number) => void
+): Promise<string> {
+  const hash = createHash("sha256");
+  const input = createReadStream(src);
+  const output = createWriteStream(dest);
+  let bytes = 0;
+  // Same error-latch hardening as rewriter.ts's rewriteJsonlStream and
+  // continuation.ts's buildContinuationStream: without racing a latched
+  // 'error' promise at both await points, a write failure (bad dest dir,
+  // disk full, EACCES) either crashes the process (unhandled 'error' event)
+  // or hangs forever (once(output, "drain") missing an 'error' that fired
+  // before the wait began).
+  const outputErrored: Promise<never> = new Promise<never>((_, reject) =>
+    output.once("error", reject)
+  );
+  outputErrored.catch(() => {});
+  try {
+    for await (const chunk of input) {
+      const buf = chunk as Buffer;
+      hash.update(buf);
+      bytes += buf.length;
+      if (!output.write(buf)) {
+        await Promise.race([once(output, "drain"), outputErrored]);
+      }
+      onBytes?.(bytes);
+    }
+    output.end();
+    await Promise.race([finished(output), outputErrored]);
+  } catch (e) {
+    output.destroy();
+    throw e;
+  } finally {
+    input.destroy();
+  }
+  return `sha256:${hash.digest("hex")}`;
 }
 
 export interface IncrementalExportOptions {
@@ -185,23 +230,14 @@ async function exportSessions(
   }> = [];
 
   if (incremental) {
+    const uuidsBySession = new Map<string, Array<{ uuid: string }>>();
+    for (const session of sessions) {
+      uuidsBySession.set(session.sessionId, await readEntryUuids(session.jsonlPath));
+    }
     const plan = computeIncrementalPlan(
       sessions,
       incremental.peerSent,
-      (session) => {
-        const raw = readFileSync(session.jsonlPath, "utf-8");
-        return raw
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => {
-            try {
-              return { uuid: (JSON.parse(line) as { uuid: string }).uuid };
-            } catch {
-              return { uuid: "" };
-            }
-          });
-      }
+      (session) => uuidsBySession.get(session.sessionId)!
     );
     warnings.push(...plan.warnings);
     toFull = plan.full;
@@ -209,11 +245,9 @@ async function exportSessions(
   }
 
   for (const session of toFull) {
-    const jsonlContent = readFileSync(session.jsonlPath, "utf-8");
-    writeFileSync(
-      join(exportPath, "sessions", `${session.sessionId}.jsonl`),
-      jsonlContent
-    );
+    const destJsonl = join(exportPath, "sessions", `${session.sessionId}.jsonl`);
+    // copyFileWithHash returns "sha256:<hex>" — used directly as the manifest hash
+    const sessionHash = await copyFileWithHash(session.jsonlPath, destJsonl);
 
     const sessionBase = join(configDir, "projects", session.encodedProjectDir, session.sessionId);
     if (includedLayers.includes("subagents")) {
@@ -226,26 +260,10 @@ async function exportSessions(
       copyDirIfExists(join(configDir, "file-history", session.sessionId), join(exportPath, "file-history", session.sessionId));
     }
 
-    const entries = noSummary
-      ? []
-      : jsonlContent
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => {
-            try {
-              return JSON.parse(line);
-            } catch {
-              return null;
-            }
-          })
-          .filter(Boolean);
-
     const summary = noSummary
       ? session.slug
       : summaryOverrides?.[session.sessionId] ??
-        extractSummary(session.slug, entries);
-    const sessionHash = computeIntegrityHash([jsonlContent]);
+        (await extractSummaryFromFile(session.slug, session.jsonlPath));
 
     sessionManifests.push({
       sessionId: session.sessionId,
@@ -262,11 +280,12 @@ async function exportSessions(
   }
 
   for (const item of toContinuation) {
-    const originalJsonl = readFileSync(item.session.jsonlPath, "utf-8");
     const newSessionId = randomUUID();
     const prevLocal = incremental?.peerSent[item.session.sessionId]?.sentAsSessionId;
-    const continuationJsonl = buildContinuationJsonl({
-      originalJsonl,
+    const contDest = join(exportPath, "sessions", `${newSessionId}.jsonl`);
+    const { entryCount, integrityHash } = await buildContinuationStream({
+      sourceJsonlPath: item.session.jsonlPath,
+      outputPath: contDest,
       fromEntryIndex: item.fromEntryIndex,
       fromEntryUuid: item.fromEntryUuid,
       newSessionId,
@@ -277,10 +296,6 @@ async function exportSessions(
       targetProjectPath: projectPath,
       claudeVersion,
     });
-    writeFileSync(
-      join(exportPath, "sessions", `${newSessionId}.jsonl`),
-      continuationJsonl
-    );
 
     const contBase = join(configDir, "projects", item.session.encodedProjectDir, item.session.sessionId);
     if (includedLayers.includes("subagents")) {
@@ -293,19 +308,16 @@ async function exportSessions(
       copyDirIfExists(join(configDir, "file-history", item.session.sessionId), join(exportPath, "file-history", newSessionId));
     }
 
-    const sessionHash = computeIntegrityHash([continuationJsonl]);
-    const newEntryCount = continuationJsonl.trim().split("\n").filter(Boolean).length;
-
     sessionManifests.push({
       sessionId: newSessionId,
       slug: item.session.slug,
       summary: `continuation of ${item.session.slug}`,
       createdAt: new Date().toISOString(),
       lastActiveAt: item.session.lastActiveAt,
-      messageCount: newEntryCount,
+      messageCount: entryCount,
       gitBranch: item.session.gitBranch,
       entrypoint: item.session.entrypoint,
-      integrityHash: sessionHash,
+      integrityHash,
       type: "continuation",
       continuation: {
         continuesLocalSessionId: item.session.sessionId,

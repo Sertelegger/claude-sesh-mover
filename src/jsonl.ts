@@ -1,4 +1,5 @@
-import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, openSync, readSync, statSync } from "node:fs";
+import { createInterface } from "node:readline";
 
 const CHUNK = 4096;
 // A single JSONL line larger than this is treated as unreadable (return null)
@@ -100,4 +101,28 @@ export function readLastEntryUuid(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+// Streaming uuid scan for incremental-plan diffing: one small object per
+// line instead of the whole file in memory.
+export async function readEntryUuids(
+  jsonlPath: string
+): Promise<Array<{ uuid: string }>> {
+  const uuids: Array<{ uuid: string }> = [];
+  const input = createReadStream(jsonlPath, { encoding: "utf-8" });
+  const rl = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (!line) continue;
+      try {
+        uuids.push({ uuid: (JSON.parse(line) as { uuid?: string }).uuid ?? "" });
+      } catch {
+        uuids.push({ uuid: "" });
+      }
+    }
+  } finally {
+    rl.close();
+    input.destroy();
+  }
+  return uuids;
 }

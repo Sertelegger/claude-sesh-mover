@@ -102,4 +102,18 @@ describe("jsonl", () => {
     const p = write("empty2.jsonl", "");
     expect(readLastJsonlLine(p)).toBeNull();
   });
+
+  describe("readEntryUuids", () => {
+    it("returns one {uuid} per line, empty string for unparseable lines", async () => {
+      const { readEntryUuids } = await import("../src/jsonl.js");
+      const p = write("uuids.jsonl", '{"uuid":"a"}\n{bad\n{"uuid":"c"}\n');
+      expect(await readEntryUuids(p)).toEqual([{ uuid: "a" }, { uuid: "" }, { uuid: "c" }]);
+    });
+
+    it("skips empty lines", async () => {
+      const { readEntryUuids } = await import("../src/jsonl.js");
+      const p = write("uuids-blank.jsonl", '{"uuid":"a"}\n\n{"uuid":"b"}\n');
+      expect(await readEntryUuids(p)).toEqual([{ uuid: "a" }, { uuid: "b" }]);
+    });
+  });
 });

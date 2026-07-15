@@ -11,4 +11,12 @@ export interface ContinuationInput {
     claudeVersion: string;
 }
 export declare function buildContinuationJsonl(input: ContinuationInput): string;
+export interface ContinuationStreamInput extends Omit<ContinuationInput, "originalJsonl"> {
+    sourceJsonlPath: string;
+    outputPath: string;
+}
+export declare function buildContinuationStream(input: ContinuationStreamInput): Promise<{
+    entryCount: number;
+    integrityHash: string;
+}>;
 //# sourceMappingURL=continuation.d.ts.map

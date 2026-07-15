@@ -4,7 +4,9 @@ exports.readFirstJsonlLine = readFirstJsonlLine;
 exports.readLastJsonlLine = readLastJsonlLine;
 exports.countJsonlLines = countJsonlLines;
 exports.readLastEntryUuid = readLastEntryUuid;
+exports.readEntryUuids = readEntryUuids;
 const node_fs_1 = require("node:fs");
+const node_readline_1 = require("node:readline");
 const CHUNK = 4096;
 // A single JSONL line larger than this is treated as unreadable (return null)
 // rather than ballooning memory — same fallback the callers already handle.
@@ -120,5 +122,29 @@ function readLastEntryUuid(path) {
     catch {
         return null;
     }
+}
+// Streaming uuid scan for incremental-plan diffing: one small object per
+// line instead of the whole file in memory.
+async function readEntryUuids(jsonlPath) {
+    const uuids = [];
+    const input = (0, node_fs_1.createReadStream)(jsonlPath, { encoding: "utf-8" });
+    const rl = (0, node_readline_1.createInterface)({ input, crlfDelay: Infinity });
+    try {
+        for await (const line of rl) {
+            if (!line)
+                continue;
+            try {
+                uuids.push({ uuid: JSON.parse(line).uuid ?? "" });
+            }
+            catch {
+                uuids.push({ uuid: "" });
+            }
+        }
+    }
+    finally {
+        rl.close();
+        input.destroy();
+    }
+    return uuids;
 }
 //# sourceMappingURL=jsonl.js.map
