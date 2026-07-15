@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, createReadStream } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type { ExportManifest } from "./types.js";
@@ -60,6 +60,18 @@ export function computeIntegrityHash(contents: string[]): string {
   const hash = createHash("sha256");
   for (const content of contents) {
     hash.update(content);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+// Streaming twin of computeIntegrityHash: sha256 over raw file bytes.
+// For valid UTF-8 files (all session JSONL) this yields the same digest as
+// computeIntegrityHash([readFileSync(path, "utf-8")]) — hash.update(string)
+// encodes utf-8 — so manifests from pre-streaming exports keep verifying.
+export async function computeIntegrityHashFromFile(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) {
+    hash.update(chunk as Buffer);
   }
   return `sha256:${hash.digest("hex")}`;
 }

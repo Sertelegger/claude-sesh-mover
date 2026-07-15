@@ -1,4 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function wslToWinCtx() {
   return (async () => {
@@ -725,6 +728,139 @@ describe("rewriter", () => {
       expect(r.line).toBe("{not json");
       expect(r.parseError).toBeTruthy();
       expect(r.changed).toBe(false);
+    });
+  });
+
+  describe("rewriteJsonlStream", () => {
+    function makeJsonl(lines: Array<Record<string, unknown> | string>): string {
+      return (
+        lines.map((l) => (typeof l === "string" ? l : JSON.stringify(l))).join("\n") + "\n"
+      );
+    }
+
+    it("output is byte-identical to rewriteJsonl and reports match", async () => {
+      const { rewriteJsonl, rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const content = makeJsonl([
+        { type: "user", cwd: "/mnt/e/GitHub/proj", message: { role: "user", content: "hi" } },
+        {
+          type: "user",
+          cwd: "/mnt/e/GitHub/proj",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "t1", content: "at /mnt/e/GitHub/proj/src/a.ts" }],
+          },
+          toolUseResult: { stdout: "/tmp/out.log", stderr: "" },
+        },
+        "{unparseable",
+        { type: "file-history-snapshot", snapshot: { trackedFileBackups: { "/mnt/e/GitHub/proj/a.ts": { v: 1 } } } },
+      ]);
+      const dir = mkdtempSync(join(tmpdir(), "sesh-stream-"));
+      try {
+        const input = join(dir, "in.jsonl");
+        const output = join(dir, "out.jsonl");
+        writeFileSync(input, content, "utf-8");
+
+        const stringResult = rewriteJsonl(content, ctx, "new-id");
+        const streamReport = await rewriteJsonlStream(input, output, ctx, {
+          newSessionId: "new-id",
+          computeHash: true,
+        });
+
+        expect(readFileSync(output, "utf-8")).toBe(stringResult.rewritten);
+        expect(streamReport.entriesRewritten).toBe(stringResult.report.entriesRewritten);
+        expect(streamReport.fieldsRewritten).toBe(stringResult.report.fieldsRewritten);
+        expect(streamReport.warnings).toEqual(stringResult.report.warnings);
+        expect(streamReport.parseFailures).toBe(1);
+
+        const { computeIntegrityHash } = await import("../src/manifest.js");
+        expect(streamReport.outputHash).toBe(computeIntegrityHash([stringResult.rewritten]));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("report-only mode (null output) writes nothing and still reports", async () => {
+      const { rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const dir = mkdtempSync(join(tmpdir(), "sesh-stream-"));
+      try {
+        const input = join(dir, "in.jsonl");
+        writeFileSync(
+          input,
+          JSON.stringify({ type: "user", cwd: "/mnt/e/GitHub/proj", message: { role: "user", content: "x" } }) + "\n",
+          "utf-8"
+        );
+        const report = await rewriteJsonlStream(input, null, ctx, {});
+        expect(report.entriesRewritten).toBe(1);
+        expect(readFileSync(input, "utf-8")).toContain("/mnt/e/GitHub/proj"); // input untouched
+        expect(existsSync(join(dir, "out.jsonl"))).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("emits monotonically non-decreasing progress ending at the file size", async () => {
+      const { rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const dir = mkdtempSync(join(tmpdir(), "sesh-stream-"));
+      try {
+        const input = join(dir, "in.jsonl");
+        const lines = Array.from({ length: 500 }, (_, i) =>
+          JSON.stringify({ type: "user", uuid: `u${i}`, cwd: "/mnt/e/GitHub/proj", message: { role: "user", content: `msg ${i}` } })
+        );
+        const content = lines.join("\n") + "\n";
+        writeFileSync(input, content, "utf-8");
+        const calls: Array<[number, number]> = [];
+        await rewriteJsonlStream(input, join(dir, "out.jsonl"), ctx, {
+          onProgress: (b, t) => calls.push([b, t]),
+        });
+        expect(calls.length).toBe(500);
+        for (let i = 1; i < calls.length; i++) {
+          expect(calls[i][0]).toBeGreaterThanOrEqual(calls[i - 1][0]);
+        }
+        expect(calls[calls.length - 1][0]).toBe(Buffer.byteLength(content, "utf8"));
+        expect(calls[0][1]).toBe(Buffer.byteLength(content, "utf8"));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("handles a large synthetic session correctly (10k lines incl. a long line)", async () => {
+      const { rewriteJsonl, rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const dir = mkdtempSync(join(tmpdir(), "sesh-stream-"));
+      try {
+        const input = join(dir, "in.jsonl");
+        const big = "x".repeat(512 * 1024); // one 512KB line
+        const lines = Array.from({ length: 10_000 }, (_, i) =>
+          JSON.stringify({
+            type: "user",
+            uuid: `u${i}`,
+            cwd: "/mnt/e/GitHub/proj",
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: `t${i}`, content: i === 5000 ? big : `out /mnt/e/GitHub/proj/f${i}.ts` }],
+            },
+          })
+        );
+        const content = lines.join("\n") + "\n";
+        writeFileSync(input, content, "utf-8");
+        const output = join(dir, "out.jsonl");
+        const report = await rewriteJsonlStream(input, output, ctx, { newSessionId: "big-new" });
+        expect(report.entriesRewritten).toBe(10_000);
+        expect(readFileSync(output, "utf-8")).toBe(rewriteJsonl(content, ctx, "big-new").rewritten);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects on unreadable input (error propagation)", async () => {
+      const { rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      await expect(
+        rewriteJsonlStream("/definitely/not/a/real/path.jsonl", null, ctx, {})
+      ).rejects.toThrow();
     });
   });
 });

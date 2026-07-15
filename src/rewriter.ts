@@ -1,3 +1,8 @@
+import { createReadStream, createWriteStream, statSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
 import { applyAdapters } from "./version-adapters.js";
 import type { PathMapping, RewriteReport, Platform, VersionAdapter } from "./types.js";
 import { samePlatformFamily, translatePath } from "./platform.js";
@@ -323,5 +328,118 @@ export function rewriteJsonl(
   return {
     rewritten: rewrittenLines.join("\n") + "\n",
     report: { mappings: ctx.mappings, entriesRewritten, fieldsRewritten, warnings },
+  };
+}
+
+export interface RewriteStreamOptions {
+  adapters?: VersionAdapter[];
+  newSessionId?: string;
+  onProgress?: (bytesProcessed: number, bytesTotal: number) => void;
+  computeHash?: boolean;
+}
+
+export interface RewriteStreamReport extends RewriteReport {
+  outputHash?: string;
+  adaptationsApplied: string[];
+  parseFailures: number;
+}
+
+// Streaming twin of rewriteJsonl: O(longest line) memory instead of O(file).
+// outputPath null = report-only (dry-run preview): full transform + report,
+// nothing written. Backpressure honored (awaits drain). Unparseable lines are
+// passed through verbatim with a warning, mirroring rewriteJsonl; import-level
+// strictness on parse failures is the CALLER's job (see importer.ts).
+export async function rewriteJsonlStream(
+  inputPath: string,
+  outputPath: string | null,
+  ctx: RewriteContext,
+  opts: RewriteStreamOptions = {}
+): Promise<RewriteStreamReport> {
+  const bytesTotal = statSync(inputPath).size;
+  let bytesProcessed = 0;
+  let entriesRewritten = 0;
+  let fieldsRewritten = 0;
+  let parseFailures = 0;
+  const warnings: string[] = [];
+  const adaptationsApplied: string[] = [];
+  const hash = opts.computeHash && outputPath ? createHash("sha256") : null;
+
+  const input = createReadStream(inputPath, { encoding: "utf-8" });
+  const rl = createInterface({ input, crlfDelay: Infinity });
+  const out = outputPath ? createWriteStream(outputPath, { encoding: "utf-8" }) : null;
+  // A write-stream failure (bad output dir, disk full, EACCES) needs three
+  // guards, or it either crashes the process or hangs forever:
+  // (1) With zero 'error' listeners it's an "unhandled error event" that
+  //     crashes the process outright — out.once("error", reject) below
+  //     doubles as that listener.
+  // (2) once(out, "drain") only reacts to an 'error' that fires *after* we
+  //     start waiting on it — if the stream already errored (and destroyed
+  //     itself, e.g. on open failure) before we reach that await, the wait
+  //     hangs forever. Latching the first 'error' into a promise and racing
+  //     it at every await point fixes this: once rejected, it stays
+  //     rejected, so racing it after the fact still wins instantly.
+  // (3) The promise from (2) is only "consumed" once raced below, which
+  //     can't happen before the input stream yields its first line. If the
+  //     output errors first, Node sees a rejected promise with no handler
+  //     yet and crashes with an unhandled-rejection error. The no-op catch
+  //     marks it handled immediately without swallowing the rejection for
+  //     the real race later.
+  const outErrored: Promise<never> | null = out
+    ? new Promise<never>((_, reject) => out.once("error", reject))
+    : null;
+  outErrored?.catch(() => {});
+
+  try {
+    for await (const line of rl) {
+      // readline strips the terminator; count it back for progress (LF assumed).
+      bytesProcessed += Buffer.byteLength(line, "utf8") + 1;
+      if (!line) continue; // mirror rewriteJsonl's filter(Boolean)
+
+      const r = transformLine(line, ctx, {
+        adapters: opts.adapters,
+        newSessionId: opts.newSessionId,
+      });
+      let outLine: string;
+      if (r.parseFailed) {
+        parseFailures++;
+        warnings.push(`Failed to parse JSONL line: ${r.parseError}`);
+        outLine = line; // preserve unparseable lines
+      } else {
+        if (r.changed) {
+          entriesRewritten++;
+          fieldsRewritten += r.fieldsChanged;
+        }
+        adaptationsApplied.push(...r.adaptationsApplied);
+        outLine = r.line;
+      }
+
+      const chunk = outLine + "\n";
+      hash?.update(chunk);
+      if (out && !out.write(chunk)) {
+        await Promise.race([once(out, "drain"), outErrored as Promise<never>]);
+      }
+      opts.onProgress?.(Math.min(bytesProcessed, bytesTotal), bytesTotal);
+    }
+
+    if (out) {
+      out.end();
+      await Promise.race([finished(out), outErrored as Promise<never>]);
+    }
+  } catch (e) {
+    out?.destroy();
+    throw e;
+  } finally {
+    rl.close();
+    input.destroy();
+  }
+
+  return {
+    mappings: ctx.mappings,
+    entriesRewritten,
+    fieldsRewritten,
+    warnings,
+    adaptationsApplied,
+    parseFailures,
+    outputHash: hash ? `sha256:${hash.digest("hex")}` : undefined,
   };
 }

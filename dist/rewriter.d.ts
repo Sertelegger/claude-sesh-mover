@@ -27,4 +27,16 @@ export declare function rewriteJsonl(jsonlContent: string, ctx: RewriteContext, 
     rewritten: string;
     report: RewriteReport;
 };
+export interface RewriteStreamOptions {
+    adapters?: VersionAdapter[];
+    newSessionId?: string;
+    onProgress?: (bytesProcessed: number, bytesTotal: number) => void;
+    computeHash?: boolean;
+}
+export interface RewriteStreamReport extends RewriteReport {
+    outputHash?: string;
+    adaptationsApplied: string[];
+    parseFailures: number;
+}
+export declare function rewriteJsonlStream(inputPath: string, outputPath: string | null, ctx: RewriteContext, opts?: RewriteStreamOptions): Promise<RewriteStreamReport>;
 //# sourceMappingURL=rewriter.d.ts.map

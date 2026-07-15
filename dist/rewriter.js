@@ -6,6 +6,12 @@ exports.buildPathMappings = buildPathMappings;
 exports.rewriteEntry = rewriteEntry;
 exports.transformLine = transformLine;
 exports.rewriteJsonl = rewriteJsonl;
+exports.rewriteJsonlStream = rewriteJsonlStream;
+const node_fs_1 = require("node:fs");
+const node_readline_1 = require("node:readline");
+const node_crypto_1 = require("node:crypto");
+const node_events_1 = require("node:events");
+const promises_1 = require("node:stream/promises");
 const version_adapters_js_1 = require("./version-adapters.js");
 const platform_js_1 = require("./platform.js");
 // Characters that terminate a path token embedded in free text.
@@ -248,6 +254,98 @@ function rewriteJsonl(jsonlContent, ctx, newSessionId) {
     return {
         rewritten: rewrittenLines.join("\n") + "\n",
         report: { mappings: ctx.mappings, entriesRewritten, fieldsRewritten, warnings },
+    };
+}
+// Streaming twin of rewriteJsonl: O(longest line) memory instead of O(file).
+// outputPath null = report-only (dry-run preview): full transform + report,
+// nothing written. Backpressure honored (awaits drain). Unparseable lines are
+// passed through verbatim with a warning, mirroring rewriteJsonl; import-level
+// strictness on parse failures is the CALLER's job (see importer.ts).
+async function rewriteJsonlStream(inputPath, outputPath, ctx, opts = {}) {
+    const bytesTotal = (0, node_fs_1.statSync)(inputPath).size;
+    let bytesProcessed = 0;
+    let entriesRewritten = 0;
+    let fieldsRewritten = 0;
+    let parseFailures = 0;
+    const warnings = [];
+    const adaptationsApplied = [];
+    const hash = opts.computeHash && outputPath ? (0, node_crypto_1.createHash)("sha256") : null;
+    const input = (0, node_fs_1.createReadStream)(inputPath, { encoding: "utf-8" });
+    const rl = (0, node_readline_1.createInterface)({ input, crlfDelay: Infinity });
+    const out = outputPath ? (0, node_fs_1.createWriteStream)(outputPath, { encoding: "utf-8" }) : null;
+    // A write-stream failure (bad output dir, disk full, EACCES) needs three
+    // guards, or it either crashes the process or hangs forever:
+    // (1) With zero 'error' listeners it's an "unhandled error event" that
+    //     crashes the process outright — out.once("error", reject) below
+    //     doubles as that listener.
+    // (2) once(out, "drain") only reacts to an 'error' that fires *after* we
+    //     start waiting on it — if the stream already errored (and destroyed
+    //     itself, e.g. on open failure) before we reach that await, the wait
+    //     hangs forever. Latching the first 'error' into a promise and racing
+    //     it at every await point fixes this: once rejected, it stays
+    //     rejected, so racing it after the fact still wins instantly.
+    // (3) The promise from (2) is only "consumed" once raced below, which
+    //     can't happen before the input stream yields its first line. If the
+    //     output errors first, Node sees a rejected promise with no handler
+    //     yet and crashes with an unhandled-rejection error. The no-op catch
+    //     marks it handled immediately without swallowing the rejection for
+    //     the real race later.
+    const outErrored = out
+        ? new Promise((_, reject) => out.once("error", reject))
+        : null;
+    outErrored?.catch(() => { });
+    try {
+        for await (const line of rl) {
+            // readline strips the terminator; count it back for progress (LF assumed).
+            bytesProcessed += Buffer.byteLength(line, "utf8") + 1;
+            if (!line)
+                continue; // mirror rewriteJsonl's filter(Boolean)
+            const r = transformLine(line, ctx, {
+                adapters: opts.adapters,
+                newSessionId: opts.newSessionId,
+            });
+            let outLine;
+            if (r.parseFailed) {
+                parseFailures++;
+                warnings.push(`Failed to parse JSONL line: ${r.parseError}`);
+                outLine = line; // preserve unparseable lines
+            }
+            else {
+                if (r.changed) {
+                    entriesRewritten++;
+                    fieldsRewritten += r.fieldsChanged;
+                }
+                adaptationsApplied.push(...r.adaptationsApplied);
+                outLine = r.line;
+            }
+            const chunk = outLine + "\n";
+            hash?.update(chunk);
+            if (out && !out.write(chunk)) {
+                await Promise.race([(0, node_events_1.once)(out, "drain"), outErrored]);
+            }
+            opts.onProgress?.(Math.min(bytesProcessed, bytesTotal), bytesTotal);
+        }
+        if (out) {
+            out.end();
+            await Promise.race([(0, promises_1.finished)(out), outErrored]);
+        }
+    }
+    catch (e) {
+        out?.destroy();
+        throw e;
+    }
+    finally {
+        rl.close();
+        input.destroy();
+    }
+    return {
+        mappings: ctx.mappings,
+        entriesRewritten,
+        fieldsRewritten,
+        warnings,
+        adaptationsApplied,
+        parseFailures,
+        outputHash: hash ? `sha256:${hash.digest("hex")}` : undefined,
     };
 }
 //# sourceMappingURL=rewriter.js.map

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExportManifest } from "../src/types.js";
@@ -211,6 +211,23 @@ describe("manifest", () => {
         };
         writeFileSync(join(dir, "manifest.json"), JSON.stringify(m));
         expect(() => readManifest(dir)).toThrow(/unsafe session id/i);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("computeIntegrityHashFromFile", () => {
+    it("matches the string-based hash for the same content (old bundles keep verifying)", async () => {
+      const { computeIntegrityHash, computeIntegrityHashFromFile } = await import("../src/manifest.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-hash-"));
+      try {
+        const content = '{"uuid":"a","type":"user"}\n{"uuid":"b","type":"assistant"}\n';
+        const file = join(dir, "s.jsonl");
+        writeFileSync(file, content, "utf-8");
+        expect(await computeIntegrityHashFromFile(file)).toBe(
+          computeIntegrityHash([content])
+        );
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

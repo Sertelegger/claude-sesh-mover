@@ -5,6 +5,7 @@ exports.readManifest = readManifest;
 exports.isSafeSessionId = isSafeSessionId;
 exports.assertSafeManifestIds = assertSafeManifestIds;
 exports.computeIntegrityHash = computeIntegrityHash;
+exports.computeIntegrityHashFromFile = computeIntegrityHashFromFile;
 exports.verifyIntegrity = verifyIntegrity;
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
@@ -60,6 +61,17 @@ function computeIntegrityHash(contents) {
     const hash = (0, node_crypto_1.createHash)("sha256");
     for (const content of contents) {
         hash.update(content);
+    }
+    return `sha256:${hash.digest("hex")}`;
+}
+// Streaming twin of computeIntegrityHash: sha256 over raw file bytes.
+// For valid UTF-8 files (all session JSONL) this yields the same digest as
+// computeIntegrityHash([readFileSync(path, "utf-8")]) — hash.update(string)
+// encodes utf-8 — so manifests from pre-streaming exports keep verifying.
+async function computeIntegrityHashFromFile(path) {
+    const hash = (0, node_crypto_1.createHash)("sha256");
+    for await (const chunk of (0, node_fs_1.createReadStream)(path)) {
+        hash.update(chunk);
     }
     return `sha256:${hash.digest("hex")}`;
 }
