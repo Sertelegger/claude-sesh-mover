@@ -1,9 +1,3 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.compareVersions = compareVersions;
-exports.classifyVersionDifference = classifyVersionDifference;
-exports.getApplicableAdapters = getApplicableAdapters;
-exports.applyAdapters = applyAdapters;
 /**
  * Registry of version adapters. Add new adapters here as Claude Code
  * evolves its session format. Keep them ordered by fromVersion.
@@ -24,7 +18,7 @@ const ADAPTER_REGISTRY = [
 //   },
 // },
 ];
-function compareVersions(a, b) {
+export function compareVersions(a, b) {
     const partsA = a.split(".").map(Number);
     const partsB = b.split(".").map(Number);
     for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
@@ -35,7 +29,7 @@ function compareVersions(a, b) {
     }
     return 0;
 }
-function classifyVersionDifference(sourceVersion, targetVersion) {
+export function classifyVersionDifference(sourceVersion, targetVersion) {
     const cmp = compareVersions(sourceVersion, targetVersion);
     if (cmp === 0)
         return "same";
@@ -43,7 +37,7 @@ function classifyVersionDifference(sourceVersion, targetVersion) {
         return "source-newer";
     return "target-newer";
 }
-function getApplicableAdapters(sourceVersion, targetVersion) {
+export function getApplicableAdapters(sourceVersion, targetVersion) {
     if (compareVersions(sourceVersion, targetVersion) >= 0) {
         // Source is same or newer — no upgrade adapters needed
         return [];
@@ -52,7 +46,7 @@ function getApplicableAdapters(sourceVersion, targetVersion) {
     return ADAPTER_REGISTRY.filter((adapter) => compareVersions(adapter.fromVersion, sourceVersion) >= 0 &&
         compareVersions(adapter.toVersion, targetVersion) <= 0);
 }
-function applyAdapters(entry, adapters) {
+export function applyAdapters(entry, adapters) {
     let current = entry;
     const applied = [];
     for (const adapter of adapters) {

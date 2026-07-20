@@ -47,7 +47,7 @@ describe("cli", () => {
     args: string | string[],
     envOverrides?: Record<string, string>
   ): string | { stdout: string; stderr: string } {
-    const cliPath = join(__dirname, "..", "dist", "cli.js");
+    const cliPath = join(import.meta.dirname, "..", "dist", "cli.js");
     const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...envOverrides };
     if (Array.isArray(args)) {
       const result = spawnSync("node", [cliPath, ...args], {
@@ -172,7 +172,7 @@ describe("cli", () => {
       const manifestPath = join(outputDir, "scope-all-test", "manifest.json");
       expect(existsSync(manifestPath)).toBe(true);
       const manifest = JSON.parse(
-        require("node:fs").readFileSync(manifestPath, "utf-8")
+        readFileSync(manifestPath, "utf-8")
       );
       expect(manifest.sessionScope).toBe("all");
     });
@@ -203,7 +203,7 @@ describe("cli", () => {
       const result = JSON.parse(output);
       expect(result.success).toBe(true);
       const manifest = JSON.parse(
-        require("node:fs").readFileSync(join(outputDir, "nosum", "manifest.json"), "utf-8")
+        readFileSync(join(outputDir, "nosum", "manifest.json"), "utf-8")
       );
       expect(manifest.sessions[0].summary).toBe("test-session");
     });
@@ -416,7 +416,7 @@ describe("cli", () => {
 
         let caught: { stdout: string; status: number } | null = null;
         try {
-          const cliPath = join(__dirname, "..", "dist", "cli.js");
+          const cliPath = join(import.meta.dirname, "..", "dist", "cli.js");
           execSync(
             `node "${cliPath}" export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path ${projectPath} --storage user --format zstd --name inc-zstd-fail --output "${outputDir}" --incremental --to peer-1`,
             {
@@ -549,7 +549,7 @@ describe("cli", () => {
       // so keyed-by-LOCAL-id the diff sees it as unchanged → zero sessions.
       // The old bundle-id keying found no record and re-exported it whole.
       const manifest = JSON.parse(
-        require("node:fs").readFileSync(
+        readFileSync(
           join(outputDir, "since-cont", "manifest.json"),
           "utf-8"
         )

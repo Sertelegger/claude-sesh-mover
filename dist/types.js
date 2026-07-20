@@ -1,4 +1,3 @@
-"use strict";
 // --- Platform ---
-Object.defineProperty(exports, "__esModule", { value: true });
+export {};
 //# sourceMappingURL=types.js.map

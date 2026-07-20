@@ -1,26 +1,19 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.readFirstJsonlLine = readFirstJsonlLine;
-exports.readLastJsonlLine = readLastJsonlLine;
-exports.countJsonlLines = countJsonlLines;
-exports.readLastEntryUuid = readLastEntryUuid;
-exports.readEntryUuids = readEntryUuids;
-const node_fs_1 = require("node:fs");
-const node_readline_1 = require("node:readline");
+import { closeSync, createReadStream, existsSync, openSync, readSync, statSync } from "node:fs";
+import { createInterface } from "node:readline";
 const CHUNK = 4096;
 // A single JSONL line larger than this is treated as unreadable (return null)
 // rather than ballooning memory — same fallback the callers already handle.
 const MAX_LINE_BYTES = 1024 * 1024;
-function readFirstJsonlLine(path) {
-    if (!(0, node_fs_1.existsSync)(path))
+export function readFirstJsonlLine(path) {
+    if (!existsSync(path))
         return null;
-    const fd = (0, node_fs_1.openSync)(path, "r");
+    const fd = openSync(path, "r");
     try {
         const chunk = Buffer.alloc(CHUNK);
         let acc = Buffer.alloc(0);
         let pos = 0;
         for (;;) {
-            const bytes = (0, node_fs_1.readSync)(fd, chunk, 0, CHUNK, pos);
+            const bytes = readSync(fd, chunk, 0, CHUNK, pos);
             if (bytes === 0)
                 break;
             acc = Buffer.concat([acc, chunk.subarray(0, bytes)]);
@@ -35,16 +28,16 @@ function readFirstJsonlLine(path) {
         return acc.length > 0 ? acc.toString("utf-8") : null;
     }
     finally {
-        (0, node_fs_1.closeSync)(fd);
+        closeSync(fd);
     }
 }
-function readLastJsonlLine(path) {
-    if (!(0, node_fs_1.existsSync)(path))
+export function readLastJsonlLine(path) {
+    if (!existsSync(path))
         return null;
-    const size = (0, node_fs_1.statSync)(path).size;
+    const size = statSync(path).size;
     if (size === 0)
         return null;
-    const fd = (0, node_fs_1.openSync)(path, "r");
+    const fd = openSync(path, "r");
     try {
         let end = size;
         let acc = Buffer.alloc(0);
@@ -52,7 +45,7 @@ function readLastJsonlLine(path) {
         while (end > 0) {
             const start = Math.max(0, end - CHUNK);
             const chunk = Buffer.alloc(end - start);
-            (0, node_fs_1.readSync)(fd, chunk, 0, end - start, start);
+            readSync(fd, chunk, 0, end - start, start);
             acc = Buffer.concat([chunk, acc]);
             end = start;
             if (!trimmed) {
@@ -76,20 +69,20 @@ function readLastJsonlLine(path) {
         return acc.length > 0 ? acc.toString("utf-8") : null;
     }
     finally {
-        (0, node_fs_1.closeSync)(fd);
+        closeSync(fd);
     }
 }
-function countJsonlLines(path) {
-    if (!(0, node_fs_1.existsSync)(path))
+export function countJsonlLines(path) {
+    if (!existsSync(path))
         return 0;
-    const fd = (0, node_fs_1.openSync)(path, "r");
+    const fd = openSync(path, "r");
     try {
         const chunk = Buffer.alloc(64 * 1024);
         let pos = 0;
         let count = 0;
         let atLineStart = true;
         for (;;) {
-            const bytes = (0, node_fs_1.readSync)(fd, chunk, 0, chunk.length, pos);
+            const bytes = readSync(fd, chunk, 0, chunk.length, pos);
             if (bytes === 0)
                 break;
             for (let i = 0; i < bytes; i++) {
@@ -109,10 +102,10 @@ function countJsonlLines(path) {
         return count;
     }
     finally {
-        (0, node_fs_1.closeSync)(fd);
+        closeSync(fd);
     }
 }
-function readLastEntryUuid(path) {
+export function readLastEntryUuid(path) {
     const line = readLastJsonlLine(path);
     if (!line)
         return null;
@@ -125,10 +118,10 @@ function readLastEntryUuid(path) {
 }
 // Streaming uuid scan for incremental-plan diffing: one small object per
 // line instead of the whole file in memory.
-async function readEntryUuids(jsonlPath) {
+export async function readEntryUuids(jsonlPath) {
     const uuids = [];
-    const input = (0, node_fs_1.createReadStream)(jsonlPath, { encoding: "utf-8" });
-    const rl = (0, node_readline_1.createInterface)({ input, crlfDelay: Infinity });
+    const input = createReadStream(jsonlPath, { encoding: "utf-8" });
+    const rl = createInterface({ input, crlfDelay: Infinity });
     try {
         for await (const line of rl) {
             if (!line)

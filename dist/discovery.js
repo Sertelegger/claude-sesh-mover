@@ -1,23 +1,18 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.discoverSessions = discoverSessions;
-exports.discoverSessionById = discoverSessionById;
-exports.listAllProjects = listAllProjects;
-const node_fs_1 = require("node:fs");
-const node_path_1 = require("node:path");
-const platform_js_1 = require("./platform.js");
-const jsonl_js_1 = require("./jsonl.js");
-function discoverSessions(configDir, projectPath) {
-    const encoded = (0, platform_js_1.encodeProjectPath)(projectPath);
-    const projectDir = (0, node_path_1.join)(configDir, "projects", encoded);
-    if (!(0, node_fs_1.existsSync)(projectDir)) {
+import { readdirSync, existsSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { encodeProjectPath } from "./platform.js";
+import { readFirstJsonlLine, readLastJsonlLine, countJsonlLines, } from "./jsonl.js";
+export function discoverSessions(configDir, projectPath) {
+    const encoded = encodeProjectPath(projectPath);
+    const projectDir = join(configDir, "projects", encoded);
+    if (!existsSync(projectDir)) {
         return [];
     }
     const sessions = [];
-    const files = (0, node_fs_1.readdirSync)(projectDir).filter((f) => f.endsWith(".jsonl"));
+    const files = readdirSync(projectDir).filter((f) => f.endsWith(".jsonl"));
     for (const file of files) {
         const sessionId = file.replace(".jsonl", "");
-        const jsonlPath = (0, node_path_1.join)(projectDir, file);
+        const jsonlPath = join(projectDir, file);
         const session = parseSessionJsonl(jsonlPath, sessionId, projectPath, encoded, configDir);
         if (session) {
             sessions.push(session);
@@ -25,14 +20,14 @@ function discoverSessions(configDir, projectPath) {
     }
     return sessions.sort((a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime());
 }
-function discoverSessionById(configDir, sessionId) {
-    const projectsDir = (0, node_path_1.join)(configDir, "projects");
-    if (!(0, node_fs_1.existsSync)(projectsDir))
+export function discoverSessionById(configDir, sessionId) {
+    const projectsDir = join(configDir, "projects");
+    if (!existsSync(projectsDir))
         return null;
-    const projectDirs = (0, node_fs_1.readdirSync)(projectsDir);
+    const projectDirs = readdirSync(projectsDir);
     for (const encoded of projectDirs) {
-        const jsonlPath = (0, node_path_1.join)(projectsDir, encoded, `${sessionId}.jsonl`);
-        if ((0, node_fs_1.existsSync)(jsonlPath)) {
+        const jsonlPath = join(projectsDir, encoded, `${sessionId}.jsonl`);
+        if (existsSync(jsonlPath)) {
             // Read actual project path from JSONL (encoding is lossy, cannot decode)
             const projectPath = readProjectPathFromJsonl(jsonlPath) ?? encoded;
             const session = parseSessionJsonl(jsonlPath, sessionId, projectPath, encoded, configDir);
@@ -41,20 +36,20 @@ function discoverSessionById(configDir, sessionId) {
     }
     return null;
 }
-function listAllProjects(configDir) {
-    const projectsDir = (0, node_path_1.join)(configDir, "projects");
-    if (!(0, node_fs_1.existsSync)(projectsDir))
+export function listAllProjects(configDir) {
+    const projectsDir = join(configDir, "projects");
+    if (!existsSync(projectsDir))
         return [];
-    const dirs = (0, node_fs_1.readdirSync)(projectsDir);
+    const dirs = readdirSync(projectsDir);
     const projects = [];
     for (const encoded of dirs) {
-        const dirPath = (0, node_path_1.join)(projectsDir, encoded);
-        if (!(0, node_fs_1.statSync)(dirPath).isDirectory())
+        const dirPath = join(projectsDir, encoded);
+        if (!statSync(dirPath).isDirectory())
             continue;
-        const jsonlFiles = (0, node_fs_1.readdirSync)(dirPath).filter((f) => f.endsWith(".jsonl"));
+        const jsonlFiles = readdirSync(dirPath).filter((f) => f.endsWith(".jsonl"));
         if (jsonlFiles.length > 0) {
             // Read actual project path from first session's JSONL (lossy encoding, cannot decode)
-            const firstJsonl = (0, node_path_1.join)(dirPath, jsonlFiles[0]);
+            const firstJsonl = join(dirPath, jsonlFiles[0]);
             const projectPath = readProjectPathFromJsonl(firstJsonl) ?? encoded;
             projects.push({
                 projectPath,
@@ -70,7 +65,7 @@ function listAllProjects(configDir) {
  * This is necessary because the directory encoding (/ -> -) is lossy for hyphenated paths.
  */
 function readProjectPathFromJsonl(jsonlPath) {
-    const firstLine = (0, jsonl_js_1.readFirstJsonlLine)(jsonlPath);
+    const firstLine = readFirstJsonlLine(jsonlPath);
     if (!firstLine)
         return null;
     try {
@@ -82,7 +77,7 @@ function readProjectPathFromJsonl(jsonlPath) {
 }
 function parseSessionJsonl(jsonlPath, sessionId, projectPath, encodedProjectDir, configDir) {
     try {
-        const firstLine = (0, jsonl_js_1.readFirstJsonlLine)(jsonlPath);
+        const firstLine = readFirstJsonlLine(jsonlPath);
         if (!firstLine)
             return null;
         let firstEntry;
@@ -92,7 +87,7 @@ function parseSessionJsonl(jsonlPath, sessionId, projectPath, encodedProjectDir,
         catch {
             return null;
         }
-        const lastLine = (0, jsonl_js_1.readLastJsonlLine)(jsonlPath);
+        const lastLine = readLastJsonlLine(jsonlPath);
         let lastEntry = firstEntry;
         if (lastLine) {
             try {
@@ -102,18 +97,18 @@ function parseSessionJsonl(jsonlPath, sessionId, projectPath, encodedProjectDir,
                 /* keep firstEntry as fallback */
             }
         }
-        const messageCount = (0, jsonl_js_1.countJsonlLines)(jsonlPath);
+        const messageCount = countJsonlLines(jsonlPath);
         if (messageCount === 0)
             return null;
         // Check for subagents
-        const sessionSubDir = (0, node_path_1.join)(configDir, "projects", encodedProjectDir, sessionId, "subagents");
-        const hasSubagents = (0, node_fs_1.existsSync)(sessionSubDir) && (0, node_fs_1.readdirSync)(sessionSubDir).length > 0;
+        const sessionSubDir = join(configDir, "projects", encodedProjectDir, sessionId, "subagents");
+        const hasSubagents = existsSync(sessionSubDir) && readdirSync(sessionSubDir).length > 0;
         // Check for tool results
-        const toolResultsDir = (0, node_path_1.join)(configDir, "projects", encodedProjectDir, sessionId, "tool-results");
-        const hasToolResults = (0, node_fs_1.existsSync)(toolResultsDir) && (0, node_fs_1.readdirSync)(toolResultsDir).length > 0;
+        const toolResultsDir = join(configDir, "projects", encodedProjectDir, sessionId, "tool-results");
+        const hasToolResults = existsSync(toolResultsDir) && readdirSync(toolResultsDir).length > 0;
         // Check for file history
-        const fileHistoryDir = (0, node_path_1.join)(configDir, "file-history", sessionId);
-        const hasFileHistory = (0, node_fs_1.existsSync)(fileHistoryDir) && (0, node_fs_1.readdirSync)(fileHistoryDir).length > 0;
+        const fileHistoryDir = join(configDir, "file-history", sessionId);
+        const hasFileHistory = existsSync(fileHistoryDir) && readdirSync(fileHistoryDir).length > 0;
         return {
             sessionId,
             projectPath,

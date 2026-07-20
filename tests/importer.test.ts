@@ -246,7 +246,7 @@ describe("importer", () => {
           existsSync(projDir) &&
           readdirSync(projDir).some((f) =>
             f.endsWith(".jsonl") &&
-            require("node:fs").readFileSync(join(projDir, f), "utf-8").includes("TOP_SECRET_MARKER")
+            readFileSync(join(projDir, f), "utf-8").includes("TOP_SECRET_MARKER")
           );
         expect(leaked).toBe(false);
       } finally {

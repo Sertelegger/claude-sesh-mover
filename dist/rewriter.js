@@ -1,19 +1,10 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.rewriteString = rewriteString;
-exports.rewriteWholePath = rewriteWholePath;
-exports.buildPathMappings = buildPathMappings;
-exports.rewriteEntry = rewriteEntry;
-exports.transformLine = transformLine;
-exports.rewriteJsonl = rewriteJsonl;
-exports.rewriteJsonlStream = rewriteJsonlStream;
-const node_fs_1 = require("node:fs");
-const node_readline_1 = require("node:readline");
-const node_crypto_1 = require("node:crypto");
-const node_events_1 = require("node:events");
-const promises_1 = require("node:stream/promises");
-const version_adapters_js_1 = require("./version-adapters.js");
-const platform_js_1 = require("./platform.js");
+import { createReadStream, createWriteStream, statSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
+import { applyAdapters } from "./version-adapters.js";
+import { samePlatformFamily, translatePath } from "./platform.js";
 // Characters that terminate a path token embedded in free text.
 // (?<!\/) — a token immediately preceded by "/" is URL-context
 // (http://mnt/..., protocol-relative //tmp/..., file:///mnt/...) and is
@@ -32,8 +23,8 @@ function normalizeSeparators(tail, targetPlatform) {
         ? tail.replace(/\//g, "\\")
         : tail.replace(/\\/g, "/");
 }
-function rewriteString(input, ctx) {
-    const crossFamily = !(0, platform_js_1.samePlatformFamily)(ctx.sourcePlatform, ctx.targetPlatform);
+export function rewriteString(input, ctx) {
+    const crossFamily = !samePlatformFamily(ctx.sourcePlatform, ctx.targetPlatform);
     let result = input;
     // Stage 1: exact mappings (project path, config dir, home), longest first.
     // Cross-family, the tail after the replacement gets its separators
@@ -49,7 +40,7 @@ function rewriteString(input, ctx) {
     // the platform engine (/mnt/<drive>, /tmp, /home, /Users, drive letters).
     if (crossFamily) {
         const tokenRe = ctx.sourcePlatform === "win32" ? WIN_TOKEN : UNIX_TOKEN;
-        result = result.replace(tokenRe, (token) => (0, platform_js_1.translatePath)(token, ctx.sourcePlatform, ctx.targetPlatform, {
+        result = result.replace(tokenRe, (token) => translatePath(token, ctx.sourcePlatform, ctx.targetPlatform, {
             sourceUser: ctx.sourceUser,
             targetUser: ctx.targetUser,
         }));
@@ -62,8 +53,8 @@ function rewriteString(input, ctx) {
 // the first token boundary), so spaces and other non-token characters in the
 // tail still get separator-normalized cross-family. Falls through to the
 // same token-translation engine as rewriteString when no mapping matches.
-function rewriteWholePath(input, ctx) {
-    const crossFamily = !(0, platform_js_1.samePlatformFamily)(ctx.sourcePlatform, ctx.targetPlatform);
+export function rewriteWholePath(input, ctx) {
+    const crossFamily = !samePlatformFamily(ctx.sourcePlatform, ctx.targetPlatform);
     for (const mapping of ctx.mappings) {
         if (input === mapping.from ||
             input.startsWith(mapping.from + "/") ||
@@ -73,14 +64,14 @@ function rewriteWholePath(input, ctx) {
         }
     }
     if (crossFamily) {
-        return (0, platform_js_1.translatePath)(input, ctx.sourcePlatform, ctx.targetPlatform, {
+        return translatePath(input, ctx.sourcePlatform, ctx.targetPlatform, {
             sourceUser: ctx.sourceUser,
             targetUser: ctx.targetUser,
         });
     }
     return input;
 }
-function buildPathMappings(sourcePlatform, targetPlatform, sourceProjectPath, targetProjectPath, sourceConfigDir, targetConfigDir, sourceUser, targetUser) {
+export function buildPathMappings(sourcePlatform, targetPlatform, sourceProjectPath, targetProjectPath, sourceConfigDir, targetConfigDir, sourceUser, targetUser) {
     const mappings = [];
     // Project path mapping (most specific first)
     if (sourceProjectPath !== targetProjectPath) {
@@ -99,7 +90,7 @@ function buildPathMappings(sourcePlatform, targetPlatform, sourceProjectPath, ta
         });
     }
     // Home dir mapping — cross-platform or same-platform different user
-    if (!(0, platform_js_1.samePlatformFamily)(sourcePlatform, targetPlatform)) {
+    if (!samePlatformFamily(sourcePlatform, targetPlatform)) {
         const sourceHome = getHomePath(sourcePlatform, sourceUser);
         const targetHome = getHomePath(targetPlatform, targetUser);
         if (sourceHome !== targetHome) {
@@ -133,7 +124,7 @@ function getHomePath(platform, user) {
         return `/Users/${user}`;
     return `/home/${user}`;
 }
-function rewriteEntry(entry, ctx, newSessionId) {
+export function rewriteEntry(entry, ctx, newSessionId) {
     const result = structuredClone(entry);
     // Rewrite sessionId
     if (newSessionId) {
@@ -193,7 +184,7 @@ function rewriteEntry(entry, ctx, newSessionId) {
 // streaming API (rewriteJsonlStream) are built on: parse once, apply version
 // adapters, rewrite, stringify. Replaces the importer's old double-parse
 // (adapter pass + rewrite pass).
-function transformLine(line, ctx, opts = {}) {
+export function transformLine(line, ctx, opts = {}) {
     let entry;
     try {
         entry = JSON.parse(line);
@@ -210,7 +201,7 @@ function transformLine(line, ctx, opts = {}) {
     }
     let adaptationsApplied = [];
     if (opts.adapters && opts.adapters.length > 0) {
-        const { entry: adapted, applied } = (0, version_adapters_js_1.applyAdapters)(entry, opts.adapters);
+        const { entry: adapted, applied } = applyAdapters(entry, opts.adapters);
         entry = adapted;
         adaptationsApplied = applied;
     }
@@ -234,7 +225,7 @@ function transformLine(line, ctx, opts = {}) {
         parseFailed: false,
     };
 }
-function rewriteJsonl(jsonlContent, ctx, newSessionId) {
+export function rewriteJsonl(jsonlContent, ctx, newSessionId) {
     const lines = jsonlContent.trim().split("\n").filter(Boolean);
     let entriesRewritten = 0;
     let fieldsRewritten = 0;
@@ -261,18 +252,18 @@ function rewriteJsonl(jsonlContent, ctx, newSessionId) {
 // nothing written. Backpressure honored (awaits drain). Unparseable lines are
 // passed through verbatim with a warning, mirroring rewriteJsonl; import-level
 // strictness on parse failures is the CALLER's job (see importer.ts).
-async function rewriteJsonlStream(inputPath, outputPath, ctx, opts = {}) {
-    const bytesTotal = (0, node_fs_1.statSync)(inputPath).size;
+export async function rewriteJsonlStream(inputPath, outputPath, ctx, opts = {}) {
+    const bytesTotal = statSync(inputPath).size;
     let bytesProcessed = 0;
     let entriesRewritten = 0;
     let fieldsRewritten = 0;
     let parseFailures = 0;
     const warnings = [];
     const adaptationsApplied = [];
-    const hash = opts.computeHash && outputPath ? (0, node_crypto_1.createHash)("sha256") : null;
-    const input = (0, node_fs_1.createReadStream)(inputPath, { encoding: "utf-8" });
-    const rl = (0, node_readline_1.createInterface)({ input, crlfDelay: Infinity });
-    const out = outputPath ? (0, node_fs_1.createWriteStream)(outputPath, { encoding: "utf-8" }) : null;
+    const hash = opts.computeHash && outputPath ? createHash("sha256") : null;
+    const input = createReadStream(inputPath, { encoding: "utf-8" });
+    const rl = createInterface({ input, crlfDelay: Infinity });
+    const out = outputPath ? createWriteStream(outputPath, { encoding: "utf-8" }) : null;
     // A write-stream failure (bad output dir, disk full, EACCES) needs three
     // guards, or it either crashes the process or hangs forever:
     // (1) With zero 'error' listeners it's an "unhandled error event" that
@@ -321,13 +312,13 @@ async function rewriteJsonlStream(inputPath, outputPath, ctx, opts = {}) {
             const chunk = outLine + "\n";
             hash?.update(chunk);
             if (out && !out.write(chunk)) {
-                await Promise.race([(0, node_events_1.once)(out, "drain"), outErrored]);
+                await Promise.race([once(out, "drain"), outErrored]);
             }
             opts.onProgress?.(Math.min(bytesProcessed, bytesTotal), bytesTotal);
         }
         if (out) {
             out.end();
-            await Promise.race([(0, promises_1.finished)(out), outErrored]);
+            await Promise.race([finished(out), outErrored]);
         }
     }
     catch (e) {

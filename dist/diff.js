@@ -1,7 +1,4 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.computeIncrementalPlan = computeIncrementalPlan;
-function computeIncrementalPlan(localSessions, peerSent, readEntries) {
+export function computeIncrementalPlan(localSessions, peerSent, readEntries) {
     const plan = {
         full: [],
         continuation: [],

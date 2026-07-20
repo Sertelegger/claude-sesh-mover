@@ -1,34 +1,30 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.exportSession = exportSession;
-exports.exportAllSessions = exportAllSessions;
-const node_fs_1 = require("node:fs");
-const node_path_1 = require("node:path");
-const node_crypto_1 = require("node:crypto");
-const node_events_1 = require("node:events");
-const promises_1 = require("node:stream/promises");
-const manifest_js_1 = require("./manifest.js");
-const discovery_js_1 = require("./discovery.js");
-const platform_js_1 = require("./platform.js");
-const summary_js_1 = require("./summary.js");
-const continuation_js_1 = require("./continuation.js");
-const diff_js_1 = require("./diff.js");
-const jsonl_js_1 = require("./jsonl.js");
-const progress_js_1 = require("./progress.js");
+import { mkdirSync, copyFileSync, readdirSync, existsSync, createReadStream, createWriteStream, statSync, } from "node:fs";
+import { join } from "node:path";
+import { randomUUID, createHash } from "node:crypto";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
+import { writeManifest } from "./manifest.js";
+import { discoverSessions } from "./discovery.js";
+import { detectPlatform } from "./platform.js";
+import { extractSummaryFromFile } from "./summary.js";
+import { buildContinuationStream } from "./continuation.js";
+import { computeIncrementalPlan } from "./diff.js";
+import { readEntryUuids } from "./jsonl.js";
+import { percentThrottle } from "./progress.js";
 function copyDirIfExists(srcDir, destDir) {
-    if (!(0, node_fs_1.existsSync)(srcDir))
+    if (!existsSync(srcDir))
         return;
-    (0, node_fs_1.mkdirSync)(destDir, { recursive: true });
-    for (const file of (0, node_fs_1.readdirSync)(srcDir)) {
-        (0, node_fs_1.copyFileSync)((0, node_path_1.join)(srcDir, file), (0, node_path_1.join)(destDir, file));
+    mkdirSync(destDir, { recursive: true });
+    for (const file of readdirSync(srcDir)) {
+        copyFileSync(join(srcDir, file), join(destDir, file));
     }
 }
 // Stream copy with a sha256 tee: the copy and the manifest hash in one pass,
 // O(chunk) memory. onBytes reports cumulative bytes for progress.
 async function copyFileWithHash(src, dest, onBytes) {
-    const hash = (0, node_crypto_1.createHash)("sha256");
-    const input = (0, node_fs_1.createReadStream)(src);
-    const output = (0, node_fs_1.createWriteStream)(dest);
+    const hash = createHash("sha256");
+    const input = createReadStream(src);
+    const output = createWriteStream(dest);
     let bytes = 0;
     // Same error-latch hardening as rewriter.ts's rewriteJsonlStream and
     // continuation.ts's buildContinuationStream: without racing a latched
@@ -44,12 +40,12 @@ async function copyFileWithHash(src, dest, onBytes) {
             hash.update(buf);
             bytes += buf.length;
             if (!output.write(buf)) {
-                await Promise.race([(0, node_events_1.once)(output, "drain"), outputErrored]);
+                await Promise.race([once(output, "drain"), outputErrored]);
             }
             onBytes?.(bytes);
         }
         output.end();
-        await Promise.race([(0, promises_1.finished)(output), outputErrored]);
+        await Promise.race([finished(output), outputErrored]);
     }
     catch (e) {
         output.destroy();
@@ -60,11 +56,11 @@ async function copyFileWithHash(src, dest, onBytes) {
     }
     return `sha256:${hash.digest("hex")}`;
 }
-async function exportSession(options) {
+export async function exportSession(options) {
     const { configDir, projectPath, sessionId, outputDir, name, excludeLayers, claudeVersion, collisionCheck, summaryOverrides, incremental, noSummary, onProgress, } = options;
-    const exportPath = (0, node_path_1.join)(outputDir, name);
+    const exportPath = join(outputDir, name);
     // Collision check
-    if (collisionCheck && (0, node_fs_1.existsSync)(exportPath)) {
+    if (collisionCheck && existsSync(exportPath)) {
         return {
             success: true,
             command: "export",
@@ -77,7 +73,7 @@ async function exportSession(options) {
         };
     }
     // Find the session
-    const sessions = (0, discovery_js_1.discoverSessions)(configDir, projectPath);
+    const sessions = discoverSessions(configDir, projectPath);
     const target = sessionId
         ? sessions.find((s) => s.sessionId === sessionId)
         : sessions[0];
@@ -92,9 +88,9 @@ async function exportSession(options) {
     }
     return exportSessions([target], configDir, projectPath, exportPath, excludeLayers, claudeVersion, "current", summaryOverrides, noSummary, incremental, onProgress);
 }
-async function exportAllSessions(options) {
+export async function exportAllSessions(options) {
     const { configDir, projectPath, outputDir, name, excludeLayers, claudeVersion, summaryOverrides, incremental, noSummary, onProgress, } = options;
-    const sessions = (0, discovery_js_1.discoverSessions)(configDir, projectPath);
+    const sessions = discoverSessions(configDir, projectPath);
     if (sessions.length === 0) {
         return {
             success: false,
@@ -102,31 +98,31 @@ async function exportAllSessions(options) {
             error: "No sessions found for this project",
         };
     }
-    const exportPath = (0, node_path_1.join)(outputDir, name);
+    const exportPath = join(outputDir, name);
     return exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, "all", summaryOverrides, noSummary, incremental, onProgress);
 }
 async function exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, scope, summaryOverrides, noSummary, incremental, onProgress) {
     const includedLayers = getAllLayers().filter((l) => !excludeLayers.includes(l));
     const warnings = [];
-    (0, node_fs_1.mkdirSync)((0, node_path_1.join)(exportPath, "sessions"), { recursive: true });
+    mkdirSync(join(exportPath, "sessions"), { recursive: true });
     const sessionManifests = [];
     let toFull = sessions;
     let toContinuation = [];
     if (incremental) {
         const uuidsBySession = new Map();
         for (const session of sessions) {
-            uuidsBySession.set(session.sessionId, await (0, jsonl_js_1.readEntryUuids)(session.jsonlPath));
+            uuidsBySession.set(session.sessionId, await readEntryUuids(session.jsonlPath));
         }
-        const plan = (0, diff_js_1.computeIncrementalPlan)(sessions, incremental.peerSent, (session) => uuidsBySession.get(session.sessionId));
+        const plan = computeIncrementalPlan(sessions, incremental.peerSent, (session) => uuidsBySession.get(session.sessionId));
         warnings.push(...plan.warnings);
         toFull = plan.full;
         toContinuation = plan.continuation;
     }
     for (const [sessionIndex, session] of toFull.entries()) {
-        const destJsonl = (0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`);
-        const bytesTotal = (0, node_fs_1.statSync)(session.jsonlPath).size;
+        const destJsonl = join(exportPath, "sessions", `${session.sessionId}.jsonl`);
+        const bytesTotal = statSync(session.jsonlPath).size;
         const throttled = onProgress
-            ? (0, progress_js_1.percentThrottle)(bytesTotal, (percent, bytesProcessed) => onProgress({
+            ? percentThrottle(bytesTotal, (percent, bytesProcessed) => onProgress({
                 phase: "export-copy",
                 sessionId: session.sessionId,
                 sessionIndex,
@@ -138,20 +134,20 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             : undefined;
         // copyFileWithHash returns "sha256:<hex>" — used directly as the manifest hash
         const sessionHash = await copyFileWithHash(session.jsonlPath, destJsonl, throttled);
-        const sessionBase = (0, node_path_1.join)(configDir, "projects", session.encodedProjectDir, session.sessionId);
+        const sessionBase = join(configDir, "projects", session.encodedProjectDir, session.sessionId);
         if (includedLayers.includes("subagents")) {
-            copyDirIfExists((0, node_path_1.join)(sessionBase, "subagents"), (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "subagents"));
+            copyDirIfExists(join(sessionBase, "subagents"), join(exportPath, "sessions", session.sessionId, "subagents"));
         }
         if (includedLayers.includes("tool-results")) {
-            copyDirIfExists((0, node_path_1.join)(sessionBase, "tool-results"), (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "tool-results"));
+            copyDirIfExists(join(sessionBase, "tool-results"), join(exportPath, "sessions", session.sessionId, "tool-results"));
         }
         if (includedLayers.includes("file-history")) {
-            copyDirIfExists((0, node_path_1.join)(configDir, "file-history", session.sessionId), (0, node_path_1.join)(exportPath, "file-history", session.sessionId));
+            copyDirIfExists(join(configDir, "file-history", session.sessionId), join(exportPath, "file-history", session.sessionId));
         }
         const summary = noSummary
             ? session.slug
             : summaryOverrides?.[session.sessionId] ??
-                (await (0, summary_js_1.extractSummaryFromFile)(session.slug, session.jsonlPath));
+                (await extractSummaryFromFile(session.slug, session.jsonlPath));
         sessionManifests.push({
             sessionId: session.sessionId,
             slug: session.slug,
@@ -166,7 +162,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         });
     }
     for (const [contIndex, item] of toContinuation.entries()) {
-        const newSessionId = (0, node_crypto_1.randomUUID)();
+        const newSessionId = randomUUID();
         onProgress?.({
             phase: "export-copy",
             sessionId: newSessionId,
@@ -174,8 +170,8 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             sessionCount: toContinuation.length,
         });
         const prevLocal = incremental?.peerSent[item.session.sessionId]?.sentAsSessionId;
-        const contDest = (0, node_path_1.join)(exportPath, "sessions", `${newSessionId}.jsonl`);
-        const { entryCount, integrityHash } = await (0, continuation_js_1.buildContinuationStream)({
+        const contDest = join(exportPath, "sessions", `${newSessionId}.jsonl`);
+        const { entryCount, integrityHash } = await buildContinuationStream({
             sourceJsonlPath: item.session.jsonlPath,
             outputPath: contDest,
             fromEntryIndex: item.fromEntryIndex,
@@ -188,15 +184,15 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             targetProjectPath: projectPath,
             claudeVersion,
         });
-        const contBase = (0, node_path_1.join)(configDir, "projects", item.session.encodedProjectDir, item.session.sessionId);
+        const contBase = join(configDir, "projects", item.session.encodedProjectDir, item.session.sessionId);
         if (includedLayers.includes("subagents")) {
-            copyDirIfExists((0, node_path_1.join)(contBase, "subagents"), (0, node_path_1.join)(exportPath, "sessions", newSessionId, "subagents"));
+            copyDirIfExists(join(contBase, "subagents"), join(exportPath, "sessions", newSessionId, "subagents"));
         }
         if (includedLayers.includes("tool-results")) {
-            copyDirIfExists((0, node_path_1.join)(contBase, "tool-results"), (0, node_path_1.join)(exportPath, "sessions", newSessionId, "tool-results"));
+            copyDirIfExists(join(contBase, "tool-results"), join(exportPath, "sessions", newSessionId, "tool-results"));
         }
         if (includedLayers.includes("file-history")) {
-            copyDirIfExists((0, node_path_1.join)(configDir, "file-history", item.session.sessionId), (0, node_path_1.join)(exportPath, "file-history", newSessionId));
+            copyDirIfExists(join(configDir, "file-history", item.session.sessionId), join(exportPath, "file-history", newSessionId));
         }
         sessionManifests.push({
             sessionId: newSessionId,
@@ -220,18 +216,18 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
     if (!incremental) {
         if (includedLayers.includes("memory") && sessions.length > 0) {
             const encoded = sessions[0].encodedProjectDir;
-            const memoryDir = (0, node_path_1.join)(configDir, "projects", encoded, "memory");
-            copyDirIfExists(memoryDir, (0, node_path_1.join)(exportPath, "memory"));
+            const memoryDir = join(configDir, "projects", encoded, "memory");
+            copyDirIfExists(memoryDir, join(exportPath, "memory"));
         }
         if (includedLayers.includes("plans")) {
-            const plansDir = (0, node_path_1.join)(configDir, "plans");
-            if ((0, node_fs_1.existsSync)(plansDir)) {
-                const planFiles = (0, node_fs_1.readdirSync)(plansDir).filter((f) => f.endsWith(".md"));
+            const plansDir = join(configDir, "plans");
+            if (existsSync(plansDir)) {
+                const planFiles = readdirSync(plansDir).filter((f) => f.endsWith(".md"));
                 if (planFiles.length > 0) {
-                    const targetPlansDir = (0, node_path_1.join)(exportPath, "plans");
-                    (0, node_fs_1.mkdirSync)(targetPlansDir, { recursive: true });
+                    const targetPlansDir = join(exportPath, "plans");
+                    mkdirSync(targetPlansDir, { recursive: true });
                     for (const file of planFiles) {
-                        (0, node_fs_1.copyFileSync)((0, node_path_1.join)(plansDir, file), (0, node_path_1.join)(targetPlansDir, file));
+                        copyFileSync(join(plansDir, file), join(targetPlansDir, file));
                     }
                 }
             }
@@ -241,7 +237,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         version: 1,
         plugin: "sesh-mover",
         exportedAt: new Date().toISOString(),
-        sourcePlatform: (0, platform_js_1.detectPlatform)(),
+        sourcePlatform: detectPlatform(),
         sourceProjectPath: projectPath,
         sourceConfigDir: configDir,
         sourceClaudeVersion: claudeVersion,
@@ -260,7 +256,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             }
             : undefined,
     };
-    (0, manifest_js_1.writeManifest)(exportPath, manifest);
+    writeManifest(exportPath, manifest);
     for (const layer of excludeLayers) {
         warnings.push(`${layer} excluded by user request`);
     }
