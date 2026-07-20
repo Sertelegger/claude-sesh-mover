@@ -1,0 +1,55 @@
+name: Bug report
+description: Something broke during export, import, migrate, browse, or configure
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Path handling differs per platform, so the platform fields below matter a lot for reproducing.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: command-output
+    attributes:
+      label: Command and JSON output
+      description: |
+        The exact CLI command (or slash command) you ran and the full JSON it printed.
+        **Redact anything sensitive** — session summaries and paths can contain conversation content.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: source-platform
+    attributes:
+      label: Source platform
+      description: Where the session was exported from (or lives, for migrate)
+      options: [macOS, Linux, Windows, WSL1, WSL2]
+    validations:
+      required: true
+  - type: dropdown
+    id: target-platform
+    attributes:
+      label: Target platform
+      description: Where the session was imported to. Pick the same value for export-only or migrate issues.
+      options: [macOS, Linux, Windows, WSL1, WSL2]
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Claude Code version (`claude --version`) and plugin/CLI version
+      placeholder: "Claude Code 2.1.3, sesh-mover 0.4.0"
+    validations:
+      required: true
+  - type: input
+    id: config-dir
+    attributes:
+      label: Config directory setup
+      description: Default `~/.claude`, or a custom dir via `CLAUDE_CONFIG_DIR` / `--*-config-dir`?
+      placeholder: "default ~/.claude on both sides"
