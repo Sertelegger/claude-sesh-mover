@@ -14,6 +14,10 @@ updates:
       # deliberately raising the Node floor / migrating to ESM.
       - dependency-name: commander
         update-types: ["version-update:semver-major"]
+      # TypeScript majors are a compiler migration (TS7 native compiler needs
+      # tsconfig + src changes and a reviewed dist/ rebuild) — adopt manually.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
