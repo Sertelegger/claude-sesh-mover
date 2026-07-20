@@ -8,6 +8,12 @@ updates:
       # One PR per week for routine bumps instead of one PR per package.
       minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # commander ≥14 raises the Node floor above our supported >=18.17,
+      # and 15 is ESM-only while we compile to CommonJS. Revisit when
+      # deliberately raising the Node floor / migrating to ESM.
+      - dependency-name: commander
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
