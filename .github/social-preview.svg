@@ -1,0 +1,68 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="glow" cx="0.5" cy="0.58" r="0.75">
+      <stop offset="0%" stop-color="#D97757" stop-opacity="0.10"/>
+      <stop offset="55%" stop-color="#D97757" stop-opacity="0.03"/>
+      <stop offset="100%" stop-color="#D97757" stop-opacity="0"/>
+    </radialGradient>
+    <marker id="arrowhead" markerWidth="9" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 Z" fill="#D97757"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect width="1280" height="640" fill="#0D1420"/>
+  <rect width="1280" height="640" fill="url(#glow)"/>
+
+  <!-- wordmark -->
+  <text x="640" y="128" text-anchor="middle" font-family="DejaVu Sans Mono, monospace" font-size="64" font-weight="bold">
+    <tspan fill="#7D8B9F">claude-</tspan><tspan fill="#E0895F">sesh-mover</tspan>
+  </text>
+
+  <!-- tagline -->
+  <text x="640" y="184" text-anchor="middle" font-family="Ubuntu Sans, DejaVu Sans, sans-serif" font-size="27" fill="#96A2B4">
+    Export, import &amp; migrate Claude Code sessions — across machines, OSes &amp; config dirs
+  </text>
+
+  <!-- left terminal -->
+  <g>
+    <rect x="90" y="258" width="420" height="234" rx="14" fill="#141C2B" stroke="#263349" stroke-width="1.5"/>
+    <circle cx="120" cy="290" r="7" fill="#FF5F57"/>
+    <circle cx="143" cy="290" r="7" fill="#FEBC2E"/>
+    <circle cx="166" cy="290" r="7" fill="#28C840"/>
+    <text x="190" y="296" font-family="DejaVu Sans Mono, monospace" font-size="15" fill="#5F6C80">macOS · ~/.claude</text>
+    <line x1="90" y1="312" x2="510" y2="312" stroke="#263349" stroke-width="1"/>
+    <text x="118" y="366" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#5F6C80">$</text>
+    <text x="141" y="366" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#DCE3EC">/sesh-mover:export</text>
+    <text x="118" y="406" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#3FB950">✓</text>
+    <text x="141" y="406" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#9AA7B8">3 sessions bundled</text>
+    <text x="118" y="446" font-family="DejaVu Sans Mono, monospace" font-size="19">
+      <tspan fill="#5F6C80">→ sesh-2026-07-20.tar.gz</tspan>
+    </text>
+  </g>
+
+  <!-- right terminal -->
+  <g>
+    <rect x="770" y="258" width="420" height="234" rx="14" fill="#141C2B" stroke="#263349" stroke-width="1.5"/>
+    <circle cx="800" cy="290" r="7" fill="#FF5F57"/>
+    <circle cx="823" cy="290" r="7" fill="#FEBC2E"/>
+    <circle cx="846" cy="290" r="7" fill="#28C840"/>
+    <text x="870" y="296" font-family="DejaVu Sans Mono, monospace" font-size="15" fill="#5F6C80">WSL2 · ~/.claude</text>
+    <line x1="770" y1="312" x2="1190" y2="312" stroke="#263349" stroke-width="1"/>
+    <text x="798" y="366" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#5F6C80">$</text>
+    <text x="821" y="366" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#DCE3EC">/sesh-mover:import</text>
+    <text x="798" y="406" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#3FB950">✓</text>
+    <text x="821" y="406" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#9AA7B8">paths rewritten</text>
+    <text x="798" y="446" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#3FB950">✓</text>
+    <text x="821" y="446" font-family="DejaVu Sans Mono, monospace" font-size="19" fill="#9AA7B8">claude --resume ready</text>
+  </g>
+
+  <!-- transfer arrow with session pill -->
+  <line x1="524" y1="375" x2="562" y2="375" stroke="#D97757" stroke-width="3" stroke-dasharray="10 8"/>
+  <line x1="716" y1="375" x2="752" y2="375" stroke="#D97757" stroke-width="3" stroke-dasharray="10 8" marker-end="url(#arrowhead)"/>
+  <rect x="566" y="354" width="148" height="42" rx="21" fill="#22304A" stroke="#D97757" stroke-width="1.5"/>
+  <text x="640" y="382" text-anchor="middle" font-family="DejaVu Sans Mono, monospace" font-size="17" fill="#F0C5A8">session.jsonl</text>
+
+  <!-- footer -->
+  <text x="640" y="566" text-anchor="middle" font-family="DejaVu Sans Mono, monospace" font-size="17" fill="#4E5A6C">Claude Code plugin + CLI</text>
+</svg>
