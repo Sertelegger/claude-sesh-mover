@@ -2,17 +2,28 @@
   "name": "claude-sesh-mover",
   "version": "0.4.0",
   "description": "Claude Code plugin for migrating sessions between machines, platforms, config directories, and project paths",
+  "author": "Sascha Sertel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sertelegger/claude-sesh-mover.git"
+  },
+  "homepage": "https://github.com/Sertelegger/claude-sesh-mover#readme",
+  "bugs": {
+    "url": "https://github.com/Sertelegger/claude-sesh-mover/issues"
+  },
   "main": "dist/cli.js",
   "bin": {
     "sesh-mover": "dist/cli.js"
   },
+  "files": ["dist"],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test"
   },
-  "keywords": ["claude-code", "session", "migration", "export", "import"],
+  "keywords": ["claude-code", "claude-code-plugin", "claude", "session", "migration", "export", "import", "cli", "wsl"],
   "license": "MIT",
   "devDependencies": {
     "typescript": "^5.7.0",
