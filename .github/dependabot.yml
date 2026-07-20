@@ -8,11 +8,6 @@ updates:
       # One PR per week for routine bumps instead of one PR per package.
       minor-and-patch:
         update-types: [minor, patch]
-    ignore:
-      # TypeScript majors are a compiler migration (TS7 native compiler needs
-      # tsconfig + src changes and a reviewed dist/ rebuild) — adopt manually.
-      - dependency-name: typescript
-        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
