@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Sertelegger/claude-sesh-mover/security
+    about: Please report security issues privately via GitHub's vulnerability reporting, not as public issues.
