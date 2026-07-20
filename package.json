@@ -31,7 +31,7 @@
     "@types/node": "^22.0.0"
   },
   "dependencies": {
-    "commander": "^13.0.0",
+    "commander": "^15.0.0",
     "tar": "^7.0.0"
   },
   "engines": {
