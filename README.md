@@ -23,7 +23,7 @@ Where this is heading — a cross-machine session index with remote pull ("the h
 /plugin install sesh-mover@claude-sesh-mover
 ```
 
-If the slash commands don't appear, run `/reload-plugins`. No build step — the plugin only needs Node.js ≥ 18.17, which Claude Code already requires. Optional: a `zstd` binary for `.tar.zst` archives (falls back to `.tar.gz` automatically).
+If the slash commands don't appear, run `/reload-plugins`. No build step — the plugin only needs Node.js ≥ 22.12 (current Claude Code releases already require Node ≥ 22). Optional: a `zstd` binary for `.tar.zst` archives (falls back to `.tar.gz` automatically).
 
 For local development, clone and load directly (a pre-built `dist/` ships in the repo):
 

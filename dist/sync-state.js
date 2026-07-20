@@ -1,17 +1,11 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.syncStatePath = syncStatePath;
-exports.readSyncState = readSyncState;
-exports.writeSyncState = writeSyncState;
-exports.recordSentFromBundle = recordSentFromBundle;
-const node_fs_1 = require("node:fs");
-const node_os_1 = require("node:os");
-const node_path_1 = require("node:path");
-const platform_js_1 = require("./platform.js");
-const manifest_js_1 = require("./manifest.js");
-const jsonl_js_1 = require("./jsonl.js");
-function syncStatePath(projectPath) {
-    return (0, node_path_1.join)((0, node_os_1.homedir)(), ".claude-sesh-mover", "sync-state", `${(0, platform_js_1.encodeProjectPath)(projectPath)}.json`);
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { encodeProjectPath } from "./platform.js";
+import { readManifest } from "./manifest.js";
+import { readLastEntryUuid } from "./jsonl.js";
+export function syncStatePath(projectPath) {
+    return join(homedir(), ".claude-sesh-mover", "sync-state", `${encodeProjectPath(projectPath)}.json`);
 }
 function defaultState(projectPath) {
     return {
@@ -22,13 +16,13 @@ function defaultState(projectPath) {
         imported: {},
     };
 }
-function readSyncState(projectPath) {
+export function readSyncState(projectPath) {
     const p = syncStatePath(projectPath);
-    if (!(0, node_fs_1.existsSync)(p))
+    if (!existsSync(p))
         return defaultState(projectPath);
     let raw;
     try {
-        raw = (0, node_fs_1.readFileSync)(p, "utf-8");
+        raw = readFileSync(p, "utf-8");
     }
     catch {
         return defaultState(projectPath);
@@ -52,7 +46,7 @@ function readSyncState(projectPath) {
     catch {
         const aside = `${p}.corrupt.${Date.now()}`;
         try {
-            (0, node_fs_1.renameSync)(p, aside);
+            renameSync(p, aside);
         }
         catch {
             /* best effort */
@@ -60,14 +54,14 @@ function readSyncState(projectPath) {
         return defaultState(projectPath);
     }
 }
-function writeSyncState(state) {
+export function writeSyncState(state) {
     const p = syncStatePath(state.projectPath);
-    (0, node_fs_1.mkdirSync)((0, node_path_1.dirname)(p), { recursive: true });
+    mkdirSync(dirname(p), { recursive: true });
     const tmp = `${p}.tmp`;
-    (0, node_fs_1.writeFileSync)(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
-    (0, node_fs_1.renameSync)(tmp, p);
+    writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
+    renameSync(tmp, p);
 }
-function recordSentFromBundle(projectPath, peer, bundleDir) {
+export function recordSentFromBundle(projectPath, peer, bundleDir) {
     const state = readSyncState(projectPath);
     if (!state.peers[peer.id]) {
         state.peers[peer.id] = {
@@ -85,14 +79,14 @@ function recordSentFromBundle(projectPath, peer, bundleDir) {
     // readManifest is the validation chokepoint (assertSafeManifestIds runs
     // inside it) — session/continuation ids here are already guaranteed safe,
     // no need to re-validate.
-    const manifest = (0, manifest_js_1.readManifest)(bundleDir);
+    const manifest = readManifest(bundleDir);
     for (const s of manifest.sessions) {
         const localSessionId = s.type === "continuation" && s.continuation
             ? s.continuation.continuesLocalSessionId
             : s.sessionId;
         // Head uuid comes from the BUNDLE's snapshot, never the live JSONL:
         // entries appended mid-export stay "unsent" and ship next sync.
-        const headUuid = (0, jsonl_js_1.readLastEntryUuid)((0, node_path_1.join)(bundleDir, "sessions", `${s.sessionId}.jsonl`)) ?? "";
+        const headUuid = readLastEntryUuid(join(bundleDir, "sessions", `${s.sessionId}.jsonl`)) ?? "";
         p.sent[localSessionId] = {
             headEntryUuid: headUuid,
             messageCount: s.messageCount,

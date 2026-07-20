@@ -1,17 +1,14 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.migrateSession = migrateSession;
-const node_fs_1 = require("node:fs");
-const node_path_1 = require("node:path");
-const node_os_1 = require("node:os");
-const exporter_js_1 = require("./exporter.js");
-const importer_js_1 = require("./importer.js");
-const platform_js_1 = require("./platform.js");
+import { rmSync, existsSync, mkdtempSync, renameSync, } from "node:fs";
+import { join, dirname, relative, isAbsolute } from "node:path";
+import { tmpdir } from "node:os";
+import { exportSession, exportAllSessions } from "./exporter.js";
+import { importSession } from "./importer.js";
+import { encodeProjectPath } from "./platform.js";
 function isWithin(child, parent) {
-    const rel = (0, node_path_1.relative)(parent, child);
-    return rel === "" || (!rel.startsWith("..") && !(0, node_path_1.isAbsolute)(rel));
+    const rel = relative(parent, child);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
-async function migrateSession(options) {
+export async function migrateSession(options) {
     const { sourceConfigDir, targetConfigDir, sourceProjectPath, targetProjectPath, scope, sessionId, excludeLayers, claudeVersion, dryRun, renameDir, currentCwd, force, onProgress, } = options;
     const isSelfMigration = !!currentCwd && isWithin(currentCwd, sourceProjectPath);
     const selfMigrationWarnings = [];
@@ -39,7 +36,7 @@ async function migrateSession(options) {
         };
     }
     // Create temp directory for the intermediate export
-    const tempExportDir = (0, node_fs_1.mkdtempSync)((0, node_path_1.join)((0, node_os_1.tmpdir)(), "sesh-mover-migrate-"));
+    const tempExportDir = mkdtempSync(join(tmpdir(), "sesh-mover-migrate-"));
     try {
         // Step 1: Export
         const exportOpts = {
@@ -52,15 +49,15 @@ async function migrateSession(options) {
             onProgress,
         };
         const exportResult = scope === "current" && sessionId
-            ? await (0, exporter_js_1.exportSession)({ ...exportOpts, sessionId })
-            : await (0, exporter_js_1.exportAllSessions)(exportOpts);
+            ? await exportSession({ ...exportOpts, sessionId })
+            : await exportAllSessions(exportOpts);
         if (!exportResult.success) {
             return exportResult;
         }
         const exported = exportResult;
         const exportPath = exported.exportPath;
         // Step 2: Import to target (or dry-run)
-        const importResult = await (0, importer_js_1.importSession)({
+        const importResult = await importSession({
             exportPath,
             targetConfigDir,
             targetProjectPath,
@@ -97,43 +94,43 @@ async function migrateSession(options) {
         const movedIds = new Set(imported.importedSessions.map((s) => s.originalId));
         for (const s of imported.skippedSessions ?? [])
             movedIds.add(s.originalId);
-        const sourceEncoded = (0, platform_js_1.encodeProjectPath)(sourceProjectPath);
-        const sourceProjectDir = (0, node_path_1.join)(sourceConfigDir, "projects", sourceEncoded);
+        const sourceEncoded = encodeProjectPath(sourceProjectPath);
+        const sourceProjectDir = join(sourceConfigDir, "projects", sourceEncoded);
         let cleanedUp = false;
         for (const movedId of movedIds) {
-            const jsonlPath = (0, node_path_1.join)(sourceProjectDir, `${movedId}.jsonl`);
-            if ((0, node_fs_1.existsSync)(jsonlPath))
-                (0, node_fs_1.rmSync)(jsonlPath);
-            const sessionSubDir = (0, node_path_1.join)(sourceProjectDir, movedId);
-            if ((0, node_fs_1.existsSync)(sessionSubDir))
-                (0, node_fs_1.rmSync)(sessionSubDir, { recursive: true });
-            const fileHistoryDir = (0, node_path_1.join)(sourceConfigDir, "file-history", movedId);
-            if ((0, node_fs_1.existsSync)(fileHistoryDir))
-                (0, node_fs_1.rmSync)(fileHistoryDir, { recursive: true });
+            const jsonlPath = join(sourceProjectDir, `${movedId}.jsonl`);
+            if (existsSync(jsonlPath))
+                rmSync(jsonlPath);
+            const sessionSubDir = join(sourceProjectDir, movedId);
+            if (existsSync(sessionSubDir))
+                rmSync(sessionSubDir, { recursive: true });
+            const fileHistoryDir = join(sourceConfigDir, "file-history", movedId);
+            if (existsSync(fileHistoryDir))
+                rmSync(fileHistoryDir, { recursive: true });
             cleanedUp = true;
         }
         // Step 4: Optionally rename the actual project directory
         let directoryRenamed = false;
         if (renameDir && sourceProjectPath !== targetProjectPath) {
-            if ((0, node_fs_1.existsSync)(sourceProjectPath) && !(0, node_fs_1.existsSync)(targetProjectPath)) {
+            if (existsSync(sourceProjectPath) && !existsSync(targetProjectPath)) {
                 try {
                     // Ensure parent directory of target exists
-                    const targetParent = (0, node_path_1.dirname)(targetProjectPath);
-                    if (!(0, node_fs_1.existsSync)(targetParent)) {
+                    const targetParent = dirname(targetProjectPath);
+                    if (!existsSync(targetParent)) {
                         const { mkdirSync } = await import("node:fs");
                         mkdirSync(targetParent, { recursive: true });
                     }
-                    (0, node_fs_1.renameSync)(sourceProjectPath, targetProjectPath);
+                    renameSync(sourceProjectPath, targetProjectPath);
                     directoryRenamed = true;
                 }
                 catch (e) {
                     imported.warnings.push(`Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${e.message}. You may need to rename it manually.`);
                 }
             }
-            else if (!(0, node_fs_1.existsSync)(sourceProjectPath)) {
+            else if (!existsSync(sourceProjectPath)) {
                 imported.warnings.push(`Source directory ${sourceProjectPath} does not exist — cannot rename. It may have already been moved.`);
             }
-            else if ((0, node_fs_1.existsSync)(targetProjectPath)) {
+            else if (existsSync(targetProjectPath)) {
                 imported.warnings.push(`Target directory ${targetProjectPath} already exists — skipping rename to avoid overwriting. Move files manually if needed.`);
             }
         }
@@ -151,7 +148,7 @@ async function migrateSession(options) {
     }
     finally {
         // Clean up temp export
-        (0, node_fs_1.rmSync)(tempExportDir, { recursive: true, force: true });
+        rmSync(tempExportDir, { recursive: true, force: true });
     }
 }
 //# sourceMappingURL=migrator.js.map

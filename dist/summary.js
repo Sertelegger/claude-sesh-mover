@@ -1,14 +1,9 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.extractSummary = extractSummary;
-exports.extractFirstExchanges = extractFirstExchanges;
-exports.extractSummaryFromFile = extractSummaryFromFile;
-const node_fs_1 = require("node:fs");
-const node_readline_1 = require("node:readline");
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 const GENERIC_SLUGS = new Set(["new-session", "untitled", ""]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_SUMMARY_LENGTH = 100;
-function extractSummary(slug, entries) {
+export function extractSummary(slug, entries) {
     // Try slug first
     if (slug && !GENERIC_SLUGS.has(slug) && !UUID_PATTERN.test(slug)) {
         return slug;
@@ -38,7 +33,7 @@ function extractSummary(slug, entries) {
     }
     return "(no summary available)";
 }
-function extractFirstExchanges(entries, maxEntries) {
+export function extractFirstExchanges(entries, maxEntries) {
     const result = [];
     for (const entry of entries) {
         if (entry.type === "user" || entry.type === "assistant") {
@@ -57,13 +52,13 @@ function truncate(text) {
 // Streaming twin of extractSummary: same precedence (slug → first user
 // string-content message → first assistant text block → placeholder) with
 // O(1) memory and early exit on the user-message match.
-async function extractSummaryFromFile(slug, jsonlPath) {
+export async function extractSummaryFromFile(slug, jsonlPath) {
     if (slug && !GENERIC_SLUGS.has(slug) && !UUID_PATTERN.test(slug)) {
         return slug;
     }
     let firstAssistantText;
-    const input = (0, node_fs_1.createReadStream)(jsonlPath, { encoding: "utf-8" });
-    const rl = (0, node_readline_1.createInterface)({ input, crlfDelay: Infinity });
+    const input = createReadStream(jsonlPath, { encoding: "utf-8" });
+    const rl = createInterface({ input, crlfDelay: Infinity });
     try {
         for await (const line of rl) {
             if (!line)

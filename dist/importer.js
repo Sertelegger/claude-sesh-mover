@@ -1,23 +1,20 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.importSession = importSession;
-const node_fs_1 = require("node:fs");
-const node_path_1 = require("node:path");
-const node_crypto_1 = require("node:crypto");
-const manifest_js_1 = require("./manifest.js");
-const rewriter_js_1 = require("./rewriter.js");
-const platform_js_1 = require("./platform.js");
-const version_adapters_js_1 = require("./version-adapters.js");
-const sync_state_js_1 = require("./sync-state.js");
-const jsonl_js_1 = require("./jsonl.js");
-const progress_js_1 = require("./progress.js");
-async function importSession(options) {
+import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendFileSync, rmSync, statSync, } from "node:fs";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, } from "./manifest.js";
+import { rewriteJsonlStream, buildPathMappings } from "./rewriter.js";
+import { encodeProjectPath, detectPlatform, extractUserFromPath, getCurrentUser, } from "./platform.js";
+import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
+import { readSyncState, writeSyncState } from "./sync-state.js";
+import { readLastEntryUuid } from "./jsonl.js";
+import { percentThrottle } from "./progress.js";
+export async function importSession(options) {
     const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, onProgress, } = options;
     const warnings = [];
     // Step 1: Read manifest
     let manifest;
     try {
-        manifest = (0, manifest_js_1.readManifest)(exportPath);
+        manifest = readManifest(exportPath);
     }
     catch (e) {
         return {
@@ -42,9 +39,9 @@ async function importSession(options) {
     // trusting it (see Fix 1: a registry/peer record can outlive the file it
     // points at, e.g. after a migrate deleted it, and trusting the record
     // alone would silently drop the session instead of importing it fresh).
-    const encodedTargetPath = (0, platform_js_1.encodeProjectPath)(targetProjectPath);
-    const targetProjectDir = (0, node_path_1.join)(targetConfigDir, "projects", encodedTargetPath);
-    const state = (0, sync_state_js_1.readSyncState)(targetProjectPath);
+    const encodedTargetPath = encodeProjectPath(targetProjectPath);
+    const targetProjectDir = join(targetConfigDir, "projects", encodedTargetPath);
+    const state = readSyncState(targetProjectPath);
     const skippedSessions = [];
     if (!allowDuplicates && manifest.sourceMachineId) {
         const peer = state.peers[manifest.sourceMachineId];
@@ -53,7 +50,7 @@ async function importSession(options) {
             targetSessions = targetSessions.filter((session) => {
                 const prior = peer.received[session.sessionId];
                 if (prior &&
-                    (0, node_fs_1.existsSync)((0, node_path_1.join)(targetProjectDir, `${prior.localSessionId}.jsonl`))) {
+                    existsSync(join(targetProjectDir, `${prior.localSessionId}.jsonl`))) {
                     skippedSessions.push({
                         originalId: session.sessionId,
                         reason: "already-received",
@@ -72,7 +69,7 @@ async function importSession(options) {
         targetSessions = targetSessions.filter((session) => {
             const prior = state.imported[session.integrityHash];
             const priorFileExists = !!prior &&
-                (0, node_fs_1.existsSync)((0, node_path_1.join)(targetProjectDir, `${prior.localSessionId}.jsonl`));
+                existsSync(join(targetProjectDir, `${prior.localSessionId}.jsonl`));
             if (priorFileExists && (prior.registered || noRegister)) {
                 skippedSessions.push({
                     originalId: session.sessionId,
@@ -111,18 +108,18 @@ async function importSession(options) {
         };
     }
     // Step 1.5: Version reconciliation
-    const versionDiff = (0, version_adapters_js_1.classifyVersionDifference)(manifest.sourceClaudeVersion, targetClaudeVersion);
-    const adapters = (0, version_adapters_js_1.getApplicableAdapters)(manifest.sourceClaudeVersion, targetClaudeVersion);
+    const versionDiff = classifyVersionDifference(manifest.sourceClaudeVersion, targetClaudeVersion);
+    const adapters = getApplicableAdapters(manifest.sourceClaudeVersion, targetClaudeVersion);
     const versionAdaptations = [];
     if (versionDiff === "source-newer") {
         warnings.push(`Export from newer Claude Code (${manifest.sourceClaudeVersion}) than target (${targetClaudeVersion}). Unknown entry types will be preserved.`);
     }
     // Step 2: Build path mappings
-    const targetPlatform = (0, platform_js_1.detectPlatform)();
-    const sourceUser = (0, platform_js_1.extractUserFromPath)(manifest.sourceProjectPath, manifest.sourcePlatform) ??
+    const targetPlatform = detectPlatform();
+    const sourceUser = extractUserFromPath(manifest.sourceProjectPath, manifest.sourcePlatform) ??
         "unknown";
-    const targetUser = (0, platform_js_1.getCurrentUser)();
-    const mappings = (0, rewriter_js_1.buildPathMappings)(manifest.sourcePlatform, targetPlatform, manifest.sourceProjectPath, targetProjectPath, manifest.sourceConfigDir, targetConfigDir, sourceUser, targetUser);
+    const targetUser = getCurrentUser();
+    const mappings = buildPathMappings(manifest.sourcePlatform, targetPlatform, manifest.sourceProjectPath, targetProjectPath, manifest.sourceConfigDir, targetConfigDir, sourceUser, targetUser);
     const ctx = {
         mappings,
         sourcePlatform: manifest.sourcePlatform,
@@ -139,9 +136,9 @@ async function importSession(options) {
             sessionIndex,
             sessionCount: targetSessions.length,
         });
-        const jsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`);
-        if ((0, node_fs_1.existsSync)(jsonlPath)) {
-            const actualHash = await (0, manifest_js_1.computeIntegrityHashFromFile)(jsonlPath);
+        const jsonlPath = join(exportPath, "sessions", `${session.sessionId}.jsonl`);
+        if (existsSync(jsonlPath)) {
+            const actualHash = await computeIntegrityHashFromFile(jsonlPath);
             if (actualHash !== session.integrityHash) {
                 integrityFailedSessions.add(session.sessionId);
                 warnings.push(`integrity check failed for session "${session.slug}" (${session.sessionId}): JSONL content doesn't match manifest hash. Data may be corrupted.`);
@@ -151,7 +148,7 @@ async function importSession(options) {
     // Generate new session IDs
     const sessionIdMap = new Map();
     for (const session of targetSessions) {
-        sessionIdMap.set(session.sessionId, (0, node_crypto_1.randomUUID)());
+        sessionIdMap.set(session.sessionId, randomUUID());
     }
     const importedSessions = targetSessions.map((session) => ({
         originalId: session.sessionId,
@@ -163,9 +160,9 @@ async function importSession(options) {
     if (dryRun) {
         let rewriteReport;
         const firstSession = targetSessions[0];
-        const firstJsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${firstSession.sessionId}.jsonl`);
-        if ((0, node_fs_1.existsSync)(firstJsonlPath)) {
-            rewriteReport = await (0, rewriter_js_1.rewriteJsonlStream)(firstJsonlPath, null, ctx, { newSessionId: sessionIdMap.get(firstSession.sessionId) });
+        const firstJsonlPath = join(exportPath, "sessions", `${firstSession.sessionId}.jsonl`);
+        if (existsSync(firstJsonlPath)) {
+            rewriteReport = await rewriteJsonlStream(firstJsonlPath, null, ctx, { newSessionId: sessionIdMap.get(firstSession.sessionId) });
         }
         return {
             success: true,
@@ -180,22 +177,22 @@ async function importSession(options) {
         };
     }
     // Step 4: Write session files
-    (0, node_fs_1.mkdirSync)(targetProjectDir, { recursive: true });
+    mkdirSync(targetProjectDir, { recursive: true });
     // Helper: remove only the files written by this import (targeted rollback)
     const rollbackImportedFiles = () => {
         for (const [, newId] of sessionIdMap) {
             // Remove new session JSONL file
-            const jsonlFile = (0, node_path_1.join)(targetProjectDir, `${newId}.jsonl`);
-            if ((0, node_fs_1.existsSync)(jsonlFile))
-                (0, node_fs_1.rmSync)(jsonlFile, { force: true });
+            const jsonlFile = join(targetProjectDir, `${newId}.jsonl`);
+            if (existsSync(jsonlFile))
+                rmSync(jsonlFile, { force: true });
             // Remove new session subdirectory (subagents, tool-results)
-            const sessionSubDir = (0, node_path_1.join)(targetProjectDir, newId);
-            if ((0, node_fs_1.existsSync)(sessionSubDir))
-                (0, node_fs_1.rmSync)(sessionSubDir, { recursive: true, force: true });
+            const sessionSubDir = join(targetProjectDir, newId);
+            if (existsSync(sessionSubDir))
+                rmSync(sessionSubDir, { recursive: true, force: true });
             // Remove new file-history directory
-            const fhDir = (0, node_path_1.join)(targetConfigDir, "file-history", newId);
-            if ((0, node_fs_1.existsSync)(fhDir))
-                (0, node_fs_1.rmSync)(fhDir, { recursive: true, force: true });
+            const fhDir = join(targetConfigDir, "file-history", newId);
+            if (existsSync(fhDir))
+                rmSync(fhDir, { recursive: true, force: true });
         }
     };
     const postRewriteHashes = new Map();
@@ -203,11 +200,11 @@ async function importSession(options) {
         for (const [sessionIndex, session] of targetSessions.entries()) {
             const newSessionId = sessionIdMap.get(session.sessionId);
             // Rewrite and write JSONL
-            const jsonlPath = (0, node_path_1.join)(exportPath, "sessions", `${session.sessionId}.jsonl`);
-            if ((0, node_fs_1.existsSync)(jsonlPath)) {
-                const bytesTotal = (0, node_fs_1.statSync)(jsonlPath).size;
+            const jsonlPath = join(exportPath, "sessions", `${session.sessionId}.jsonl`);
+            if (existsSync(jsonlPath)) {
+                const bytesTotal = statSync(jsonlPath).size;
                 const throttled = onProgress
-                    ? (0, progress_js_1.percentThrottle)(bytesTotal, (percent, bytesProcessed) => onProgress({
+                    ? percentThrottle(bytesTotal, (percent, bytesProcessed) => onProgress({
                         phase: "import-rewrite",
                         sessionId: session.sessionId,
                         sessionIndex,
@@ -217,7 +214,7 @@ async function importSession(options) {
                         percent,
                     }))
                     : undefined;
-                const streamReport = await (0, rewriter_js_1.rewriteJsonlStream)(jsonlPath, (0, node_path_1.join)(targetProjectDir, `${newSessionId}.jsonl`), ctx, { adapters, newSessionId, computeHash: true, onProgress: throttled });
+                const streamReport = await rewriteJsonlStream(jsonlPath, join(targetProjectDir, `${newSessionId}.jsonl`), ctx, { adapters, newSessionId, computeHash: true, onProgress: throttled });
                 versionAdaptations.push(...streamReport.adaptationsApplied);
                 postRewriteHashes.set(session.sessionId, streamReport.outputHash);
                 // Strict-validation semantics (previously a post-write re-read in
@@ -242,36 +239,36 @@ async function importSession(options) {
                 }
             }
             // Copy subagents
-            const subagentsDir = (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "subagents");
-            if ((0, node_fs_1.existsSync)(subagentsDir)) {
-                const targetSubDir = (0, node_path_1.join)(targetProjectDir, newSessionId, "subagents");
-                (0, node_fs_1.mkdirSync)(targetSubDir, { recursive: true });
-                for (const file of (0, node_fs_1.readdirSync)(subagentsDir)) {
+            const subagentsDir = join(exportPath, "sessions", session.sessionId, "subagents");
+            if (existsSync(subagentsDir)) {
+                const targetSubDir = join(targetProjectDir, newSessionId, "subagents");
+                mkdirSync(targetSubDir, { recursive: true });
+                for (const file of readdirSync(subagentsDir)) {
                     if (file.endsWith(".jsonl")) {
                         // Rewrite subagent JSONL too (never applies version adapters).
-                        await (0, rewriter_js_1.rewriteJsonlStream)((0, node_path_1.join)(subagentsDir, file), (0, node_path_1.join)(targetSubDir, file), ctx, { newSessionId });
+                        await rewriteJsonlStream(join(subagentsDir, file), join(targetSubDir, file), ctx, { newSessionId });
                     }
                     else {
-                        (0, node_fs_1.copyFileSync)((0, node_path_1.join)(subagentsDir, file), (0, node_path_1.join)(targetSubDir, file));
+                        copyFileSync(join(subagentsDir, file), join(targetSubDir, file));
                     }
                 }
             }
             // Copy tool results
-            const toolResultsDir = (0, node_path_1.join)(exportPath, "sessions", session.sessionId, "tool-results");
-            if ((0, node_fs_1.existsSync)(toolResultsDir)) {
-                const targetTrDir = (0, node_path_1.join)(targetProjectDir, newSessionId, "tool-results");
-                (0, node_fs_1.mkdirSync)(targetTrDir, { recursive: true });
-                for (const file of (0, node_fs_1.readdirSync)(toolResultsDir)) {
-                    (0, node_fs_1.copyFileSync)((0, node_path_1.join)(toolResultsDir, file), (0, node_path_1.join)(targetTrDir, file));
+            const toolResultsDir = join(exportPath, "sessions", session.sessionId, "tool-results");
+            if (existsSync(toolResultsDir)) {
+                const targetTrDir = join(targetProjectDir, newSessionId, "tool-results");
+                mkdirSync(targetTrDir, { recursive: true });
+                for (const file of readdirSync(toolResultsDir)) {
+                    copyFileSync(join(toolResultsDir, file), join(targetTrDir, file));
                 }
             }
             // Copy file history
-            const fileHistoryDir = (0, node_path_1.join)(exportPath, "file-history", session.sessionId);
-            if ((0, node_fs_1.existsSync)(fileHistoryDir)) {
-                const targetFhDir = (0, node_path_1.join)(targetConfigDir, "file-history", newSessionId);
-                (0, node_fs_1.mkdirSync)(targetFhDir, { recursive: true });
-                for (const file of (0, node_fs_1.readdirSync)(fileHistoryDir)) {
-                    (0, node_fs_1.copyFileSync)((0, node_path_1.join)(fileHistoryDir, file), (0, node_path_1.join)(targetFhDir, file));
+            const fileHistoryDir = join(exportPath, "file-history", session.sessionId);
+            if (existsSync(fileHistoryDir)) {
+                const targetFhDir = join(targetConfigDir, "file-history", newSessionId);
+                mkdirSync(targetFhDir, { recursive: true });
+                for (const file of readdirSync(fileHistoryDir)) {
+                    copyFileSync(join(fileHistoryDir, file), join(targetFhDir, file));
                 }
             }
         }
@@ -294,43 +291,43 @@ async function importSession(options) {
     }
     // Step 5: Merge memory files, tracking conflicts for user resolution
     const memoryConflicts = [];
-    const memoryDir = (0, node_path_1.join)(exportPath, "memory");
-    if ((0, node_fs_1.existsSync)(memoryDir)) {
-        const targetMemDir = (0, node_path_1.join)(targetProjectDir, "memory");
-        (0, node_fs_1.mkdirSync)(targetMemDir, { recursive: true });
-        for (const file of (0, node_fs_1.readdirSync)(memoryDir)) {
-            const targetFile = (0, node_path_1.join)(targetMemDir, file);
-            if ((0, node_fs_1.existsSync)(targetFile)) {
-                const existingContent = (0, node_fs_1.readFileSync)(targetFile, "utf-8");
-                const newContent = (0, node_fs_1.readFileSync)((0, node_path_1.join)(memoryDir, file), "utf-8");
+    const memoryDir = join(exportPath, "memory");
+    if (existsSync(memoryDir)) {
+        const targetMemDir = join(targetProjectDir, "memory");
+        mkdirSync(targetMemDir, { recursive: true });
+        for (const file of readdirSync(memoryDir)) {
+            const targetFile = join(targetMemDir, file);
+            if (existsSync(targetFile)) {
+                const existingContent = readFileSync(targetFile, "utf-8");
+                const newContent = readFileSync(join(memoryDir, file), "utf-8");
                 if (existingContent !== newContent) {
-                    const existingHash = (0, manifest_js_1.computeIntegrityHash)([existingContent]);
-                    const incomingHash = (0, manifest_js_1.computeIntegrityHash)([newContent]);
+                    const existingHash = computeIntegrityHash([existingContent]);
+                    const incomingHash = computeIntegrityHash([newContent]);
                     memoryConflicts.push({ filename: file, existingHash, incomingHash });
                     warnings.push(`Memory file "${file}" exists with different content — kept existing version. Use memoryConflicts in result to resolve.`);
                 }
                 // Skip — keep existing (skill can overwrite if user chooses incoming)
             }
             else {
-                (0, node_fs_1.copyFileSync)((0, node_path_1.join)(memoryDir, file), targetFile);
+                copyFileSync(join(memoryDir, file), targetFile);
             }
         }
     }
     // Copy plans
-    const plansDir = (0, node_path_1.join)(exportPath, "plans");
-    if ((0, node_fs_1.existsSync)(plansDir)) {
-        const targetPlansDir = (0, node_path_1.join)(targetConfigDir, "plans");
-        (0, node_fs_1.mkdirSync)(targetPlansDir, { recursive: true });
-        for (const file of (0, node_fs_1.readdirSync)(plansDir)) {
-            const targetFile = (0, node_path_1.join)(targetPlansDir, file);
-            if (!(0, node_fs_1.existsSync)(targetFile)) {
-                (0, node_fs_1.copyFileSync)((0, node_path_1.join)(plansDir, file), targetFile);
+    const plansDir = join(exportPath, "plans");
+    if (existsSync(plansDir)) {
+        const targetPlansDir = join(targetConfigDir, "plans");
+        mkdirSync(targetPlansDir, { recursive: true });
+        for (const file of readdirSync(plansDir)) {
+            const targetFile = join(targetPlansDir, file);
+            if (!existsSync(targetFile)) {
+                copyFileSync(join(plansDir, file), targetFile);
             }
         }
     }
     // Step 7: Register in indexes (only after successful validation)
     if (!noRegister) {
-        const historyPath = (0, node_path_1.join)(targetConfigDir, "history.jsonl");
+        const historyPath = join(targetConfigDir, "history.jsonl");
         for (const session of targetSessions) {
             const newSessionId = sessionIdMap.get(session.sessionId);
             const historyEntry = {
@@ -340,7 +337,7 @@ async function importSession(options) {
                 project: targetProjectPath,
                 sessionId: newSessionId,
             };
-            (0, node_fs_1.appendFileSync)(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
+            appendFileSync(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
         }
     }
     // Always record the imported-hash registry entries — machine-id or not —
@@ -389,7 +386,7 @@ async function importSession(options) {
             };
             state.lineage[newId] = lineage;
             const sent = {
-                headEntryUuid: (0, jsonl_js_1.readLastEntryUuid)((0, node_path_1.join)(targetProjectDir, `${newId}.jsonl`)) ?? "",
+                headEntryUuid: readLastEntryUuid(join(targetProjectDir, `${newId}.jsonl`)) ?? "",
                 messageCount: session.messageCount,
                 sentAsType: type,
                 sentAsSessionId: session.sessionId,
@@ -397,7 +394,7 @@ async function importSession(options) {
             peer.sent[newId] = sent;
         }
     }
-    (0, sync_state_js_1.writeSyncState)(state);
+    writeSyncState(state);
     return {
         success: true,
         command: "import",

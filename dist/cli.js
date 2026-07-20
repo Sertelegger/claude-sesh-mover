@@ -1,23 +1,21 @@
 #!/usr/bin/env node
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-const commander_1 = require("commander");
-const node_os_1 = require("node:os");
-const node_path_1 = require("node:path");
-const node_fs_1 = require("node:fs");
-const node_child_process_1 = require("node:child_process");
-const platform_js_1 = require("./platform.js");
-const config_js_1 = require("./config.js");
-const exporter_js_1 = require("./exporter.js");
-const importer_js_1 = require("./importer.js");
-const migrator_js_1 = require("./migrator.js");
-const manifest_js_1 = require("./manifest.js");
-const machine_js_1 = require("./machine.js");
-const sync_state_js_1 = require("./sync-state.js");
-const jsonl_js_1 = require("./jsonl.js");
-const archiver_js_1 = require("./archiver.js");
-const discovery_js_1 = require("./discovery.js");
-const program = new commander_1.Command();
+import { Command } from "commander";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { resolveConfigDir, detectPlatform } from "./platform.js";
+import { getDefaultConfig, readConfig, writeConfig, mergeConfigs, setConfigValue, } from "./config.js";
+import { exportSession, exportAllSessions } from "./exporter.js";
+import { importSession } from "./importer.js";
+import { migrateSession } from "./migrator.js";
+import { readManifest, assertSafeManifestIds } from "./manifest.js";
+import { loadOrCreateMachineId } from "./machine.js";
+import { readSyncState, recordSentFromBundle } from "./sync-state.js";
+import { readLastEntryUuid } from "./jsonl.js";
+import { createArchive, extractArchive, detectArchiveFormat, isZstdAvailable, } from "./archiver.js";
+import { discoverSessionById } from "./discovery.js";
+const program = new Command();
 program
     .name("sesh-mover")
     .description("Export, import, and migrate Claude Code sessions")
@@ -47,7 +45,7 @@ program
         const onProgress = opts.progress
             ? (ev) => process.stderr.write(JSON.stringify(ev) + "\n")
             : undefined;
-        const configDir = (0, platform_js_1.resolveConfigDir)(opts.sourceConfigDir);
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
         const config = loadEffectiveConfig(configDir, process.cwd());
         const scope = parseScope(opts.scope ?? config.export.scope, "export");
         const storage = parseStorage(opts.storage ?? config.export.storage);
@@ -73,12 +71,12 @@ program
             outputDir = opts.output;
         }
         else if (storage === "project") {
-            outputDir = (0, node_path_1.join)(process.cwd(), ".claude-sesh-mover");
+            outputDir = join(process.cwd(), ".claude-sesh-mover");
         }
         else {
-            outputDir = (0, node_path_1.join)((0, node_os_1.homedir)(), ".claude-sesh-mover");
+            outputDir = join(homedir(), ".claude-sesh-mover");
         }
-        (0, node_fs_1.mkdirSync)(outputDir, { recursive: true });
+        mkdirSync(outputDir, { recursive: true });
         // Generate name
         const name = opts.name ?? generateExportName(configDir, opts.sessionId);
         // Collision handling: resolve the final name first, then run ONE shared
@@ -90,12 +88,12 @@ program
                 output({
                     success: true,
                     command: "export",
-                    exportPath: (0, node_path_1.join)(outputDir, name),
+                    exportPath: join(outputDir, name),
                     sessions: [],
                     warnings: [],
                     archivePath: null,
                     collision: true,
-                    existingPath: (0, node_path_1.join)(outputDir, name),
+                    existingPath: join(outputDir, name),
                 });
                 return;
             }
@@ -141,17 +139,17 @@ program
             : undefined;
         let fromPath = opts.from;
         // If archive, extract first
-        const archiveFormat = (0, archiver_js_1.detectArchiveFormat)(fromPath);
+        const archiveFormat = detectArchiveFormat(fromPath);
         if (archiveFormat) {
             onProgress?.({ phase: "extract", percent: 0 });
-            tempExtractDir = (0, node_fs_1.mkdtempSync)((0, node_path_1.join)((0, node_os_1.tmpdir)(), "sesh-mover-extract-"));
-            await (0, archiver_js_1.extractArchive)(fromPath, tempExtractDir);
+            tempExtractDir = mkdtempSync(join(tmpdir(), "sesh-mover-extract-"));
+            await extractArchive(fromPath, tempExtractDir);
             onProgress?.({ phase: "extract", percent: 100 });
             fromPath = tempExtractDir;
         }
-        const targetConfigDir = (0, platform_js_1.resolveConfigDir)(opts.targetConfigDir);
+        const targetConfigDir = resolveConfigDir(opts.targetConfigDir);
         const claudeVersion = getClaudeVersion();
-        const result = await (0, importer_js_1.importSession)({
+        const result = await importSession({
             exportPath: fromPath,
             targetConfigDir,
             targetProjectPath: opts.targetProjectPath,
@@ -169,7 +167,7 @@ program
     }
     finally {
         if (tempExtractDir)
-            (0, node_fs_1.rmSync)(tempExtractDir, { recursive: true, force: true });
+            rmSync(tempExtractDir, { recursive: true, force: true });
     }
 });
 // --- Migrate ---
@@ -192,13 +190,13 @@ program
         const onProgress = opts.progress
             ? (ev) => process.stderr.write(JSON.stringify(ev) + "\n")
             : undefined;
-        const sourceConfigDir = (0, platform_js_1.resolveConfigDir)(opts.sourceConfigDir);
-        const targetConfigDir = (0, platform_js_1.resolveConfigDir)(opts.targetConfigDir);
+        const sourceConfigDir = resolveConfigDir(opts.sourceConfigDir);
+        const targetConfigDir = resolveConfigDir(opts.targetConfigDir);
         const claudeVersion = getClaudeVersion();
         const sourceProjectPath = opts.sourceProjectPath ?? process.cwd();
         const config = loadEffectiveConfig(sourceConfigDir, sourceProjectPath);
         const scope = parseScope(opts.scope ?? config.migrate.scope, "migrate");
-        const result = await (0, migrator_js_1.migrateSession)({
+        const result = await migrateSession({
             sourceConfigDir,
             targetConfigDir,
             sourceProjectPath,
@@ -232,27 +230,27 @@ program
         const exports = [];
         const searchDirs = [];
         if (opts.storage === "user" || opts.storage === "all") {
-            const userDir = (0, node_path_1.join)((0, node_os_1.homedir)(), ".claude-sesh-mover");
-            if ((0, node_fs_1.existsSync)(userDir)) {
+            const userDir = join(homedir(), ".claude-sesh-mover");
+            if (existsSync(userDir)) {
                 searchDirs.push({ dir: userDir, storage: "user" });
             }
         }
         if (opts.storage === "project" || opts.storage === "all") {
-            const projectDir = (0, node_path_1.join)(process.cwd(), ".claude-sesh-mover");
-            if ((0, node_fs_1.existsSync)(projectDir)) {
+            const projectDir = join(process.cwd(), ".claude-sesh-mover");
+            if (existsSync(projectDir)) {
                 searchDirs.push({ dir: projectDir, storage: "project" });
             }
         }
         for (const { dir, storage } of searchDirs) {
-            const entries = (0, node_fs_1.readdirSync)(dir);
+            const entries = readdirSync(dir);
             for (const entry of entries) {
-                const manifestPath = (0, node_path_1.join)(dir, entry, "manifest.json");
-                if ((0, node_fs_1.existsSync)(manifestPath)) {
+                const manifestPath = join(dir, entry, "manifest.json");
+                if (existsSync(manifestPath)) {
                     try {
-                        const manifest = (0, manifest_js_1.readManifest)((0, node_path_1.join)(dir, entry));
+                        const manifest = readManifest(join(dir, entry));
                         exports.push({
                             name: entry,
-                            path: (0, node_path_1.join)(dir, entry),
+                            path: join(dir, entry),
                             exportedAt: manifest.exportedAt,
                             sourcePlatform: manifest.sourcePlatform,
                             sourceProjectPath: manifest.sourceProjectPath,
@@ -269,16 +267,16 @@ program
         }
         // Also look for archives in the search dirs
         for (const { dir, storage } of searchDirs) {
-            const entries = (0, node_fs_1.readdirSync)(dir);
+            const entries = readdirSync(dir);
             for (const entry of entries) {
                 if (entry.endsWith(".tar.gz") || entry.endsWith(".tar.zst")) {
                     // We can't read manifests from archives without extracting
                     // Just list them with minimal info
                     exports.push({
                         name: entry,
-                        path: (0, node_path_1.join)(dir, entry),
+                        path: join(dir, entry),
                         exportedAt: "",
-                        sourcePlatform: (0, platform_js_1.detectPlatform)(),
+                        sourcePlatform: detectPlatform(),
                         sourceProjectPath: "",
                         sessionCount: 0,
                         sessions: [],
@@ -291,16 +289,16 @@ program
         // This catches exports dropped directly in the project root (e.g., received via file transfer)
         if (opts.storage === "project" || opts.storage === "all") {
             const cwd = process.cwd();
-            const cwdEntries = (0, node_fs_1.readdirSync)(cwd);
+            const cwdEntries = readdirSync(cwd);
             for (const entry of cwdEntries) {
                 if (entry === ".claude-sesh-mover")
                     continue; // already scanned above
-                const entryPath = (0, node_path_1.join)(cwd, entry);
+                const entryPath = join(cwd, entry);
                 // Check for export directories with manifest.json
-                const manifestPath = (0, node_path_1.join)(entryPath, "manifest.json");
-                if ((0, node_fs_1.existsSync)(manifestPath)) {
+                const manifestPath = join(entryPath, "manifest.json");
+                if (existsSync(manifestPath)) {
                     try {
-                        const manifest = (0, manifest_js_1.readManifest)(entryPath);
+                        const manifest = readManifest(entryPath);
                         if (manifest.plugin === "sesh-mover") {
                             exports.push({
                                 name: entry,
@@ -326,7 +324,7 @@ program
                             name: entry,
                             path: entryPath,
                             exportedAt: "",
-                            sourcePlatform: (0, platform_js_1.detectPlatform)(),
+                            sourcePlatform: detectPlatform(),
                             sourceProjectPath: "",
                             sessionCount: 0,
                             sessions: [],
@@ -363,14 +361,14 @@ program
     .action(async (opts) => {
     try {
         const configDir = opts.scope === "project"
-            ? (0, node_path_1.join)(process.cwd(), ".claude-sesh-mover")
-            : (0, node_path_1.join)((0, node_os_1.homedir)(), ".claude-sesh-mover");
+            ? join(process.cwd(), ".claude-sesh-mover")
+            : join(homedir(), ".claude-sesh-mover");
         if (opts.reset) {
-            (0, config_js_1.writeConfig)(configDir, (0, config_js_1.getDefaultConfig)());
+            writeConfig(configDir, getDefaultConfig());
             const result = {
                 success: true,
                 command: "configure",
-                config: (0, config_js_1.getDefaultConfig)(),
+                config: getDefaultConfig(),
                 scope: opts.scope,
                 message: "Config reset to defaults",
             };
@@ -395,14 +393,14 @@ program
                 const result = {
                     success: true,
                     command: "configure",
-                    config: (0, config_js_1.readConfig)(configDir),
+                    config: readConfig(configDir),
                     scope: opts.scope,
                     message: `Set machine.name = ${identity.name}`,
                 };
                 output(result);
                 return;
             }
-            let config = (0, config_js_1.readConfig)(configDir);
+            let config = readConfig(configDir);
             // Parse value
             let parsedValue = value;
             if (value === "true")
@@ -418,8 +416,8 @@ program
                     return;
                 }
             }
-            config = (0, config_js_1.setConfigValue)(config, key, parsedValue);
-            (0, config_js_1.writeConfig)(configDir, config);
+            config = setConfigValue(config, key, parsedValue);
+            writeConfig(configDir, config);
             const result = {
                 success: true,
                 command: "configure",
@@ -431,7 +429,7 @@ program
             return;
         }
         if (opts.show) {
-            const config = loadEffectiveConfig((0, platform_js_1.resolveConfigDir)(), process.cwd());
+            const config = loadEffectiveConfig(resolveConfigDir(), process.cwd());
             const result = {
                 success: true,
                 command: "configure",
@@ -443,7 +441,7 @@ program
             return;
         }
         // Default: show config
-        const config = (0, config_js_1.readConfig)(configDir);
+        const config = readConfig(configDir);
         const result = {
             success: true,
             command: "configure",
@@ -463,15 +461,15 @@ program
 // never collide silently (an archive's staging dir is removed after
 // packaging, so only `<name>.tar.gz`/`<name>.tar.zst` remains on disk).
 function exportArtifactExists(outputDir, name) {
-    return ((0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, name)) ||
-        (0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, `${name}.tar.gz`)) ||
-        (0, node_fs_1.existsSync)((0, node_path_1.join)(outputDir, `${name}.tar.zst`)));
+    return (existsSync(join(outputDir, name)) ||
+        existsSync(join(outputDir, `${name}.tar.gz`)) ||
+        existsSync(join(outputDir, `${name}.tar.zst`)));
 }
 async function doExport(configDir, scope, sessionId, outputDir, name, excludeLayers, claudeVersion, projectPathOverride, noSummary, incremental, onProgress) {
     // Detect project path from cwd or override
     const projectPath = projectPathOverride ?? process.cwd();
     if (scope === "all") {
-        return (0, exporter_js_1.exportAllSessions)({
+        return exportAllSessions({
             configDir,
             projectPath,
             outputDir,
@@ -483,7 +481,7 @@ async function doExport(configDir, scope, sessionId, outputDir, name, excludeLay
             onProgress,
         });
     }
-    return (0, exporter_js_1.exportSession)({
+    return exportSession({
         configDir,
         projectPath,
         sessionId,
@@ -501,7 +499,7 @@ async function finalizeExport(params) {
     const bundleDir = result.exportPath;
     if (format === "archive" || format === "zstd") {
         let compression = format === "zstd" ? "zstd" : "gzip";
-        if (compression === "zstd" && !(await (0, archiver_js_1.isZstdAvailable)())) {
+        if (compression === "zstd" && !(await isZstdAvailable())) {
             result.warnings.push("zstd not found on system, falling back to gzip");
             compression = "gzip";
             result.actualFormat = "archive"; // signal fallback to skill
@@ -513,22 +511,22 @@ async function finalizeExport(params) {
         // (those entries would never actually ship, and would be silently
         // skipped on the next incremental export as "already sent").
         onProgress?.({ phase: "archive", percent: 0 });
-        await (0, archiver_js_1.createArchive)(bundleDir, archivePath, compression);
+        await createArchive(bundleDir, archivePath, compression);
         onProgress?.({ phase: "archive", percent: 100 });
         // Record sync state from the bundle now that the archive exists — the
         // staging dir is still present at this point, so recordSentFromBundle
         // can still read the session JSONL snapshots out of it.
         if (incremental?.targetMachineId) {
-            (0, sync_state_js_1.recordSentFromBundle)(projectPath, { id: incremental.targetMachineId, name: incremental.targetMachineName }, bundleDir);
+            recordSentFromBundle(projectPath, { id: incremental.targetMachineId, name: incremental.targetMachineName }, bundleDir);
         }
-        (0, node_fs_1.rmSync)(bundleDir, { recursive: true, force: true });
+        rmSync(bundleDir, { recursive: true, force: true });
         result.archivePath = archivePath;
         result.exportPath = archivePath;
         return;
     }
     // dir format: no archiving step that can fail, so record immediately.
     if (incremental?.targetMachineId) {
-        (0, sync_state_js_1.recordSentFromBundle)(projectPath, { id: incremental.targetMachineId, name: incremental.targetMachineName }, bundleDir);
+        recordSentFromBundle(projectPath, { id: incremental.targetMachineId, name: incremental.targetMachineName }, bundleDir);
     }
 }
 function resolvePeer(state, needle) {
@@ -540,12 +538,12 @@ function resolvePeer(state, needle) {
     return null;
 }
 function readReferenceManifest(path) {
-    const manifestPath = (0, node_path_1.join)(path, "manifest.json");
-    if (!(0, node_fs_1.existsSync)(manifestPath)) {
+    const manifestPath = join(path, "manifest.json");
+    if (!existsSync(manifestPath)) {
         throw new Error(`--since ${path} does not contain a manifest.json (archive --since is a phase-2 feature).`);
     }
-    const manifest = JSON.parse((0, node_fs_1.readFileSync)(manifestPath, "utf-8"));
-    (0, manifest_js_1.assertSafeManifestIds)(manifest);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    assertSafeManifestIds(manifest);
     return manifest;
 }
 function resolveIncrementalOptions(opts) {
@@ -557,10 +555,10 @@ function resolveIncrementalOptions(opts) {
     if (opts.to && opts.since) {
         throw new Error("Invalid --incremental usage: --to and --since are mutually exclusive.");
     }
-    const machine = (0, machine_js_1.loadOrCreateMachineId)();
+    const machine = loadOrCreateMachineId();
     const projectPath = opts.projectPath ?? process.cwd();
     if (opts.to) {
-        const state = (0, sync_state_js_1.readSyncState)(projectPath);
+        const state = readSyncState(projectPath);
         const match = resolvePeer(state, opts.to);
         if (!match) {
             throw new Error(`No sync history with peer "${opts.to}". Run a full export to this peer first, or use --since <path>.`);
@@ -581,7 +579,7 @@ function resolveIncrementalOptions(opts) {
             ? s.continuation.continuesLocalSessionId
             : s.sessionId;
         peerSent[localId] = {
-            headEntryUuid: (0, jsonl_js_1.readLastEntryUuid)((0, node_path_1.join)(opts.since, "sessions", `${s.sessionId}.jsonl`)) ?? "",
+            headEntryUuid: readLastEntryUuid(join(opts.since, "sessions", `${s.sessionId}.jsonl`)) ?? "",
             messageCount: s.messageCount,
             sentAsType: s.type === "continuation" ? "continuation" : "full",
             sentAsSessionId: s.sessionId,
@@ -625,16 +623,16 @@ function parseFormat(value) {
     }
 }
 function loadEffectiveConfig(configDir, projectDir) {
-    const userConfigDir = (0, node_path_1.join)((0, node_os_1.homedir)(), ".claude-sesh-mover");
-    const projectConfigDir = (0, node_path_1.join)(projectDir, ".claude-sesh-mover");
-    const userConfig = (0, config_js_1.readConfig)(userConfigDir);
-    const projectConfig = (0, config_js_1.readConfig)(projectConfigDir);
-    return (0, config_js_1.mergeConfigs)(userConfig, projectConfig);
+    const userConfigDir = join(homedir(), ".claude-sesh-mover");
+    const projectConfigDir = join(projectDir, ".claude-sesh-mover");
+    const userConfig = readConfig(userConfigDir);
+    const projectConfig = readConfig(projectConfigDir);
+    return mergeConfigs(userConfig, projectConfig);
 }
 function generateExportName(configDir, sessionId) {
     const date = new Date().toISOString().split("T")[0];
     if (sessionId) {
-        const session = (0, discovery_js_1.discoverSessionById)(configDir, sessionId);
+        const session = discoverSessionById(configDir, sessionId);
         if (session && session.slug) {
             return `${date}-${session.slug}`;
         }
@@ -643,7 +641,7 @@ function generateExportName(configDir, sessionId) {
 }
 function getClaudeVersion() {
     try {
-        const version = (0, node_child_process_1.execFileSync)("claude", ["--version"], {
+        const version = execFileSync("claude", ["--version"], {
             encoding: "utf-8",
             timeout: 5000,
         }).trim();

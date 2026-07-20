@@ -1,16 +1,7 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.detectPlatform = detectPlatform;
-exports.translatePath = translatePath;
-exports.samePlatformFamily = samePlatformFamily;
-exports.encodeProjectPath = encodeProjectPath;
-exports.resolveConfigDir = resolveConfigDir;
-exports.getCurrentUser = getCurrentUser;
-exports.extractUserFromPath = extractUserFromPath;
-const node_fs_1 = require("node:fs");
-const node_os_1 = require("node:os");
-const node_path_1 = require("node:path");
-function detectPlatform() {
+import { readFileSync, existsSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
+import { join } from "node:path";
+export function detectPlatform() {
     if (process.platform === "win32")
         return "win32";
     if (process.platform === "darwin")
@@ -18,8 +9,8 @@ function detectPlatform() {
     // Linux — check for WSL
     if (process.platform === "linux") {
         try {
-            if ((0, node_fs_1.existsSync)("/proc/version")) {
-                const procVersion = (0, node_fs_1.readFileSync)("/proc/version", "utf-8");
+            if (existsSync("/proc/version")) {
+                const procVersion = readFileSync("/proc/version", "utf-8");
                 if (/microsoft/i.test(procVersion)) {
                     // Detect WSL version
                     if (/WSL2/i.test(procVersion))
@@ -27,7 +18,7 @@ function detectPlatform() {
                     return "wsl1";
                 }
             }
-            if ((0, node_fs_1.existsSync)("/proc/sys/fs/binfmt_misc/WSLInterop")) {
+            if (existsSync("/proc/sys/fs/binfmt_misc/WSLInterop")) {
                 return "wsl2"; // WSLInterop fallback — unreachable in practice since /proc/version check fires first on any WSL system
             }
         }
@@ -39,7 +30,7 @@ function detectPlatform() {
     return "linux"; // fallback
 }
 // Note: darwin↔linux cross-platform translation is intentionally not handled here. Callers always provide sourceProjectPath/targetProjectPath for those cases, which triggers same-platform substitution.
-function translatePath(inputPath, sourcePlatform, targetPlatform, options) {
+export function translatePath(inputPath, sourcePlatform, targetPlatform, options) {
     const { sourceUser, targetUser, sourceProjectPath, targetProjectPath } = options;
     // Same-platform path substitution
     if (samePlatformFamily(sourcePlatform, targetPlatform) &&
@@ -117,7 +108,7 @@ function translatePath(inputPath, sourcePlatform, targetPlatform, options) {
     }
     return inputPath;
 }
-function samePlatformFamily(a, b) {
+export function samePlatformFamily(a, b) {
     const wslOrLinux = (p) => p === "linux" || p === "wsl1" || p === "wsl2";
     if (a === b)
         return true;
@@ -128,7 +119,7 @@ function samePlatformFamily(a, b) {
 function escapeRegex(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-function encodeProjectPath(projectPath) {
+export function encodeProjectPath(projectPath) {
     // Claude Code encodes project paths by replacing / with -
     // On Windows, normalize backslashes to forward slashes first, remove drive colon
     // "/Users/sascha/Projects/foo" -> "-Users-sascha-Projects-foo"
@@ -143,7 +134,7 @@ function encodeProjectPath(projectPath) {
 // cannot be distinguished from path separators in the encoded form.
 // Always read the actual project path from JSONL cwd fields or history.jsonl
 // instead of trying to decode the directory name.
-function resolveConfigDir(explicitFlag, envVar) {
+export function resolveConfigDir(explicitFlag, envVar) {
     if (explicitFlag)
         return explicitFlag;
     if (envVar)
@@ -151,12 +142,12 @@ function resolveConfigDir(explicitFlag, envVar) {
     const envConfigDir = process.env.CLAUDE_CONFIG_DIR;
     if (envConfigDir)
         return envConfigDir;
-    return (0, node_path_1.join)((0, node_os_1.homedir)(), ".claude");
+    return join(homedir(), ".claude");
 }
-function getCurrentUser() {
-    return (0, node_os_1.userInfo)().username;
+export function getCurrentUser() {
+    return userInfo().username;
 }
-function extractUserFromPath(path, platform) {
+export function extractUserFromPath(path, platform) {
     if (platform === "win32") {
         const match = path.replace(/\\/g, "/").match(/^[A-Za-z]:\/Users\/([^/]+)/);
         return match ? match[1] : null;

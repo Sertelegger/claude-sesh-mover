@@ -1,12 +1,8 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.buildContinuationJsonl = buildContinuationJsonl;
-exports.buildContinuationStream = buildContinuationStream;
-const node_fs_1 = require("node:fs");
-const node_readline_1 = require("node:readline");
-const node_crypto_1 = require("node:crypto");
-const node_events_1 = require("node:events");
-const promises_1 = require("node:stream/promises");
+import { createReadStream, createWriteStream } from "node:fs";
+import { createInterface } from "node:readline";
+import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
 // Shared by string and stream builders so header text can never drift.
 function buildContinuationHeader(input, previousCount, newCount) {
     const priorLocation = input.previousLocalSessionId
@@ -17,7 +13,7 @@ function buildContinuationHeader(input, previousCount, newCount) {
         `The earlier ${previousCount} message(s) ${priorLocation}. ` +
         `The entries below are the ${newCount} new message(s) appended on the other machine since the last sync.`;
     return {
-        uuid: (0, node_crypto_1.randomUUID)(),
+        uuid: randomUUID(),
         timestamp: new Date().toISOString(),
         sessionId: input.newSessionId,
         cwd: input.targetProjectPath ?? "",
@@ -26,7 +22,7 @@ function buildContinuationHeader(input, previousCount, newCount) {
         message: { role: "user", content },
     };
 }
-function buildContinuationJsonl(input) {
+export function buildContinuationJsonl(input) {
     const { originalJsonl, fromEntryIndex, fromEntryUuid } = input;
     const lines = originalJsonl.trim().split("\n").filter(Boolean);
     if (fromEntryIndex < 0 || fromEntryIndex >= lines.length) {
@@ -52,14 +48,14 @@ function buildContinuationJsonl(input) {
 // the uuid at fromEntryIndex (the header text needs the tail count before
 // any tail line is written). Pass 2 writes header + tail, hashing exactly
 // the written bytes. O(longest line) memory.
-async function buildContinuationStream(input) {
+export async function buildContinuationStream(input) {
     const { sourceJsonlPath, outputPath, fromEntryIndex, fromEntryUuid } = input;
     // Pass 1: count + verify
     let total = 0;
     let uuidAtIndex;
     {
-        const src = (0, node_fs_1.createReadStream)(sourceJsonlPath, { encoding: "utf-8" });
-        const rl = (0, node_readline_1.createInterface)({ input: src, crlfDelay: Infinity });
+        const src = createReadStream(sourceJsonlPath, { encoding: "utf-8" });
+        const rl = createInterface({ input: src, crlfDelay: Infinity });
         try {
             for await (const line of rl) {
                 if (!line)
@@ -89,10 +85,10 @@ async function buildContinuationStream(input) {
     const newCount = total - fromEntryIndex;
     const header = buildContinuationHeader(input, fromEntryIndex, newCount);
     // Pass 2: write header + tail
-    const hash = (0, node_crypto_1.createHash)("sha256");
-    const out = (0, node_fs_1.createWriteStream)(outputPath, { encoding: "utf-8" });
-    const src = (0, node_fs_1.createReadStream)(sourceJsonlPath, { encoding: "utf-8" });
-    const rl = (0, node_readline_1.createInterface)({ input: src, crlfDelay: Infinity });
+    const hash = createHash("sha256");
+    const out = createWriteStream(outputPath, { encoding: "utf-8" });
+    const src = createReadStream(sourceJsonlPath, { encoding: "utf-8" });
+    const rl = createInterface({ input: src, crlfDelay: Infinity });
     let index = 0;
     let entryCount = 0;
     // A write-stream failure (bad output dir, disk full, EACCES) needs three
@@ -120,7 +116,7 @@ async function buildContinuationStream(input) {
         const headerLine = JSON.stringify(header) + "\n";
         hash.update(headerLine);
         if (!out.write(headerLine)) {
-            await Promise.race([(0, node_events_1.once)(out, "drain"), outErrored]);
+            await Promise.race([once(out, "drain"), outErrored]);
         }
         entryCount++;
         for await (const line of rl) {
@@ -135,14 +131,14 @@ async function buildContinuationStream(input) {
                 const chunk = line + "\n";
                 hash.update(chunk);
                 if (!out.write(chunk)) {
-                    await Promise.race([(0, node_events_1.once)(out, "drain"), outErrored]);
+                    await Promise.race([once(out, "drain"), outErrored]);
                 }
                 entryCount++;
             }
             index++;
         }
         out.end();
-        await Promise.race([(0, promises_1.finished)(out), outErrored]);
+        await Promise.race([finished(out), outErrored]);
     }
     catch (e) {
         out.destroy();

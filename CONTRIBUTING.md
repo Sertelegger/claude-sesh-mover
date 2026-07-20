@@ -4,7 +4,7 @@ Thanks for your interest in contributing! This document covers the local setup, 
 
 ## Development setup
 
-Requirements: Node.js ≥ 18.17 (CI runs Node 24) and npm.
+Requirements: Node.js ≥ 22.12 (CI runs Node 24) and npm.
 
 ```bash
 git clone https://github.com/Sertelegger/claude-sesh-mover.git
