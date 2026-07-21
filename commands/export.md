@@ -64,4 +64,6 @@ You are running the sesh-mover export command. Follow these steps:
 
 7. Report what was exported: session name, summary, layers included, destination path.
 
+**See also:** for ongoing cross-machine sync through a shared hub folder instead of a one-off export/import round-trip, use `/sesh-mover:push` (requires `/sesh-mover:hub-init` once).
+
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and any conditional/retry branches, e.g. `--suffix`/`--overwrite` for collision handling) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

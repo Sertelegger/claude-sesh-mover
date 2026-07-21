@@ -12,6 +12,10 @@
     "./commands/import.md",
     "./commands/migrate.md",
     "./commands/browse.md",
-    "./commands/configure.md"
+    "./commands/configure.md",
+    "./commands/hub-init.md",
+    "./commands/push.md",
+    "./commands/pull.md",
+    "./commands/whereis.md"
   ]
 }

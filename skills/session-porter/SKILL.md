@@ -5,7 +5,7 @@ description: Full context for Claude Code session export/import/migration operat
 
 # sesh-mover Session Porter Skill
 
-This skill provides background knowledge for all sesh-mover slash commands. It is not invoked directly by users — the individual commands (export, import, migrate, browse, configure) reference this knowledge.
+This skill provides background knowledge for all sesh-mover slash commands. It is not invoked directly by users — the individual commands (export, import, migrate, browse, configure, hub-init, push, pull, whereis) reference this knowledge.
 
 ## CLI Location
 
@@ -84,3 +84,19 @@ sesh-mover supports incremental export/import between machines. Key concepts:
 - **Idempotent import:** import is idempotent by default for every export, not just incremental ones — a per-project content-hash registry recognizes sessions whose exact content was already imported into this project and skips them (`skippedSessions` reason `duplicate`). Peer-tracked incremental syncs additionally skip sessions already recorded as received from that specific peer (reason `already-received`). Pass `--allow-duplicates` to force a re-import.
 
 When users ask "why are there two sessions that look like the same conversation?" — check `~/.claude-sesh-mover/sync-state/<encoded>.json`'s `lineage` map. The continuation header in the JSONL also spells out the origin session.
+
+## Hub
+
+The hub is a shared directory (synced folder or network share) that lets sessions move between machines without a manual export/import round-trip: `/sesh-mover:hub-init` sets it up once, `/sesh-mover:push` publishes this project's sessions to it, `/sesh-mover:pull` brings a thread from another machine down onto this one, and `/sesh-mover:whereis` is a read-only view of which machines have which threads. There's also a CLI-only repair verb, `hub reindex` — it rebuilds this machine's own hub index for the current project from its own pushed bundles (no dedicated command doc; run it directly if a machine's index looks stale or corrupted, e.g. `node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" hub reindex --project-path "<path>"`).
+
+A **thread** is the hub's cross-machine identity for a logical conversation — one thread can have a different local session id (and even different JSONL content, if machines are out of sync) on each machine. `push`/`pull`/`whereis` all resolve threads before doing anything else.
+
+**JSON result classes the skill must branch on:**
+- `reason: "unlinked"` (push, pull — a `success: false` result instead of their normal shape) — this project directory isn't linked to a hub project yet. Comes with `linkCandidates` (matched by git remote) to present as a pick-list, plus a "create new" option for push (`--create-project`) or pick-and-relink for either (`--project-id <id>`). `whereis` reports the equivalent state differently: it always returns `success: true`, with `linked: false` and the same `linkCandidates` shape embedded in its normal result — there's no separate error case to catch there.
+- `reason: "lock-busy"` (push, pull) — another sesh-mover hub operation is already running for this project **on this machine** (see the lock caveat below). Wait briefly and retry once; don't loop.
+- `reason: "not-yet-synced"` (pull) — the hub folder's own sync client (OneDrive/Dropbox/Syncthing/etc.) hasn't finished copying the needed bundle files to this machine yet. Lists `missing` files; offer a retry.
+- `pickRequired: true` (pull, when run without `--thread`/`--latest`) — presents the same thread list shape as `whereis` (`threads: WhereisThread[]`); ask the user to pick one, or offer `--latest`.
+
+**Same-machine lock caveat:** the push/pull lock (`~/.claude-sesh-mover/locks/<encoded-project-path>.lock`) only guards against two hub operations racing on the **same machine** for the same project. It is not a distributed lock — two different machines can still push or pull concurrently, and the hub's append-only bundle/index design is what keeps that safe, not the lock.
+
+**Trust model:** the hub directory is a trust boundary — sessions are stored there in plaintext at rest until a future encryption slice ships. Anyone with read access to the hub folder can read every pushed session.
