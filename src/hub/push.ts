@@ -13,7 +13,7 @@ import {
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
 import { snapshotWorkspace } from "./workspace.js";
-import { exportAllSessions, exportSession } from "../exporter.js";
+import { exportAllSessions } from "../exporter.js";
 import { createArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
@@ -51,8 +51,11 @@ export async function hubPush(
     throw e;
   }
 
-  const staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
+  // Staging is created inside the protecting try so a mkdtemp failure still
+  // releases the lock in the finally (review fix: post-acquire throw window).
+  let staging: string | null = null;
   try {
+    staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
     const backend = createFsBackend(opts.hubPath);
     const warnings: string[] = [];
     if (lock.stoleStale) {
@@ -97,42 +100,27 @@ export async function hubPush(
     }
     writeSyncState(state);
 
-    // Incremental export against the hub pseudo-peer. exportAllSessions has
-    // no session-id filter, so a single requested id goes through
-    // exportSession (which does filter); a multi-id filter falls back to
-    // exporting every discovered session — the exporter's public API has no
-    // way to export an arbitrary subset in one call.
+    // Incremental export against the hub pseudo-peer. One export path:
+    // exportAllSessions honors sessionIds (undefined = all) and errors on
+    // any requested id that doesn't exist.
     const bundleId = randomUUID();
-    const incremental = {
-      sourceMachineId: machine.id,
-      sourceMachineName: machine.name,
-      targetMachineId: hubPeerId,
-      targetMachineName: "hub",
-      peerSent: state.peers[hubPeerId]?.sent ?? {},
-    };
-    const exportResult =
-      opts.sessionIds && opts.sessionIds.length === 1
-        ? await exportSession({
-            configDir: opts.configDir,
-            projectPath: opts.projectPath,
-            sessionId: opts.sessionIds[0],
-            outputDir: staging,
-            name: "bundle",
-            excludeLayers: [],
-            claudeVersion: opts.claudeVersion,
-            incremental,
-            onProgress: opts.onProgress,
-          })
-        : await exportAllSessions({
-            configDir: opts.configDir,
-            projectPath: opts.projectPath,
-            outputDir: staging,
-            name: "bundle",
-            excludeLayers: [],
-            claudeVersion: opts.claudeVersion,
-            incremental,
-            onProgress: opts.onProgress,
-          });
+    const exportResult = await exportAllSessions({
+      configDir: opts.configDir,
+      projectPath: opts.projectPath,
+      sessionIds: opts.sessionIds,
+      outputDir: staging,
+      name: "bundle",
+      excludeLayers: [],
+      claudeVersion: opts.claudeVersion,
+      incremental: {
+        sourceMachineId: machine.id,
+        sourceMachineName: machine.name,
+        targetMachineId: hubPeerId,
+        targetMachineName: "hub",
+        peerSent: state.peers[hubPeerId]?.sent ?? {},
+      },
+      onProgress: opts.onProgress,
+    });
     if (!exportResult.success) return exportResult;
     const bundleStaging = exportResult.exportPath;
     const manifest = readManifest(bundleStaging);
@@ -217,7 +205,7 @@ export async function hubPush(
       bundleId, pushedSessions, upToDate: false, hasWorkspace, warnings,
     };
   } finally {
-    rmSync(staging, { recursive: true, force: true });
+    if (staging) rmSync(staging, { recursive: true, force: true });
     lock.release();
   }
 }

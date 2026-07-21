@@ -95,6 +95,8 @@ export interface ExportOptions {
   configDir: string;
   projectPath: string;
   sessionId?: string;
+  /** Restrict an all-sessions export to this subset (exportAllSessions only). */
+  sessionIds?: string[];
   outputDir: string;
   name: string;
   excludeLayers: ExportLayer[];
@@ -177,6 +179,7 @@ export async function exportAllSessions(
   const {
     configDir,
     projectPath,
+    sessionIds,
     outputDir,
     name,
     excludeLayers,
@@ -187,13 +190,27 @@ export async function exportAllSessions(
     onProgress,
   } = options;
 
-  const sessions = discoverSessions(configDir, projectPath);
+  let sessions = discoverSessions(configDir, projectPath);
   if (sessions.length === 0) {
     return {
       success: false,
       command: "export",
       error: "No sessions found for this project",
     };
+  }
+
+  if (sessionIds && sessionIds.length > 0) {
+    const discovered = new Set(sessions.map((s) => s.sessionId));
+    const missing = sessionIds.filter((id) => !discovered.has(id));
+    if (missing.length > 0) {
+      return {
+        success: false,
+        command: "export",
+        error: missing.map((id) => `Session ${id} not found`).join("; "),
+      };
+    }
+    const wanted = new Set(sessionIds);
+    sessions = sessions.filter((s) => wanted.has(s.sessionId));
   }
 
   const exportPath = join(outputDir, name);

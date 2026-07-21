@@ -4,6 +4,7 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -170,6 +171,73 @@ describe("exporter", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
       expect(result.sessions.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Extra fixture sessions for the sessionIds filter tests below.
+    function writeExtraSession(id: string, slug: string): void {
+      writeFileSync(
+        join(configDir, "projects", "-Users-testuser-Projects-testproject", `${id}.jsonl`),
+        JSON.stringify({
+          uuid: `${slug}-e1`,
+          timestamp: "2026-07-20T00:00:00Z",
+          sessionId: id,
+          cwd: "/Users/testuser/Projects/testproject",
+          version: "2.1.81",
+          slug,
+          type: "user",
+          message: { role: "user", content: `hello from ${slug}` },
+        }) + "\n"
+      );
+    }
+
+    it("sessionIds filters the export to exactly the requested subset", async () => {
+      const { exportAllSessions } = await import("../src/exporter.js");
+      const idB = "660e8400-e29b-41d4-a716-446655440001";
+      const idC = "660e8400-e29b-41d4-a716-446655440002";
+      writeExtraSession(idB, "session-b");
+      writeExtraSession(idC, "session-c");
+
+      const outputDir = join(tempDir, "export-subset");
+      const result = await exportAllSessions({
+        configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir,
+        name: "subset",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        sessionIds: [sessionId, idB],
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.sessions.map((s) => s.originalId).sort()).toEqual(
+        [sessionId, idB].sort()
+      );
+      const manifest = JSON.parse(
+        readFileSync(join(result.exportPath, "manifest.json"), "utf-8")
+      );
+      expect(manifest.sessions.map((s: { sessionId: string }) => s.sessionId).sort()).toEqual(
+        [sessionId, idB].sort()
+      );
+      expect(existsSync(join(result.exportPath, "sessions", `${idC}.jsonl`))).toBe(false);
+    });
+
+    it("sessionIds with a missing id returns an error naming it", async () => {
+      const { exportAllSessions } = await import("../src/exporter.js");
+      const outputDir = join(tempDir, "export-subset-missing");
+      const result = await exportAllSessions({
+        configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir,
+        name: "subset-missing",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        sessionIds: [sessionId, "00000000-0000-0000-0000-00000000dead"],
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error).toContain("Session 00000000-0000-0000-0000-00000000dead not found");
     });
   });
 

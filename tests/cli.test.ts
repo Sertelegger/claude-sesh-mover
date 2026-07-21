@@ -599,14 +599,12 @@ describe("cli", () => {
           recursive: true,
         });
 
-        const result = JSON.parse(
-          (
-            await runCli(
-              ["push", "--project-path", tempDir, "--create-project", "--source-config-dir", configDir],
-              homeEnv(home)
-            )
-          ).stdout
+        const { stdout, stderr } = await runCli(
+          ["push", "--project-path", tempDir, "--create-project", "--source-config-dir", configDir],
+          homeEnv(home)
         );
+        expect(stderr.trim()).toBe(""); // no --progress: stderr stays pristine
+        const result = JSON.parse(stdout);
         expect(result.success).toBe(true);
         expect(result.command).toBe("push");
         expect(result.pushedSessions).toHaveLength(1);

@@ -90,14 +90,27 @@ export async function exportSession(options) {
     return exportSessions([target], configDir, projectPath, exportPath, excludeLayers, claudeVersion, "current", summaryOverrides, noSummary, incremental, onProgress);
 }
 export async function exportAllSessions(options) {
-    const { configDir, projectPath, outputDir, name, excludeLayers, claudeVersion, summaryOverrides, incremental, noSummary, onProgress, } = options;
-    const sessions = discoverSessions(configDir, projectPath);
+    const { configDir, projectPath, sessionIds, outputDir, name, excludeLayers, claudeVersion, summaryOverrides, incremental, noSummary, onProgress, } = options;
+    let sessions = discoverSessions(configDir, projectPath);
     if (sessions.length === 0) {
         return {
             success: false,
             command: "export",
             error: "No sessions found for this project",
         };
+    }
+    if (sessionIds && sessionIds.length > 0) {
+        const discovered = new Set(sessions.map((s) => s.sessionId));
+        const missing = sessionIds.filter((id) => !discovered.has(id));
+        if (missing.length > 0) {
+            return {
+                success: false,
+                command: "export",
+                error: missing.map((id) => `Session ${id} not found`).join("; "),
+            };
+        }
+        const wanted = new Set(sessionIds);
+        sessions = sessions.filter((s) => wanted.has(s.sessionId));
     }
     const exportPath = join(outputDir, name);
     return exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, "all", summaryOverrides, noSummary, incremental, onProgress);

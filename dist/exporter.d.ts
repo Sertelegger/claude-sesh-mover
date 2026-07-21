@@ -12,6 +12,8 @@ export interface ExportOptions {
     configDir: string;
     projectPath: string;
     sessionId?: string;
+    /** Restrict an all-sessions export to this subset (exportAllSessions only). */
+    sessionIds?: string[];
     outputDir: string;
     name: string;
     excludeLayers: ExportLayer[];

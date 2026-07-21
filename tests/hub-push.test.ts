@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, cpSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, cpSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome } from "./helpers/env.js";
@@ -102,6 +102,71 @@ describe("hub push", () => {
       expect(r.success).toBe(false);
       if (r.success) return;
       expect((r as { reason?: string }).reason).toBe("unlinked");
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("multi-session-id push bundles exactly the requested subset", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      const realEncoded = encodeProjectPath(projectPath);
+      const idB = "660e8400-e29b-41d4-a716-446655440001";
+      const idC = "660e8400-e29b-41d4-a716-446655440002";
+      for (const [id, slug] of [
+        [idB, "session-b"],
+        [idC, "session-c"],
+      ] as const) {
+        writeFileSync(
+          join(configDir, "projects", realEncoded, `${id}.jsonl`),
+          JSON.stringify({
+            uuid: `${slug}-e1`,
+            timestamp: "2026-07-20T00:00:00Z",
+            sessionId: id,
+            cwd: projectPath,
+            version: "2.1.81",
+            slug,
+            type: "user",
+            message: { role: "user", content: `hello from ${slug}` },
+          }) + "\n"
+        );
+      }
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const result = await hubPush({
+        configDir,
+        projectPath,
+        hubPath: hub,
+        sessionIds: [sessionId, idB],
+        createProject: true,
+        claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.pushedSessions.map((s) => s.sessionId).sort()).toEqual(
+        [sessionId, idB].sort()
+      );
+
+      const backend = createFsBackend(hub);
+      const { indexes } = await readAllIndexes(backend, result.projectId);
+      const bundleFile = Object.values(indexes[0].threads).flatMap((t) => t.bundles)[0].file;
+      const archiveTmp = join(base, "subset-bundle.tar.gz");
+      writeFileSync(archiveTmp, await backend.read(bundleFile));
+      const extractDir = join(base, "subset-extracted");
+      mkdirSync(extractDir, { recursive: true });
+      await extractArchive(archiveTmp, extractDir);
+
+      const manifest = JSON.parse(readFileSync(join(extractDir, "manifest.json"), "utf-8"));
+      expect(manifest.sessions.map((s: { sessionId: string }) => s.sessionId).sort()).toEqual(
+        [sessionId, idB].sort()
+      );
+      expect(existsSync(join(extractDir, "sessions", `${idC}.jsonl`))).toBe(false);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
