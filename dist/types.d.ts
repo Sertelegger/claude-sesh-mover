@@ -358,7 +358,17 @@ export interface NotYetSyncedResult {
     missing: string[];
     suggestion: string;
 }
-export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | WhereisResult | HubUnlinkedResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | ErrorResult;
+export interface HubReindexResult {
+    success: true;
+    command: "hub-reindex";
+    projects: Array<{
+        projectId: string;
+        threads: number;
+        bundlesScanned: number;
+    }>;
+    warnings: string[];
+}
+export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | WhereisResult | HubUnlinkedResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | HubReindexResult | ErrorResult;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;

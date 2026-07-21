@@ -397,6 +397,13 @@ export interface NotYetSyncedResult {
   suggestion: string;
 }
 
+export interface HubReindexResult {
+  success: true;
+  command: "hub-reindex";
+  projects: Array<{ projectId: string; threads: number; bundlesScanned: number }>;
+  warnings: string[];
+}
+
 export type CliResult =
   | ExportResult
   | ImportResult
@@ -413,6 +420,7 @@ export type CliResult =
   | HubPullResult
   | HubPullListResult
   | NotYetSyncedResult
+  | HubReindexResult
   | ErrorResult;
 
 // --- Version Adapters ---

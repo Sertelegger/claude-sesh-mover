@@ -487,6 +487,29 @@ hub
         outputError("hub-status", e);
     }
 });
+hub
+    .command("reindex")
+    .description("Rebuild this machine's hub index for the current project from its own bundles")
+    .option("--project-path <path>", "Override project path (default: cwd)")
+    .option("--source-config-dir <path>", "Override Claude config dir")
+    .action(async (opts) => {
+    try {
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
+        const projectPath = opts.projectPath ?? process.cwd();
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { resolveHubPath } = await import("./hub/init.js");
+        const hubPath = resolveHubPath(config);
+        if (!hubPath) {
+            outputError("hub-reindex", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+            return;
+        }
+        const { hubReindex } = await import("./hub/reindex.js");
+        output(await hubReindex({ configDir, projectPath, hubPath }));
+    }
+    catch (e) {
+        outputError("hub-reindex", e);
+    }
+});
 // --- Push ---
 program
     .command("push")
