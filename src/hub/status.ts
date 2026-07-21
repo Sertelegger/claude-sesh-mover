@@ -8,7 +8,7 @@ import { computeEffectiveConfig } from "../config.js";
 import { readLocalProjectId } from "./identity.js";
 import type { HubStatusResult } from "../types.js";
 
-export async function hubStatus(opts: { configDir: string; cwd: string }): Promise<HubStatusResult> {
+export async function hubStatus(opts: { cwd: string }): Promise<HubStatusResult> {
   const warnings: string[] = [];
   const config = computeEffectiveConfig(
     join(homedir(), ".claude-sesh-mover"),

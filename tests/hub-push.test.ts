@@ -173,6 +173,45 @@ describe("hub push", () => {
     }
   });
 
+  it("empty sessionIds array behaves like undefined — pushes all, mints all threads", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      // [] is programmatically distinct from omitted but must behave
+      // identically: not "mint zero threads yet export everything" (the bug
+      // this guards against — see src/hub/push.ts's sessionIds normalization).
+      const result = await hubPush({
+        configDir,
+        projectPath,
+        hubPath: hub,
+        sessionIds: [],
+        createProject: true,
+        claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.pushedSessions.map((s) => s.sessionId)).toEqual([sessionId]);
+
+      const backend = createFsBackend(hub);
+      const { indexes } = await readAllIndexes(backend, result.projectId);
+      expect(indexes).toHaveLength(1);
+      const threads = Object.values(indexes[0].threads);
+      // One thread minted (for the one session), matching the pushed set —
+      // not zero threads with a fully-exported bundle underneath.
+      expect(threads).toHaveLength(1);
+      expect(threads[0].bundles).toHaveLength(1);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
   it("workspace snapshot included for non-git projects; manifest records it", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));

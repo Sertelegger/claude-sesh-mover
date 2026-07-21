@@ -3,16 +3,6 @@ import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { finished } from "node:stream/promises";
 import { assertHubRelPath } from "./layout.js";
-// Thrown by orchestrators (pull) when index records reference files the sync
-// client hasn't materialized yet. Defined here because it is part of the
-// backend's consumer contract, not because backends throw it.
-export class HubNotSyncedError extends Error {
-    missing;
-    constructor(missing) {
-        super(`hub files not yet synced: ${missing.join(", ")}`);
-        this.missing = missing;
-    }
-}
 export function createFsBackend(rootDir) {
     const abs = (relPath) => {
         assertHubRelPath(relPath);

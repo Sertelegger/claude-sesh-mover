@@ -15,17 +15,6 @@ import { join, dirname } from "node:path";
 import { finished } from "node:stream/promises";
 import { assertHubRelPath } from "./layout.js";
 
-// Thrown by orchestrators (pull) when index records reference files the sync
-// client hasn't materialized yet. Defined here because it is part of the
-// backend's consumer contract, not because backends throw it.
-export class HubNotSyncedError extends Error {
-  readonly missing: string[];
-  constructor(missing: string[]) {
-    super(`hub files not yet synced: ${missing.join(", ")}`);
-    this.missing = missing;
-  }
-}
-
 export interface HubWriteStream {
   stream: NodeJS.WritableStream;
   commit(): Promise<void>;

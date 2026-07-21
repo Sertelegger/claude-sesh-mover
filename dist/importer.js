@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendFileSync, rmSync, statSync, } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, } from "./manifest.js";
+import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, isSafeSessionId, } from "./manifest.js";
 import { rewriteJsonlStream, buildPathMappings } from "./rewriter.js";
 import { encodeProjectPath, detectPlatform, extractUserFromPath, getCurrentUser, } from "./platform.js";
 import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
@@ -292,18 +292,27 @@ export async function importSession(options) {
     }
     // Plant the project identity carried by the bundle so hub adoption is
     // seamless later. Never overwrite an existing (different) identity.
+    // manifest.projectId isn't covered by assertSafeManifestIds (that only
+    // guards session ids), so it must be validated here before it's ever
+    // written to disk or used to build a hub path.
     if (manifest.projectId && existsSync(targetProjectPath)) {
-        const existing = readLocalProjectId(targetProjectPath);
-        if (!existing) {
-            writeLocalProjectId(targetProjectPath, {
-                projectId: manifest.projectId,
-                name: manifest.sourceProjectPath.split(/[\\/]/).pop() ?? "project",
-                createdAt: new Date().toISOString(),
-                createdByMachine: manifest.sourceMachineId ?? "unknown",
-            });
+        if (!isSafeSessionId(manifest.projectId)) {
+            warnings.push("Bundle carries an unsafe project id — ignored.");
         }
-        else if (existing.projectId !== manifest.projectId) {
-            warnings.push(`Bundle carries project id ${manifest.projectId} but this project is already ${existing.projectId} — kept existing.`);
+        else {
+            const existing = readLocalProjectId(targetProjectPath);
+            if (!existing) {
+                writeLocalProjectId(targetProjectPath, {
+                    projectId: manifest.projectId,
+                    name: manifest.sourceProjectPath.split(/[\\/]/).filter(Boolean).pop() ??
+                        "project",
+                    createdAt: new Date().toISOString(),
+                    createdByMachine: manifest.sourceMachineId ?? "unknown",
+                });
+            }
+            else if (existing.projectId !== manifest.projectId) {
+                warnings.push(`Bundle carries project id ${manifest.projectId} but this project is already ${existing.projectId} — kept existing.`);
+            }
         }
     }
     // Step 5: Merge memory files, tracking conflicts for user resolution

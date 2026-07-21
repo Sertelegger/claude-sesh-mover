@@ -14,6 +14,7 @@ import {
   readManifest,
   computeIntegrityHash,
   computeIntegrityHashFromFile,
+  isSafeSessionId,
 } from "./manifest.js";
 import { rewriteJsonlStream, buildPathMappings } from "./rewriter.js";
 import {
@@ -463,19 +464,28 @@ export async function importSession(
 
   // Plant the project identity carried by the bundle so hub adoption is
   // seamless later. Never overwrite an existing (different) identity.
+  // manifest.projectId isn't covered by assertSafeManifestIds (that only
+  // guards session ids), so it must be validated here before it's ever
+  // written to disk or used to build a hub path.
   if (manifest.projectId && existsSync(targetProjectPath)) {
-    const existing = readLocalProjectId(targetProjectPath);
-    if (!existing) {
-      writeLocalProjectId(targetProjectPath, {
-        projectId: manifest.projectId,
-        name: manifest.sourceProjectPath.split(/[\\/]/).pop() ?? "project",
-        createdAt: new Date().toISOString(),
-        createdByMachine: manifest.sourceMachineId ?? "unknown",
-      });
-    } else if (existing.projectId !== manifest.projectId) {
-      warnings.push(
-        `Bundle carries project id ${manifest.projectId} but this project is already ${existing.projectId} — kept existing.`
-      );
+    if (!isSafeSessionId(manifest.projectId)) {
+      warnings.push("Bundle carries an unsafe project id — ignored.");
+    } else {
+      const existing = readLocalProjectId(targetProjectPath);
+      if (!existing) {
+        writeLocalProjectId(targetProjectPath, {
+          projectId: manifest.projectId,
+          name:
+            manifest.sourceProjectPath.split(/[\\/]/).filter(Boolean).pop() ??
+            "project",
+          createdAt: new Date().toISOString(),
+          createdByMachine: manifest.sourceMachineId ?? "unknown",
+        });
+      } else if (existing.projectId !== manifest.projectId) {
+        warnings.push(
+          `Bundle carries project id ${manifest.projectId} but this project is already ${existing.projectId} — kept existing.`
+        );
+      }
     }
   }
 

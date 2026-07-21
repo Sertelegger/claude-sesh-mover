@@ -58,7 +58,7 @@ describe("hub init/status", () => {
     const home = tmp("sesh-hub-home-");
     const restore = overrideHome(home);
     try {
-      const s = await hubStatus({ configDir: join(home, ".claude"), cwd: home });
+      const s = await hubStatus({ cwd: home });
       expect(s.success).toBe(true);
       expect(s.hubPath).toBeNull();
       expect(s.reachable).toBe(false);
@@ -74,7 +74,7 @@ describe("hub init/status", () => {
     const restore = overrideHome(home);
     try {
       await hubInit({ hubPath: hub, configScope: "user", cwd: home });
-      const s = await hubStatus({ configDir: join(home, ".claude"), cwd: home });
+      const s = await hubStatus({ cwd: home });
       expect(s.reachable).toBe(true);
       expect(s.machineRegistered).toBe(true);
       expect(s.machinesKnown).toBe(1);

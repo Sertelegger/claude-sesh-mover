@@ -253,6 +253,156 @@ describe("integration: full export/import cycle", () => {
     expect(planted?.projectId).toBe("prj-carry-1");
   });
 
+  it("refuses to plant a bundle-carried project id that is path-traversal-shaped", async () => {
+    const { exportSession } = await import("../src/exporter.js");
+    const { importSession } = await import("../src/importer.js");
+    const { encodeProjectPath } = await import("../src/platform.js");
+    const { writeLocalProjectId, readLocalProjectId } = await import(
+      "../src/hub/identity.js"
+    );
+
+    // A hostile (or corrupted) local project.json at the source carries the
+    // unsafe id straight into the export manifest — readManifest/
+    // assertSafeManifestIds only guard session ids, not projectId, so this
+    // is importer.ts's plant step that must catch it before ever writing it
+    // to the target's .claude-sesh-mover/project.json.
+    const hostileSourceProjectPath = join(tempDir, "hostile-source-project");
+    mkdirSync(hostileSourceProjectPath, { recursive: true });
+    writeLocalProjectId(hostileSourceProjectPath, {
+      projectId: "../x",
+      name: "t",
+      createdAt: "t",
+      createdByMachine: "m",
+    });
+
+    const hostileSessionId = "22222222-2222-2222-2222-222222222222";
+    const hostileConfigDir = join(tempDir, "hostile-source-claude");
+    const hostileEncoded = encodeProjectPath(hostileSourceProjectPath);
+    const hostileProjectDir = join(hostileConfigDir, "projects", hostileEncoded);
+    mkdirSync(hostileProjectDir, { recursive: true });
+    writeFileSync(
+      join(hostileProjectDir, `${hostileSessionId}.jsonl`),
+      JSON.stringify({
+        uuid: "entry-1",
+        timestamp: "2026-04-10T12:00:00Z",
+        sessionId: hostileSessionId,
+        cwd: hostileSourceProjectPath,
+        version: "2.1.81",
+        gitBranch: "main",
+        slug: "hostile-test-session",
+        type: "user",
+        message: { role: "user", content: "hello" },
+      }) + "\n"
+    );
+
+    const hostileExportDir = join(tempDir, "hostile-export");
+    const exportResult = await exportSession({
+      configDir: hostileConfigDir,
+      projectPath: hostileSourceProjectPath,
+      sessionId: hostileSessionId,
+      outputDir: hostileExportDir,
+      name: "hostile-test",
+      excludeLayers: [],
+      claudeVersion: "2.1.81",
+    });
+    expect(exportResult.success).toBe(true);
+    const hostileExportPath = (exportResult as ExportResult).exportPath;
+
+    const hostileTargetProjectPath = join(tempDir, "hostile-target-project");
+    mkdirSync(hostileTargetProjectPath, { recursive: true });
+    const hostileTargetConfigDir = join(tempDir, "hostile-target-claude");
+    mkdirSync(join(hostileTargetConfigDir, "projects"), { recursive: true });
+
+    const importResult = await importSession({
+      exportPath: hostileExportPath,
+      targetConfigDir: hostileTargetConfigDir,
+      targetProjectPath: hostileTargetProjectPath,
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    });
+    expect(importResult.success).toBe(true);
+    if (!importResult.success) return;
+
+    // No project.json planted at the target...
+    expect(readLocalProjectId(hostileTargetProjectPath)).toBeNull();
+    // ...and a warning was surfaced instead of silently dropping it.
+    expect(
+      importResult.warnings.some((w) => w.toLowerCase().includes("unsafe project id"))
+    ).toBe(true);
+  });
+
+  it("derives the planted project name correctly when sourceProjectPath has a trailing separator", async () => {
+    const { exportSession } = await import("../src/exporter.js");
+    const { importSession } = await import("../src/importer.js");
+    const { encodeProjectPath } = await import("../src/platform.js");
+    const { writeLocalProjectId, readLocalProjectId } = await import(
+      "../src/hub/identity.js"
+    );
+
+    // A trailing separator makes String.prototype.split's last element ""
+    // rather than the actual folder name — regressed the plant's `name`
+    // field to "" before the ".filter(Boolean)" fix.
+    const trailingSourceProjectPath =
+      join(tempDir, "trailing-source-project") + "/";
+    mkdirSync(trailingSourceProjectPath, { recursive: true });
+    writeLocalProjectId(trailingSourceProjectPath, {
+      projectId: "prj-trailing-1",
+      name: "t",
+      createdAt: "t",
+      createdByMachine: "m",
+    });
+
+    const trailingSessionId = "33333333-3333-3333-3333-333333333333";
+    const trailingConfigDir = join(tempDir, "trailing-source-claude");
+    const trailingEncoded = encodeProjectPath(trailingSourceProjectPath);
+    const trailingProjectDir = join(trailingConfigDir, "projects", trailingEncoded);
+    mkdirSync(trailingProjectDir, { recursive: true });
+    writeFileSync(
+      join(trailingProjectDir, `${trailingSessionId}.jsonl`),
+      JSON.stringify({
+        uuid: "entry-1",
+        timestamp: "2026-04-10T12:00:00Z",
+        sessionId: trailingSessionId,
+        cwd: trailingSourceProjectPath,
+        version: "2.1.81",
+        gitBranch: "main",
+        slug: "trailing-test-session",
+        type: "user",
+        message: { role: "user", content: "hello" },
+      }) + "\n"
+    );
+
+    const trailingExportDir = join(tempDir, "trailing-export");
+    const exportResult = await exportSession({
+      configDir: trailingConfigDir,
+      projectPath: trailingSourceProjectPath,
+      sessionId: trailingSessionId,
+      outputDir: trailingExportDir,
+      name: "trailing-test",
+      excludeLayers: [],
+      claudeVersion: "2.1.81",
+    });
+    expect(exportResult.success).toBe(true);
+    const trailingExportPath = (exportResult as ExportResult).exportPath;
+
+    const trailingTargetProjectPath = join(tempDir, "trailing-target-project");
+    mkdirSync(trailingTargetProjectPath, { recursive: true });
+    const trailingTargetConfigDir = join(tempDir, "trailing-target-claude");
+    mkdirSync(join(trailingTargetConfigDir, "projects"), { recursive: true });
+
+    const importResult = await importSession({
+      exportPath: trailingExportPath,
+      targetConfigDir: trailingTargetConfigDir,
+      targetProjectPath: trailingTargetProjectPath,
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    });
+    expect(importResult.success).toBe(true);
+
+    const planted = readLocalProjectId(trailingTargetProjectPath);
+    expect(planted?.name).toBe("trailing-source-project");
+  });
+
   it("migrates a session to a new path and cleans up source", async () => {
     const { migrateSession } = await import("../src/migrator.js");
 

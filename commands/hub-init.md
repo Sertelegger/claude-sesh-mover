@@ -24,10 +24,10 @@ You are running the sesh-mover hub init command. Follow these steps:
 
 6. Confirm registration by running:
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" hub status --source-config-dir "<config-dir>"
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" hub status
    ```
    Report `hubPath`, `reachable`, `machineRegistered`, and `project.linked` from the result. If `reachable` is false or there are `warnings`, surface them — a hub that was just created should normally come back reachable and registered.
 
 7. Report to the user: hub path, created-vs-joined, machine registration confirmed, and point them at `/sesh-mover:push` to start sharing this project's sessions through the hub (linking happens automatically on the first push/pull, not during init).
 
-**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (`--path`, `--scope` for `hub init`; `--source-config-dir` for `hub status`) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (`--path`, `--scope` for `hub init`; `hub status` takes no flags) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

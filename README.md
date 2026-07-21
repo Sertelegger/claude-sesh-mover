@@ -85,7 +85,7 @@ The hub backend is filesystem-only in this slice: point `hub init --path` at any
 Synced folders have two gotchas the hub can't paper over:
 
 - **On-demand hydration** (OneDrive Files On-Demand, Dropbox Smart Sync, and similar): a file can exist in the folder's listing before its content is actually downloaded to this machine. If `pull` needs a bundle that hasn't hydrated yet, it returns `reason: "not-yet-synced"` with the specific files it's waiting on, instead of silently reading a truncated file.
-- **Sync lag**: a push from another machine may not be visible here until the sync client catches up. The fix in both cases is the same — wait a moment for the client to sync/hydrate, then retry the same command. The slash commands do this retry for you (once) on `not-yet-synced`.
+- **Sync lag**: a push from another machine may not be visible here until the sync client catches up. The fix in both cases is the same — wait a moment for the client to sync/hydrate, then retry the same command. On `not-yet-synced`, the slash command will offer to retry for you rather than retrying automatically.
 
 ### Trust model
 
@@ -93,7 +93,7 @@ Synced folders have two gotchas the hub can't paper over:
 
 ### Workspace snapshots
 
-For git-less projects, `push`/`pull` also carry a **workspace snapshot** — a copy of the project's files, not just its Claude Code sessions — because there's no git remote to reconstruct the project from otherwise. Skip it with `--no-workspace` on push. To exclude specific paths from the snapshot (large build artifacts, secrets, anything you don't want copied into the hub), add a `.claude-sesh-mover/hubignore` file (one pattern per line, `#` comments allowed; matched against path segments, with `*` wildcards — not full `.gitignore` semantics). `pull` refuses to overwrite a non-empty target directory with a workspace snapshot unless you pass `--force-workspace`.
+For projects with no git remotes (including remote-less git repositories), `push`/`pull` also carry a **workspace snapshot** — a copy of the project's files, not just its Claude Code sessions — because there's no git remote to reconstruct the project from otherwise. Skip it with `--no-workspace` on push. To exclude specific paths from the snapshot (large build artifacts, secrets, anything you don't want copied into the hub), add a `.claude-sesh-mover/hubignore` file (one pattern per line, `#` comments allowed; matched against path segments, with `*` wildcards — not full `.gitignore` semantics). `pull` refuses to overwrite a non-empty target directory with a workspace snapshot unless you pass `--force-workspace`.
 
 ### Same-machine lock
 

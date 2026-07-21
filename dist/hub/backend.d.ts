@@ -1,7 +1,3 @@
-export declare class HubNotSyncedError extends Error {
-    readonly missing: string[];
-    constructor(missing: string[]);
-}
 export interface HubWriteStream {
     stream: NodeJS.WritableStream;
     commit(): Promise<void>;

@@ -37,6 +37,11 @@ export interface HubPushOptions {
 export async function hubPush(
   opts: HubPushOptions
 ): Promise<HubPushResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult> {
+  // An empty array is programmatically distinct from "omitted" but must mean
+  // the same thing here — otherwise it mints zero threads (the filter below
+  // matches nothing) while still exporting every session (exportAllSessions
+  // treats [] as "no filter" today), silently over-exporting.
+  const sessionIds = opts.sessionIds && opts.sessionIds.length > 0 ? opts.sessionIds : undefined;
   let lock;
   try {
     lock = acquireProjectLock(opts.projectPath);
@@ -93,7 +98,7 @@ export async function hubPush(
 
     // Thread minting for every session in scope
     let sessions = discoverSessions(opts.configDir, opts.projectPath);
-    if (opts.sessionIds) sessions = sessions.filter((s) => opts.sessionIds!.includes(s.sessionId));
+    if (sessionIds) sessions = sessions.filter((s) => sessionIds.includes(s.sessionId));
     const state = readSyncState(opts.projectPath);
     for (const s of sessions) {
       if (!getThreadId(state, s.sessionId)) setThreadId(state, hub.hubId, s.sessionId, randomUUID());
@@ -107,7 +112,7 @@ export async function hubPush(
     const exportResult = await exportAllSessions({
       configDir: opts.configDir,
       projectPath: opts.projectPath,
-      sessionIds: opts.sessionIds,
+      sessionIds,
       outputDir: staging,
       name: "bundle",
       excludeLayers: [],
@@ -136,7 +141,9 @@ export async function hubPush(
       };
     }
 
-    // Workspace payload (non-git projects only)
+    // Workspace payload — projects with no git remotes (including
+    // remote-less git repositories), since there's no remote to reconstruct
+    // the working tree from otherwise.
     let hasWorkspace = false;
     if (!opts.noWorkspace && localGitRemotes(opts.projectPath).length === 0 && existsSync(opts.projectPath)) {
       const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));

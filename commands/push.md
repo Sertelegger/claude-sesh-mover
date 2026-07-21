@@ -7,7 +7,7 @@ You are running the sesh-mover push command. Follow these steps:
 
 1. Check hub configuration and current link state first:
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" hub status --source-config-dir "<config-dir>"
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" hub status
    ```
    - If `hubPath` is `null`, tell the user no hub is configured yet and point them at `/sesh-mover:hub-init`. Stop.
    - If `reachable` is false, surface the `warnings` (e.g. the synced folder isn't mounted) and stop.

@@ -477,11 +477,9 @@ hub
 hub
     .command("status")
     .description("Report hub reachability, machine registration, and project link state")
-    .option("--source-config-dir <path>", "Override Claude config dir")
-    .action(async (opts) => {
+    .action(async () => {
     try {
-        const configDir = resolveConfigDir(opts.sourceConfigDir);
-        output(await hubStatus({ configDir, cwd: process.cwd() }));
+        output(await hubStatus({ cwd: process.cwd() }));
     }
     catch (e) {
         outputError("hub-status", e);
