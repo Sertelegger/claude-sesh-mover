@@ -2,6 +2,28 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.4.1] — 2026-07-20
+
+Toolchain and repo-hygiene release: the package is now ESM on current dependency
+majors, and the repo gained CI-enforced community and security scaffolding.
+
+### Changed
+- Package is now ESM (`"type": "module"`); `dist/` is emitted as ES modules (#26).
+- Node floor raised 18.17 → 22.12 — current Claude Code releases already require
+  Node ≥ 22, and commander 15 needs ≥ 22.12 (#26).
+- commander 13 → 15 (ESM-only major) (#26).
+- Dev toolchain: TypeScript 7 (native compiler — emitted `dist/` byte-identical
+  to 5.9), vitest 4, @types/node 26 (#22, #25, #26).
+
+### Added
+- Community health files: contributing guide, security policy, code of conduct,
+  issue forms, PR template (#17).
+- Dependabot (grouped minor/patch updates), CodeQL scanning, and automatic
+  GitHub Releases on `v*` tag push (#17).
+- npm publish metadata: `repository`/`homepage`/`bugs` fields, `files` allowlist,
+  `prepublishOnly` guard (#17).
+- Social preview banner assets under `.github/`.
+
 ## [0.4.0] — 2026-07-14
 
 First CI-tested release: a 3-OS test matrix, a streaming rewrite/import/export pipeline for
