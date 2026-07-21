@@ -17,8 +17,9 @@ You are running the sesh-mover push command. Follow these steps:
 
 3. Run:
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" push --project-path "<cwd>" --source-config-dir "<config-dir>" [--session-id <id> ...]
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" push --project-path "<cwd>" --source-config-dir "<config-dir>" [--session-id <id> ...] [--no-workspace]
    ```
+   For non-git projects, push bundles a workspace snapshot (the project's files) alongside the sessions by default — offer `--no-workspace` when the user doesn't want project files uploaded to the hub (large or sensitive working directory), and carry it into any re-run in step 4.
 
 4. Parse the result and branch on its shape:
    - `reason: "unlinked"` (this project isn't linked to any hub project yet): present `linkCandidates` (name + gitRemotes) as a pick-list via AskUserQuestion, with an extra "Create a new hub project for this directory" option. Then re-run the step 3 invocation with `--project-id <picked-id>` appended (if the user picked a candidate) or `--create-project` appended (if they chose to create new). Do this once automatically as part of the flow — don't ask the user to re-invoke the command themselves.
@@ -29,4 +30,4 @@ You are running the sesh-mover push command. Follow these steps:
 
 5. Report a final summary: hub project id, sessions pushed (count, and full-vs-continuation breakdown), whether a workspace snapshot was included, and whether the project was newly linked or created during this run.
 
-**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and the unlinked-retry branches, `--project-id`/`--create-project`) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and the unlinked-retry branches, `--project-id`/`--create-project`, plus `--no-workspace`) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface. `push` also accepts `--progress` (NDJSON progress events on stderr) — it's oriented at humans running the CLI directly; don't pass it from this command flow.
