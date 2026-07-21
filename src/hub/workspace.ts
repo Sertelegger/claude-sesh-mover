@@ -76,15 +76,23 @@ export async function unpackWorkspace(
   srcDir: string,
   targetPath: string,
   opts: { force: boolean }
-): Promise<{ fileCount: number }> {
+): Promise<{ fileCount: number; symlinksSkipped: number }> {
   if (existsSync(targetPath) && readdirSync(targetPath).length > 0 && !opts.force) {
     throw new WorkspaceTargetNotEmptyError(targetPath);
   }
   let fileCount = 0;
+  let symlinksSkipped = 0;
   const walk = (from: string, to: string): void => {
     mkdirSync(to, { recursive: true });
     for (const entry of readdirSync(from, { withFileTypes: true })) {
       const src = join(from, entry.name);
+      if (entry.isSymbolicLink()) {
+        // Never follow (loop/escape safety). Bundles reaching unpack already
+        // passed the archiver's tar validation, which rejects symlink entries —
+        // this skip+count is defense-in-depth for direct callers of this module.
+        symlinksSkipped++;
+        continue;
+      }
       if (entry.isDirectory()) walk(src, join(to, entry.name));
       else if (entry.isFile()) {
         copyFileSync(src, join(to, entry.name));
@@ -93,5 +101,5 @@ export async function unpackWorkspace(
     }
   };
   walk(srcDir, targetPath);
-  return { fileCount };
+  return { fileCount, symlinksSkipped };
 }

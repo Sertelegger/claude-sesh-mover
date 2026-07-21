@@ -68,10 +68,18 @@ export async function unpackWorkspace(srcDir, targetPath, opts) {
         throw new WorkspaceTargetNotEmptyError(targetPath);
     }
     let fileCount = 0;
+    let symlinksSkipped = 0;
     const walk = (from, to) => {
         mkdirSync(to, { recursive: true });
         for (const entry of readdirSync(from, { withFileTypes: true })) {
             const src = join(from, entry.name);
+            if (entry.isSymbolicLink()) {
+                // Never follow (loop/escape safety). Bundles reaching unpack already
+                // passed the archiver's tar validation, which rejects symlink entries —
+                // this skip+count is defense-in-depth for direct callers of this module.
+                symlinksSkipped++;
+                continue;
+            }
             if (entry.isDirectory())
                 walk(src, join(to, entry.name));
             else if (entry.isFile()) {
@@ -81,6 +89,6 @@ export async function unpackWorkspace(srcDir, targetPath, opts) {
         }
     };
     walk(srcDir, targetPath);
-    return { fileCount };
+    return { fileCount, symlinksSkipped };
 }
 //# sourceMappingURL=workspace.js.map

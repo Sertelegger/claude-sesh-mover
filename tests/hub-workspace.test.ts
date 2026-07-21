@@ -85,4 +85,50 @@ describe("workspace snapshot", () => {
       expect(r.fileCount).toBe(1);
     } finally { for (const d of [src, parent]) rmSync(d, { recursive: true, force: true }); }
   });
+
+  it("force-merge overwrites colliding filenames with src content", async () => {
+    // Load-bearing for pull's retry flow: re-unpacking after a partial pull
+    // must leave the incoming (src) content in place on collision.
+    const src = tmp("sesh-ws-src-");
+    const target = tmp("sesh-ws-target-");
+    try {
+      writeFileSync(join(src, "shared.txt"), "incoming");
+      writeFileSync(join(target, "shared.txt"), "stale");
+      writeFileSync(join(target, "keep.txt"), "untouched");
+      const r = await unpackWorkspace(src, target, { force: true });
+      expect(r.fileCount).toBe(1);
+      expect(readFileSync(join(target, "shared.txt"), "utf-8")).toBe("incoming");
+      expect(readFileSync(join(target, "keep.txt"), "utf-8")).toBe("untouched");
+    } finally { for (const d of [src, target]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(isWindows)("unpack skips symlinks with a count, never follows", async () => {
+    // Windows: symlinkSync needs elevation; the skip logic is platform-independent.
+    const src = tmp("sesh-ws-src-");
+    const parent = tmp("sesh-ws-parent-");
+    try {
+      writeFileSync(join(src, "real.txt"), "x");
+      symlinkSync("/etc", join(src, "escape"));
+      const target = join(parent, "new-project");
+      const r = await unpackWorkspace(src, target, { force: false });
+      expect(r.fileCount).toBe(1);
+      expect(r.symlinksSkipped).toBe(1);
+      expect(existsSync(join(target, "escape"))).toBe(false);
+    } finally { for (const d of [src, parent]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("hubignore pattern suppresses matching files during snapshot", async () => {
+    const src = tmp("sesh-ws-src-");
+    const dest = tmp("sesh-ws-dest-");
+    try {
+      mkdirSync(join(src, ".claude-sesh-mover"), { recursive: true });
+      writeFileSync(join(src, ".claude-sesh-mover", "hubignore"), "# ignore logs\n*.log\n");
+      writeFileSync(join(src, "app.log"), "log line");
+      writeFileSync(join(src, "keep.ts"), "ok");
+      const r = await snapshotWorkspace(src, dest);
+      expect(r.fileCount).toBe(1);
+      expect(existsSync(join(dest, "keep.ts"))).toBe(true);
+      expect(existsSync(join(dest, "app.log"))).toBe(false);
+    } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
 });

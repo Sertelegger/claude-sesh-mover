@@ -14,5 +14,6 @@ export declare function unpackWorkspace(srcDir: string, targetPath: string, opts
     force: boolean;
 }): Promise<{
     fileCount: number;
+    symlinksSkipped: number;
 }>;
 //# sourceMappingURL=workspace.d.ts.map
