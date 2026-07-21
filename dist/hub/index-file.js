@@ -10,6 +10,18 @@ export function buildIndexFile(inputs) {
         const threadId = getThreadId(inputs.state, s.sessionId);
         if (!threadId)
             continue;
+        // Multiple local session files can map to the same thread — a
+        // continuation pull mints a brand-new local file thread-mapped onto a
+        // thread an earlier (now older) local file already represented (see
+        // hub/pull.ts's setThreadId call). Keep whichever is genuinely more
+        // recent; never just "whichever appears last in inputs.sessions" —
+        // discoverSessions happens to return most-recent-first, so blindly
+        // overwriting would silently keep the OLDEST one and report a stale head
+        // for a thread this machine just updated.
+        const existing = threads[threadId];
+        if (existing && new Date(existing.lastActiveAt).getTime() >= new Date(s.lastActiveAt).getTime()) {
+            continue;
+        }
         threads[threadId] = {
             localSessionId: s.sessionId,
             slug: s.slug,

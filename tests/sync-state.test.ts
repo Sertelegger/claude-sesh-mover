@@ -229,6 +229,52 @@ describe("sync-state", () => {
     expect(state.peers["peer-1"].sent["local-orig"].sentAsSessionId).toBe("cont-9");
     expect(state.peers["peer-1"].sent["local-orig"].headEntryUuid).toBe("tail-uuid");
   });
+
+  // Regression (Task 12 integration test): hub pull imports content whose
+  // manifest.sourceMachineId is the ORIGINATING machine, never the hub
+  // itself — so importSession's own peer bookkeeping (see importer.ts) never
+  // credits the hub's symbolic peer id. Without this, a machine's first push
+  // back to the hub after a pull always re-uploads the whole session as
+  // "full" (hub/push.ts's incremental diff only ever consults
+  // state.peers[hubPeerId]?.sent), defeating incremental sync entirely for
+  // any machine that joined via pull before ever pushing.
+  it("recordSentToPeer marks a freshly-imported local session as already known to a given peer", async () => {
+    const { recordSentToPeer, readSyncState } = await import("../src/sync-state.js");
+    recordSentToPeer("/p", { id: "hub:abc", name: "hub" }, "local-new", {
+      headEntryUuid: "entry-3",
+      messageCount: 3,
+      sentAsType: "full",
+      sentAsSessionId: "orig-session",
+    });
+    const state = readSyncState("/p");
+    expect(state.peers["hub:abc"].sent["local-new"]).toEqual({
+      headEntryUuid: "entry-3",
+      messageCount: 3,
+      sentAsType: "full",
+      sentAsSessionId: "orig-session",
+    });
+  });
+
+  it("recordSentToPeer preserves an existing peer's other bookkeeping (received, prior sent entries)", async () => {
+    const { recordSentToPeer, readSyncState, writeSyncState } = await import("../src/sync-state.js");
+    const state = readSyncState("/p2");
+    state.peers["hub:abc"] = {
+      name: "hub", lastSentAt: null, lastReceivedAt: "2026-07-01T00:00:00Z",
+      sent: { "other-session": { headEntryUuid: "u1", messageCount: 1, sentAsType: "full", sentAsSessionId: "other-session" } },
+      received: { "remote-1": { localSessionId: "local-1", type: "full", importedAt: "2026-07-01T00:00:00Z" } },
+    };
+    writeSyncState(state);
+
+    recordSentToPeer("/p2", { id: "hub:abc" }, "local-new", {
+      headEntryUuid: "entry-3", messageCount: 3, sentAsType: "full", sentAsSessionId: "orig-session",
+    });
+
+    const reloaded = readSyncState("/p2");
+    expect(reloaded.peers["hub:abc"].sent["other-session"].headEntryUuid).toBe("u1");
+    expect(reloaded.peers["hub:abc"].received["remote-1"].localSessionId).toBe("local-1");
+    expect(reloaded.peers["hub:abc"].lastReceivedAt).toBe("2026-07-01T00:00:00Z");
+    expect(reloaded.peers["hub:abc"].sent["local-new"].headEntryUuid).toBe("entry-3");
+  });
 });
 
 describe("sync-state v2 (hub)", () => {

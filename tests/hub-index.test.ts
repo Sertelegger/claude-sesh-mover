@@ -37,6 +37,38 @@ describe("index file", () => {
     expect(next.threads.t1.messageCount).toBe(5);
   });
 
+  // Regression (Task 12 keystone integration test): a continuation pull
+  // creates a BRAND NEW local session file thread-mapped to the SAME
+  // threadId as the original session it continues (see hub/pull.ts's
+  // setThreadId call) — so a single project can have multiple local
+  // sessions mapped to one thread. The projection must keep whichever is
+  // genuinely most recent, not whichever happens to appear last in
+  // `inputs.sessions` (discoverSessions returns sessions most-recent-first,
+  // so "last wins" silently picked the OLDEST one and made a machine's own
+  // index report a stale head for a thread it had, in fact, just updated).
+  it("two local sessions mapped to the same thread: the more recent one wins, regardless of input order", () => {
+    const older = { ...SESSION, sessionId: "s-old", lastActiveAt: "2026-04-10T12:01:00Z", headEntryUuid: "u-old" };
+    const newer = { ...SESSION, sessionId: "s-new", lastActiveAt: "2026-07-21T01:00:05Z", headEntryUuid: "u-new" };
+    const state = stateWithThreads({ "s-old": "t1", "s-new": "t1" });
+
+    // Most-recent-first order (discoverSessions's actual convention).
+    const mostRecentFirst = buildIndexFile({
+      projectId: "p", machineId: "m", projectPath: "/x",
+      sessions: [newer, older], state, priorIndex: null, newBundles: [], now: "t",
+    });
+    expect(mostRecentFirst.threads.t1.localSessionId).toBe("s-new");
+    expect(mostRecentFirst.threads.t1.headEntryUuid).toBe("u-new");
+
+    // Reversed order must produce the SAME winner — the projection can't
+    // depend on caller iteration order.
+    const oldestFirst = buildIndexFile({
+      projectId: "p", machineId: "m", projectPath: "/x",
+      sessions: [older, newer], state, priorIndex: null, newBundles: [], now: "t",
+    });
+    expect(oldestFirst.threads.t1.localSessionId).toBe("s-new");
+    expect(oldestFirst.threads.t1.headEntryUuid).toBe("u-new");
+  });
+
   it("sessions without a thread mapping are omitted (never pushed)", () => {
     const built = buildIndexFile({
       projectId: "p", machineId: "m", projectPath: "/x",

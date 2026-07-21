@@ -96,6 +96,33 @@ export function recordSentFromBundle(projectPath, peer, bundleDir) {
     }
     writeSyncState(state);
 }
+// Mark a single local session as already-known-to `peer`, without requiring
+// a bundle directory on disk (unlike recordSentFromBundle, which derives the
+// head uuid + session mapping from a manifest). Used by hub pull: a bundle
+// pulled through the hub carries manifest.sourceMachineId set to the
+// ORIGINATING machine (see hub/push.ts), so importSession's own peer
+// bookkeeping (importer.ts) only ever credits that machine, never the hub
+// itself. Without also recording it here, this machine's first push back to
+// the hub would see no baseline for the hub's peer id and re-upload the
+// whole session as "full" instead of recognizing later edits as a
+// continuation (hub/push.ts's incremental diff only consults
+// state.peers[hubPeerId]?.sent).
+export function recordSentToPeer(projectPath, peer, localSessionId, sent) {
+    const state = readSyncState(projectPath);
+    if (!state.peers[peer.id]) {
+        state.peers[peer.id] = {
+            name: peer.name ?? peer.id,
+            lastSentAt: null,
+            lastReceivedAt: null,
+            sent: {},
+            received: {},
+        };
+    }
+    if (peer.name)
+        state.peers[peer.id].name = peer.name;
+    state.peers[peer.id].sent[localSessionId] = sent;
+    writeSyncState(state);
+}
 export function getThreadId(state, localSessionId) {
     return state.hub?.threadByLocalSession[localSessionId] ?? null;
 }

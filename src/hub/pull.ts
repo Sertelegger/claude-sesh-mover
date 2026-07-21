@@ -18,7 +18,7 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
-import { readSyncState, writeSyncState, setThreadId } from "../sync-state.js";
+import { readSyncState, writeSyncState, setThreadId, recordSentToPeer } from "../sync-state.js";
 import type {
   ErrorResult,
   ExportManifest,
@@ -125,6 +125,12 @@ export async function hubPull(
     }
 
     await registerMachine(opts.hubPath);
+
+    // Read once, reused both for the hub-peer bookkeeping below (recognizing
+    // pulled content as already-known-to-the-hub) and for this thread's
+    // mapping write further down.
+    const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
+    const hubPeerId = `hub:${hub.hubId}`;
 
     const { indexes, warnings: indexWarnings } = await readAllIndexes(backend, local.projectId);
     warnings.push(...indexWarnings);
@@ -299,6 +305,18 @@ export async function hubPull(
       warnings.push(...importResult.warnings);
       if (importResult.importedSessions.length > 0) {
         lastImportedNewId = importResult.importedSessions[importResult.importedSessions.length - 1].newId;
+        // The hub is the origin of this bundle's content, so as far as this
+        // machine's OWN sync-state is concerned the hub already has it up to
+        // this head — record that against the hub's own peer id (not the
+        // originating machine's, which importSession already recorded above)
+        // so a future push of just-appended content is recognized as a
+        // continuation instead of re-uploading the whole session as "full".
+        recordSentToPeer(effectiveProjectPath, { id: hubPeerId, name: "hub" }, lastImportedNewId, {
+          headEntryUuid: record.headEntryUuid,
+          messageCount: record.messageCount,
+          sentAsType: record.type,
+          sentAsSessionId: record.sessionIdInBundle,
+        });
       }
     }
 
@@ -323,7 +341,6 @@ export async function hubPull(
       null;
 
     if (localSessionId !== null) {
-      const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
       setThreadId(stateAfter, hub.hubId, localSessionId, target.threadId);
       writeSyncState(stateAfter);
     } else {
