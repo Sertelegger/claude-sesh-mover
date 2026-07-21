@@ -117,6 +117,7 @@ export interface ExportManifest {
     sourceMachineName?: string;
     incremental?: boolean;
     baseline?: ExportBaseline;
+    projectId?: string;
 }
 export interface SeshMoverConfig {
     export: {

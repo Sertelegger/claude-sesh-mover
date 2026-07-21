@@ -11,6 +11,7 @@ import { buildContinuationStream } from "./continuation.js";
 import { computeIncrementalPlan } from "./diff.js";
 import { readEntryUuids } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
+import { readLocalProjectId } from "./hub/identity.js";
 function copyDirIfExists(srcDir, destDir) {
     if (!existsSync(srcDir))
         return;
@@ -246,6 +247,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         sessions: sessionManifests,
         sourceMachineId: incremental?.sourceMachineId,
         sourceMachineName: incremental?.sourceMachineName,
+        projectId: readLocalProjectId(projectPath)?.projectId,
         incremental: incremental ? true : undefined,
         baseline: incremental?.targetMachineId
             ? {

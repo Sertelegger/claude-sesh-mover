@@ -5,6 +5,7 @@ import {
   readFileSync,
   existsSync,
   mkdirSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -169,6 +170,87 @@ describe("integration: full export/import cycle", () => {
     expect(jsonl).toContain("/home/devuser/projects/testproject");
     // Original paths should NOT be present in tool results
     expect(jsonl).not.toContain("/Users/testuser/Projects/testproject");
+  });
+
+  it("carries projectId through export → import and plants it at the target", async () => {
+    const { exportSession } = await import("../src/exporter.js");
+    const { importSession } = await import("../src/importer.js");
+    const { encodeProjectPath } = await import("../src/platform.js");
+    const { readManifest } = await import("../src/manifest.js");
+    const { writeLocalProjectId, readLocalProjectId } = await import(
+      "../src/hub/identity.js"
+    );
+
+    // Arrange like the neighboring round-trip tests, but with real
+    // (writable) source/target project directories — unlike the
+    // "/Users/testuser/..."-style literal paths used elsewhere, this test
+    // needs an actual filesystem project directory to plant
+    // .claude-sesh-mover/project.json into and read it back from.
+    const carrySourceProjectPath = join(tempDir, "carry-source-project");
+    mkdirSync(carrySourceProjectPath, { recursive: true });
+    writeLocalProjectId(carrySourceProjectPath, {
+      projectId: "prj-carry-1",
+      name: "t",
+      createdAt: "t",
+      createdByMachine: "m",
+    });
+
+    const carrySessionId = "11111111-1111-1111-1111-111111111111";
+    const carryConfigDir = join(tempDir, "carry-source-claude");
+    const carryEncoded = encodeProjectPath(carrySourceProjectPath);
+    const carryProjectDir = join(carryConfigDir, "projects", carryEncoded);
+    mkdirSync(carryProjectDir, { recursive: true });
+    writeFileSync(
+      join(carryProjectDir, `${carrySessionId}.jsonl`),
+      JSON.stringify({
+        uuid: "entry-1",
+        timestamp: "2026-04-10T12:00:00Z",
+        sessionId: carrySessionId,
+        cwd: carrySourceProjectPath,
+        version: "2.1.81",
+        gitBranch: "main",
+        slug: "carry-test-session",
+        type: "user",
+        message: { role: "user", content: "hello" },
+      }) + "\n"
+    );
+
+    // Act: export
+    const carryExportDir = join(tempDir, "carry-export");
+    const exportResult = await exportSession({
+      configDir: carryConfigDir,
+      projectPath: carrySourceProjectPath,
+      sessionId: carrySessionId,
+      outputDir: carryExportDir,
+      name: "carry-test",
+      excludeLayers: [],
+      claudeVersion: "2.1.81",
+    });
+    expect(exportResult.success).toBe(true);
+    const carryExportPath = (exportResult as ExportResult).exportPath;
+
+    // Assert: bundle manifest carries the source projectId
+    const manifest = readManifest(carryExportPath);
+    expect(manifest.projectId).toBe("prj-carry-1");
+
+    // Act: import into a fresh target project dir
+    const carryTargetProjectPath = join(tempDir, "carry-target-project");
+    mkdirSync(carryTargetProjectPath, { recursive: true });
+    const carryTargetConfigDir = join(tempDir, "carry-target-claude");
+    mkdirSync(join(carryTargetConfigDir, "projects"), { recursive: true });
+
+    const importResult = await importSession({
+      exportPath: carryExportPath,
+      targetConfigDir: carryTargetConfigDir,
+      targetProjectPath: carryTargetProjectPath,
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    });
+    expect(importResult.success).toBe(true);
+
+    // Assert: the target project dir now has the planted project.json
+    const planted = readLocalProjectId(carryTargetProjectPath);
+    expect(planted?.projectId).toBe("prj-carry-1");
   });
 
   it("migrates a session to a new path and cleans up source", async () => {

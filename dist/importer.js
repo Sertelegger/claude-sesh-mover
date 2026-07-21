@@ -8,6 +8,7 @@ import { getApplicableAdapters, classifyVersionDifference, } from "./version-ada
 import { readSyncState, writeSyncState } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
+import { readLocalProjectId, writeLocalProjectId } from "./hub/identity.js";
 export async function importSession(options) {
     const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, onProgress, } = options;
     const warnings = [];
@@ -288,6 +289,22 @@ export async function importSession(options) {
             details: "Partially written files have been cleaned up. No indexes were modified.",
             suggestion: "Check available disk space or file permissions and retry.",
         };
+    }
+    // Plant the project identity carried by the bundle so hub adoption is
+    // seamless later. Never overwrite an existing (different) identity.
+    if (manifest.projectId && existsSync(targetProjectPath)) {
+        const existing = readLocalProjectId(targetProjectPath);
+        if (!existing) {
+            writeLocalProjectId(targetProjectPath, {
+                projectId: manifest.projectId,
+                name: manifest.sourceProjectPath.split(/[\\/]/).pop() ?? "project",
+                createdAt: new Date().toISOString(),
+                createdByMachine: manifest.sourceMachineId ?? "unknown",
+            });
+        }
+        else if (existing.projectId !== manifest.projectId) {
+            warnings.push(`Bundle carries project id ${manifest.projectId} but this project is already ${existing.projectId} — kept existing.`);
+        }
     }
     // Step 5: Merge memory files, tracking conflicts for user resolution
     const memoryConflicts = [];

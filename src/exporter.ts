@@ -19,6 +19,7 @@ import { buildContinuationStream } from "./continuation.js";
 import { computeIncrementalPlan } from "./diff.js";
 import { readEntryUuids } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
+import { readLocalProjectId } from "./hub/identity.js";
 import type {
   ExportManifest,
   ExportLayer,
@@ -391,6 +392,7 @@ async function exportSessions(
     sessions: sessionManifests,
     sourceMachineId: incremental?.sourceMachineId,
     sourceMachineName: incremental?.sourceMachineName,
+    projectId: readLocalProjectId(projectPath)?.projectId,
     incremental: incremental ? true : undefined,
     baseline: incremental?.targetMachineId
       ? {
