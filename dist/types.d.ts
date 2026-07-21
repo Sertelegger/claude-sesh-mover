@@ -273,6 +273,44 @@ export interface HubPushResult {
     hasWorkspace: boolean;
     warnings: string[];
 }
+export interface WhereisThread {
+    threadId: string;
+    slug: string;
+    summary: string;
+    latest: {
+        machineId: string;
+        machineName: string | null;
+        lastActiveAt: string;
+        messageCount: number;
+    };
+    copies: Array<{
+        machineId: string;
+        machineName: string | null;
+        localSessionId: string;
+        lastActiveAt: string;
+        messageCount: number;
+        headEntryUuid: string;
+    }>;
+    localCopy: {
+        localSessionId: string;
+        headEntryUuid: string;
+        current: boolean;
+    } | null;
+    pullNeeded: boolean;
+}
+export interface WhereisResult {
+    success: true;
+    command: "whereis";
+    linked: boolean;
+    projectId: string | null;
+    linkCandidates?: Array<{
+        projectId: string;
+        name: string;
+        gitRemotes: string[];
+    }>;
+    threads: WhereisThread[];
+    warnings: string[];
+}
 export interface HubUnlinkedResult {
     success: false;
     command: "push" | "pull" | "whereis";
@@ -292,7 +330,7 @@ export interface HubLockBusyResult {
     ageSeconds: number | null;
     suggestion: string;
 }
-export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult;
+export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | WhereisResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;

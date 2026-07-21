@@ -1,15 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { resolveThreads } from "../src/hub/threads.js";
-import type { HubIndexJson } from "../src/hub/layout.js";
-
-function idx(machineId: string, threads: HubIndexJson["threads"]): HubIndexJson {
-  return { schemaVersion: 1, agent: "claude-code", projectId: "p", machineId,
-    updatedAt: "t", projectPath: "/x", threads };
-}
-function entry(over: Partial<HubIndexJson["threads"][string]>): HubIndexJson["threads"][string] {
-  return { localSessionId: "s", slug: "slug", summary: "sum", headEntryUuid: "u",
-    messageCount: 1, lastActiveAt: "2026-07-21T00:00:00Z", bundles: [], ...over };
-}
+import { idx, entry } from "./helpers/hub-fixtures.js";
 
 describe("resolveThreads", () => {
   it("merges copies across machines under one thread", () => {

@@ -1,0 +1,1 @@
+{"version":3,"file":"whereis.d.ts","sourceRoot":"","sources":["../../src/hub/whereis.ts"],"names":[],"mappings":"AAMA,OAAO,KAAK,EAAE,aAAa,EAAiB,MAAM,aAAa,CAAC;AAMhE,wBAAsB,UAAU,CAAC,IAAI,EAAE;IACrC,SAAS,EAAE,MAAM,CAAC;IAClB,WAAW,EAAE,MAAM,CAAC;IACpB,OAAO,EAAE,MAAM,CAAC;CACjB,GAAG,OAAO,CAAC,aAAa,CAAC,CA4FzB"}

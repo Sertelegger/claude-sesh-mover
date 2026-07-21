@@ -598,6 +598,30 @@ program
     }
   });
 
+// --- Whereis ---
+program
+  .command("whereis")
+  .description("Show this project's sessions across all hub machines")
+  .option("--project-path <path>", "Override project path (default: cwd)")
+  .option("--source-config-dir <path>", "Override Claude config dir")
+  .action(async (opts) => {
+    try {
+      const configDir = resolveConfigDir(opts.sourceConfigDir);
+      const projectPath = opts.projectPath ?? process.cwd();
+      const config = loadEffectiveConfig(configDir, projectPath);
+      const { resolveHubPath } = await import("./hub/init.js");
+      const hubPath = resolveHubPath(config);
+      if (!hubPath) {
+        outputError("whereis", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+        return;
+      }
+      const { hubWhereis } = await import("./hub/whereis.js");
+      output(await hubWhereis({ configDir, projectPath, hubPath }));
+    } catch (e) {
+      outputError("whereis", e as Error);
+    }
+  });
+
 // --- Helpers ---
 
 // Single predicate for both the collision gate and the --suffix loop, so a

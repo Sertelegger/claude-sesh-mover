@@ -321,6 +321,33 @@ export interface HubPushResult {
   warnings: string[];
 }
 
+export interface WhereisThread {
+  threadId: string;
+  slug: string;
+  summary: string;
+  latest: { machineId: string; machineName: string | null; lastActiveAt: string; messageCount: number };
+  copies: Array<{
+    machineId: string;
+    machineName: string | null;
+    localSessionId: string;
+    lastActiveAt: string;
+    messageCount: number;
+    headEntryUuid: string;
+  }>;
+  localCopy: { localSessionId: string; headEntryUuid: string; current: boolean } | null;
+  pullNeeded: boolean; // latest is on another machine AND (no local copy or local head != latest head)
+}
+
+export interface WhereisResult {
+  success: true;
+  command: "whereis";
+  linked: boolean;
+  projectId: string | null;
+  linkCandidates?: Array<{ projectId: string; name: string; gitRemotes: string[] }>;
+  threads: WhereisThread[];
+  warnings: string[];
+}
+
 export interface HubUnlinkedResult {
   success: false;
   command: "push" | "pull" | "whereis";
@@ -348,6 +375,7 @@ export type CliResult =
   | HubInitResult
   | HubStatusResult
   | HubPushResult
+  | WhereisResult
   | HubUnlinkedResult
   | HubLockBusyResult
   | ErrorResult;
