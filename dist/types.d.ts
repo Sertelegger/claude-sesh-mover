@@ -335,9 +335,13 @@ export interface SyncStateImported {
 }
 export interface SyncState {
     projectPath: string;
-    schemaVersion: 1;
+    schemaVersion: 1 | 2;
     peers: Record<string, SyncStatePeer>;
     lineage: Record<string, SyncStateLineage>;
     imported: Record<string, SyncStateImported>;
+    hub?: {
+        hubId: string;
+        threadByLocalSession: Record<string, string>;
+    };
 }
 //# sourceMappingURL=types.d.ts.map

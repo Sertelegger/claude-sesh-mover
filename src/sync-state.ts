@@ -43,7 +43,7 @@ export function readSyncState(projectPath: string): SyncState {
   try {
     const parsed = JSON.parse(raw) as SyncState;
     if (
-      parsed.schemaVersion !== 1 ||
+      (parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2) ||
       parsed.peers === null ||
       typeof parsed.peers !== "object" ||
       parsed.lineage === null ||
@@ -115,4 +115,25 @@ export function recordSentFromBundle(
     };
   }
   writeSyncState(state);
+}
+
+export function getThreadId(state: SyncState, localSessionId: string): string | null {
+  return state.hub?.threadByLocalSession[localSessionId] ?? null;
+}
+
+// Files stay schemaVersion 1 until hub data is first written: non-hub users
+// keep v1 files readable by older plugin versions. Older versions treat v2
+// files as corrupt (rename-aside + fresh state) — that loses only peer
+// bookkeeping, never session data.
+export function setThreadId(
+  state: SyncState,
+  hubId: string,
+  localSessionId: string,
+  threadId: string
+): void {
+  if (!state.hub) {
+    state.hub = { hubId, threadByLocalSession: {} };
+    state.schemaVersion = 2;
+  }
+  state.hub.threadByLocalSession[localSessionId] = threadId;
 }

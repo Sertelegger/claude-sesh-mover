@@ -230,3 +230,64 @@ describe("sync-state", () => {
     expect(state.peers["peer-1"].sent["local-orig"].headEntryUuid).toBe("tail-uuid");
   });
 });
+
+describe("sync-state v2 (hub)", () => {
+  let tempHome: string;
+  let homeOverride: HomeOverrideHandle;
+
+  beforeEach(() => {
+    tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-sync-test-"));
+    homeOverride = overrideHome(tempHome);
+  });
+
+  afterEach(() => {
+    homeOverride.restore();
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it("reads v1 files unchanged and keeps them v1 on write when hub is untouched", async () => {
+    const { readSyncState, writeSyncState } = await import("../src/sync-state.js");
+    // arrange: use the file's existing temp-home pattern (overrideHome) and
+    // write a v1 state file via writeSyncState with no hub key
+    const s = readSyncState("/tmp/proj-v2-a");
+    expect(s.schemaVersion).toBe(1);
+    writeSyncState(s);
+    expect(readSyncState("/tmp/proj-v2-a").schemaVersion).toBe(1);
+  });
+
+  it("setThreadId initializes hub section, bumps to v2, round-trips", async () => {
+    const { readSyncState, writeSyncState, setThreadId, getThreadId } = await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-v2-b");
+    expect(getThreadId(s, "sess-1")).toBeNull();
+    setThreadId(s, "hub-1", "sess-1", "thread-1");
+    expect(s.schemaVersion).toBe(2);
+    expect(s.hub?.hubId).toBe("hub-1");
+    writeSyncState(s);
+    const again = readSyncState("/tmp/proj-v2-b");
+    expect(again.schemaVersion).toBe(2);
+    expect(getThreadId(again, "sess-1")).toBe("thread-1");
+  });
+
+  it("v2 files with unknown extra fields still read (forward tolerance)", async () => {
+    const { readSyncState, writeSyncState, setThreadId } = await import("../src/sync-state.js");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { syncStatePath } = await import("../src/sync-state.js");
+
+    // arrange: write a v2 state with hub section
+    const s = readSyncState("/tmp/proj-v2-c");
+    setThreadId(s, "hub-1", "sess-1", "thread-1");
+    writeSyncState(s);
+
+    // act: JSON-edit the file on disk to add unknown field {"future":"x"}
+    const p = syncStatePath("/tmp/proj-v2-c");
+    const fileContent = readFileSync(p, "utf-8");
+    const parsed = JSON.parse(fileContent);
+    parsed.future = "x";
+    writeFileSync(p, JSON.stringify(parsed, null, 2) + "\n", "utf-8");
+
+    // assert: schemaVersion 2 and thread mapping intact
+    const reread = readSyncState("/tmp/proj-v2-c");
+    expect(reread.schemaVersion).toBe(2);
+    expect(reread.hub?.threadByLocalSession["sess-1"]).toBe("thread-1");
+  });
+});
