@@ -159,6 +159,7 @@ export interface ExportManifest {
   incremental?: boolean;
   baseline?: ExportBaseline;
   projectId?: string;
+  workspace?: { fileCount: number; byteSize: number; snapshotAt: string };
 }
 
 // --- Config ---
@@ -309,6 +310,34 @@ export interface HubStatusResult {
   warnings: string[];
 }
 
+export interface HubPushResult {
+  success: true;
+  command: "push";
+  projectId: string;
+  bundleId: string | null; // null when nothing to push
+  pushedSessions: Array<{ threadId: string; sessionId: string; type: "full" | "continuation" }>;
+  upToDate: boolean;
+  hasWorkspace: boolean;
+  warnings: string[];
+}
+
+export interface HubUnlinkedResult {
+  success: false;
+  command: "push" | "pull" | "whereis";
+  reason: "unlinked";
+  linkCandidates: Array<{ projectId: string; name: string; gitRemotes: string[] }>;
+  suggestion: string;
+}
+
+export interface HubLockBusyResult {
+  success: false;
+  command: "push" | "pull";
+  reason: "lock-busy";
+  holderPid: number | null;
+  ageSeconds: number | null;
+  suggestion: string;
+}
+
 export type CliResult =
   | ExportResult
   | ImportResult
@@ -318,6 +347,9 @@ export type CliResult =
   | ConfigureResult
   | HubInitResult
   | HubStatusResult
+  | HubPushResult
+  | HubUnlinkedResult
+  | HubLockBusyResult
   | ErrorResult;
 
 // --- Version Adapters ---
@@ -348,7 +380,14 @@ export interface RewriteReport {
 // --- Progress ---
 
 export interface ProgressEvent {
-  phase: "export-copy" | "import-rewrite" | "import-verify" | "archive" | "extract";
+  phase:
+    | "export-copy"
+    | "import-rewrite"
+    | "import-verify"
+    | "archive"
+    | "extract"
+    | "hub-push"
+    | "hub-pull";
   sessionId?: string;
   sessionIndex?: number;
   sessionCount?: number;

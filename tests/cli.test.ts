@@ -8,6 +8,7 @@ import {
   writeFileSync,
   readFileSync,
   chmodSync,
+  cpSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir, platform } from "node:os";
@@ -576,6 +577,71 @@ describe("cli", () => {
       } finally {
         rmSync(home, { recursive: true, force: true });
         rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("push CLI", () => {
+    it("push creates a hub project and bundle for the current project's sessions", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-push-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-push-hub-"));
+      try {
+        await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+
+        // Hub identity writes .claude-sesh-mover/project.json under the real
+        // project directory, so (unlike plain export/import/migrate) push
+        // needs a real, writable projectPath. Reuse tempDir (already real,
+        // from beforeEach) and relocate the fixture's session data to
+        // tempDir's own encoded name so discovery finds it there.
+        const fixtureEncoded = "-Users-testuser-Projects-testproject";
+        const realEncoded = encodeProjectPath(tempDir);
+        cpSync(join(configDir, "projects", fixtureEncoded), join(configDir, "projects", realEncoded), {
+          recursive: true,
+        });
+
+        const result = JSON.parse(
+          (
+            await runCli(
+              ["push", "--project-path", tempDir, "--create-project", "--source-config-dir", configDir],
+              homeEnv(home)
+            )
+          ).stdout
+        );
+        expect(result.success).toBe(true);
+        expect(result.command).toBe("push");
+        expect(result.pushedSessions).toHaveLength(1);
+        expect(result.upToDate).toBe(false);
+
+        // Repeat push with no changes: up to date, no new bundle.
+        const again = JSON.parse(
+          (
+            await runCli(["push", "--project-path", tempDir, "--source-config-dir", configDir], homeEnv(home))
+          ).stdout
+        );
+        expect(again.success).toBe(true);
+        expect(again.upToDate).toBe(true);
+        expect(again.bundleId).toBeNull();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+
+    it("push without a configured hub returns an error", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-push-nohub-home-"));
+      try {
+        const result = JSON.parse(
+          (
+            await runCli(
+              ["push", "--project-path", tempDir, "--source-config-dir", configDir],
+              homeEnv(home)
+            )
+          ).stdout
+        );
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("No hub configured");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
       }
     });
   });

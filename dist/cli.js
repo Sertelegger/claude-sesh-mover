@@ -487,6 +487,46 @@ hub
         outputError("hub-status", e);
     }
 });
+// --- Push ---
+program
+    .command("push")
+    .description("Push this project's sessions to the hub")
+    .option("--session-id <ids...>", "Push specific sessions only")
+    .option("--project-path <path>", "Override project path (default: cwd)")
+    .option("--source-config-dir <path>", "Override Claude config dir")
+    .option("--project-id <id>", "Link to an existing hub project id")
+    .option("--create-project", "Mint a new hub project for this directory")
+    .option("--no-workspace", "Skip the workspace snapshot for non-git projects")
+    .option("--progress", "Emit NDJSON progress events on stderr")
+    .action(async (opts) => {
+    try {
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
+        const projectPath = opts.projectPath ?? process.cwd();
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { resolveHubPath } = await import("./hub/init.js");
+        const hubPath = resolveHubPath(config);
+        if (!hubPath) {
+            outputError("push", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+            return;
+        }
+        const { hubPush } = await import("./hub/push.js");
+        const onProgress = opts.progress
+            ? (ev) => process.stderr.write(JSON.stringify(ev) + "\n")
+            : undefined;
+        output(await hubPush({
+            configDir, projectPath, hubPath,
+            sessionIds: opts.sessionId,
+            noWorkspace: opts.workspace === false || config.hub.noWorkspace,
+            projectIdOverride: opts.projectId,
+            createProject: !!opts.createProject,
+            claudeVersion: getClaudeVersion(),
+            onProgress,
+        }));
+    }
+    catch (e) {
+        outputError("push", e);
+    }
+});
 // --- Helpers ---
 // Single predicate for both the collision gate and the --suffix loop, so a
 // plain directory export and an archive/zstd export of the same name can

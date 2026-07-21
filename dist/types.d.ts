@@ -118,6 +118,11 @@ export interface ExportManifest {
     incremental?: boolean;
     baseline?: ExportBaseline;
     projectId?: string;
+    workspace?: {
+        fileCount: number;
+        byteSize: number;
+        snapshotAt: string;
+    };
 }
 export interface SeshMoverConfig {
     export: {
@@ -254,7 +259,40 @@ export interface HubStatusResult {
     };
     warnings: string[];
 }
-export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | ErrorResult;
+export interface HubPushResult {
+    success: true;
+    command: "push";
+    projectId: string;
+    bundleId: string | null;
+    pushedSessions: Array<{
+        threadId: string;
+        sessionId: string;
+        type: "full" | "continuation";
+    }>;
+    upToDate: boolean;
+    hasWorkspace: boolean;
+    warnings: string[];
+}
+export interface HubUnlinkedResult {
+    success: false;
+    command: "push" | "pull" | "whereis";
+    reason: "unlinked";
+    linkCandidates: Array<{
+        projectId: string;
+        name: string;
+        gitRemotes: string[];
+    }>;
+    suggestion: string;
+}
+export interface HubLockBusyResult {
+    success: false;
+    command: "push" | "pull";
+    reason: "lock-busy";
+    holderPid: number | null;
+    ageSeconds: number | null;
+    suggestion: string;
+}
+export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;
@@ -274,7 +312,7 @@ export interface RewriteReport {
     warnings: string[];
 }
 export interface ProgressEvent {
-    phase: "export-copy" | "import-rewrite" | "import-verify" | "archive" | "extract";
+    phase: "export-copy" | "import-rewrite" | "import-verify" | "archive" | "extract" | "hub-push" | "hub-pull";
     sessionId?: string;
     sessionIndex?: number;
     sessionCount?: number;
