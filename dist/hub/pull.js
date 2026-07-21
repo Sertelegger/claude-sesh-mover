@@ -184,27 +184,36 @@ export async function hubPull(opts) {
             const bundleManifest = readManifest(extractDir);
             lastBundleManifest = bundleManifest;
             // Workspace gate (first needed bundle only):
-            // - target absent or empty       -> unpack (bootstrap; no force needed)
+            // - target absent, empty, or
+            //   metadata-only                -> unpack (bootstrap; no force needed)
             // - explicit --target-path,
-            //   non-empty, no force          -> let unpackWorkspace throw, surface
+            //   has real content, no force   -> let unpackWorkspace throw, surface
             //                                   an ErrorResult with the
             //                                   --force-workspace suggestion (the
             //                                   user asked for that destination;
             //                                   refuse loudly)
             // - no explicit --target-path,
-            //   project dir non-empty,
+            //   project dir has real content,
             //   no force                     -> SKIP with a warning (routine repeat
             //                                   pulls of non-git projects must not
             //                                   start erroring)
             // - --force-workspace            -> unpack with force (merge) regardless
+            //
+            // ".claude-sesh-mover" counts as non-content on BOTH sides: identity
+            // linking above may have just planted project.json into an otherwise
+            // fresh directory (the in-place bootstrap flow, --project-id with no
+            // --target-path), and that metadata alone must neither trigger the
+            // routine-skip branch nor trip unpackWorkspace's own emptiness check —
+            // hence force is also set when the dir holds nothing but our metadata.
             if (i === 0 && bundleManifest.workspace) {
-                const targetNonEmpty = existsSync(effectiveProjectPath) && readdirSync(effectiveProjectPath).length > 0;
-                if (targetNonEmpty && !opts.forceWorkspace && !opts.targetPath) {
-                    warnings.push("Bundle carries a workspace payload but the project directory already exists locally — pass --force-workspace to merge it.");
+                const entries = existsSync(effectiveProjectPath) ? readdirSync(effectiveProjectPath) : [];
+                const hasRealContent = entries.some((n) => n !== ".claude-sesh-mover");
+                if (hasRealContent && !opts.forceWorkspace && !opts.targetPath) {
+                    warnings.push("Bundle carries a workspace payload but the project directory already has content — pass --force-workspace to merge it here, or re-pull with --target-path <fresh-dir> to unpack it elsewhere.");
                 }
                 else {
                     try {
-                        const ws = await unpackWorkspace(join(extractDir, "workspace"), effectiveProjectPath, { force: !!opts.forceWorkspace });
+                        const ws = await unpackWorkspace(join(extractDir, "workspace"), effectiveProjectPath, { force: !!opts.forceWorkspace || !hasRealContent });
                         workspaceUnpacked = { path: effectiveProjectPath, fileCount: ws.fileCount };
                         if (ws.symlinksSkipped > 0) {
                             warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);

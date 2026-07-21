@@ -467,6 +467,7 @@ describe("hub pull", () => {
       expect(p.workspaceUnpacked).toBeNull();
       expect(p.importedSessions).toHaveLength(1);
       expect(p.warnings.join(" ")).toContain("--force-workspace");
+      expect(p.warnings.join(" ")).toContain("--target-path"); // names the fresh-dir recovery too
       // The bundle's workspace payload (README.md from projA) was NOT written.
       expect(existsSync(join(projectB, "README.md"))).toBe(false);
       expect(readFileSync(join(projectB, "local-work.txt"), "utf-8")).toBe("mine\n");
@@ -526,6 +527,59 @@ describe("hub pull", () => {
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
       if (identityAnchorB) rmSync(identityAnchorB, { recursive: true, force: true });
       if (targetPath) rmSync(targetPath, { recursive: true, force: true });
+    }
+  });
+
+  it("in-place bootstrap: fresh dir + --project-id + NO target-path unpacks the workspace despite the just-planted metadata", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let projectB: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-ws");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+      expect(pushResult.hasWorkspace).toBe(true);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+
+      const configDirB = join(homeB, ".claude");
+      // FRESH directory, no pre-link, no --target-path: identity linking via
+      // --project-id plants .claude-sesh-mover/project.json into it before
+      // the workspace gate runs. That metadata alone must count as "empty" —
+      // otherwise the gate would skip with a warning whose --force-workspace
+      // remedy can never work (the first pull already consumed the chain).
+      projectB = mkdtempSync(join(tmpdir(), "sesh-pull-inplace-"));
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true,
+        projectIdOverride: pushResult.projectId,
+        claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceUnpacked).not.toBeNull();
+      expect(p.workspaceUnpacked!.path).toBe(projectB);
+      expect(p.workspaceUnpacked!.fileCount).toBeGreaterThanOrEqual(1);
+      expect(p.importedSessions).toHaveLength(1);
+      // Payload arrived in place, alongside the planted metadata.
+      expect(readFileSync(join(projectB, "README.md"), "utf-8")).toBe("hello\n");
+      expect(existsSync(join(projectB, ".claude-sesh-mover", "project.json"))).toBe(true);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectB) rmSync(projectB, { recursive: true, force: true });
     }
   });
 
