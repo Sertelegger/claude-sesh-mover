@@ -337,7 +337,7 @@ export interface HubPullResult {
     sourceMachineId: string;
     importedSessions: ImportResult["importedSessions"];
     skippedSessions: ImportResult["skippedSessions"];
-    localSessionId: string;
+    localSessionId: string | null;
     workspaceUnpacked: {
         path: string;
         fileCount: number;

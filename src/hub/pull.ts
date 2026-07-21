@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, mkdirSync, createWriteStream, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, createWriteStream, existsSync, readdirSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +21,7 @@ import { encodeProjectPath } from "../platform.js";
 import { readSyncState, writeSyncState, setThreadId } from "../sync-state.js";
 import type {
   ErrorResult,
+  ExportManifest,
   HubLockBusyResult,
   HubPullListResult,
   HubPullResult,
@@ -206,6 +207,7 @@ export async function hubPull(
     const importedSessions: HubPullResult["importedSessions"] = [];
     const skippedSessions: HubPullResult["skippedSessions"] = [];
     let lastImportedNewId: string | null = null;
+    let lastBundleManifest: ExportManifest | null = null;
 
     for (const [i, record] of needed.entries()) {
       const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
@@ -228,27 +230,50 @@ export async function hubPull(
       // action treats its own tempExtractDir as the exportPath (no nested
       // "bundle/" to join).
       const bundleManifest = readManifest(extractDir);
+      lastBundleManifest = bundleManifest;
 
-      if (i === 0 && bundleManifest.workspace && !existsSync(effectiveProjectPath)) {
-        try {
-          const ws = await unpackWorkspace(
-            join(extractDir, "workspace"),
-            effectiveProjectPath,
-            { force: !!opts.forceWorkspace }
+      // Workspace gate (first needed bundle only):
+      // - target absent or empty       -> unpack (bootstrap; no force needed)
+      // - explicit --target-path,
+      //   non-empty, no force          -> let unpackWorkspace throw, surface
+      //                                   an ErrorResult with the
+      //                                   --force-workspace suggestion (the
+      //                                   user asked for that destination;
+      //                                   refuse loudly)
+      // - no explicit --target-path,
+      //   project dir non-empty,
+      //   no force                     -> SKIP with a warning (routine repeat
+      //                                   pulls of non-git projects must not
+      //                                   start erroring)
+      // - --force-workspace            -> unpack with force (merge) regardless
+      if (i === 0 && bundleManifest.workspace) {
+        const targetNonEmpty =
+          existsSync(effectiveProjectPath) && readdirSync(effectiveProjectPath).length > 0;
+        if (targetNonEmpty && !opts.forceWorkspace && !opts.targetPath) {
+          warnings.push(
+            "Bundle carries a workspace payload but the project directory already exists locally — pass --force-workspace to merge it."
           );
-          workspaceUnpacked = { path: effectiveProjectPath, fileCount: ws.fileCount };
-          if (ws.symlinksSkipped > 0) {
-            warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
+        } else {
+          try {
+            const ws = await unpackWorkspace(
+              join(extractDir, "workspace"),
+              effectiveProjectPath,
+              { force: !!opts.forceWorkspace }
+            );
+            workspaceUnpacked = { path: effectiveProjectPath, fileCount: ws.fileCount };
+            if (ws.symlinksSkipped > 0) {
+              warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
+            }
+          } catch (e) {
+            if (e instanceof WorkspaceTargetNotEmptyError) {
+              return {
+                success: false, command: "pull",
+                error: e.message,
+                suggestion: "Pass --force-workspace to merge into the existing (non-empty) target directory.",
+              };
+            }
+            throw e;
           }
-        } catch (e) {
-          if (e instanceof WorkspaceTargetNotEmptyError) {
-            return {
-              success: false, command: "pull",
-              error: e.message,
-              suggestion: "Pass --force-workspace to merge into the existing (non-empty) target directory.",
-            };
-          }
-          throw e;
         }
       }
 
@@ -270,18 +295,36 @@ export async function hubPull(
     }
 
     // Thread mapping: prefer this pull's own import; if every bundle in the
-    // chain was skipped as an already-received duplicate, fall back to the
-    // local session id that earlier receipt was recorded against.
+    // chain was skipped, fall back to (1) the local session id an earlier
+    // receipt from this peer was recorded against, then (2) the imported-hash
+    // registry — the cross-route duplicate case, where identical content
+    // arrived earlier via a plain import (no peer bookkeeping) and the
+    // importer skipped it via state.imported[integrityHash] rather than
+    // peers[...].received.
     const lastRecord = needed[needed.length - 1];
     const stateAfter = readSyncState(effectiveProjectPath);
-    const localSessionId =
+    const lastSessionManifest =
+      lastBundleManifest?.sessions.find((s) => s.sessionId === lastRecord.sessionIdInBundle) ?? null;
+    const hashRegistryFallback = lastSessionManifest
+      ? stateAfter.imported[lastSessionManifest.integrityHash]?.localSessionId
+      : undefined;
+    const localSessionId: string | null =
       lastImportedNewId ??
       stateAfter.peers[sourceCopy.machineId]?.received[lastRecord.sessionIdInBundle]?.localSessionId ??
-      "";
+      hashRegistryFallback ??
+      null;
 
-    const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
-    setThreadId(stateAfter, hub.hubId, localSessionId, target.threadId);
-    writeSyncState(stateAfter);
+    if (localSessionId !== null) {
+      const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
+      setThreadId(stateAfter, hub.hubId, localSessionId, target.threadId);
+      writeSyncState(stateAfter);
+    } else {
+      // Never map a thread to a fabricated id (an empty string would poison
+      // the index projection below and every future pull's dedup).
+      warnings.push(
+        "pulled content already exists locally but its session could not be identified — a future push from this machine will re-map the thread"
+      );
+    }
 
     // Rewrite our machine index over current local sessions — pulls never
     // create bundles, so newBundles is always empty here.

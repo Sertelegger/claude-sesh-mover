@@ -372,7 +372,11 @@ export interface HubPullResult {
   sourceMachineId: string;
   importedSessions: ImportResult["importedSessions"];
   skippedSessions: ImportResult["skippedSessions"];
-  localSessionId: string; // the thread's local session after pull
+  // The thread's local session after pull. null when every bundle was
+  // skipped as a duplicate AND the existing local copy could not be
+  // identified through peer bookkeeping or the imported-hash registry —
+  // in that case no thread mapping is written (a future push re-maps it).
+  localSessionId: string | null;
   workspaceUnpacked: { path: string; fileCount: number } | null;
   warnings: string[];
 }

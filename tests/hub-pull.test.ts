@@ -13,6 +13,9 @@ import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes } from "../src/hub/index-file.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
+import { extractArchive } from "../src/archiver.js";
+import { importSession } from "../src/importer.js";
+import { readSyncState, getThreadId } from "../src/sync-state.js";
 import { encodeProjectPath } from "../src/platform.js";
 import type { HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
 
@@ -367,6 +370,248 @@ describe("hub pull", () => {
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
       if (identityAnchorB) rmSync(identityAnchorB, { recursive: true, force: true });
       if (targetParent) rmSync(targetParent, { recursive: true, force: true });
+    }
+  });
+
+  it("explicit --target-path at a non-empty dir without --force-workspace refuses with the force suggestion", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let identityAnchorB: string | undefined;
+    let targetPath: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-ws");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+      expect(pushResult.hasWorkspace).toBe(true);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+
+      const configDirB = join(homeB, ".claude");
+      identityAnchorB = mkdtempSync(join(tmpdir(), "sesh-pull-identB-"));
+      // The user EXPLICITLY asked for this destination and it is non-empty:
+      // refuse loudly instead of silently skipping the unpack.
+      targetPath = mkdtempSync(join(tmpdir(), "sesh-pull-occupied-"));
+      writeFileSync(join(targetPath, "occupied.txt"), "already here\n");
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: identityAnchorB, hubPath: hub,
+        targetPath, latest: true,
+        projectIdOverride: pushResult.projectId,
+        claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      expect((pull as { suggestion?: string }).suggestion).toContain("--force-workspace");
+      // Refusal happens before any session import: no project dir was created
+      // for the target path, and the occupied file is untouched.
+      expect(existsSync(join(configDirB, "projects", encodeProjectPath(targetPath)))).toBe(false);
+      expect(readFileSync(join(targetPath, "occupied.txt"), "utf-8")).toBe("already here\n");
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (identityAnchorB) rmSync(identityAnchorB, { recursive: true, force: true });
+      if (targetPath) rmSync(targetPath, { recursive: true, force: true });
+    }
+  });
+
+  it("no explicit target: non-empty project dir skips the workspace unpack with a warning, sessions still import", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let projectB: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-ws");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+      expect(pushResult.hasWorkspace).toBe(true);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+
+      const configDirB = join(homeB, ".claude");
+      // Routine repeat-pull shape: the project already exists locally (it is
+      // at minimum non-empty from its own .claude-sesh-mover/project.json).
+      projectB = mkdtempSync(join(tmpdir(), "sesh-pull-projB-"));
+      writeLocalProjectId(projectB, {
+        projectId: pushResult.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+      writeFileSync(join(projectB, "local-work.txt"), "mine\n");
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      // Unpack was skipped, not errored — sessions still imported.
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.importedSessions).toHaveLength(1);
+      expect(p.warnings.join(" ")).toContain("--force-workspace");
+      // The bundle's workspace payload (README.md from projA) was NOT written.
+      expect(existsSync(join(projectB, "README.md"))).toBe(false);
+      expect(readFileSync(join(projectB, "local-work.txt"), "utf-8")).toBe("mine\n");
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectB) rmSync(projectB, { recursive: true, force: true });
+    }
+  });
+
+  it("--force-workspace merges into a non-empty target, overwriting collided files and keeping the rest", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let identityAnchorB: string | undefined;
+    let targetPath: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-ws");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+      expect(pushResult.hasWorkspace).toBe(true);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+
+      const configDirB = join(homeB, ".claude");
+      identityAnchorB = mkdtempSync(join(tmpdir(), "sesh-pull-identB-"));
+      targetPath = mkdtempSync(join(tmpdir(), "sesh-pull-merge-"));
+      writeFileSync(join(targetPath, "README.md"), "stale\n"); // collides with the pushed workspace file
+      writeFileSync(join(targetPath, "keep.txt"), "untouched\n");
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: identityAnchorB, hubPath: hub,
+        targetPath, latest: true, forceWorkspace: true,
+        projectIdOverride: pushResult.projectId,
+        claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceUnpacked).not.toBeNull();
+      expect(p.workspaceUnpacked!.path).toBe(targetPath);
+      expect(p.importedSessions).toHaveLength(1);
+      // Incoming content wins the collision; unrelated local files survive.
+      expect(readFileSync(join(targetPath, "README.md"), "utf-8")).toBe("hello\n");
+      expect(readFileSync(join(targetPath, "keep.txt"), "utf-8")).toBe("untouched\n");
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (identityAnchorB) rmSync(identityAnchorB, { recursive: true, force: true });
+      if (targetPath) rmSync(targetPath, { recursive: true, force: true });
+    }
+  });
+
+  it("cross-route duplicate: thread mapping falls back to the imported-hash registry", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let projectB: string | undefined;
+    let extractStage: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, noWorkspace: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+
+      restore.restore();
+      restore = overrideHome(homeB);
+
+      const configDirB = join(homeB, ".claude");
+      projectB = mkdtempSync(join(tmpdir(), "sesh-pull-projB-"));
+      writeLocalProjectId(projectB, {
+        projectId: pushResult.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      // Cross-route arrangement: the SAME bundle content reaches B first via
+      // a plain import whose manifest carries no source machine id — so only
+      // the integrity-hash registry (state.imported) records it, never
+      // peers[A].received. A subsequent pull then sees the bundle as needed
+      // (no received entry), and its inner import skips it as a "duplicate"
+      // via the hash registry.
+      const backend = createFsBackend(hub);
+      const { indexes } = await readAllIndexes(backend, pushResult.projectId);
+      const bundleFile = Object.values(indexes[0].threads)[0].bundles[0].file;
+      extractStage = mkdtempSync(join(tmpdir(), "sesh-pull-xroute-"));
+      const tarPath = join(extractStage, "bundle.tar.gz");
+      writeFileSync(tarPath, await backend.read(bundleFile));
+      const extractedDir = join(extractStage, "extracted");
+      mkdirSync(extractedDir, { recursive: true });
+      await extractArchive(tarPath, extractedDir);
+      const manifestPath = join(extractedDir, "manifest.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      delete manifest.sourceMachineId;
+      delete manifest.sourceMachineName;
+      writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+      const plainImport = await importSession({
+        exportPath: extractedDir,
+        targetConfigDir: configDirB,
+        targetProjectPath: projectB,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+      expect(plainImport.success).toBe(true);
+      if (!plainImport.success) return;
+      const priorLocalId = (plainImport.importedSessions as Array<{ newId: string }>)[0].newId;
+      const stateBefore = readSyncState(projectB);
+      expect(Object.keys(stateBefore.peers)).toHaveLength(0); // no peer bookkeeping recorded
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.importedSessions).toHaveLength(0);
+      expect(p.skippedSessions.map((s) => s.reason)).toEqual(["duplicate"]);
+      // The resolved local session id comes from the imported-hash registry,
+      // never a fabricated "".
+      expect(p.localSessionId).toBe(priorLocalId);
+      // ...and setThreadId really ran against that id.
+      const stateAfter = readSyncState(projectB);
+      expect(getThreadId(stateAfter, priorLocalId)).toBe(p.threadId);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectB) rmSync(projectB, { recursive: true, force: true });
+      if (extractStage) rmSync(extractStage, { recursive: true, force: true });
     }
   });
 });
