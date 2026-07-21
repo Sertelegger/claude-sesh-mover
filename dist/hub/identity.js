@@ -33,7 +33,7 @@ export function normalizeGitRemote(url) {
     let host;
     let path;
     const scp = /^(?:[\w.-]+@)?([\w.-]+):(?!\/\/)(.+)$/.exec(rest); // git@host:path
-    const uri = /^\w+:\/\/(?:[\w.-]+@)?([\w.-]+)(?::\d+)?\/(.+)$/.exec(rest); // scheme://host/path
+    const uri = /^\w+:\/\/(?:[\w.%-]+(?::[^@/]*)?@)?([\w.-]+)(?::\d+)?\/(.+)$/.exec(rest); // scheme://[user[:pass]@]host/path
     if (uri) {
         host = uri[1];
         path = uri[2];
@@ -81,10 +81,15 @@ export async function listHubProjects(backend) {
         try {
             const parsed = JSON.parse((await backend.read(f)).toString());
             assertSafeHubId(parsed.projectId, "projectId");
+            // Shape check: a valid-JSON record with missing/malformed matchers would
+            // otherwise crash consumers (resolveProjectIdentity's candidate map) —
+            // one bad hub file must not break identity resolution for everyone.
+            if (!Array.isArray(parsed.matchers?.gitRemotes))
+                throw new Error("malformed matchers");
             projects.push(parsed);
         }
         catch {
-            // unparseable/unsafe project.json (possibly mid-sync) — skip, never throw
+            // unparseable/unsafe/malformed project.json (possibly mid-sync) — skip, never throw
         }
     }
     return projects;

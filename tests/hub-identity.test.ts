@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { createFsBackend } from "../src/hub/backend.js";
 import {
   normalizeGitRemote, localGitRemotes, resolveProjectIdentity,
-  createHubProject, linkToHubProject, readLocalProjectId,
+  createHubProject, linkToHubProject, readLocalProjectId, listHubProjects,
 } from "../src/hub/identity.js";
 import { projectJsonPath } from "../src/hub/layout.js";
 
@@ -21,6 +21,9 @@ describe("normalizeGitRemote", () => {
   });
   it("returns null on garbage", () => {
     expect(normalizeGitRemote("not a url")).toBeNull();
+  });
+  it("strips user:pass credentials from https forms", () => {
+    expect(normalizeGitRemote("https://user:pass@Host.com/x/y.git")).toBe("host.com/x/y");
   });
 });
 
@@ -71,6 +74,38 @@ describe("identity resolution", () => {
       const r = await resolveProjectIdentity(backend, dir);
       expect(r.kind).toBe("match");
       if (r.kind === "match") expect(r.hubProject.projectId).toBe("p-hub");
+    } finally { for (const d of [dir, hub]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("skips project.json with malformed or missing matchers; good candidates survive", async () => {
+    const dir = tmp("sesh-id-p-");
+    const hub = tmp("sesh-id-hub-");
+    try {
+      const backend = createFsBackend(hub);
+      // Valid JSON, safe id, but matchers is an empty object (no gitRemotes array)
+      await backend.writeAtomic(projectJsonPath("p-bad-empty"), JSON.stringify({
+        schemaVersion: 1, projectId: "p-bad-empty", name: "bad-empty", matchers: {},
+        createdAt: "t", createdByMachine: "m",
+      }));
+      // Valid JSON, safe id, but no matchers key at all
+      await backend.writeAtomic(projectJsonPath("p-bad-missing"), JSON.stringify({
+        schemaVersion: 1, projectId: "p-bad-missing", name: "bad-missing",
+        createdAt: "t", createdByMachine: "m",
+      }));
+      // A well-formed one that must survive
+      await backend.writeAtomic(projectJsonPath("p-good"), JSON.stringify({
+        schemaVersion: 1, projectId: "p-good", name: "good", matchers: { gitRemotes: [] },
+        createdAt: "t", createdByMachine: "m",
+      }));
+
+      const projects = await listHubProjects(backend);
+      expect(projects.map((p) => p.projectId)).toEqual(["p-good"]);
+
+      const r = await resolveProjectIdentity(backend, dir);
+      expect(r.kind).toBe("unlinked");
+      if (r.kind === "unlinked") {
+        expect(r.candidates.map((c) => c.projectId)).toEqual(["p-good"]);
+      }
     } finally { for (const d of [dir, hub]) rmSync(d, { recursive: true, force: true }); }
   });
 
