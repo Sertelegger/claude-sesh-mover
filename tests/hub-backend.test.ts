@@ -74,11 +74,27 @@ export function backendContract(makeBackend: () => { backend: HubBackend; root: 
       ? readdirSync(join(root, "projects/p1/bundles/m1")).length : 0).toBe(0);
   });
 
+  it("failed stream commit rejects and cleans up its temp file", async () => {
+    const w = await backend.writeStreamAtomic("projects/p1/bundles/m1/fail.tar.gz");
+    w.stream.write("partial");
+    // Simulate a mid-write failure (disk full, connection lost) before commit.
+    (w.stream as unknown as { destroy(err: Error): void }).destroy(new Error("simulated failure"));
+    await new Promise((resolve) => setImmediate(resolve)); // let the error event latch
+    await expect(w.commit()).rejects.toThrow(/simulated failure/);
+    expect(await backend.exists("projects/p1/bundles/m1/fail.tar.gz")).toBe(false);
+    expect(existsSync(join(root, "projects/p1/bundles/m1"))
+      ? readdirSync(join(root, "projects/p1/bundles/m1")).length : 0).toBe(0);
+  });
+
   it("rejects unsafe relative paths on every method", async () => {
     for (const p of ["/abs", "a/../b", "a\\b", ""]) {
       await expect(backend.read(p)).rejects.toThrow(/hub-relative/i);
       await expect(backend.writeAtomic(p, "x")).rejects.toThrow(/hub-relative/i);
       await expect(backend.exists(p)).rejects.toThrow(/hub-relative/i);
+      await expect(backend.list(p)).rejects.toThrow(/hub-relative/i);
+      await expect(backend.delete(p)).rejects.toThrow(/hub-relative/i);
+      await expect(backend.readStream(p)).rejects.toThrow(/hub-relative/i);
+      await expect(backend.writeStreamAtomic(p)).rejects.toThrow(/hub-relative/i);
     }
   });
 }

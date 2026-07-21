@@ -75,14 +75,23 @@ export function createFsBackend(rootDir) {
             return {
                 stream,
                 async commit() {
-                    if (streamError)
-                        throw streamError;
-                    if (!stream.writableEnded)
-                        stream.end();
-                    await finished(stream);
-                    if (streamError)
-                        throw streamError;
-                    renameSync(tmp, target);
+                    // On any failure, remove the temp file before rethrowing — a
+                    // caller that awaited commit() won't also call abort(), so this
+                    // is the only chance to avoid orphaning the temp.
+                    try {
+                        if (streamError)
+                            throw streamError;
+                        if (!stream.writableEnded)
+                            stream.end();
+                        await finished(stream);
+                        if (streamError)
+                            throw streamError;
+                        renameSync(tmp, target);
+                    }
+                    catch (err) {
+                        rmSync(tmp, { force: true });
+                        throw err;
+                    }
                 },
                 async abort() {
                     stream.destroy();
