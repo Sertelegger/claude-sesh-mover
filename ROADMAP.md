@@ -12,17 +12,36 @@ you lose track of **which machine has which sessions and where the latest one li
 finding it means SSH-ing around. The hub answers "where did I work last?" and moves the
 session to wherever you are now.
 
-**Architecture direction: dumb storage + smart client.** No hosted service. A designated
-storage backend — a private git repo first (auth via existing SSH keys, history for free),
-abstracted so S3/WebDAV/synced folders can slot in later — holds incremental bundles plus a
-small JSON index (machines, sessions, lineage, last-active). Planned surface:
+**Architecture direction: dumb storage + smart client.** No hosted service (yet — see Slice
+4 below). A designated storage backend holds bundles plus a small JSON index (machines,
+sessions, lineage, last-active) per machine.
 
-- `/sesh-mover:whereis` — all sessions for the current project across all machines, sorted
-  by last activity.
-- `/sesh-mover:push` / `/sesh-mover:pull` — send/fetch bundles through the hub, reusing the
-  existing incremental-sync machinery (machine identity, peer state, continuations).
-- Optional `SessionEnd` hook that auto-pushes index updates, so the index is always current.
-- Optional age/gpg encryption of bundles at rest (sessions contain secrets).
+**Slice 1 — filesystem-directory backend: shipped in v0.5.0.** `hub init`/`hub status`/
+`hub reindex`, `push`/`pull`, and `whereis` all work today against any directory that
+behaves like a shared filesystem path — a network share or a synced folder (OneDrive/
+Dropbox/Syncthing/iCloud Drive). Project identity, git-remote matching, cross-machine
+thread lineage, and git-less workspace snapshots are all in place; see the README's
+"The Hub" section and [CHANGELOG.md](./CHANGELOG.md#050--2026-07-21) for the full surface.
+Sessions are plaintext at rest in the hub directory until Slice 3 ships.
+
+**Git backend: not planned.** The original direction here was "a private git repo first,
+auth via existing SSH keys, history for free" — dropped after Slice 1's design pass:
+bundle blobs (JSONL + optional workspace snapshots, potentially large and always
+binary-ish after compression) don't fit git's history model or LFS economics well enough
+to justify the added complexity over a plain shared directory, which needs no git
+tooling on either machine and already satisfies the sync/network-share requirement.
+
+**Remaining slices** (each gets its own design pass before implementation; not scheduled):
+
+- **Slice 2 — automation.** An optional `SessionEnd` hook that auto-pushes so the hub
+  index stays current without a manual `/sesh-mover:push`; carrying a git-diff summary
+  alongside a push so `whereis`/`pull` can show what changed, not just when.
+- **Slice 3 — encryption at rest + compaction.** Age/gpg encryption of bundles in the hub
+  (closing the plaintext-at-rest gap called out in Slice 1's security notes); compaction
+  of superseded bundles so a long-lived hub directory doesn't grow unbounded.
+- **Slice 4 — web service + UI.** A hosted alternative to the filesystem backend (own
+  design pass — auth, multi-user access control, and a browsable UI are all out of scope
+  for the dumb-storage model above and need dedicated design work).
 
 **Why build it (landscape as of 2026-07):** Claude Code local CLI sessions are machine-local
 with no native sync; Remote Control steers live sessions but transfers nothing and requires

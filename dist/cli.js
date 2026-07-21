@@ -21,7 +21,7 @@ const program = new Command();
 program
     .name("sesh-mover")
     .description("Export, import, and migrate Claude Code sessions")
-    .version("0.4.1");
+    .version("0.5.0");
 // --- Export ---
 program
     .command("export")

@@ -2,6 +2,71 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.5.0] — 2026-07-21
+
+The Hub, Slice 1: a cross-machine session index with a filesystem backend — push, pull,
+and see where a project's sessions live across every machine you use.
+
+### Added
+- **The Hub** — `hub init`, `hub status`, `hub reindex`, `push`, `pull`, `whereis`.
+  - Filesystem hub backend: any directory works as the hub — network share, or a
+    synced folder (OneDrive/Dropbox/Syncthing/iCloud Drive).
+  - Project identity (`.claude-sesh-mover/project.json`, meant to be committed) with
+    git-remote matching, so a project links to the same hub project from any clone.
+  - Logical-session **threads** with cross-machine lineage — `whereis` shows every
+    machine's copy of a thread, which one is latest, and whether the local copy is
+    current or stale.
+  - Workspace snapshots for git-less projects (project files bundled alongside
+    sessions on push/pull), with `.claude-sesh-mover/hubignore` support to exclude
+    paths from the snapshot.
+  - `--progress` NDJSON phases on `push`/`pull` (extends the existing
+    export/import/migrate progress contract).
+  - Same-machine advisory locking so two hub operations for the same project on one
+    machine don't race each other.
+  - Plugin slash commands: `/sesh-mover:push`, `/sesh-mover:pull`,
+    `/sesh-mover:whereis`, `/sesh-mover:hub-init` (`plugin.json`'s `commands` array
+    updated to match).
+  - Library: the `src/hub/*` module surface (backend, layout, identity, threads,
+    index-file, workspace, lock, init, status, push, pull, whereis, reindex) is
+    re-exported from the package barrel (`src/index.ts`).
+  - `--session-id` filtering on `push` is an **exact subset** of the project's
+    sessions — reuses `exporter.ts`'s existing sessionIds filter (unknown ids are
+    rejected, not silently skipped).
+
+### Changed
+- Sync-state schema **v2** (additive): a `hub` block (`hubId` + thread-by-local-session
+  mapping) is added only once a project first pushes/pulls through a hub; files
+  otherwise stay v1. Older plugin versions that see a v2 file don't understand
+  `schemaVersion: 2` and treat it as corrupt — the file is renamed aside and a fresh
+  state is started, which loses only peer/thread bookkeeping, never session data.
+- Export manifest gains two optional, backward-compatible fields: `projectId` (hub
+  project this bundle belongs to) and `workspace` (`fileCount`/`byteSize`/`snapshotAt`
+  when a workspace snapshot was included).
+- `HubPullResult.localSessionId` is `string | null` — `null` specifically means the
+  pulled content was already present locally, but sesh-mover couldn't identify which
+  existing local session it corresponds to (a bookkeeping edge case), not that the
+  pull failed.
+
+### Fixed
+- Config-merge bug (pre-existing, since the two-tier config was introduced): merging
+  user-scope and project-scope config silently reset any user-scope-only setting to
+  its default whenever the project-scope `config.json` didn't exist, because
+  `readConfig` always backfills defaults even for a missing file — the merge couldn't
+  distinguish "no project override" from "project explicitly set back to default".
+  Fixed via `computeEffectiveConfig`, which layers raw (non-backfilled) file overrides
+  onto defaults instead of merging two independently-defaulted config objects; `cli.ts`'s
+  `loadEffectiveConfig` now routes through it. Affects `export`, `migrate`,
+  `configure --show`, and the new `hub status`/`push`/`pull` — everywhere effective
+  config is read (57cd7b7).
+
+### Security
+- **Hub trust model documented:** the hub directory is the trust boundary — every
+  pulled bundle still passes the existing tar-entry validation and manifest-id safety
+  checks before anything touches disk, but **sessions are stored in the hub in
+  plaintext at rest** until a future encryption slice ships. Anyone with read access
+  to the hub folder can read every pushed session; treat the hub directory like you'd
+  treat `~/.claude/projects/` itself.
+
 ## [0.4.1] — 2026-07-20
 
 Toolchain and repo-hygiene release: the package is now ESM on current dependency
