@@ -1,5 +1,6 @@
 import { indexPath, indexDirPath, assertSafeHubId } from "./layout.js";
 import { getThreadId } from "../sync-state.js";
+import { isSafeSessionId } from "../manifest.js";
 // Pure projection: local sessions (with thread mappings) + prior bundle
 // history + this push's new bundle records. Sessions never pushed (no thread
 // mapping) are omitted — the hub only knows what was shared with it.
@@ -71,11 +72,20 @@ export async function readAllIndexes(backend, projectId) {
     const indexes = [];
     for (const file of await backend.list(indexDirPath(projectId))) {
         const machineId = file.split("/").pop().replace(/\.json$/, "");
+        // Containment: a hostile/corrupt filename like ".json" (machineId "")
+        // or "..json" (machineId ".") would make indexPath's assertSafeHubId
+        // throw and wedge the whole-project read that whereis/pull depend on.
+        // Skip + warn instead, naming the FILE (the derived id is the unsafe
+        // part, so never echo it into a message as if it were an id).
+        if (!isSafeSessionId(machineId)) {
+            warnings.push(`index file ${file} has an unsafe name — skipped.`);
+            continue;
+        }
         const index = await readMachineIndex(backend, projectId, machineId);
         if (index)
             indexes.push(index);
         else
-            warnings.push(`index for machine ${machineId} is missing or not yet synced — skipped.`);
+            warnings.push(`index file for machine ${machineId} is unreadable (corrupt or not yet synced) — skipped.`);
     }
     return { indexes, warnings };
 }

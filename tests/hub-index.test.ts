@@ -63,4 +63,29 @@ describe("index file", () => {
       expect(all.warnings.join(" ")).toContain("m2");
     } finally { rmSync(hub, { recursive: true, force: true }); }
   });
+
+  it("readAllIndexes contains filename-unsafe machine ids: skips + warns, never throws", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-hub-idx-"));
+    try {
+      const backend = createFsBackend(hub);
+      const index = buildIndexFile({
+        projectId: "p", machineId: "m1", projectPath: "/x",
+        sessions: [SESSION], state: stateWithThreads({ s1: "t1" }),
+        priorIndex: null, newBundles: [{ threadId: "t1", record: RECORD }], now: "t",
+      });
+      await writeMachineIndex(backend, index);
+      // Hostile/corrupt filenames whose derived machineId is filename-unsafe:
+      // ".json" -> machineId "", "..json" -> machineId "." — both would make
+      // indexPath's assertSafeHubId throw if they reached readMachineIndex.
+      await backend.writeAtomic("projects/p/index/.json", "{}");
+      await backend.writeAtomic("projects/p/index/..json", "{}");
+      const all = await readAllIndexes(backend, "p");
+      expect(all.indexes).toHaveLength(1);
+      expect(all.indexes[0].machineId).toBe("m1");
+      expect(all.warnings).toHaveLength(2);
+      // Warnings must name the offending FILE, not the (unsafe) derived id.
+      expect(all.warnings.join(" ")).toContain("projects/p/index/.json");
+      expect(all.warnings.join(" ")).toContain("projects/p/index/..json");
+    } finally { rmSync(hub, { recursive: true, force: true }); }
+  });
 });
