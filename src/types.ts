@@ -365,6 +365,34 @@ export interface HubLockBusyResult {
   suggestion: string;
 }
 
+export interface HubPullResult {
+  success: true;
+  command: "pull";
+  threadId: string;
+  sourceMachineId: string;
+  importedSessions: ImportResult["importedSessions"];
+  skippedSessions: ImportResult["skippedSessions"];
+  localSessionId: string; // the thread's local session after pull
+  workspaceUnpacked: { path: string; fileCount: number } | null;
+  warnings: string[];
+}
+
+export interface HubPullListResult {
+  success: true;
+  command: "pull";
+  pickRequired: true;
+  threads: WhereisThread[];
+  warnings: string[];
+}
+
+export interface NotYetSyncedResult {
+  success: false;
+  command: "pull";
+  reason: "not-yet-synced";
+  missing: string[];
+  suggestion: string;
+}
+
 export type CliResult =
   | ExportResult
   | ImportResult
@@ -378,6 +406,9 @@ export type CliResult =
   | WhereisResult
   | HubUnlinkedResult
   | HubLockBusyResult
+  | HubPullResult
+  | HubPullListResult
+  | NotYetSyncedResult
   | ErrorResult;
 
 // --- Version Adapters ---

@@ -642,5 +642,45 @@ describe("cli", () => {
         rmSync(home, { recursive: true, force: true });
       }
     });
+
+    it("push --progress emits NDJSON hub-push events on stderr while stdout stays one JSON object", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-push-progress-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-push-progress-hub-"));
+      try {
+        await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+
+        // Same real-directory arrangement as the plain push CLI test above —
+        // hub identity writes .claude-sesh-mover/project.json under the real
+        // project directory.
+        const fixtureEncoded = "-Users-testuser-Projects-testproject";
+        const realEncoded = encodeProjectPath(tempDir);
+        cpSync(join(configDir, "projects", fixtureEncoded), join(configDir, "projects", realEncoded), {
+          recursive: true,
+        });
+
+        const { stdout, stderr } = await runCli(
+          ["push", "--project-path", tempDir, "--create-project", "--source-config-dir", configDir, "--progress"],
+          homeEnv(home)
+        );
+        const result = JSON.parse(stdout); // throws if stdout isn't exactly one JSON doc
+        expect(result.success).toBe(true);
+        expect(result.command).toBe("push");
+
+        const events = stderr
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l));
+        expect(events.length).toBeGreaterThan(0);
+        // push's export step forwards onProgress too (export-copy events),
+        // so only assert on the hub-push phase specifically.
+        const hubPushEvents = events.filter((e) => e.phase === "hub-push");
+        expect(hubPushEvents.some((e) => e.percent === 0)).toBe(true);
+        expect(hubPushEvents.some((e) => e.percent === 100)).toBe(true);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
   });
 });

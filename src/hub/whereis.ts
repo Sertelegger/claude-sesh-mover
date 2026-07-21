@@ -1,10 +1,73 @@
-import { createFsBackend } from "./backend.js";
+import { createFsBackend, type HubBackend } from "./backend.js";
 import { machinePath, type HubMachineJson } from "./layout.js";
 import { resolveProjectIdentity } from "./identity.js";
 import { readAllIndexes } from "./index-file.js";
-import { resolveThreads } from "./threads.js";
+import { resolveThreads, type ResolvedThread } from "./threads.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import type { WhereisResult, WhereisThread } from "../types.js";
+
+// Shared thread-shaping used by both whereis and pull's list mode (pull needs
+// the identical WhereisThread[] shape when it returns a HubPullListResult).
+//
+// SECURITY (Task 6 review, binding): the machineId field INSIDE a parsed
+// index file is never validated by readMachineIndex — only ids used in ITS
+// OWN path building (derived from the filename) are. A hostile index file
+// can therefore declare an internal machineId that is unsafe as a path
+// component (e.g. "../evil"). resolveThreads copies that internal field
+// verbatim into ThreadCopy.machineId, so the machineName() helper below —
+// which calls machinePath(id) to read machines/<id>.json — must be the one
+// to contain the resulting throw (machinePath asserts and throws on unsafe
+// ids), not let it escape and wedge the whole command.
+export async function shapeThreads(
+  backend: HubBackend,
+  resolved: ResolvedThread[],
+  meId: string
+): Promise<WhereisThread[]> {
+  const names = new Map<string, string | null>();
+  const machineName = async (id: string): Promise<string | null> => {
+    if (!names.has(id)) {
+      try {
+        const raw = await backend.read(machinePath(id));
+        names.set(id, (JSON.parse(raw.toString()) as HubMachineJson).name);
+      } catch {
+        names.set(id, null);
+      }
+    }
+    return names.get(id)!;
+  };
+
+  const threads: WhereisThread[] = [];
+  for (const t of resolved) {
+    const localEntry = t.copies.find((c) => c.machineId === meId) ?? null;
+    const current = localEntry !== null && localEntry.headEntryUuid === t.latest.headEntryUuid;
+    threads.push({
+      threadId: t.threadId,
+      slug: t.slug,
+      summary: t.summary,
+      latest: {
+        machineId: t.latest.machineId,
+        machineName: await machineName(t.latest.machineId),
+        lastActiveAt: t.latest.lastActiveAt,
+        messageCount: t.latest.messageCount,
+      },
+      copies: await Promise.all(
+        t.copies.map(async (c) => ({
+          machineId: c.machineId,
+          machineName: await machineName(c.machineId),
+          localSessionId: c.localSessionId,
+          lastActiveAt: c.lastActiveAt,
+          messageCount: c.messageCount,
+          headEntryUuid: c.headEntryUuid,
+        }))
+      ),
+      localCopy: localEntry
+        ? { localSessionId: localEntry.localSessionId, headEntryUuid: localEntry.headEntryUuid, current }
+        : null,
+      pullNeeded: t.latest.machineId !== meId && !current,
+    });
+  }
+  return threads;
+}
 
 // Read-only cross-machine thread view. Never mints a hub project and never
 // links this project directory to one — linking happens on push/pull, not
@@ -51,59 +114,8 @@ export async function hubWhereis(opts: {
   warnings.push(...indexWarnings);
   const resolved = resolveThreads(indexes);
 
-  const names = new Map<string, string | null>();
-  // A ThreadCopy's machineId is copied verbatim from an index file's own
-  // (unvalidated-by-readMachineIndex) `machineId` field — see
-  // readMachineIndex in index-file.ts and resolveThreads in threads.ts. A
-  // hostile index file can declare an internal machineId that is unsafe as
-  // a path component (e.g. "../evil"); machinePath(id) asserts and throws
-  // on exactly that. The throw is synchronous and happens while evaluating
-  // the argument to backend.read(...) — i.e. still inside this function's
-  // try block's dynamic extent — so it is caught here and degrades to
-  // machineName: null instead of escaping and wedging the whole command.
-  const machineName = async (id: string): Promise<string | null> => {
-    if (!names.has(id)) {
-      try {
-        const raw = await backend.read(machinePath(id));
-        names.set(id, (JSON.parse(raw.toString()) as HubMachineJson).name);
-      } catch {
-        names.set(id, null);
-      }
-    }
-    return names.get(id)!;
-  };
-
   const me = loadOrCreateMachineId();
-  const threads: WhereisThread[] = [];
-  for (const t of resolved) {
-    const localEntry = t.copies.find((c) => c.machineId === me.id) ?? null;
-    const current = localEntry !== null && localEntry.headEntryUuid === t.latest.headEntryUuid;
-    threads.push({
-      threadId: t.threadId,
-      slug: t.slug,
-      summary: t.summary,
-      latest: {
-        machineId: t.latest.machineId,
-        machineName: await machineName(t.latest.machineId),
-        lastActiveAt: t.latest.lastActiveAt,
-        messageCount: t.latest.messageCount,
-      },
-      copies: await Promise.all(
-        t.copies.map(async (c) => ({
-          machineId: c.machineId,
-          machineName: await machineName(c.machineId),
-          localSessionId: c.localSessionId,
-          lastActiveAt: c.lastActiveAt,
-          messageCount: c.messageCount,
-          headEntryUuid: c.headEntryUuid,
-        }))
-      ),
-      localCopy: localEntry
-        ? { localSessionId: localEntry.localSessionId, headEntryUuid: localEntry.headEntryUuid, current }
-        : null,
-      pullNeeded: t.latest.machineId !== me.id && !current,
-    });
-  }
+  const threads = await shapeThreads(backend, resolved, me.id);
 
   return { success: true, command: "whereis", linked: true, projectId, threads, warnings };
 }

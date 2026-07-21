@@ -330,7 +330,35 @@ export interface HubLockBusyResult {
     ageSeconds: number | null;
     suggestion: string;
 }
-export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | WhereisResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult;
+export interface HubPullResult {
+    success: true;
+    command: "pull";
+    threadId: string;
+    sourceMachineId: string;
+    importedSessions: ImportResult["importedSessions"];
+    skippedSessions: ImportResult["skippedSessions"];
+    localSessionId: string;
+    workspaceUnpacked: {
+        path: string;
+        fileCount: number;
+    } | null;
+    warnings: string[];
+}
+export interface HubPullListResult {
+    success: true;
+    command: "pull";
+    pickRequired: true;
+    threads: WhereisThread[];
+    warnings: string[];
+}
+export interface NotYetSyncedResult {
+    success: false;
+    command: "pull";
+    reason: "not-yet-synced";
+    missing: string[];
+    suggestion: string;
+}
+export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | WhereisResult | HubUnlinkedResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | ErrorResult;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;

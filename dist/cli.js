@@ -527,6 +527,48 @@ program
         outputError("push", e);
     }
 });
+// --- Pull ---
+program
+    .command("pull")
+    .description("Pull a project's thread from the hub into this machine")
+    .option("--thread <id>", "Pull a specific thread by id")
+    .option("--latest", "Pull whichever thread most needs updating on this machine")
+    .option("--project-path <path>", "Override project path (default: cwd)")
+    .option("--target-path <path>", "Workspace unpack destination when the project directory doesn't exist locally yet")
+    .option("--force-workspace", "Merge workspace files into a non-empty target directory")
+    .option("--project-id <id>", "Link to an existing hub project id")
+    .option("--source-config-dir <path>", "Override Claude config dir")
+    .option("--progress", "Emit NDJSON progress events on stderr")
+    .action(async (opts) => {
+    try {
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
+        const projectPath = opts.projectPath ?? process.cwd();
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { resolveHubPath } = await import("./hub/init.js");
+        const hubPath = resolveHubPath(config);
+        if (!hubPath) {
+            outputError("pull", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+            return;
+        }
+        const { hubPull } = await import("./hub/pull.js");
+        const onProgress = opts.progress
+            ? (ev) => process.stderr.write(JSON.stringify(ev) + "\n")
+            : undefined;
+        output(await hubPull({
+            configDir, projectPath, hubPath,
+            threadId: opts.thread,
+            latest: !!opts.latest,
+            targetPath: opts.targetPath,
+            forceWorkspace: !!opts.forceWorkspace,
+            projectIdOverride: opts.projectId,
+            claudeVersion: getClaudeVersion(),
+            onProgress,
+        }));
+    }
+    catch (e) {
+        outputError("pull", e);
+    }
+});
 // --- Whereis ---
 program
     .command("whereis")
