@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolveConfigDir, detectPlatform } from "./platform.js";
-import { getDefaultConfig, readConfig, writeConfig, mergeConfigs, setConfigValue, } from "./config.js";
+import { getDefaultConfig, readConfig, writeConfig, setConfigValue, computeEffectiveConfig, } from "./config.js";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
@@ -15,6 +15,8 @@ import { readSyncState, recordSentFromBundle } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import { createArchive, extractArchive, detectArchiveFormat, isZstdAvailable, } from "./archiver.js";
 import { discoverSessionById } from "./discovery.js";
+import { hubInit } from "./hub/init.js";
+import { hubStatus } from "./hub/status.js";
 const program = new Command();
 program
     .name("sesh-mover")
@@ -455,6 +457,36 @@ program
         outputError("configure", e);
     }
 });
+// --- Hub ---
+const hub = program.command("hub").description("Cross-machine session hub");
+hub
+    .command("init")
+    .description("Initialize or join a hub directory and set hub.path")
+    .requiredOption("--path <dir>", "Hub directory (network share, synced folder, or local path)")
+    .option("--scope <scope>", "Config scope to write hub.path into: user or project", "user")
+    .action(async (opts) => {
+    try {
+        const scope = parseStorage(opts.scope);
+        const result = await hubInit({ hubPath: opts.path, configScope: scope, cwd: process.cwd() });
+        output(result);
+    }
+    catch (e) {
+        outputError("hub-init", e);
+    }
+});
+hub
+    .command("status")
+    .description("Report hub reachability, machine registration, and project link state")
+    .option("--source-config-dir <path>", "Override Claude config dir")
+    .action(async (opts) => {
+    try {
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
+        output(await hubStatus({ configDir, cwd: process.cwd() }));
+    }
+    catch (e) {
+        outputError("hub-status", e);
+    }
+});
 // --- Helpers ---
 // Single predicate for both the collision gate and the --suffix loop, so a
 // plain directory export and an archive/zstd export of the same name can
@@ -622,12 +654,10 @@ function parseFormat(value) {
             throw new Error(`Invalid --format value: "${value}". Valid: dir, archive (tar.gz), zstd (tar.zst).`);
     }
 }
-function loadEffectiveConfig(configDir, projectDir) {
+function loadEffectiveConfig(_configDir, projectDir) {
     const userConfigDir = join(homedir(), ".claude-sesh-mover");
     const projectConfigDir = join(projectDir, ".claude-sesh-mover");
-    const userConfig = readConfig(userConfigDir);
-    const projectConfig = readConfig(projectConfigDir);
-    return mergeConfigs(userConfig, projectConfig);
+    return computeEffectiveConfig(userConfigDir, projectConfigDir);
 }
 function generateExportName(configDir, sessionId) {
     const date = new Date().toISOString().split("T")[0];

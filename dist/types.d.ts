@@ -132,6 +132,10 @@ export interface SeshMoverConfig {
     migrate: {
         scope: SessionScope;
     };
+    hub: {
+        path: string;
+        noWorkspace: boolean;
+    };
 }
 export interface ExportResult {
     success: true;
@@ -226,7 +230,30 @@ export interface ErrorResult {
     details?: string;
     suggestion?: string;
 }
-export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | ErrorResult;
+export interface HubInitResult {
+    success: true;
+    command: "hub-init";
+    hubPath: string;
+    hubId: string;
+    created: boolean;
+    machineRegistered: true;
+    configScope: StorageScope;
+}
+export interface HubStatusResult {
+    success: true;
+    command: "hub-status";
+    hubPath: string | null;
+    reachable: boolean;
+    hubId: string | null;
+    machineRegistered: boolean;
+    machinesKnown: number;
+    project: {
+        linked: boolean;
+        projectId: string | null;
+    };
+    warnings: string[];
+}
+export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | ErrorResult;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;

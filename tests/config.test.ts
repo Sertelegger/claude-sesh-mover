@@ -116,5 +116,40 @@ describe("config", () => {
       expect(() => setConfigValue(config, "export.__proto__", "x")).toThrow(/invalid config path/i);
       expect(() => setConfigValue(config, "constructor.prototype.x", "x")).toThrow(/invalid config path/i);
     });
+
+    it("defaults include the hub section so setConfigValue accepts hub.path", async () => {
+      const { getDefaultConfig, setConfigValue } = await import("../src/config.js");
+      const cfg = getDefaultConfig();
+      expect(cfg.hub).toEqual({ path: "", noWorkspace: false });
+      const updated = setConfigValue(cfg, "hub.path", "/mnt/share/hub");
+      expect(updated.hub.path).toBe("/mnt/share/hub");
+    });
+  });
+
+  describe("computeEffectiveConfig", () => {
+    it("preserves a user-scope-only value when the project directory has no config file", async () => {
+      const { computeEffectiveConfig, readConfig, writeConfig, setConfigValue } = await import(
+        "../src/config.js"
+      );
+      const userDir = join(tempDir, "user-scope");
+      const projectDir = join(tempDir, "project-scope"); // never written to
+      writeConfig(userDir, setConfigValue(readConfig(userDir), "hub.path", "/mnt/share/hub"));
+
+      const effective = computeEffectiveConfig(userDir, projectDir);
+      expect(effective.hub.path).toBe("/mnt/share/hub");
+    });
+
+    it("still lets an existing project config file override the user's value", async () => {
+      const { computeEffectiveConfig, readConfig, writeConfig, setConfigValue } = await import(
+        "../src/config.js"
+      );
+      const userDir = join(tempDir, "user-scope2");
+      const projectDir = join(tempDir, "project-scope2");
+      writeConfig(userDir, setConfigValue(readConfig(userDir), "export.storage", "user"));
+      writeConfig(projectDir, setConfigValue(readConfig(projectDir), "export.storage", "project"));
+
+      const effective = computeEffectiveConfig(userDir, projectDir);
+      expect(effective.export.storage).toBe("project");
+    });
   });
 });

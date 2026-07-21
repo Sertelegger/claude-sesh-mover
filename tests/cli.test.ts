@@ -557,4 +557,26 @@ describe("cli", () => {
       expect(manifest.sessions.length).toBe(0);
     });
   });
+
+  describe("hub init/status CLI", () => {
+    it("hub init then hub status round-trips through the CLI", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-hub-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-hub-dir-"));
+      try {
+        const init = JSON.parse(
+          (await runCli(["hub", "init", "--path", hubDir], homeEnv(home))).stdout
+        );
+        expect(init.success).toBe(true);
+        expect(init.command).toBe("hub-init");
+        const status = JSON.parse(
+          (await runCli(["hub", "status"], homeEnv(home))).stdout
+        );
+        expect(status.reachable).toBe(true);
+        expect(status.hubId).toBe(init.hubId);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

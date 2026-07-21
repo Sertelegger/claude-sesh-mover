@@ -15,6 +15,10 @@ export function getDefaultConfig() {
         migrate: {
             scope: "current",
         },
+        hub: {
+            path: "",
+            noWorkspace: false,
+        },
     };
 }
 export function readConfig(configDir) {
@@ -31,6 +35,41 @@ export function readConfig(configDir) {
     catch {
         return defaults;
     }
+}
+// Raw partial config from a directory's file, WITHOUT defaults backfilled —
+// {} when the file is missing or unreadable. Used by computeEffectiveConfig
+// so an absent layer contributes nothing, instead of a full defaults-filled
+// object that would clobber a customization set only at another layer (see
+// commit adding hub.path: readConfig() alone can't tell "user left this at
+// the default" apart from "user explicitly set this to the default").
+function readConfigOverrides(configDir) {
+    const configPath = join(configDir, "config.json");
+    if (!existsSync(configPath))
+        return {};
+    try {
+        return JSON.parse(readFileSync(configPath, "utf-8"));
+    }
+    catch {
+        return {};
+    }
+}
+// Resolve the effective config across the user/project two-tier hierarchy by
+// layering raw file overrides directly onto defaults (defaults -> user file
+// -> project file), rather than merging two independently defaults-backfilled
+// SeshMoverConfig objects. The latter is what mergeConfigs(readConfig(a),
+// readConfig(b)) does, and it is only safe when both directories actually
+// have a config.json (each already a complete, self-consistent snapshot per
+// configure's writeConfig) — if a directory has no file at all, readConfig
+// backfills a full default object indistinguishable from "explicitly set to
+// default", so merging it in would silently overwrite the other layer's
+// customizations. This is the deterministic core's "give me the config that
+// actually applies right now" entry point; every command that needs to read
+// (not write) an effective, cross-scope config should go through here.
+export function computeEffectiveConfig(userConfigDir, projectConfigDir) {
+    const defaults = getDefaultConfig();
+    const withUser = deepMerge(defaults, readConfigOverrides(userConfigDir));
+    const withProject = deepMerge(withUser, readConfigOverrides(projectConfigDir));
+    return withProject;
 }
 export function writeConfig(configDir, config) {
     if (!existsSync(configDir)) {
