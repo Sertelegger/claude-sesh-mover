@@ -17,6 +17,16 @@ You are running the sesh-mover import command. Follow these steps:
 
 3. If exports exist, present the list with: date, name, summary, source platform, source project path, session count. Format as a numbered table.
 
+   These values come from each bundle's own `manifest.json` — for `.tar.gz`/`.tar.zst` archives just as for directory exports — so they describe the machine the bundle was *exported from*, not this one. That's what lets the user tell two archives apart without unpacking them, so always show source platform and source project path in the picker, not just the file name.
+
+   **Degraded entries.** An entry with `metadataAvailable: false` has `null` for `exportedAt` / `sourcePlatform` / `sourceProjectPath` / `sessionCount` — its metadata could not be read, which is not the same as "the bundle has none". List it with its name and the `metadataError` in place of those columns rather than blank or zero values, and still offer it as a selectable option (import itself unpacks the real bundle and will work if the archive is intact).
+
+   If `metadataError` mentions **zstd** (`.tar.zst` metadata can only be read where the `zstd` binary is installed), offer to install it rather than leaving the row unexplained:
+   - macOS: `brew install zstd`
+   - Debian/Ubuntu/WSL: `sudo apt-get install -y zstd`
+
+   After a successful install, re-run step 1 so the picker shows the archive's real platform, path, date, and session count. zstd is also required to *import* a `.tar.zst` bundle, so this install is worth offering before the user picks one.
+
 4. Use AskUserQuestion to let the user pick which export to import. Always include an extra option:
    - Each found export as a selectable option (name + summary)
    - "Specify a different file path" — for exports not in the standard locations
@@ -24,6 +34,8 @@ You are running the sesh-mover import command. Follow these steps:
 5. If the chosen export contains multiple sessions, use AskUserQuestion to ask:
    - "Import all sessions" (recommended)
    - "Pick specific sessions" — then present individual sessions as selectable options
+
+   For an entry with `metadataAvailable: false`, `sessions` is `[]` — that means "unknown", not "empty". Skip this question and let the step 6 dry-run report what the bundle actually contains.
 
 6. Run a dry-run first:
    ```bash

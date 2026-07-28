@@ -36,6 +36,21 @@ The current session ID can be found by:
 
 Do **not** use `sesh-mover browse` to find live session IDs — `browse` only lists previously-exported bundles, not live sessions. There is no `--project` flag on `browse`.
 
+## Browse Metadata (archives included)
+
+Every `BrowseResult.exports[]` entry — directory bundle or `.tar.gz`/`.tar.zst` archive — reports `exportedAt`, `sourcePlatform`, `sourceProjectPath`, and `sessionCount` read from that bundle's own `manifest.json`. They describe the machine the bundle was **exported from**, so an archive carried from WSL to a Mac lists as `wsl2` with its WSL path. Never substitute the local platform for an archive's.
+
+Those four fields are **nullable**, and each entry carries `metadataAvailable: boolean` (plus `metadataError: string` iff it's false):
+
+- `metadataAvailable: true` — the four fields hold real manifest values and `sessions[]` is the manifest's session list.
+- `metadataAvailable: false` — all four are `null` and `sessions` is `[]`. `null` means **"not read"**, never "not applicable" and never "zero": don't render it as `0`, an empty string, or the local platform. Show the bundle name and `metadataError` instead, and keep listing the other exports — one unreadable archive degrades only its own row.
+
+Causes of `metadataAvailable: false`: no `zstd` binary on *this* machine (`.tar.zst` only), a corrupt/unrecognized archive, no bundle-root `manifest.json`, unparseable or unsafe manifest content.
+
+**When `metadataError` mentions zstd, offer to install it** rather than just reporting the degradation — `brew install zstd` (macOS) or `sudo apt-get install -y zstd` (Debian/Ubuntu/WSL) — then re-run `browse`. zstd is required to import a `.tar.zst` bundle too, not just to read its metadata.
+
+Cost note: reading a `.tar.zst` manifest decompresses the **whole** bundle to a temp file before the manifest can be pulled out, so `browse` is IO-bound in total archive size when zstd bundles are present. `.tar.gz` bundles are streamed instead of copied, but are still read end to end. Archive reads run 8 at a time, so a directory of many bundles is slower than one of a few — expect seconds, not a hang.
+
 ## Config Directory Detection
 
 The Claude config directory is resolved in order:

@@ -2,6 +2,21 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.5.1] — 2026-07-28
+
+### Fixed
+- `browse` (and the `/sesh-mover:import` picker) reported archives with the *browsing*
+  machine's platform and blank/zero metadata; it now reads each archive's real
+  `manifest.json` and reports the true origin platform, project path, export date, and
+  session count. Archives whose metadata genuinely can't be read (e.g. `.tar.zst` on a
+  machine without `zstd`) are now marked `metadataAvailable: false` with a reason instead
+  of showing fabricated values.
+
+### Changed
+- `BrowseResult` archive entries: `exportedAt` / `sourcePlatform` / `sourceProjectPath` /
+  `sessionCount` are nullable and accompanied by `metadataAvailable` (+ `metadataError`
+  when false).
+
 ## [0.5.0] — 2026-07-21
 
 The Hub, Slice 1: a cross-machine session index with a filesystem backend — push, pull,

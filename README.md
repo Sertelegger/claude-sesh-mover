@@ -27,7 +27,7 @@ Where this is heading beyond Slice 1 — hub automation, encryption at rest, a w
 /plugin install sesh-mover@claude-sesh-mover
 ```
 
-If the slash commands don't appear, run `/reload-plugins`. No build step — the plugin only needs Node.js ≥ 22.12 (current Claude Code releases already require Node ≥ 22). Optional: a `zstd` binary for `.tar.zst` archives (falls back to `.tar.gz` automatically).
+If the slash commands don't appear, run `/reload-plugins`. No build step — the plugin only needs Node.js ≥ 22.12 (current Claude Code releases already require Node ≥ 22). Optional: a `zstd` binary for `.tar.zst` archives — exporting falls back to `.tar.gz` automatically without it, but *reading* a `.tar.zst` someone else sent you (browsing its metadata or importing it) does require zstd on this machine (`brew install zstd`, or `sudo apt-get install -y zstd` on Debian/Ubuntu/WSL).
 
 For local development, clone and load directly (a pre-built `dist/` ships in the repo):
 
@@ -50,6 +50,8 @@ Move a session from machine A to machine B:
 **Export** prompts for scope (one session / all for the project), storage (`~/.claude-sesh-mover/` or `./.claude-sesh-mover/`), format, and layers (JSONL, file-history, tool-results, memory, plans, subagents). `--no-summary` keeps conversation excerpts out of the manifest and resume listings (the JSONL itself is still exported in full).
 
 **Import** shows a dry-run of the path rewrites before touching anything. If Claude Code rejects the session over a version mismatch, `--no-register` imports the content without the resume entry. Already-imported sessions are skipped and reported in `skippedSessions`; `--allow-duplicates` forces a re-import.
+
+**Browse** lists every export it finds in `~/.claude-sesh-mover/`, `./.claude-sesh-mover/`, and the project root, with each bundle's *origin* platform, project path, export date, and session count — read from the bundle's own manifest, archives included, so a `.tar.gz` carried over from WSL still says `wsl2`. If a bundle's metadata can't be read (a `.tar.zst` on a machine without `zstd`, a corrupt archive), that entry is marked `metadataAvailable: false` with the reason instead of showing invented values, and the rest of the listing is unaffected. Reading `.tar.zst` metadata decompresses the whole bundle first, so browsing a directory of large zstd archives takes a moment.
 
 **Migrate** is for same-machine moves (repo relocated, home dir renamed, config dir switched). Don't run it from inside the session being migrated — the CLI blocks this; exit, start a fresh session from an outer directory (e.g. `~/`), and run it there. `--scope current` requires `--session-id`.
 
