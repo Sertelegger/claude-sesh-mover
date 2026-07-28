@@ -1,12 +1,21 @@
 /**
- * Shared home-directory override helpers for test isolation.
+ * Shared environment-override helpers for test isolation.
  *
- * node:os's homedir() reads $HOME on POSIX but $USERPROFILE on Windows
- * (falling back to a native lookup only when neither is set). Any test
- * that redirects the home directory to an isolated temp dir must set
- * BOTH env vars — overriding HOME alone silently no-ops on Windows:
- * assertions fail AND the code under test writes into the real runner's
- * user profile instead of the temp dir.
+ * Every helper here exists because the env var that steers a node:os lookup
+ * is NOT the same variable on every platform, so the obvious single-variable
+ * override silently no-ops on Windows:
+ *
+ * - homedir() reads $HOME on POSIX but $USERPROFILE on Windows (falling back
+ *   to a native lookup only when neither is set).
+ * - tmpdir() reads $TMPDIR on POSIX but $TEMP/$TMP on Windows — it never
+ *   consults TMPDIR there.
+ * - PATH is spelled "Path" on Windows, where env var names are
+ *   case-insensitive at the OS level but not in a JS object.
+ *
+ * A no-op override is worse than a missing one: assertions fail, the code
+ * under test touches the real runner's home/temp dir instead of the isolated
+ * one, and "nothing leaked" style assertions pass *vacuously* against a
+ * directory the code never used.
  */
 
 import { delimiter } from "node:path";
@@ -42,6 +51,52 @@ export function overrideHome(dir: string): HomeOverrideHandle {
       else delete process.env.HOME;
       if (originalUserProfile !== undefined) process.env.USERPROFILE = originalUserProfile;
       else delete process.env.USERPROFILE;
+    },
+  };
+}
+
+/**
+ * Env var overrides for spawning a child process whose temp root is `dir`.
+ *
+ * node:os's tmpdir() reads $TMPDIR on POSIX but `$TEMP || $TMP ||
+ * <SystemRoot>\temp` on Windows — TMPDIR is never consulted there. So a test
+ * that steers mkdtempSync (into a dir it owns, or into a deliberately
+ * unusable one) must set all three names, or on Windows the child happily
+ * uses the real system temp dir: "unusable temp root" assertions fail, and
+ * scratch-dir leak assertions pass against a directory nothing ever wrote to.
+ *
+ * Unlike PATH (see prependPath) these keys need no casing dance when spread
+ * over `process.env`: node's child_process sorts env keys and drops
+ * case-insensitive duplicates keeping the lexicographically first, and ASCII
+ * uppercase sorts before lowercase — so a literal "TEMP" key always wins over
+ * an inherited "Temp". These overrides also *replace* rather than extend the
+ * inherited value, so there is nothing to read out of the original casing.
+ */
+export function tmpEnv(dir: string): { TMPDIR: string; TMP: string; TEMP: string } {
+  return { TMPDIR: dir, TMP: dir, TEMP: dir };
+}
+
+export interface TmpOverrideHandle {
+  /** Restore the previous TMPDIR/TMP/TEMP values (deleting any that were unset). */
+  restore(): void;
+}
+
+/**
+ * In-process twin of `tmpEnv`: point this process's temp root at `dir` and
+ * return a handle that restores the originals. Safe on Windows, where
+ * `process.env` is a case-insensitive proxy — assigning "TEMP" overwrites an
+ * existing "Temp" rather than adding a second key.
+ */
+export function overrideTmp(dir: string): TmpOverrideHandle {
+  const names = ["TMPDIR", "TMP", "TEMP"] as const;
+  const saved = names.map((n) => [n, process.env[n]] as const);
+  for (const n of names) process.env[n] = dir;
+  return {
+    restore(): void {
+      for (const [n, value] of saved) {
+        if (value !== undefined) process.env[n] = value;
+        else delete process.env[n];
+      }
     },
   };
 }

@@ -77,9 +77,9 @@ export async function readManifestFromArchive(archivePath) {
         if (statSync(manifestPath).size > MAX_MANIFEST_BYTES) {
             return { ok: false, reason: "unreadable", detail: "manifest.json is implausibly large" };
         }
-        let manifest;
+        let parsed;
         try {
-            manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+            parsed = JSON.parse(readFileSync(manifestPath, "utf-8"));
         }
         catch (e) {
             return {
@@ -88,6 +88,20 @@ export async function readManifestFromArchive(archivePath) {
                 detail: `manifest.json is not valid JSON: ${e.message}`,
             };
         }
+        // Valid JSON is not yet a manifest. Everything below is surfaced to the
+        // user as fact, so a wrong-shaped `sessions` must degrade rather than
+        // fabricate: `sessions: "abc"` would otherwise report sessionCount 3
+        // (string length) — an invented number, in the code path whose whole
+        // point is never inventing metadata. Deliberately minimal, not a schema
+        // validator: the plugin marker plus the one field a count is derived from.
+        if (!isBundleManifestShape(parsed)) {
+            return {
+                ok: false,
+                reason: "unreadable",
+                detail: 'manifest.json is not a sesh-mover bundle manifest (needs plugin "sesh-mover" and a sessions array)',
+            };
+        }
+        const manifest = parsed;
         try {
             assertSafeManifestIds(manifest); // 0.3.2 chokepoint — surfaced data must be safe
         }
@@ -100,9 +114,33 @@ export async function readManifestFromArchive(archivePath) {
         return { ok: false, reason: "unreadable", detail: e.message };
     }
     finally {
-        if (work !== undefined)
-            rmSync(work, { recursive: true, force: true });
+        // Best-effort: `force: true` swallows ENOENT but NOT EBUSY/EPERM, which
+        // Windows really does return for a just-closed file. A throw here escapes
+        // the finally, rejects this thunk, and fails the caller's whole Promise.all
+        // batch — collapsing an entire listing to success:false over nothing but
+        // an undeleted scratch dir. Leaking a temp dir is the lesser outcome.
+        if (work !== undefined) {
+            try {
+                rmSync(work, { recursive: true, force: true });
+            }
+            catch {
+                /* leave the scratch dir to the OS temp reaper */
+            }
+        }
     }
+}
+/**
+ * Minimal structural check that a parsed manifest.json is a sesh-mover bundle
+ * manifest — the plugin marker (the same one the directory-export path in
+ * cli.ts checks) and a real `sessions` array. Field-level validation is
+ * deliberately out of scope; this only guards against reporting numbers
+ * derived from a value that was never a session list.
+ */
+function isBundleManifestShape(value) {
+    if (typeof value !== "object" || value === null)
+        return false;
+    const m = value;
+    return m.plugin === "sesh-mover" && Array.isArray(m.sessions);
 }
 /**
  * Validate all tar entry metadata BEFORE extraction. node-tar has its own

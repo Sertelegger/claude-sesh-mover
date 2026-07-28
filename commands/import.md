@@ -19,9 +19,9 @@ You are running the sesh-mover import command. Follow these steps:
 
    These values come from each bundle's own `manifest.json` — for `.tar.gz`/`.tar.zst` archives just as for directory exports — so they describe the machine the bundle was *exported from*, not this one. That's what lets the user tell two archives apart without unpacking them, so always show source platform and source project path in the picker, not just the file name.
 
-   **Degraded entries.** An entry with `metadataAvailable: false` has `null` for `exportedAt` / `sourcePlatform` / `sourceProjectPath` / `sessionCount` — its metadata could not be read, which is not the same as "the bundle has none". List it with its name and the `metadataError` in place of those columns rather than blank or zero values, and still offer it as a selectable option (import itself unpacks the real bundle and will work if the archive is intact).
+   **Degraded entries.** An entry with `metadataAvailable: false` has `null` for `exportedAt` / `sourcePlatform` / `sourceProjectPath` / `sessionCount` — its metadata could not be read, which is not the same as "the bundle has none". List it with its name and the `metadataError` in place of those columns rather than blank or zero values, and still offer it as a selectable option — but say it will likely fail until the cause is fixed. Import unpacks the real bundle and will work if the archive is intact *and readable on this machine*: a `.tar.zst` whose metadata could not be read for lack of `zstd` will fail to import for exactly the same reason, so offer the install below before the user selects it.
 
-   If `metadataError` mentions **zstd** (`.tar.zst` metadata can only be read where the `zstd` binary is installed), offer to install it rather than leaving the row unexplained:
+   **The zstd case.** A degraded entry whose **name ends in `.tar.zst`** is this case: `.tar.zst` bundles can only be read where the `zstd` binary is installed. Key off the name, not off the wording of `metadataError` — that field carries a free-text detail string that is not guaranteed to contain the word "zstd" (it usually will, and when it does it corroborates the name). Offer to install it rather than leaving the row unexplained:
    - macOS: `brew install zstd`
    - Debian/Ubuntu/WSL: `sudo apt-get install -y zstd`
 

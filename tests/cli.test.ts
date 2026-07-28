@@ -16,7 +16,7 @@ import { tmpdir, platform } from "node:os";
 import * as tar from "tar";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
-import { overrideHome, homeEnv, prependPath } from "./helpers/env.js";
+import { overrideHome, homeEnv, prependPath, tmpEnv } from "./helpers/env.js";
 
 const isWindows = platform() === "win32";
 
@@ -441,11 +441,15 @@ describe("cli", () => {
 
       // Point the child's temp root at a dir we own, so we can prove the
       // reads clean up after themselves instead of leaking a scratch dir
-      // per archive.
+      // per archive. tmpEnv (all of TMPDIR/TMP/TEMP), not a bare TMPDIR:
+      // Windows ignores TMPDIR, which would send the child to the system
+      // temp dir and make the leak assertion below pass vacuously. The
+      // sibling "temp root itself is unusable" test is the positive control
+      // that this steering reaches the child at all.
       const tmpRoot = join(tempDir, "many-tmproot");
       mkdirSync(tmpRoot, { recursive: true });
       const result = JSON.parse(
-        runCli(`browse --storage user --json`, { ...homeEnv(homeDir), TMPDIR: tmpRoot })
+        runCli(`browse --storage user --json`, { ...homeEnv(homeDir), ...tmpEnv(tmpRoot) })
       );
 
       expect(result.success).toBe(true);
@@ -528,10 +532,13 @@ describe("cli", () => {
       await writeForeignArchive(join(store, "2026-07-25-a.tar.gz"));
       await writeForeignArchive(join(store, "2026-07-25-b.tar.gz"));
 
+      // All three temp names, or this steers nothing on Windows (os.tmpdir()
+      // there reads TEMP/TMP and never TMPDIR): the child would find a
+      // perfectly usable temp root and report metadataAvailable: true.
       const result = JSON.parse(
         runCli(`browse --storage user --json`, {
           ...homeEnv(homeDir),
-          TMPDIR: join(tempDir, "no-such-temp-root"),
+          ...tmpEnv(join(tempDir, "no-such-temp-root")),
         })
       );
 

@@ -14,9 +14,9 @@ You are running the sesh-mover browse command. Follow these steps:
 
 3. If exports exist, present the results as a formatted table:
    ```
-   #  Date        Name                 Summary                                        Platform  Source path                Sessions  Storage
-   1  2026-04-11  sesh-mover-design    Designing a session migration plugin           darwin    /Users/sam/dev/sesh-mover  1         user
-   2  2026-04-09  fix-auth-middleware  Debugging JWT token expiry in auth middleware  wsl2      /mnt/e/GitHub/api-gateway  3         project
+   #  Date        Name                  Summary                                        Platform  Source path                Sessions  Storage
+   1  2026-04-11  sesh-mover-design     Designing a session migration plugin           darwin    /Users/sam/dev/sesh-mover  1         user
+   2  2026-04-09  fix-auth-middleware   Debugging JWT token expiry in auth middleware  wsl2      /mnt/e/GitHub/api-gateway  3         project
    3  —           broken-bundle.tar.gz  (metadata unreadable: TAR_BAD_ARCHIVE: Unrecognized archive format)
    ```
 
@@ -24,7 +24,7 @@ You are running the sesh-mover browse command. Follow these steps:
 
    **Degraded entries.** An entry with `metadataAvailable: false` had unreadable metadata: every manifest-derived field is `null` (never a stand-in value), `sessions` is `[]`, and `metadataError` says why. Show the name and that error in place of the metadata columns, as in row 3 above — never blanks or zeros — and keep listing every other export normally. These entries sort last.
 
-   If `metadataError` mentions **zstd** (`.tar.zst` archives can only be read where the `zstd` binary is installed), don't leave the user with an unexplained row — offer to install it:
+   **The zstd case.** A degraded entry whose **name ends in `.tar.zst`** is this case: `.tar.zst` bundles can only be read where the `zstd` binary is installed. Key off the name, not off the wording of `metadataError` — that field carries a free-text detail string that is not guaranteed to contain the word "zstd" (it usually will, and when it does it corroborates the name). Don't leave the user with an unexplained row — offer to install it:
    - macOS: `brew install zstd`
    - Debian/Ubuntu/WSL: `sudo apt-get install -y zstd`
 
@@ -32,11 +32,11 @@ You are running the sesh-mover browse command. Follow these steps:
 
    Reading `.tar.zst` metadata decompresses the whole bundle to a temp file first, so `browse` over many large zstd archives is IO-bound in total archive size — it can take a few seconds. That is expected, not a hang.
 
-4. Use AskUserQuestion to let the user pick an export (each as a selectable option with name + summary), plus a "Cancel" option.
+4. Use AskUserQuestion to let the user pick an export (each as a selectable option with name + summary), plus a "Cancel" option. A degraded entry has no summary to show (`sessions` is `[]`), so label it with its name plus a short "metadata unreadable" note instead — and keep it selectable: the bundle may still import fine.
 
 5. Once an export is selected, use AskUserQuestion to ask what to do:
-   - "Import to current project" — proceed with the import flow (dry-run, confirm, execute, report)
-   - "View details" — show the full manifest: individual sessions (ID, summary, date, message count), included layers, source platform, source path, Claude version, integrity hashes. For an entry with `metadataAvailable: false` there is no manifest to show (`sessions` is `[]`): report the `metadataError` instead, plus the zstd install offer above when it applies, and offer "Delete" as the other option.
+   - "Import to current project" — proceed with the import flow (dry-run, confirm, execute, report). Still offered for a degraded entry, but say up front that it will likely fail until the cause is fixed (install `zstd`, replace a corrupt archive), since import has to read the same bundle `browse` just couldn't.
+   - "View details" — show the full manifest: individual sessions (ID, summary, date, message count), included layers, source platform, source path, Claude version, integrity hashes. For an entry with `metadataAvailable: false` there is no manifest to show (`sessions` is `[]`): report the `metadataError` instead, plus the zstd install offer above when it applies.
    - "Delete" — confirm with AskUserQuestion ("Yes, delete" / "Cancel"), then delete the export directory or archive
 
 6. After completing an action, if the user chose "View details", offer the import/delete options again for the same export.

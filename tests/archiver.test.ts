@@ -14,6 +14,7 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as tar from "tar";
+import { overrideTmp, type TmpOverrideHandle } from "./helpers/env.js";
 
 /**
  * Install a fake `zstd` on PATH that implements the exact invocations the
@@ -323,6 +324,42 @@ describe("archiver", () => {
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
+    it("degrades a wrong-shaped manifest instead of reporting a fabricated session count", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      try {
+        // `sessions` is a string, not an array. Without a shape guard this
+        // parses fine, survives assertSafeManifestIds (iterating a string
+        // yields chars, whose .sessionId is undefined), and browse then
+        // reports sessionCount: 3 — "abc".length — as if it were real.
+        const staging = join(dir, "shapeless");
+        mkdirSync(staging, { recursive: true });
+        writeFileSync(join(staging, "manifest.json"), JSON.stringify({
+          version: 1, plugin: "sesh-mover", exportedAt: "t", sourcePlatform: "linux",
+          sourceProjectPath: "/x", sourceConfigDir: "/y", sourceClaudeVersion: "1",
+          sessionScope: "current", includedLayers: [], sessions: "abc",
+        }));
+        const archive = join(dir, "shapeless.tar.gz");
+        await createArchive(staging, archive, "gzip");
+        const r = await readManifestFromArchive(archive);
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.reason).toBe("unreadable");
+          expect(r.detail).toMatch(/sesh-mover bundle manifest/i);
+        }
+
+        // Same for a JSON document that simply isn't a bundle manifest.
+        const other = join(dir, "notours");
+        mkdirSync(other, { recursive: true });
+        writeFileSync(join(other, "manifest.json"), JSON.stringify({ some: "other tool" }));
+        const otherArchive = join(dir, "notours.tar.gz");
+        await createArchive(other, otherArchive, "gzip");
+        const r2 = await readManifestFromArchive(otherArchive);
+        expect(r2.ok).toBe(false);
+        if (!r2.ok) expect(r2.reason).toBe("unreadable");
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it("reads a .tar.zst manifest when zstd is available, else reports no-zstd", async () => {
       const { createArchive, readManifestFromArchive, isZstdAvailable } = await import("../src/archiver.js");
       const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
@@ -359,7 +396,11 @@ describe("archiver", () => {
     it("contains a scratch-dir allocation failure as a typed result instead of throwing", async () => {
       const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
       const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
-      const savedTmpdir = process.env.TMPDIR;
+      // overrideTmp, not a bare TMPDIR assignment: os.tmpdir() reads TEMP/TMP
+      // on Windows and ignores TMPDIR entirely, so a one-variable override
+      // leaves the temp root perfectly usable there and this test asserts
+      // ok === false against a read that quietly succeeded.
+      let tmp: TmpOverrideHandle | undefined;
       try {
         const staging = join(dir, "fine-export");
         mkdirSync(staging, { recursive: true });
@@ -376,7 +417,7 @@ describe("archiver", () => {
         // root doesn't exist, so mkdtempSync throws ENOENT. That used to
         // escape as a rejection because the allocation sat outside the try —
         // which, under Promise.all, failed the caller's ENTIRE listing.
-        process.env.TMPDIR = join(dir, "no-such-temp-root");
+        tmp = overrideTmp(join(dir, "no-such-temp-root"));
         const r = await readManifestFromArchive(archive);
         expect(r.ok).toBe(false);
         if (!r.ok) {
@@ -386,13 +427,12 @@ describe("archiver", () => {
 
         // ...and the very next call succeeds once the temp root is usable
         // again: the failure is per-call, not sticky.
-        if (savedTmpdir === undefined) delete process.env.TMPDIR;
-        else process.env.TMPDIR = savedTmpdir;
+        tmp.restore();
+        tmp = undefined;
         const again = await readManifestFromArchive(archive);
         expect(again.ok).toBe(true);
       } finally {
-        if (savedTmpdir === undefined) delete process.env.TMPDIR;
-        else process.env.TMPDIR = savedTmpdir;
+        tmp?.restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
@@ -400,7 +440,10 @@ describe("archiver", () => {
     it("leaves no scratch dir behind on success or failure", async () => {
       const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
       const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
-      const savedTmpdir = process.env.TMPDIR;
+      // Must override TEMP/TMP as well as TMPDIR: on Windows a TMPDIR-only
+      // override sends the reads to the real system temp dir, and scanning
+      // our own untouched tmpRoot for leftovers would pass vacuously.
+      let tmp: TmpOverrideHandle | undefined;
       try {
         const staging = join(dir, "clean-export");
         mkdirSync(staging, { recursive: true });
@@ -416,7 +459,11 @@ describe("archiver", () => {
 
         const tmpRoot = join(dir, "tmproot");
         mkdirSync(tmpRoot, { recursive: true });
-        process.env.TMPDIR = tmpRoot;
+        tmp = overrideTmp(tmpRoot);
+        // Positive control for the assertion below: prove the reads actually
+        // allocate inside tmpRoot on THIS platform before concluding anything
+        // from it being empty afterwards.
+        expect(tmpdir()).toBe(tmpRoot);
 
         expect((await readManifestFromArchive(good)).ok).toBe(true);
         expect((await readManifestFromArchive(bad)).ok).toBe(false);
@@ -424,8 +471,7 @@ describe("archiver", () => {
         const leaked = readdirSync(tmpRoot).filter((n) => n.startsWith("sesh-manifest-"));
         expect(leaked).toEqual([]);
       } finally {
-        if (savedTmpdir === undefined) delete process.env.TMPDIR;
-        else process.env.TMPDIR = savedTmpdir;
+        tmp?.restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
