@@ -10,8 +10,9 @@ import {
   chmodSync,
   cpSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir, platform } from "node:os";
+import * as tar from "tar";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { overrideHome, homeEnv, prependPath } from "./helpers/env.js";
@@ -297,6 +298,128 @@ describe("cli", () => {
       const result = JSON.parse(output);
       expect(result.success).toBe(true);
       expect(result.command).toBe("browse");
+    });
+  });
+
+  describe("browse archive metadata", () => {
+    const FOREIGN_MANIFEST = {
+      version: 1,
+      plugin: "sesh-mover",
+      exportedAt: "2026-07-25T18:30:48.718Z",
+      // A platform no test runner is: proves browse reads the archive rather
+      // than reporting its own detectPlatform().
+      sourcePlatform: "win32",
+      sourceProjectPath: "C:\\Users\\someone\\Projects\\faraway",
+      sourceConfigDir: "C:\\Users\\someone\\.claude",
+      sourceClaudeVersion: "2.1.81",
+      sessionScope: "current",
+      includedLayers: ["jsonl"],
+      sessions: [
+        {
+          sessionId: "550e8400-e29b-41d4-a716-446655440000",
+          slug: "faraway",
+          summary: "work done elsewhere",
+          lastActiveAt: "2026-07-25T18:00:00Z",
+          messageCount: 2731,
+          gitBranch: "main",
+          entrypoint: "cli",
+          integrityHash: "sha256:abc",
+        },
+      ],
+    };
+
+    /** Build a real bundle .tar.gz at `archivePath` carrying FOREIGN_MANIFEST. */
+    async function writeForeignArchive(archivePath: string): Promise<void> {
+      const staging = join(tempDir, "stage", basename(archivePath).replace(/\.tar\.gz$/, ""));
+      mkdirSync(join(staging, "sessions"), { recursive: true });
+      writeFileSync(join(staging, "manifest.json"), JSON.stringify(FOREIGN_MANIFEST, null, 2));
+      writeFileSync(
+        join(staging, "sessions", "550e8400-e29b-41d4-a716-446655440000.jsonl"),
+        '{"uuid":"a","type":"user"}\n'
+      );
+      await tar.create(
+        { gzip: true, file: archivePath, cwd: dirname(staging) },
+        [basename(staging)]
+      );
+    }
+
+    it("reports an archive's REAL origin platform, not the local one", async () => {
+      const homeDir = join(tempDir, "browse-home");
+      const store = join(homeDir, ".claude-sesh-mover");
+      mkdirSync(store, { recursive: true });
+      await writeForeignArchive(join(store, "2026-07-25-faraway.tar.gz"));
+
+      const result = JSON.parse(runCli(`browse --storage user --json`, homeEnv(homeDir)));
+      expect(result.success).toBe(true);
+      const entry = result.exports.find(
+        (e: { name: string }) => e.name === "2026-07-25-faraway.tar.gz"
+      );
+      expect(entry).toBeDefined();
+      expect(entry.metadataAvailable).toBe(true);
+      expect(entry.metadataError).toBeUndefined();
+      expect(entry.sourcePlatform).toBe("win32");
+      expect(entry.sourcePlatform).not.toBe(platform());
+      expect(entry.sourceProjectPath).toBe("C:\\Users\\someone\\Projects\\faraway");
+      expect(entry.exportedAt).toBe("2026-07-25T18:30:48.718Z");
+      expect(entry.sessionCount).toBe(1);
+      expect(entry.sessions).toHaveLength(1);
+      expect(entry.sessions[0].messageCount).toBe(2731);
+      expect(entry.storage).toBe("user");
+    });
+
+    it("marks an unreadable archive honestly instead of inventing values", () => {
+      const homeDir = join(tempDir, "browse-home-broken");
+      const store = join(homeDir, ".claude-sesh-mover");
+      mkdirSync(store, { recursive: true });
+      writeFileSync(join(store, "2026-01-01-broken.tar.gz"), "definitely not a tar archive");
+
+      const result = JSON.parse(runCli(`browse --storage user --json`, homeEnv(homeDir)));
+      expect(result.success).toBe(true);
+      const entry = result.exports.find(
+        (e: { name: string }) => e.name === "2026-01-01-broken.tar.gz"
+      );
+      expect(entry).toBeDefined();
+      expect(entry.metadataAvailable).toBe(false);
+      expect(typeof entry.metadataError).toBe("string");
+      expect(entry.metadataError.length).toBeGreaterThan(0);
+      expect(entry.sourcePlatform).toBeNull();
+      expect(entry.sourceProjectPath).toBeNull();
+      expect(entry.exportedAt).toBeNull();
+      expect(entry.sessionCount).toBeNull();
+      expect(entry.sessions).toEqual([]);
+    });
+
+    it("reads real metadata for a date-prefixed archive dropped in the project root", async () => {
+      // Covers the second fabrication site: the cwd scan below the
+      // .claude-sesh-mover scan, which keeps its date-prefix filename filter.
+      const projectDir = join(tempDir, "dropped-in-root");
+      mkdirSync(projectDir, { recursive: true });
+      const homeDir = join(tempDir, "empty-home");
+      mkdirSync(homeDir, { recursive: true });
+      await writeForeignArchive(join(projectDir, "2026-07-25-dropped.tar.gz"));
+      // Same content, no date prefix: must stay filtered out.
+      await writeForeignArchive(join(projectDir, "no-date-prefix.tar.gz"));
+
+      const cliPath = join(import.meta.dirname, "..", "dist", "cli.js");
+      const run = spawnSync("node", [cliPath, "browse", "--storage", "project", "--json"], {
+        encoding: "utf-8",
+        cwd: projectDir,
+        env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...homeEnv(homeDir) },
+      });
+      const result = JSON.parse(run.stdout);
+      expect(result.success).toBe(true);
+      const entry = result.exports.find(
+        (e: { name: string }) => e.name === "2026-07-25-dropped.tar.gz"
+      );
+      expect(entry).toBeDefined();
+      expect(entry.metadataAvailable).toBe(true);
+      expect(entry.sourcePlatform).toBe("win32");
+      expect(entry.sourceProjectPath).toBe("C:\\Users\\someone\\Projects\\faraway");
+      expect(entry.sessionCount).toBe(1);
+      expect(entry.storage).toBe("project");
+      expect(
+        result.exports.some((e: { name: string }) => e.name === "no-date-prefix.tar.gz")
+      ).toBe(false);
     });
   });
 

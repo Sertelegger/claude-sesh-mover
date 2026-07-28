@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { resolveConfigDir, detectPlatform } from "./platform.js";
+import { resolveConfigDir } from "./platform.js";
 import {
   getDefaultConfig,
   readConfig,
@@ -25,6 +25,7 @@ import {
   extractArchive,
   detectArchiveFormat,
   isZstdAvailable,
+  readManifestFromArchive,
 } from "./archiver.js";
 import { discoverSessionById } from "./discovery.js";
 import { hubInit } from "./hub/init.js";
@@ -269,6 +270,50 @@ program
   });
 
 // --- Browse ---
+
+/**
+ * One archive -> one browse entry. Reads real metadata when possible and says
+ * so plainly when not; never reports the local platform for a foreign archive.
+ */
+async function archiveBrowseEntry(
+  archivePath: string,
+  name: string,
+  storage: StorageScope
+): Promise<BrowseResult["exports"][number]> {
+  const r = await readManifestFromArchive(archivePath);
+  if (!r.ok) {
+    return {
+      name,
+      path: archivePath,
+      exportedAt: null,
+      sourcePlatform: null,
+      sourceProjectPath: null,
+      sessionCount: null,
+      sessions: [],
+      storage,
+      metadataAvailable: false,
+      metadataError: r.detail,
+    };
+  }
+  return {
+    name,
+    path: archivePath,
+    exportedAt: r.manifest.exportedAt,
+    sourcePlatform: r.manifest.sourcePlatform,
+    sourceProjectPath: r.manifest.sourceProjectPath,
+    sessionCount: r.manifest.sessions.length,
+    sessions: r.manifest.sessions,
+    storage,
+    metadataAvailable: true,
+  };
+}
+
+/** Sort key for browse entries: missing/unparseable timestamps become the epoch. */
+function exportedAtMillis(exportedAt: string | null): number {
+  const t = new Date(exportedAt ?? 0).getTime();
+  return Number.isNaN(t) ? 0 : t;
+}
+
 program
   .command("browse")
   .description("List available exports")
@@ -312,6 +357,7 @@ program
                 sessionCount: manifest.sessions.length,
                 sessions: manifest.sessions,
                 storage,
+                metadataAvailable: true,
               });
             } catch {
               // Skip malformed exports
@@ -320,23 +366,16 @@ program
         }
       }
 
-      // Also look for archives in the search dirs
+      // Also look for archives in the search dirs. Each archive's manifest is
+      // read out of the archive itself (concurrently — a directory of bundles
+      // must not serialize), so a bundle carried over from another machine
+      // reports ITS origin, not this one's.
+      const archiveEntries: Array<Promise<BrowseResult["exports"][number]>> = [];
       for (const { dir, storage } of searchDirs) {
         const entries = readdirSync(dir);
         for (const entry of entries) {
           if (entry.endsWith(".tar.gz") || entry.endsWith(".tar.zst")) {
-            // We can't read manifests from archives without extracting
-            // Just list them with minimal info
-            exports.push({
-              name: entry,
-              path: join(dir, entry),
-              exportedAt: "",
-              sourcePlatform: detectPlatform(),
-              sourceProjectPath: "",
-              sessionCount: 0,
-              sessions: [],
-              storage,
-            });
+            archiveEntries.push(archiveBrowseEntry(join(dir, entry), entry, storage));
           }
         }
       }
@@ -364,6 +403,7 @@ program
                   sessionCount: manifest.sessions.length,
                   sessions: manifest.sessions,
                   storage: "project",
+                  metadataAvailable: true,
                 });
               }
             } catch {
@@ -374,20 +414,13 @@ program
           if (entry.endsWith(".tar.gz") || entry.endsWith(".tar.zst")) {
             // Only include if filename looks like a sesh-mover export (date prefix pattern)
             if (/^\d{4}-\d{2}-\d{2}-/.test(entry)) {
-              exports.push({
-                name: entry,
-                path: entryPath,
-                exportedAt: "",
-                sourcePlatform: detectPlatform(),
-                sourceProjectPath: "",
-                sessionCount: 0,
-                sessions: [],
-                storage: "project",
-              });
+              archiveEntries.push(archiveBrowseEntry(entryPath, entry, "project"));
             }
           }
         }
       }
+
+      exports.push(...(await Promise.all(archiveEntries)));
 
       // Note: --prune is a signal for the skill layer to handle interactively.
       // The skill prompts the user and runs `rm -rf <path>` after confirmation.
@@ -396,10 +429,12 @@ program
       const result: BrowseResult = {
         success: true,
         command: "browse",
+        // Null-safe: entries whose metadata couldn't be read carry a null
+        // exportedAt. `new Date(null ?? 0)` is the epoch, and an unparseable
+        // string is coerced to the epoch too, so those sort last (newest
+        // first) instead of poisoning the comparator with NaN.
         exports: exports.sort(
-          (a, b) =>
-            new Date(b.exportedAt || 0).getTime() -
-            new Date(a.exportedAt || 0).getTime()
+          (a, b) => exportedAtMillis(b.exportedAt) - exportedAtMillis(a.exportedAt)
         ),
       };
 

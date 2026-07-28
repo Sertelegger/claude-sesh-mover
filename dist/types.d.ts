@@ -214,12 +214,14 @@ export interface BrowseResult {
     exports: Array<{
         name: string;
         path: string;
-        exportedAt: string;
-        sourcePlatform: Platform;
-        sourceProjectPath: string;
-        sessionCount: number;
+        exportedAt: string | null;
+        sourcePlatform: Platform | null;
+        sourceProjectPath: string | null;
+        sessionCount: number | null;
         sessions: SessionManifest[];
         storage: StorageScope;
+        metadataAvailable: boolean;
+        metadataError?: string;
     }>;
 }
 export interface ConfigureResult {

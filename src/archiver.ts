@@ -1,10 +1,29 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import * as tar from "tar";
+import { assertSafeManifestIds } from "./manifest.js";
+import type { ExportManifest } from "./types.js";
 
 export type CompressionType = "gzip" | "zstd";
+
+export type ArchiveManifestResult =
+  | { ok: true; manifest: ExportManifest }
+  | {
+      ok: false;
+      reason: "no-zstd" | "unreadable" | "no-manifest" | "unsafe-manifest";
+      detail: string;
+    };
+
+const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 export async function createArchive(
   sourceDir: string,
@@ -31,6 +50,85 @@ export async function extractArchive(
   } else {
     await assertSafeEntries(archivePath);
     await tar.extract({ file: archivePath, cwd: targetDir, strip: 1 });
+  }
+}
+
+/**
+ * Read ONLY manifest.json out of a bundle archive, without unpacking session
+ * content. Used by `browse` so an archive can report its real origin instead
+ * of a fabricated one. Never throws: every failure mode is a typed result, so
+ * one bad archive in a directory can't break the whole listing.
+ */
+export async function readManifestFromArchive(
+  archivePath: string
+): Promise<ArchiveManifestResult> {
+  const format = detectArchiveFormat(archivePath);
+  if (!format) {
+    return { ok: false, reason: "unreadable", detail: "not a recognized archive name" };
+  }
+
+  const work = mkdtempSync(join(tmpdir(), "sesh-manifest-"));
+  try {
+    let tarFile = archivePath;
+    if (format === "zstd") {
+      if (!(await isZstdAvailable())) {
+        return {
+          ok: false,
+          reason: "no-zstd",
+          detail: "zstd is not installed, so .tar.zst metadata cannot be read",
+        };
+      }
+      tarFile = join(work, "bundle.tar");
+      await decompressZstd(archivePath, tarFile);
+    }
+
+    // Same pre-extraction validation every other extraction path runs.
+    await assertSafeEntries(tarFile);
+
+    const out = join(work, "out");
+    mkdirSync(out, { recursive: true });
+    await tar.extract({
+      file: tarFile,
+      cwd: out,
+      strip: 1,
+      // `filter` sees the path AS STORED in the archive (pre-strip), so the
+      // bundle-root manifest is exactly two segments: "<bundle>/manifest.json".
+      // Never nested manifests, never session data.
+      filter: (p) => p.split("/").filter(Boolean).length === 2 && p.endsWith("/manifest.json"),
+    });
+
+    const manifestPath = join(out, "manifest.json");
+    if (!existsSync(manifestPath)) {
+      return {
+        ok: false,
+        reason: "no-manifest",
+        detail: "archive contains no bundle-root manifest.json",
+      };
+    }
+    if (statSync(manifestPath).size > MAX_MANIFEST_BYTES) {
+      return { ok: false, reason: "unreadable", detail: "manifest.json is implausibly large" };
+    }
+
+    let manifest: ExportManifest;
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as ExportManifest;
+    } catch (e) {
+      return {
+        ok: false,
+        reason: "unreadable",
+        detail: `manifest.json is not valid JSON: ${(e as Error).message}`,
+      };
+    }
+    try {
+      assertSafeManifestIds(manifest); // 0.3.2 chokepoint — surfaced data must be safe
+    } catch (e) {
+      return { ok: false, reason: "unsafe-manifest", detail: (e as Error).message };
+    }
+    return { ok: true, manifest };
+  } catch (e) {
+    return { ok: false, reason: "unreadable", detail: (e as Error).message };
+  } finally {
+    rmSync(work, { recursive: true, force: true });
   }
 }
 
@@ -91,11 +189,21 @@ async function createZstdArchive(sourceDir: string, archivePath: string): Promis
   }
 }
 
+/**
+ * Decompress a .tar.zst to a plain .tar at `tarPath`. Shared by the extract
+ * path and by `readManifestFromArchive` so there is exactly one place that
+ * knows how sesh-mover shells out to zstd. Callers must have already checked
+ * `isZstdAvailable()` (or be prepared for the throw when zstd is missing).
+ */
+async function decompressZstd(archivePath: string, tarPath: string): Promise<void> {
+  execFileSync("zstd", ["-d", archivePath, "-o", tarPath], { stdio: "ignore" });
+}
+
 async function extractZstdArchive(archivePath: string, targetDir: string): Promise<void> {
   const workDir = mkdtempSync(join(tmpdir(), "sesh-mover-zstd-"));
   const tarPath = join(workDir, "bundle.tar");
   try {
-    execFileSync("zstd", ["-d", archivePath, "-o", tarPath], { stdio: "ignore" });
+    await decompressZstd(archivePath, tarPath);
     await assertSafeEntries(tarPath);
     await tar.extract({ file: tarPath, cwd: targetDir, strip: 1 });
   } finally {

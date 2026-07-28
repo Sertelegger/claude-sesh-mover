@@ -201,4 +201,180 @@ describe("archiver", () => {
       await expect(extractArchive(linkTar, extractDir)).rejects.toThrow(/unsafe archive entries/i);
     });
   });
+
+  describe("readManifestFromArchive", () => {
+    it("reads the manifest out of a .tar.gz without unpacking session content", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      try {
+        // Build a realistic bundle staging dir: manifest.json + sessions/<id>.jsonl
+        const staging = join(dir, "my-export");
+        mkdirSync(join(staging, "sessions"), { recursive: true });
+        const manifest = {
+          version: 1, plugin: "sesh-mover", exportedAt: "2026-07-25T18:30:48.718Z",
+          sourcePlatform: "wsl2", sourceProjectPath: "/mnt/e/GitHub/x/y",
+          sourceConfigDir: "/home/u/.claude", sourceClaudeVersion: "2.1.81",
+          sessionScope: "current", includedLayers: ["jsonl"],
+          sessions: [{
+            sessionId: "550e8400-e29b-41d4-a716-446655440000", slug: "s", summary: "sum",
+            lastActiveAt: "2026-07-25T18:00:00Z", messageCount: 42,
+            gitBranch: "main", entrypoint: "cli", integrityHash: "sha256:abc",
+          }],
+        };
+        writeFileSync(join(staging, "manifest.json"), JSON.stringify(manifest, null, 2));
+        writeFileSync(join(staging, "sessions", "550e8400-e29b-41d4-a716-446655440000.jsonl"), '{"uuid":"a"}\n');
+        const archive = join(dir, "my-export.tar.gz");
+        await createArchive(staging, archive, "gzip");
+
+        const r = await readManifestFromArchive(archive);
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        expect(r.manifest.sourcePlatform).toBe("wsl2");
+        expect(r.manifest.sourceProjectPath).toBe("/mnt/e/GitHub/x/y");
+        expect(r.manifest.exportedAt).toBe("2026-07-25T18:30:48.718Z");
+        expect(r.manifest.sessions).toHaveLength(1);
+        expect(r.manifest.sessions[0].messageCount).toBe(42);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("ignores a nested manifest.json and only reads the bundle-root one", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      try {
+        const staging = join(dir, "nested-export");
+        mkdirSync(join(staging, "sessions", "deep"), { recursive: true });
+        const base = {
+          version: 1, plugin: "sesh-mover", exportedAt: "2026-07-25T18:30:48.718Z",
+          sourceConfigDir: "/c", sourceClaudeVersion: "2.1.81",
+          sessionScope: "current", includedLayers: ["jsonl"], sessions: [],
+        };
+        writeFileSync(
+          join(staging, "manifest.json"),
+          JSON.stringify({ ...base, sourcePlatform: "wsl2", sourceProjectPath: "/root/one" })
+        );
+        writeFileSync(
+          join(staging, "sessions", "deep", "manifest.json"),
+          JSON.stringify({ ...base, sourcePlatform: "win32", sourceProjectPath: "C:\\decoy" })
+        );
+        const archive = join(dir, "nested-export.tar.gz");
+        await createArchive(staging, archive, "gzip");
+
+        const r = await readManifestFromArchive(archive);
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        expect(r.manifest.sourcePlatform).toBe("wsl2");
+        expect(r.manifest.sourceProjectPath).toBe("/root/one");
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("reports unreadable for a corrupt archive instead of throwing", async () => {
+      const { readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      try {
+        const bogus = join(dir, "bogus.tar.gz");
+        writeFileSync(bogus, "definitely not a tar archive");
+        const r = await readManifestFromArchive(bogus);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(["unreadable", "no-manifest"]).toContain(r.reason);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("reports no-manifest for an archive that has none", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      try {
+        const staging = join(dir, "empty-export");
+        mkdirSync(staging, { recursive: true });
+        writeFileSync(join(staging, "readme.txt"), "no manifest here\n");
+        const archive = join(dir, "empty-export.tar.gz");
+        await createArchive(staging, archive, "gzip");
+        const r = await readManifestFromArchive(archive);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toBe("no-manifest");
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("reports unreadable for a name that isn't a recognized archive", async () => {
+      const { readManifestFromArchive } = await import("../src/archiver.js");
+      const r = await readManifestFromArchive(join(tempDir, "not-an-archive"));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe("unreadable");
+    });
+
+    it("rejects a manifest carrying an unsafe session id (0.3.2 chokepoint)", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      try {
+        const staging = join(dir, "hostile");
+        mkdirSync(staging, { recursive: true });
+        writeFileSync(join(staging, "manifest.json"), JSON.stringify({
+          version: 1, plugin: "sesh-mover", exportedAt: "t", sourcePlatform: "linux",
+          sourceProjectPath: "/x", sourceConfigDir: "/y", sourceClaudeVersion: "1",
+          sessionScope: "current", includedLayers: [],
+          sessions: [{ sessionId: "../../../etc/passwd", slug: "s", summary: "",
+            lastActiveAt: "t", messageCount: 1, gitBranch: "m", entrypoint: "cli", integrityHash: "sha256:x" }],
+        }));
+        const archive = join(dir, "hostile.tar.gz");
+        await createArchive(staging, archive, "gzip");
+        const r = await readManifestFromArchive(archive);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toBe("unsafe-manifest");
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("reads a .tar.zst manifest when zstd is available, else reports no-zstd", async () => {
+      const { createArchive, readManifestFromArchive, isZstdAvailable } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      try {
+        const archive = join(dir, "z-export.tar.zst");
+        if (await isZstdAvailable()) {
+          const staging = join(dir, "z-export");
+          mkdirSync(join(staging, "sessions"), { recursive: true });
+          writeFileSync(join(staging, "manifest.json"), JSON.stringify({
+            version: 1, plugin: "sesh-mover", exportedAt: "2026-07-25T18:30:48.718Z",
+            sourcePlatform: "wsl2", sourceProjectPath: "/mnt/e/GitHub/x/y",
+            sourceConfigDir: "/home/u/.claude", sourceClaudeVersion: "2.1.81",
+            sessionScope: "current", includedLayers: ["jsonl"], sessions: [],
+          }));
+          writeFileSync(join(staging, "sessions", "a.jsonl"), '{"uuid":"a"}\n');
+          // createArchive("zstd") shells out to zstd unconditionally — the
+          // gzip fallback lives in cli.ts, not here — so only call it when
+          // zstd really exists.
+          await createArchive(staging, archive, "zstd");
+          const r = await readManifestFromArchive(archive);
+          expect(r.ok).toBe(true);
+          if (!r.ok) return;
+          expect(r.manifest.sourcePlatform).toBe("wsl2");
+          expect(r.manifest.sourceProjectPath).toBe("/mnt/e/GitHub/x/y");
+        } else {
+          writeFileSync(archive, "opaque zstd bytes we cannot decode");
+          const r = await readManifestFromArchive(archive);
+          expect(r.ok).toBe(false);
+          if (!r.ok) expect(r.reason).toBe("no-zstd");
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("reports no-zstd for a .tar.zst when zstd is off PATH", async () => {
+      const { readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      const savedPath = process.env.PATH;
+      try {
+        // Deterministic coverage of the no-zstd branch even on machines that
+        // do have zstd installed.
+        process.env.PATH = join(dir, "no-such-bin");
+        const archive = join(dir, "z-export.tar.zst");
+        writeFileSync(archive, "opaque zstd bytes");
+        const r = await readManifestFromArchive(archive);
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.reason).toBe("no-zstd");
+          expect(r.detail).toMatch(/zstd/i);
+        }
+      } finally {
+        process.env.PATH = savedPath;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });

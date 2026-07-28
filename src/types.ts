@@ -261,12 +261,17 @@ export interface BrowseResult {
   exports: Array<{
     name: string;
     path: string;
-    exportedAt: string;
-    sourcePlatform: Platform;
-    sourceProjectPath: string;
-    sessionCount: number;
-    sessions: SessionManifest[];
+    // Archive entries whose manifest could not be read report null for every
+    // manifest-derived field rather than a fabricated value (the browsing
+    // machine's platform, "", 0). `metadataAvailable` says which case it is.
+    exportedAt: string | null;
+    sourcePlatform: Platform | null;
+    sourceProjectPath: string | null;
+    sessionCount: number | null;
+    sessions: SessionManifest[]; // [] when unavailable
     storage: StorageScope;
+    metadataAvailable: boolean;
+    metadataError?: string; // set iff metadataAvailable is false
   }>;
 }
 
