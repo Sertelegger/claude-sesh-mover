@@ -67,8 +67,14 @@ export async function readManifestFromArchive(
     return { ok: false, reason: "unreadable", detail: "not a recognized archive name" };
   }
 
-  const work = mkdtempSync(join(tmpdir(), "sesh-manifest-"));
+  // The scratch dir is allocated INSIDE the try: a resource failure here
+  // (no temp root, fd/inode exhaustion) is just as much "this archive could
+  // not be read" as a corrupt tar, and must not escape as a throw — callers
+  // batch these, and one escaping rejection would take a whole listing down.
+  let work: string | undefined;
   try {
+    work = mkdtempSync(join(tmpdir(), "sesh-manifest-"));
+
     let tarFile = archivePath;
     if (format === "zstd") {
       if (!(await isZstdAvailable())) {
@@ -128,7 +134,7 @@ export async function readManifestFromArchive(
   } catch (e) {
     return { ok: false, reason: "unreadable", detail: (e as Error).message };
   } finally {
-    rmSync(work, { recursive: true, force: true });
+    if (work !== undefined) rmSync(work, { recursive: true, force: true });
   }
 }
 

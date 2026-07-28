@@ -6,6 +6,7 @@ import {
   writeFileSync,
   existsSync,
   readFileSync,
+  readdirSync,
   mkdirSync as mkdirSyncFs,
   chmodSync,
   symlinkSync,
@@ -353,6 +354,80 @@ describe("archiver", () => {
           if (!r.ok) expect(r.reason).toBe("no-zstd");
         }
       } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("contains a scratch-dir allocation failure as a typed result instead of throwing", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      const savedTmpdir = process.env.TMPDIR;
+      try {
+        const staging = join(dir, "fine-export");
+        mkdirSync(staging, { recursive: true });
+        writeFileSync(join(staging, "manifest.json"), JSON.stringify({
+          version: 1, plugin: "sesh-mover", exportedAt: "2026-07-25T18:30:48.718Z",
+          sourcePlatform: "wsl2", sourceProjectPath: "/mnt/e/x",
+          sourceConfigDir: "/c", sourceClaudeVersion: "2.1.81",
+          sessionScope: "current", includedLayers: ["jsonl"], sessions: [],
+        }));
+        const archive = join(dir, "fine-export.tar.gz");
+        await createArchive(staging, archive, "gzip");
+
+        // A real resource failure, not a corrupt archive: the process temp
+        // root doesn't exist, so mkdtempSync throws ENOENT. That used to
+        // escape as a rejection because the allocation sat outside the try —
+        // which, under Promise.all, failed the caller's ENTIRE listing.
+        process.env.TMPDIR = join(dir, "no-such-temp-root");
+        const r = await readManifestFromArchive(archive);
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.reason).toBe("unreadable");
+          expect(r.detail).toMatch(/ENOENT|no such file/i);
+        }
+
+        // ...and the very next call succeeds once the temp root is usable
+        // again: the failure is per-call, not sticky.
+        if (savedTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = savedTmpdir;
+        const again = await readManifestFromArchive(archive);
+        expect(again.ok).toBe(true);
+      } finally {
+        if (savedTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = savedTmpdir;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("leaves no scratch dir behind on success or failure", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
+      const savedTmpdir = process.env.TMPDIR;
+      try {
+        const staging = join(dir, "clean-export");
+        mkdirSync(staging, { recursive: true });
+        writeFileSync(join(staging, "manifest.json"), JSON.stringify({
+          version: 1, plugin: "sesh-mover", exportedAt: "t", sourcePlatform: "linux",
+          sourceProjectPath: "/x", sourceConfigDir: "/y", sourceClaudeVersion: "1",
+          sessionScope: "current", includedLayers: [], sessions: [],
+        }));
+        const good = join(dir, "clean-export.tar.gz");
+        await createArchive(staging, good, "gzip");
+        const bad = join(dir, "corrupt.tar.gz");
+        writeFileSync(bad, "not a tar");
+
+        const tmpRoot = join(dir, "tmproot");
+        mkdirSync(tmpRoot, { recursive: true });
+        process.env.TMPDIR = tmpRoot;
+
+        expect((await readManifestFromArchive(good)).ok).toBe(true);
+        expect((await readManifestFromArchive(bad)).ok).toBe(false);
+
+        const leaked = readdirSync(tmpRoot).filter((n) => n.startsWith("sesh-manifest-"));
+        expect(leaked).toEqual([]);
+      } finally {
+        if (savedTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = savedTmpdir;
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
 
     it("reports no-zstd for a .tar.zst when zstd is off PATH", async () => {

@@ -252,6 +252,28 @@ async function archiveBrowseEntry(archivePath, name, storage) {
         metadataAvailable: true,
     };
 }
+/**
+ * How many archives `browse` reads at once. Each in-flight read holds a temp
+ * dir and an open tar stream, and an archive costs nothing to merely *list* —
+ * so an unbounded fan-out over a directory of hundreds of bundles can exhaust
+ * the process's file-descriptor limit and fail the whole command where the old
+ * (lying) code would at least have printed names. Batching caps the peak cost
+ * at this many concurrent reads regardless of how many archives are present.
+ */
+const ARCHIVE_READ_CONCURRENCY = 8;
+/**
+ * Resolve queued archive reads in bounded batches, preserving queue order.
+ * Takes thunks rather than promises on purpose: a promise is already running,
+ * so an array of them is exactly the unbounded fan-out this avoids.
+ */
+async function runBounded(thunks) {
+    const results = [];
+    for (let i = 0; i < thunks.length; i += ARCHIVE_READ_CONCURRENCY) {
+        const batch = thunks.slice(i, i + ARCHIVE_READ_CONCURRENCY);
+        results.push(...(await Promise.all(batch.map((run) => run()))));
+    }
+    return results;
+}
 /** Sort key for browse entries: missing/unparseable timestamps become the epoch. */
 function exportedAtMillis(exportedAt) {
     const t = new Date(exportedAt ?? 0).getTime();
@@ -306,15 +328,18 @@ program
             }
         }
         // Also look for archives in the search dirs. Each archive's manifest is
-        // read out of the archive itself (concurrently — a directory of bundles
-        // must not serialize), so a bundle carried over from another machine
-        // reports ITS origin, not this one's.
-        const archiveEntries = [];
+        // read out of the archive itself, so a bundle carried over from another
+        // machine reports ITS origin, not this one's. The reads are queued as
+        // thunks and run in bounded batches: concurrent enough that a directory
+        // of bundles doesn't serialize, bounded so it can't exhaust file
+        // descriptors and fail the listing outright.
+        const archiveReads = [];
         for (const { dir, storage } of searchDirs) {
             const entries = readdirSync(dir);
             for (const entry of entries) {
                 if (entry.endsWith(".tar.gz") || entry.endsWith(".tar.zst")) {
-                    archiveEntries.push(archiveBrowseEntry(join(dir, entry), entry, storage));
+                    const archivePath = join(dir, entry);
+                    archiveReads.push(() => archiveBrowseEntry(archivePath, entry, storage));
                 }
             }
         }
@@ -354,12 +379,12 @@ program
                 if (entry.endsWith(".tar.gz") || entry.endsWith(".tar.zst")) {
                     // Only include if filename looks like a sesh-mover export (date prefix pattern)
                     if (/^\d{4}-\d{2}-\d{2}-/.test(entry)) {
-                        archiveEntries.push(archiveBrowseEntry(entryPath, entry, "project"));
+                        archiveReads.push(() => archiveBrowseEntry(entryPath, entry, "project"));
                     }
                 }
             }
         }
-        exports.push(...(await Promise.all(archiveEntries)));
+        exports.push(...(await runBounded(archiveReads)));
         // Note: --prune is a signal for the skill layer to handle interactively.
         // The skill prompts the user and runs `rm -rf <path>` after confirmation.
         // The CLI just lists exports with their paths; no extra marking needed here.

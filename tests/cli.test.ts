@@ -7,6 +7,7 @@ import {
   existsSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   chmodSync,
   cpSync,
 } from "node:fs";
@@ -420,6 +421,137 @@ describe("cli", () => {
       expect(
         result.exports.some((e: { name: string }) => e.name === "no-date-prefix.tar.gz")
       ).toBe(false);
+    });
+
+    it("returns an entry for every archive when there are more than the concurrency bound", async () => {
+      // ARCHIVE_READ_CONCURRENCY is 8, so 24 archives means three batches:
+      // batching must not drop, duplicate, or reorder-away any entry.
+      const total = 24;
+      const homeDir = join(tempDir, "many-home");
+      const store = join(homeDir, ".claude-sesh-mover");
+      mkdirSync(store, { recursive: true });
+      const seed = join(tempDir, "seed.tar.gz");
+      await writeForeignArchive(seed);
+      const expected: string[] = [];
+      for (let i = 0; i < total; i++) {
+        const name = `2026-07-25-many-${String(i).padStart(2, "0")}.tar.gz`;
+        cpSync(seed, join(store, name));
+        expected.push(name);
+      }
+
+      // Point the child's temp root at a dir we own, so we can prove the
+      // reads clean up after themselves instead of leaking a scratch dir
+      // per archive.
+      const tmpRoot = join(tempDir, "many-tmproot");
+      mkdirSync(tmpRoot, { recursive: true });
+      const result = JSON.parse(
+        runCli(`browse --storage user --json`, { ...homeEnv(homeDir), TMPDIR: tmpRoot })
+      );
+
+      expect(result.success).toBe(true);
+      const names = result.exports.map((e: { name: string }) => e.name).sort();
+      expect(names).toEqual(expected);
+      expect(
+        result.exports.every(
+          (e: { metadataAvailable: boolean; sourcePlatform: string }) =>
+            e.metadataAvailable === true && e.sourcePlatform === "win32"
+        )
+      ).toBe(true);
+      expect(readdirSync(tmpRoot).filter((n) => n.startsWith("sesh-manifest-"))).toEqual([]);
+    });
+
+    it.skipIf(isWindows)(
+      "degrades only the archive that hits a resource failure and still lists the rest",
+      async () => {
+        const homeDir = join(tempDir, "mixed-home");
+        const store = join(homeDir, ".claude-sesh-mover");
+        mkdirSync(store, { recursive: true });
+
+        // A directory export (read without touching an archive at all)...
+        const dirExport = join(store, "2026-07-25-dir-export");
+        mkdirSync(join(dirExport, "sessions"), { recursive: true });
+        writeFileSync(join(dirExport, "manifest.json"), JSON.stringify(FOREIGN_MANIFEST));
+
+        // ...two healthy archives...
+        await writeForeignArchive(join(store, "2026-07-25-healthy-a.tar.gz"));
+        await writeForeignArchive(join(store, "2026-07-25-healthy-b.tar.gz"));
+
+        // ...and one the process cannot open: a real per-archive resource
+        // failure (EACCES), not a corrupt or hostile bundle.
+        const unreadable = join(store, "2026-07-25-locked.tar.gz");
+        await writeForeignArchive(unreadable);
+        chmodSync(unreadable, 0o000);
+
+        try {
+          const result = JSON.parse(runCli(`browse --storage user --json`, homeEnv(homeDir)));
+
+          // The command survives: success, and an entry for all four.
+          expect(result.success).toBe(true);
+          expect(result.exports).toHaveLength(4);
+
+          const byName = Object.fromEntries(
+            result.exports.map((e: { name: string }) => [e.name, e])
+          );
+          for (const ok of [
+            "2026-07-25-dir-export",
+            "2026-07-25-healthy-a.tar.gz",
+            "2026-07-25-healthy-b.tar.gz",
+          ]) {
+            expect(byName[ok].metadataAvailable).toBe(true);
+            expect(byName[ok].sourcePlatform).toBe("win32");
+            expect(byName[ok].sessionCount).toBe(1);
+          }
+
+          const bad = byName["2026-07-25-locked.tar.gz"];
+          expect(bad.metadataAvailable).toBe(false);
+          expect(bad.metadataError.length).toBeGreaterThan(0);
+          expect(bad.sourcePlatform).toBeNull();
+          expect(bad.sessionCount).toBeNull();
+          expect(bad.sessions).toEqual([]);
+        } finally {
+          chmodSync(unreadable, 0o644); // so afterEach can clean up
+        }
+      }
+    );
+
+    it("keeps the listing alive when the temp root itself is unusable", async () => {
+      // The regression this guards: the scratch-dir allocation used to sit
+      // outside readManifestFromArchive's try, so an allocation failure
+      // escaped as a rejection and Promise.all failed the WHOLE command —
+      // success:false with zero entries, worse than the bug being fixed.
+      const homeDir = join(tempDir, "notmp-home");
+      const store = join(homeDir, ".claude-sesh-mover");
+      mkdirSync(store, { recursive: true });
+      const dirExport = join(store, "2026-07-25-dir-export");
+      mkdirSync(dirExport, { recursive: true });
+      writeFileSync(join(dirExport, "manifest.json"), JSON.stringify(FOREIGN_MANIFEST));
+      await writeForeignArchive(join(store, "2026-07-25-a.tar.gz"));
+      await writeForeignArchive(join(store, "2026-07-25-b.tar.gz"));
+
+      const result = JSON.parse(
+        runCli(`browse --storage user --json`, {
+          ...homeEnv(homeDir),
+          TMPDIR: join(tempDir, "no-such-temp-root"),
+        })
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.exports).toHaveLength(3);
+      const archives = result.exports.filter((e: { name: string }) =>
+        e.name.endsWith(".tar.gz")
+      );
+      expect(archives).toHaveLength(2);
+      for (const a of archives) {
+        expect(a.metadataAvailable).toBe(false);
+        expect(a.metadataError).toMatch(/ENOENT|no such file/i);
+        expect(a.sourcePlatform).toBeNull();
+      }
+      // The directory export, which needs no scratch dir, is unaffected.
+      const dirEntry = result.exports.find(
+        (e: { name: string }) => e.name === "2026-07-25-dir-export"
+      );
+      expect(dirEntry.metadataAvailable).toBe(true);
+      expect(dirEntry.sourcePlatform).toBe("win32");
     });
   });
 
