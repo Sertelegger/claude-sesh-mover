@@ -307,11 +307,18 @@ describe("cli", () => {
       version: 1,
       plugin: "sesh-mover",
       exportedAt: "2026-07-25T18:30:48.718Z",
-      // A platform no test runner is: proves browse reads the archive rather
-      // than reporting its own detectPlatform().
-      sourcePlatform: "win32",
-      sourceProjectPath: "C:\\Users\\someone\\Projects\\faraway",
-      sourceConfigDir: "C:\\Users\\someone\\.claude",
+      // "wsl2" is deliberate and load-bearing: it is a valid Platform (see
+      // src/types.ts) that os.platform() can NEVER return — on WSL, node
+      // reports "linux" — so `not.toBe(platform())` below stays meaningful on
+      // every CI OS. An earlier "win32" was only foreign-looking from a Mac:
+      // on the windows-latest runner the fixture value equalled the local
+      // platform, so the assertion that browse doesn't fabricate the local
+      // platform became untestable exactly where it mattered, and failed.
+      // Pick a value no host can produce, not merely one this host isn't.
+      // It also mirrors the originating bug: a WSL2 bundle browsed elsewhere.
+      sourcePlatform: "wsl2",
+      sourceProjectPath: "/mnt/e/GitHub/someone/faraway",
+      sourceConfigDir: "/home/someone/.claude",
       sourceClaudeVersion: "2.1.81",
       sessionScope: "current",
       includedLayers: ["jsonl"],
@@ -358,9 +365,10 @@ describe("cli", () => {
       expect(entry).toBeDefined();
       expect(entry.metadataAvailable).toBe(true);
       expect(entry.metadataError).toBeUndefined();
-      expect(entry.sourcePlatform).toBe("win32");
+      expect(entry.sourcePlatform).toBe("wsl2");
+      // Holds on darwin/linux/win32 alike: os.platform() has no "wsl2".
       expect(entry.sourcePlatform).not.toBe(platform());
-      expect(entry.sourceProjectPath).toBe("C:\\Users\\someone\\Projects\\faraway");
+      expect(entry.sourceProjectPath).toBe("/mnt/e/GitHub/someone/faraway");
       expect(entry.exportedAt).toBe("2026-07-25T18:30:48.718Z");
       expect(entry.sessionCount).toBe(1);
       expect(entry.sessions).toHaveLength(1);
@@ -414,8 +422,8 @@ describe("cli", () => {
       );
       expect(entry).toBeDefined();
       expect(entry.metadataAvailable).toBe(true);
-      expect(entry.sourcePlatform).toBe("win32");
-      expect(entry.sourceProjectPath).toBe("C:\\Users\\someone\\Projects\\faraway");
+      expect(entry.sourcePlatform).toBe("wsl2");
+      expect(entry.sourceProjectPath).toBe("/mnt/e/GitHub/someone/faraway");
       expect(entry.sessionCount).toBe(1);
       expect(entry.storage).toBe("project");
       expect(
@@ -458,7 +466,7 @@ describe("cli", () => {
       expect(
         result.exports.every(
           (e: { metadataAvailable: boolean; sourcePlatform: string }) =>
-            e.metadataAvailable === true && e.sourcePlatform === "win32"
+            e.metadataAvailable === true && e.sourcePlatform === "wsl2"
         )
       ).toBe(true);
       expect(readdirSync(tmpRoot).filter((n) => n.startsWith("sesh-manifest-"))).toEqual([]);
@@ -502,7 +510,7 @@ describe("cli", () => {
             "2026-07-25-healthy-b.tar.gz",
           ]) {
             expect(byName[ok].metadataAvailable).toBe(true);
-            expect(byName[ok].sourcePlatform).toBe("win32");
+            expect(byName[ok].sourcePlatform).toBe("wsl2");
             expect(byName[ok].sessionCount).toBe(1);
           }
 
@@ -558,7 +566,7 @@ describe("cli", () => {
         (e: { name: string }) => e.name === "2026-07-25-dir-export"
       );
       expect(dirEntry.metadataAvailable).toBe(true);
-      expect(dirEntry.sourcePlatform).toBe("win32");
+      expect(dirEntry.sourcePlatform).toBe("wsl2");
     });
   });
 
