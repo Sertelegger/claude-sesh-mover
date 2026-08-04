@@ -814,8 +814,13 @@ describe("hub hook-session-start (CLI)", () => {
     writeHubMachine(ME, "my-laptop");
     writeHubMachine(OTHER, "office-desktop");
     // An arrangement that definitely produces stdout — with nothing to say,
-    // the endpoint would never write and the test would prove nothing.
+    // the endpoint would never write and the test would prove nothing. Pinned
+    // with a drained control run rather than left as a comment: if a future
+    // change to thread resolution made this arrangement silent, the destroy
+    // half below would still pass while guarding nothing.
     writeIndex(OTHER, "t-shared", { lastActiveAt: new Date().toISOString() });
+    const control = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(control.stdout).not.toBe("");
 
     const child = spawn("node", [cliPath(), "hub", "hook-session-start"], {
       env: { ...process.env, ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },

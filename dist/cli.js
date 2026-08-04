@@ -1057,7 +1057,12 @@ function noticeField(value) {
     // it. Nothing legible is in it, so replacing the whole category is both
     // safer and shorter than an escape range.
     const clean = value.replace(/\p{C}/gu, " ").replace(/\s+/g, " ").trim();
-    return clean.length > NOTICE_FIELD_MAX ? clean.slice(0, NOTICE_FIELD_MAX - 1) + "…" : clean;
+    if (clean.length <= NOTICE_FIELD_MAX)
+        return clean;
+    // Cut on code points, not UTF-16 code units: slicing an astral character in
+    // half leaves a lone surrogate, which renders as a replacement glyph in the
+    // very notice this function exists to keep legible.
+    return [...clean].slice(0, NOTICE_FIELD_MAX - 1).join("") + "…";
 }
 // Best-effort stderr diagnostic for the hook endpoints. A hook's diagnostic
 // must never be able to change its exit code, so a failing write is swallowed
