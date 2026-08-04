@@ -79,22 +79,37 @@ export function identityRewriteContext() {
  * truncated fragment. Strips the synthetic continuation header and rewrites
  * every appended entry's `sessionId` onto the base session.
  *
+ * PRECONDITION — the delta must already be local-ready. This is a same-machine
+ * splice: it rewrites `sessionId` and NOTHING else (see
+ * `identityRewriteContext`), and it applies no version adapters. The CALLER
+ * must hand over a bundle whose paths are already rewritten for this machine
+ * and whose schema is already adapted to the local Claude Code version.
+ * Splicing a raw cross-platform or cross-version continuation would embed
+ * foreign paths and an un-migrated schema into a local transcript.
+ *
  * Two guards, in order:
  * 1. **Chain** (never skippable, not even with `force`): the delta's anchor
  *    (`parentUuid` of its first real entry) must equal the base's current head
- *    uuid. Without this the splice would fabricate a broken parent chain.
+ *    uuid. Without this the splice would fabricate a broken parent chain. It is
+ *    checked TWICE — once up front, and again immediately before the write,
+ *    because the preparation between them is O(delta) and Claude Code (which
+ *    the project lock does not cover) may append to the base in that window.
  * 2. **Liveness** (`force` skips it): declines when the base was modified
  *    inside `APPEND_LIVE_WINDOW_MS`, unless the modification came from this
  *    very operation (`mtime >= opNowMs`) — that exemption is what lets one
  *    pull write a fresh base and then splice its own continuations onto it.
  *
- * The base is only ever EXTENDED, so rollback is a truncate back to the
- * pre-append byte length — byte-exact by construction. Rollback also
- * re-verifies the restored head uuid.
+ * The base is only ever EXTENDED, so rollback is a truncate back to its byte
+ * length as re-measured at that second check — byte-exact by construction, and
+ * measured late enough that it can never discard a concurrent writer's bytes.
+ * Rollback also re-verifies the restored head uuid, and is skipped entirely
+ * when nothing was written (so a decline never even bumps the base's mtime —
+ * Claude Code orders `/resume` by mtime).
  *
  * Every anticipated failure is reported as a `declined` outcome. Raw IO faults
- * still throw: an unreadable delta path, and — loudest of all — a rollback that
- * itself failed, which is the one case where the base may be left corrupt.
+ * still throw: an unreadable delta path, a fault before any byte was written,
+ * and — loudest of all — a rollback that itself failed, which is the one case
+ * where the base may be left corrupt.
  */
 export async function tryAppendContinuation(a) {
     const info = await readDeltaChainInfo(a.deltaPath);
@@ -127,7 +142,11 @@ export async function tryAppendContinuation(a) {
             detail: `base session was modified ${Math.round(ageMs / 1000)}s ago (possible live session); use --force-append to override`,
         };
     }
-    const preAppendBytes = baseStat.size;
+    // Rollback length and "did we touch the file at all" bookkeeping. The length
+    // is re-measured after the O(delta) prep below; this initial value is only a
+    // placeholder for the (impossible) case of a throw before that point.
+    let rollbackBytes = baseStat.size;
+    let wroteBytes = false;
     const work = mkdtempSync(join(tmpdir(), "sesh-append-"));
     try {
         // 1. header-stripped copy
@@ -142,16 +161,40 @@ export async function tryAppendContinuation(a) {
         // base still carrying the delta's sessionId. Refuse before touching the
         // base (mirrors importer.ts's strict-validation semantics).
         if (report.parseFailures > 0) {
-            throw new Error(`continuation contains ${report.parseFailures} unparseable JSONL line(s); refusing to splice`);
+            return {
+                kind: "declined",
+                reason: "delta-unusable",
+                detail: `continuation contains ${report.parseFailures} unparseable JSONL line(s); refusing to splice (the base was not modified)`,
+            };
         }
-        // 3. append (a base whose final line lacks its newline would otherwise be
+        // 3. Re-check the chain and re-measure the base. Everything above this
+        //    point read the base BEFORE O(delta) work; a live Claude Code session
+        //    (which no lock of ours covers) may have appended since. Without this,
+        //    the delta could be spliced after entries it does not chain to — and
+        //    post-append verification could not catch it, because the final head
+        //    would still be the delta's last uuid. Re-measuring the size here also
+        //    guarantees a later rollback can never truncate away another writer's
+        //    bytes.
+        const fresh = statSync(a.basePath);
+        const freshHead = readLastEntryUuid(a.basePath);
+        if (freshHead !== info.firstEntryParentUuid) {
+            return {
+                kind: "declined",
+                reason: "chain-mismatch",
+                detail: `base head moved during the splice (${baseHead ?? "(none)"} -> ${freshHead ?? "(none)"}, expected continuation anchor ${info.firstEntryParentUuid}); nothing was written`,
+            };
+        }
+        rollbackBytes = fresh.size;
+        // 4. append (a base whose final line lacks its newline would otherwise be
         //    glued to the delta's first entry)
-        if (preAppendBytes > 0 && !endsWithNewline(a.basePath, preAppendBytes)) {
+        if (rollbackBytes > 0 && !endsWithNewline(a.basePath, rollbackBytes)) {
+            wroteBytes = true;
             appendFileSync(a.basePath, "\n", "utf-8");
         }
+        wroteBytes = true;
         await pipeline(createReadStream(rewritten), createWriteStream(a.basePath, { flags: "a" }));
         a.__injectFailure?.();
-        // 4. verify the splice landed
+        // 5. verify the splice landed
         const newHead = readLastEntryUuid(a.basePath);
         if (newHead !== info.lastEntryUuid) {
             throw new Error(`post-append head ${newHead ?? "(none)"} != expected ${info.lastEntryUuid}`);
@@ -159,16 +202,21 @@ export async function tryAppendContinuation(a) {
         return { kind: "appended", entriesAppended, newHeadUuid: newHead };
     }
     catch (e) {
+        // Nothing of ours reached the file: truncating would be a lie in the
+        // outcome AND a real side effect, since even a same-size truncate bumps
+        // mtime (which is how Claude Code orders /resume). Let the fault surface.
+        if (!wroteBytes)
+            throw e;
         const cause = e.message;
         try {
-            truncateSync(a.basePath, preAppendBytes);
+            truncateSync(a.basePath, rollbackBytes);
         }
         catch (rollbackError) {
-            throw new Error(`append failed (${cause}) AND rollback failed — ${a.basePath} may be corrupt (expected ${preAppendBytes} bytes): ${rollbackError.message}`);
+            throw new Error(`append failed (${cause}) AND rollback failed — ${a.basePath} may be corrupt (expected ${rollbackBytes} bytes): ${rollbackError.message}`);
         }
         const restored = readLastEntryUuid(a.basePath);
         const detail = restored === baseHead
-            ? `append aborted and the base was restored to ${preAppendBytes} bytes: ${cause}`
+            ? `append aborted and the base was restored to ${rollbackBytes} bytes: ${cause}`
             : `append aborted and rollback could not restore the head (expected ${baseHead ?? "(none)"}, got ${restored ?? "(none)"}): ${cause}`;
         return { kind: "declined", reason: "rolled-back", detail };
     }

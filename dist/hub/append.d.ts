@@ -43,7 +43,17 @@ export interface AppendAttempt {
      */
     __injectFailure?: () => never;
 }
-export type AppendDeclineReason = "chain-mismatch" | "recently-active" | "no-delta-entries" | "rolled-back";
+export type AppendDeclineReason = 
+/** The base's head uuid is not the delta's anchor (checked twice: before and after the O(delta) prep). */
+"chain-mismatch"
+/** The base looks like a live session and `force` was not set. */
+ | "recently-active"
+/** The bundle carries nothing appendable (empty, or a full session with no anchor). */
+ | "no-delta-entries"
+/** The bundle itself is unusable. Aborted BEFORE the base was touched — it is byte- and mtime-identical. */
+ | "delta-unusable"
+/** Bytes were appended, then something failed and the base was truncated back. */
+ | "rolled-back";
 export type AppendOutcome = {
     kind: "appended";
     entriesAppended: number;
@@ -59,22 +69,37 @@ export type AppendOutcome = {
  * truncated fragment. Strips the synthetic continuation header and rewrites
  * every appended entry's `sessionId` onto the base session.
  *
+ * PRECONDITION — the delta must already be local-ready. This is a same-machine
+ * splice: it rewrites `sessionId` and NOTHING else (see
+ * `identityRewriteContext`), and it applies no version adapters. The CALLER
+ * must hand over a bundle whose paths are already rewritten for this machine
+ * and whose schema is already adapted to the local Claude Code version.
+ * Splicing a raw cross-platform or cross-version continuation would embed
+ * foreign paths and an un-migrated schema into a local transcript.
+ *
  * Two guards, in order:
  * 1. **Chain** (never skippable, not even with `force`): the delta's anchor
  *    (`parentUuid` of its first real entry) must equal the base's current head
- *    uuid. Without this the splice would fabricate a broken parent chain.
+ *    uuid. Without this the splice would fabricate a broken parent chain. It is
+ *    checked TWICE — once up front, and again immediately before the write,
+ *    because the preparation between them is O(delta) and Claude Code (which
+ *    the project lock does not cover) may append to the base in that window.
  * 2. **Liveness** (`force` skips it): declines when the base was modified
  *    inside `APPEND_LIVE_WINDOW_MS`, unless the modification came from this
  *    very operation (`mtime >= opNowMs`) — that exemption is what lets one
  *    pull write a fresh base and then splice its own continuations onto it.
  *
- * The base is only ever EXTENDED, so rollback is a truncate back to the
- * pre-append byte length — byte-exact by construction. Rollback also
- * re-verifies the restored head uuid.
+ * The base is only ever EXTENDED, so rollback is a truncate back to its byte
+ * length as re-measured at that second check — byte-exact by construction, and
+ * measured late enough that it can never discard a concurrent writer's bytes.
+ * Rollback also re-verifies the restored head uuid, and is skipped entirely
+ * when nothing was written (so a decline never even bumps the base's mtime —
+ * Claude Code orders `/resume` by mtime).
  *
  * Every anticipated failure is reported as a `declined` outcome. Raw IO faults
- * still throw: an unreadable delta path, and — loudest of all — a rollback that
- * itself failed, which is the one case where the base may be left corrupt.
+ * still throw: an unreadable delta path, a fault before any byte was written,
+ * and — loudest of all — a rollback that itself failed, which is the one case
+ * where the base may be left corrupt.
  */
 export declare function tryAppendContinuation(a: AppendAttempt): Promise<AppendOutcome>;
 //# sourceMappingURL=append.d.ts.map
