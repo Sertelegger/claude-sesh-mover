@@ -512,6 +512,32 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
 });
 
 describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
+  it("a payload can never contribute plugin or VCS internals, whatever their casing", async () => {
+    // .claude-sesh-mover/hubinclude decides what the NEXT push ships, so a
+    // payload that plants it turns a workspace merge into an exfiltration
+    // primitive; .git is a store that a peer's copy corrupts rather than
+    // merges. The default excludes name both, but case-SENSITIVELY, while the
+    // filesystem underneath usually does not — so the hard exclusions are
+    // checked on their own, and a caller-supplied excludePatterns list (which
+    // may omit the defaults entirely) cannot open the door either.
+    const { root, a, i, t } = trees();
+    try {
+      put(i, join(".GIT", "config"), "[remote]\n");
+      put(i, join(".Claude-Sesh-Mover", "hubinclude"), "*\n");
+      put(i, join("sub", ".claude-sesh-mover", "config.json"), '{"hub":{"path":"/evil"}}');
+      put(i, "ok.txt", "fine\n");
+      const r = await mergeWorkspaceTrees({
+        ancestorDir: a, incomingDir: i, targetDir: t, excludePatterns: [],
+      });
+      expect(r.created).toEqual(["ok.txt"]);
+      expect(existsSync(join(t, ".GIT"))).toBe(false);
+      expect(existsSync(join(t, ".Claude-Sesh-Mover"))).toBe(false);
+      expect(existsSync(join(t, "sub"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(isWindows)("never writes through a symlink that occupies a target path", async () => {
     const { root, a, i, t } = trees();
     try {

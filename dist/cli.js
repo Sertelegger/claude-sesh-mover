@@ -598,6 +598,11 @@ hub
             projectPath,
             hubPath: gate.hubPath,
             noWorkspace: config.hub.noWorkspace,
+            // Nothing this push produces is read by a human: stdout is closed to it
+            // and stderr only carries failures. `quiet` keeps it from computing the
+            // ignored-path discovery aid nobody will see (and from walking the
+            // working tree to do it) — see HubPushOptions.quiet.
+            quiet: true,
             claudeVersion: getClaudeVersion(),
         });
         // lock-busy is an expected outcome, not a failure: another sesh-mover

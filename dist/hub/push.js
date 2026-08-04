@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, createReadStream } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +10,7 @@ import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, createHubProject, linkToHubProject, localGitRemotes, readLocalProjectId, } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
-import { snapshotWorkspace } from "./workspace.js";
+import { snapshotWorkspace, hubincludePath, isNeverIncludable } from "./workspace.js";
 import { exportAllSessions } from "../exporter.js";
 import { createArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
@@ -17,6 +18,46 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, } from "../sync-state.js";
+/** Cap on `ignoredNotCarried`: a sample the user can recognize, not an inventory. */
+const MAX_IGNORED_REPORTED = 10;
+/**
+ * Top-level gitignored paths, as `git` spells them — `docs/` for a wholly
+ * ignored directory, `src/generated.ts` for a single ignored file inside a
+ * carried one. Each is a valid `hubinclude` pattern for exactly that thing.
+ *
+ * `-z` is not a nicety: without it git applies `core.quotePath`, so a name with
+ * a space, a quote, a newline or any non-ASCII character comes back C-quoted
+ * and octal-escaped, and a newline in a filename would split one entry into
+ * two. This list is shown to a user and offered as a pattern to paste, so it
+ * has to be the real bytes.
+ *
+ * Every failure — no git, not a repo, timeout, output past `maxBuffer` — is the
+ * same answer: no discovery aid this time. It is a hint, never a gate.
+ */
+function listTopLevelIgnored(projectPath) {
+    try {
+        const out = execFileSync("git", ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], {
+            cwd: projectPath, encoding: "utf-8", timeout: 5000,
+            stdio: ["ignore", "pipe", "ignore"], maxBuffer: 4 * 1024 * 1024,
+        });
+        const paths = new Set();
+        for (const entry of out.split("\0")) {
+            // No trimming: with -z the bytes between separators ARE the path, and a
+            // name may legitimately begin or end with a space.
+            if (!entry)
+                continue;
+            if (isNeverIncludable(entry))
+                continue; // can never be carried, so never suggest it
+            paths.add(entry);
+            if (paths.size >= MAX_IGNORED_REPORTED)
+                break;
+        }
+        return [...paths];
+    }
+    catch {
+        return [];
+    }
+}
 export async function hubPush(opts) {
     // An empty array is programmatically distinct from "omitted" but must mean
     // the same thing here — otherwise it mints zero threads (the filter below
@@ -122,11 +163,17 @@ export async function hubPush(opts) {
                 bundleId: null, pushedSessions: [], upToDate: true, hasWorkspace: false, warnings,
             };
         }
+        // Memoized: `git remote -v` gates both the workspace payload and the
+        // ignored-path discovery aid below, and neither runs on the up-to-date
+        // early return above — so a quiet auto-push with no workspace still spawns
+        // nothing, and a manual push of a git project spawns it once, not twice.
+        let gitRemotesCache = null;
+        const gitRemotes = () => (gitRemotesCache ??= localGitRemotes(opts.projectPath));
         // Workspace payload — projects with no git remotes (including
         // remote-less git repositories), since there's no remote to reconstruct
         // the working tree from otherwise.
         let hasWorkspace = false;
-        if (!opts.noWorkspace && localGitRemotes(opts.projectPath).length === 0 && existsSync(opts.projectPath)) {
+        if (!opts.noWorkspace && gitRemotes().length === 0 && existsSync(opts.projectPath)) {
             const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));
             if (ws.symlinksSkipped > 0)
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
@@ -219,10 +266,23 @@ export async function hubPush(opts) {
             sessions: sessionsNow, state: stateAfter, priorIndex: prior, newBundles: records,
             now: pushedAt,
         }));
+        // Discovery aid (design §6.0): name what .gitignore kept out, so the user
+        // can opt paths back in via hubinclude without having to know the file
+        // exists. Manual pushes only — the auto-push hook must stay silent — and
+        // only until a hubinclude exists, at which point the user has met the
+        // mechanism and further nagging is noise. Existence, not pattern count, is
+        // the test: a file holding only comments still means "I know about this".
+        let ignoredNotCarried;
+        if (!opts.quiet && gitRemotes().length > 0 && !existsSync(hubincludePath(opts.projectPath))) {
+            const ignored = listTopLevelIgnored(opts.projectPath);
+            if (ignored.length > 0)
+                ignoredNotCarried = ignored;
+        }
         opts.onProgress?.({ phase: "hub-push", percent: 100 });
         return {
             success: true, command: "push", projectId: local.projectId,
             bundleId, pushedSessions, upToDate: false, hasWorkspace, warnings,
+            ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
         };
     }
     finally {

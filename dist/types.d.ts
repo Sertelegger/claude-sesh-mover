@@ -316,6 +316,20 @@ export interface HubPushResult {
     upToDate: boolean;
     hasWorkspace: boolean;
     warnings: string[];
+    /**
+     * Discovery aid (design §6.0): gitignored paths that this push did NOT carry,
+     * as `git` spelled them (a trailing "/" means the whole directory), capped at
+     * 10 — a sample to recognize, not an inventory.
+     *
+     * Present only on a MANUAL push of a project with a git remote that has no
+     * `.claude-sesh-mover/hubinclude` yet. Absent otherwise, and never emitted by
+     * the auto-push hook, whose contract is silence at session exit. Each entry
+     * is a valid `hubinclude` pattern for exactly the thing it names, which is
+     * why they are reported as git gives them rather than summarized up to their
+     * top-level directory: re-include is the permissive direction, so a broader
+     * spelling would carry more than the user pointed at.
+     */
+    ignoredNotCarried?: string[];
 }
 export interface WhereisThread {
     threadId: string;

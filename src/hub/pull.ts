@@ -925,6 +925,11 @@ export async function hubPull(
             if (ws.symlinksSkipped > 0) {
               warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
             }
+            if (ws.refused.length > 0) {
+              warnings.push(
+                `${ws.refused.length} path(s) in the workspace payload were refused because they name plugin or VCS internals that never travel (${ws.refused.slice(0, 5).join(", ")}). A bundle produced by sesh-mover never contains those, so this one was hand-made or damaged — nothing from them was written here.`
+              );
+            }
             if (ws.blocked.length > 0) {
               warnings.push(
                 `${ws.blocked.length} workspace file(s) were not unpacked because of what already occupies their path here (${[...new Set(ws.blocked.map((b) => b.reason))].join(", ")}): ${ws.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them; the incoming copies are still on the hub.`

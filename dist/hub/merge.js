@@ -3,7 +3,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, isExcluded, readHubignore, } from "./workspace.js";
+import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, isExcluded, isNeverIncludable, readHubignore, } from "./workspace.js";
 /**
  * Thrown when `mergeWorkspaceTrees` is called without an ancestor tree.
  *
@@ -158,6 +158,12 @@ function listTree(root, patterns) {
     const walk = (dir, rel) => {
         for (const entry of readdirSync(dir, { withFileTypes: true })) {
             if (isExcluded(entry.name, patterns))
+                continue;
+            // Caller-supplied excludePatterns can omit the defaults, and isExcluded
+            // is case-sensitive while the filesystem often is not — so the hard
+            // exclusions get their own check here, in the one function that decides
+            // what any of the three trees may contribute to a merge.
+            if (isNeverIncludable(entry.name))
                 continue;
             if (entry.isSymbolicLink())
                 continue; // never follow (archiver/workspace posture)

@@ -378,6 +378,75 @@ describe("hub pull", () => {
     }
   });
 
+  it("a workspace payload carrying plugin/VCS internals cannot plant them, and says so", async () => {
+    // The hub is a plain directory, so a bundle is peer-supplied data. The one
+    // file such a payload would most want to write is
+    // `.claude-sesh-mover/hubinclude` — the list deciding what THIS machine's
+    // next push ships — which would turn a workspace payload into an
+    // exfiltration primitive. `.git` is the other: a store, not content.
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let identityAnchorB: string | undefined;
+    let targetParent: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-plant");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success || !pushResult.bundleId) return;
+
+      // Rewrite the bundle ON THE HUB to say what no pusher would say.
+      await mutateBundleTree(hub, pushResult.projectId, pushResult.bundleId, (dir) => {
+        const ws = join(dir, "workspace");
+        mkdirSync(join(ws, ".claude-sesh-mover"), { recursive: true });
+        mkdirSync(join(ws, ".git"), { recursive: true });
+        writeFileSync(join(ws, ".claude-sesh-mover", "hubinclude"), "*\n");
+        writeFileSync(join(ws, ".git", "config"), "[remote]\n");
+      });
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      identityAnchorB = mkdtempSync(join(tmpdir(), "sesh-pull-identB-"));
+      targetParent = mkdtempSync(join(tmpdir(), "sesh-pull-targetparent-"));
+      const targetPath = join(targetParent, "new-project");
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: identityAnchorB, hubPath: hub,
+        targetPath, latest: true,
+        projectIdOverride: pushResult.projectId,
+        claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      // The payload's own README still lands: the refusal is scoped to the two
+      // names, not to the payload.
+      expect(readFileSync(join(targetPath, "README.md"), "utf-8")).toBe("hello\n");
+      expect(existsSync(join(targetPath, ".git"))).toBe(false);
+      // `.claude-sesh-mover` exists — pull plants its OWN project.json there —
+      // but nothing of the payload's is inside it.
+      expect(existsSync(join(targetPath, ".claude-sesh-mover", "project.json"))).toBe(true);
+      expect(existsSync(join(targetPath, ".claude-sesh-mover", "hubinclude"))).toBe(false);
+      expect(
+        p.warnings.some((w) => w.includes("refused") && w.includes(".claude-sesh-mover"))
+      ).toBe(true);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (identityAnchorB) rmSync(identityAnchorB, { recursive: true, force: true });
+      if (targetParent) rmSync(targetParent, { recursive: true, force: true });
+    }
+  });
+
   it("explicit --target-path at a non-empty dir without --force-workspace refuses with the force suggestion", async () => {
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
     const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
@@ -2101,6 +2170,21 @@ async function patchBundleManifest(
   bundleId: string,
   mutate: (manifest: Record<string, unknown>) => void
 ): Promise<void> {
+  await mutateBundleTree(hubPath, projectId, bundleId, (dir) => {
+    const manifestPath = join(dir, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as Record<string, unknown>;
+    mutate(manifest);
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+  });
+}
+
+/** Round-trip a bundle archive on the hub, letting a test rewrite its tree. */
+async function mutateBundleTree(
+  hubPath: string,
+  projectId: string,
+  bundleId: string,
+  mutate: (bundleDir: string) => void
+): Promise<void> {
   const backend = createFsBackend(hubPath);
   const { indexes } = await readAllIndexes(backend, projectId);
   let file: string | null = null;
@@ -2118,10 +2202,7 @@ async function patchBundleManifest(
     const dir = join(work, "bundle");
     mkdirSync(dir, { recursive: true });
     await extractArchive(tar, dir);
-    const manifestPath = join(dir, "manifest.json");
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as Record<string, unknown>;
-    mutate(manifest);
-    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+    mutate(dir);
     const out = join(work, "out.tar.gz");
     await createArchive(dir, out, "gzip");
     await backend.writeAtomic(file, readFileSync(out));
