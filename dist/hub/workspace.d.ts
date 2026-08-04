@@ -42,11 +42,17 @@ export declare function hubincludePath(projectPath: string): string;
  * caller can echo back to them.
  *
  * Bounds are asymmetric with `readHubignore` on purpose: an ignore pattern
- * fails safe (it only ever removes files), an include pattern fails OPEN and
- * costs a glob test per candidate path. Over `MAX_HUBINCLUDE_BYTES` the file is
- * ignored entirely; past `MAX_HUBINCLUDE_PATTERNS` the tail is dropped.
+ * fails safe (it only ever removes files), an include pattern fails OPEN. Over
+ * `MAX_HUBINCLUDE_BYTES` the file is ignored entirely; past
+ * `MAX_HUBINCLUDE_PATTERNS` the tail is dropped.
+ *
+ * Both bounds fail CLOSED — fewer re-includes — which from the outside is
+ * indistinguishable from "my files silently stopped syncing". So a caller that
+ * has somewhere to put it may pass `diagnostics`, and every bound that bit
+ * appends a sentence naming the file, the limit and the consequence.
+ * `snapshotWorkspace` threads them into the push's `warnings`.
  */
-export declare function readHubinclude(projectPath: string): string[];
+export declare function readHubinclude(projectPath: string, diagnostics?: string[]): string[];
 /** Does any segment of this path name something that can never be carried? */
 export declare function isNeverIncludable(relPath: string): boolean;
 /**
@@ -55,13 +61,22 @@ export declare function isNeverIncludable(relPath: string): boolean;
  * Matching is on the RELATIVE PATH, not a bare segment, so a pattern carries a
  * subtree. Two shapes, both segment-wise with `*` globs:
  *
- * - **rooted** (`docs/superpowers/`, `build/keep.txt`, `docs/*.md`) — the
- *   pattern's segments must match the path's LEADING segments, so the pattern
- *   matches that path and everything under it, and nothing outside it.
- * - **bare** (`*.keepme`, `secrets`) — matches that name at any depth, the same
- *   way a `hubignore` line does. `snapshotWorkspace` walks excluded directories
- *   when a bare pattern exists precisely so this predicate and the payload it
- *   builds can never disagree (§6.0: one meaning in the product).
+ * - **rooted** (`docs/superpowers/`, `build/keep.txt`, `docs/*.md`, and — the
+ *   commonest line of all — `docs/`) — the pattern's segments must match the
+ *   path's LEADING segments, so the pattern matches that path and everything
+ *   under it, and nothing outside it. Anything with a separator ANYWHERE in it
+ *   is rooted, trailing one included: `docs/` is `docs` at the project root,
+ *   never `vendor/x/docs`.
+ * - **bare** (`*.keepme`, `secrets`) — no separator at all, so it matches that
+ *   name at any depth, the same way a `hubignore` line does. `snapshotWorkspace`
+ *   walks excluded directories when a bare pattern exists precisely so this
+ *   predicate and the payload it builds can never disagree (§6.0: one meaning
+ *   in the product).
+ *
+ * That split matters more than it looks: `push.md` offers `ignoredNotCarried`
+ * entries to be pasted verbatim and forbids widening one, and git spells a
+ * wholly-ignored top-level directory as exactly `dist/`. Reading that as bare
+ * would silently hand the user every nested `dist` directory as well.
  *
  * `NEVER_INCLUDABLE` wins over every pattern, on every segment — see that
  * constant. A path that is absolute or escapes the project is never a match.
@@ -118,14 +133,37 @@ export declare function classifyDestination(targetDir: string, rel: string, expe
     ok: false;
     reason: DestinationBlock;
 };
+/** The two pattern lists that together decide what a tree contributes. */
+export interface CarryRules {
+    /** `DEFAULT_WORKSPACE_EXCLUDES` + `hubignore`: matched per path SEGMENT. */
+    excludePatterns: string[];
+    /** `hubinclude`: re-admits excluded paths. Empty is the ordinary case. */
+    includePatterns: string[];
+}
+/** Why the walk dropped an entry — see `forEachCarriedFile`'s `onDropped`. */
+export type CarryDropReason = 
+/** Names `.git`/`.claude-sesh-mover` at some segment: never carried, never applied. */
+"never-includable"
+/** Excluded by `excludePatterns` and not named back by `includePatterns`. */
+ | "excluded";
 /**
- * Copy a project's working tree into `destDir`, minus the excluded paths and
- * plus whatever `hubinclude` names back in (design §5, §6.0).
+ * Walk a tree and visit every file the hub's carry rules admit — ONE definition
+ * of "carried", used by the snapshot that builds a payload and by the merge that
+ * applies one.
+ *
+ * It is shared rather than duplicated because the two disagreed in production:
+ * `mergeWorkspaceTrees` filtered its three trees through the excludes while
+ * knowing nothing about `hubinclude`, so a file the user had explicitly listed
+ * was snapshotted, archived, uploaded, downloaded — and then dropped on the
+ * ordinary pull path with no report row, while a `--force-workspace` unpack of
+ * the same bundle applied it. Given the same rule files on both machines (they
+ * live in the project and are meant to be committed), this function is what
+ * makes "the payload" and "what an apply path considers" the same set.
  *
  * The invariant the walk maintains, and the reason it tracks a relative path
  * and an "inside an excluded subtree" flag rather than deciding entry by entry:
  *
- *   **every file copied out of an excluded subtree is individually matched by
+ *   **every file admitted out of an excluded subtree is individually matched by
  *   `isReIncluded`, and therefore individually passed the `NEVER_INCLUDABLE`
  *   segment check.**
  *
@@ -133,11 +171,37 @@ export declare function classifyDestination(targetDir: string, rel: string, expe
  * are re-admitted one at a time, never wholesale — so re-including
  * `build/keep.txt` cannot drag `build/other.txt` along, and re-including a
  * subtree (`docs/`) still cannot drag a nested `.git` along.
+ *
+ * `onDropped` fires at the point the walk gives up on something, so a pruned
+ * DIRECTORY is reported once instead of enumerating a subtree that was never
+ * opened. Symlinks are never followed and never visited.
+ *
+ * `admitPaths` admits a known set of relative paths (and opens the directories
+ * on the way to them) whatever the exclude rules say — everything except the
+ * `NEVER_INCLUDABLE` floor, which nothing overrides. `mergeWorkspaceTrees` uses
+ * it to scan the LOCAL tree for exactly the paths an incoming payload names,
+ * so a local file under an excluded directory is never invisible to the merge
+ * while its incoming counterpart is being applied.
+ */
+export declare function forEachCarriedFile(root: string, rules: CarryRules, visit: (relPath: string, srcPath: string) => void, hooks?: {
+    onSymlinkSkipped?: (relPath: string) => void;
+    onDropped?: (relPath: string, reason: CarryDropReason, isDirectory: boolean) => void;
+    admitPaths?: ReadonlySet<string>;
+}): void;
+/**
+ * Copy a project's working tree into `destDir`, minus the excluded paths and
+ * plus whatever `hubinclude` names back in (design §5, §6.0). The rules
+ * themselves live in `forEachCarriedFile`, which the apply side shares.
+ *
+ * `warnings` carries anything the user would otherwise have to infer from an
+ * empty or surprising payload: a `hubinclude` big enough to be ignored, a
+ * truncated pattern list, or an exclude set that swallowed the whole tree.
  */
 export declare function snapshotWorkspace(projectPath: string, destDir: string): Promise<{
     fileCount: number;
     byteSize: number;
     symlinksSkipped: number;
+    warnings: string[];
 }>;
 /**
  * Apply a workspace payload by copying it over `targetPath`, overwriting on
@@ -150,13 +214,16 @@ export declare function snapshotWorkspace(projectPath: string, destDir: string):
  * successful copy look identical from the outside.
  *
  * `refused` reports paths dropped because the PAYLOAD named plugin or VCS
- * internals (`NEVER_INCLUDABLE`). A bundle this codebase produced never
- * contains them — `snapshotWorkspace` hard-excludes both and `mergeWorkspaceTrees`
- * lists neither — so a payload that does is malformed or hostile, and the one
- * it would most want is `.claude-sesh-mover/hubinclude`: the file deciding what
- * the NEXT push ships. Refusing here is what keeps the two apply paths (merge
- * and unpack) saying the same thing, the same argument that moved
- * `classifyDestination` into this module.
+ * internals (`NEVER_INCLUDABLE`). A CURRENT sesh-mover never produces such a
+ * bundle — `snapshotWorkspace` hard-excludes both and `mergeWorkspaceTrees`
+ * lists neither — but three things reach this branch, and only one is an
+ * attack: a hand-made or damaged bundle; a bundle written by a version older
+ * than this guard, on a case-insensitive filesystem where a store spelled
+ * `.GIT` slipped past the case-sensitive exclude list; and a deliberately
+ * planted payload, whose prize is `.claude-sesh-mover/hubinclude` — the file
+ * deciding what the NEXT push ships. Callers must not name a culprit. Refusing
+ * here is what keeps the two apply paths (merge and unpack) saying the same
+ * thing, the same argument that moved `classifyDestination` into this module.
  */
 export declare function unpackWorkspace(srcDir: string, targetPath: string, opts: {
     force: boolean;

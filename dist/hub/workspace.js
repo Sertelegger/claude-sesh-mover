@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 export const DEFAULT_WORKSPACE_EXCLUDES = [
     ".git", "node_modules", ".claude-sesh-mover", ".venv", "__pycache__", ".DS_Store",
 ];
@@ -26,19 +26,11 @@ export const DEFAULT_WORKSPACE_EXCLUDES = [
  * `__pycache__`, `.DS_Store`) is a convenience default and stays re-includable
  * on purpose — a user who names it has said what they mean.
  */
-export const NEVER_INCLUDABLE = [".git", ".claude-sesh-mover"];
+export const NEVER_INCLUDABLE = Object.freeze([".git", ".claude-sesh-mover"]);
 /** Byte cap on `hubinclude`; a bigger file is ignored outright (fail closed). */
 const MAX_HUBINCLUDE_BYTES = 64 * 1024;
 /** Pattern cap: every pattern is tested against every candidate path. */
 const MAX_HUBINCLUDE_PATTERNS = 500;
-/**
- * Wildcard cap per pattern segment. `isExcluded` compiles a glob to
- * `^…​.*…​.*…$`, and a segment like `*a*a*a*a*a*a*a*a*a*a*a*b` tested against a
- * long run of `a`s backtracks combinatorially — measured to hang the walk. A
- * pattern over the cap is dropped, which is the fail-closed direction (fewer
- * re-includes), and no honest pattern comes close.
- */
-const MAX_PATTERN_WILDCARDS = 8;
 export class WorkspaceTargetNotEmptyError extends Error {
     targetPath;
     constructor(targetPath) {
@@ -80,11 +72,17 @@ export function hubincludePath(projectPath) {
  * caller can echo back to them.
  *
  * Bounds are asymmetric with `readHubignore` on purpose: an ignore pattern
- * fails safe (it only ever removes files), an include pattern fails OPEN and
- * costs a glob test per candidate path. Over `MAX_HUBINCLUDE_BYTES` the file is
- * ignored entirely; past `MAX_HUBINCLUDE_PATTERNS` the tail is dropped.
+ * fails safe (it only ever removes files), an include pattern fails OPEN. Over
+ * `MAX_HUBINCLUDE_BYTES` the file is ignored entirely; past
+ * `MAX_HUBINCLUDE_PATTERNS` the tail is dropped.
+ *
+ * Both bounds fail CLOSED — fewer re-includes — which from the outside is
+ * indistinguishable from "my files silently stopped syncing". So a caller that
+ * has somewhere to put it may pass `diagnostics`, and every bound that bit
+ * appends a sentence naming the file, the limit and the consequence.
+ * `snapshotWorkspace` threads them into the push's `warnings`.
  */
-export function readHubinclude(projectPath) {
+export function readHubinclude(projectPath, diagnostics) {
     const p = hubincludePath(projectPath);
     let st;
     try {
@@ -95,13 +93,24 @@ export function readHubinclude(projectPath) {
     }
     // isFile() also refuses a directory and a device node (a `hubinclude ->
     // /dev/zero` symlink would otherwise be read forever).
-    if (!st.isFile() || st.size > MAX_HUBINCLUDE_BYTES)
+    if (!st.isFile()) {
+        if (st.isDirectory()) {
+            diagnostics?.push(".claude-sesh-mover/hubinclude is a directory, not a file — it was ignored entirely, so no re-includes are in effect.");
+        }
         return [];
-    return readFileSync(p, "utf-8")
+    }
+    if (st.size > MAX_HUBINCLUDE_BYTES) {
+        diagnostics?.push(`.claude-sesh-mover/hubinclude is ${st.size} bytes, over the ${MAX_HUBINCLUDE_BYTES}-byte cap — it was ignored ENTIRELY, so none of its re-includes are in effect and every path it names was left out of this snapshot.`);
+        return [];
+    }
+    const all = readFileSync(p, "utf-8")
         .split("\n")
         .map((l) => l.trim())
-        .filter((l) => l.length > 0 && !l.startsWith("#"))
-        .slice(0, MAX_HUBINCLUDE_PATTERNS);
+        .filter((l) => l.length > 0 && !l.startsWith("#"));
+    if (all.length > MAX_HUBINCLUDE_PATTERNS) {
+        diagnostics?.push(`.claude-sesh-mover/hubinclude has ${all.length} patterns, over the ${MAX_HUBINCLUDE_PATTERNS}-pattern cap — only the first ${MAX_HUBINCLUDE_PATTERNS} are in effect and the rest were dropped.`);
+    }
+    return all.slice(0, MAX_HUBINCLUDE_PATTERNS);
 }
 /**
  * Is this ONE path segment a name that can never be carried?
@@ -143,6 +152,10 @@ function toSegments(input, kind) {
     // absolute, and an absolute path is nobody's workspace-relative path.
     if (s.startsWith("/") && kind === "path")
         return null;
+    // Measured on the RAW text, before empty segments are dropped: a trailing,
+    // leading or interior separator all mean the same thing — the author spelled
+    // out a location, not a name.
+    const rooted = s.includes("/");
     const segments = [];
     for (const raw of s.split("/")) {
         if (raw === "" || raw === ".")
@@ -151,12 +164,12 @@ function toSegments(input, kind) {
             return null;
         segments.push(raw);
     }
-    return segments.length > 0 ? segments : null;
+    return segments.length > 0 ? { segments, rooted } : null;
 }
 /** Does any segment of this path name something that can never be carried? */
 export function isNeverIncludable(relPath) {
-    const segments = toSegments(relPath, "path");
-    return segments === null ? true : segments.some(isNeverSegment);
+    const parsed = toSegments(relPath, "path");
+    return parsed === null ? true : parsed.segments.some(isNeverSegment);
 }
 /**
  * Patterns are normalized once per array identity: `isReIncluded` runs per
@@ -171,8 +184,8 @@ function parsePatterns(patterns) {
         return cached;
     const parsed = [];
     for (const raw of patterns) {
-        const segments = toSegments(raw, "pattern");
-        if (segments === null)
+        const p = toSegments(raw, "pattern");
+        if (p === null)
             continue;
         // A pattern naming a hard-excluded directory is dropped whole. This is
         // belt-and-braces and INCOMPLETE by construction (`.g*` names the same
@@ -182,20 +195,11 @@ function parsePatterns(patterns) {
         // (Removing this line survives the whole suite — it is unobservable BY
         // CONSTRUCTION, since the path-side check answers first for every path such
         // a pattern could match. Kept as documentation, not as a guard.)
-        if (segments.some(isNeverSegment))
+        if (p.segments.some(isNeverSegment))
             continue;
-        const normalized = [];
-        let tooWild = false;
-        for (const segment of segments) {
-            const collapsed = segment.replace(/\*+/g, "*");
-            if ((collapsed.match(/\*/g)?.length ?? 0) > MAX_PATTERN_WILDCARDS) {
-                tooWild = true;
-                break;
-            }
-            normalized.push(collapsed);
-        }
-        if (!tooWild)
-            parsed.push(normalized);
+        // `**` and `*` mean the same thing to a per-segment matcher; collapsing
+        // runs keeps the matcher's work proportional to something a human wrote.
+        parsed.push({ segments: p.segments.map((s) => s.replace(/\*+/g, "*")), rooted: p.rooted });
     }
     patternCache.set(patterns, parsed);
     return parsed;
@@ -206,23 +210,33 @@ function parsePatterns(patterns) {
  * Matching is on the RELATIVE PATH, not a bare segment, so a pattern carries a
  * subtree. Two shapes, both segment-wise with `*` globs:
  *
- * - **rooted** (`docs/superpowers/`, `build/keep.txt`, `docs/*.md`) — the
- *   pattern's segments must match the path's LEADING segments, so the pattern
- *   matches that path and everything under it, and nothing outside it.
- * - **bare** (`*.keepme`, `secrets`) — matches that name at any depth, the same
- *   way a `hubignore` line does. `snapshotWorkspace` walks excluded directories
- *   when a bare pattern exists precisely so this predicate and the payload it
- *   builds can never disagree (§6.0: one meaning in the product).
+ * - **rooted** (`docs/superpowers/`, `build/keep.txt`, `docs/*.md`, and — the
+ *   commonest line of all — `docs/`) — the pattern's segments must match the
+ *   path's LEADING segments, so the pattern matches that path and everything
+ *   under it, and nothing outside it. Anything with a separator ANYWHERE in it
+ *   is rooted, trailing one included: `docs/` is `docs` at the project root,
+ *   never `vendor/x/docs`.
+ * - **bare** (`*.keepme`, `secrets`) — no separator at all, so it matches that
+ *   name at any depth, the same way a `hubignore` line does. `snapshotWorkspace`
+ *   walks excluded directories when a bare pattern exists precisely so this
+ *   predicate and the payload it builds can never disagree (§6.0: one meaning
+ *   in the product).
+ *
+ * That split matters more than it looks: `push.md` offers `ignoredNotCarried`
+ * entries to be pasted verbatim and forbids widening one, and git spells a
+ * wholly-ignored top-level directory as exactly `dist/`. Reading that as bare
+ * would silently hand the user every nested `dist` directory as well.
  *
  * `NEVER_INCLUDABLE` wins over every pattern, on every segment — see that
  * constant. A path that is absolute or escapes the project is never a match.
  */
 export function isReIncluded(relPath, patterns) {
-    const segments = toSegments(relPath, "path");
-    if (segments === null || segments.some(isNeverSegment))
+    const path = toSegments(relPath, "path");
+    if (path === null || path.segments.some(isNeverSegment))
         return false;
-    for (const pattern of parsePatterns(patterns)) {
-        if (pattern.length === 1) {
+    const segments = path.segments;
+    for (const { segments: pattern, rooted } of parsePatterns(patterns)) {
+        if (!rooted && pattern.length === 1) {
             if (segments.some((s) => matchesSegment(pattern[0], s)))
                 return true;
         }
@@ -246,12 +260,13 @@ export function isReIncluded(relPath, patterns) {
  * inside it can be carried, so reading it would be pure cost.
  */
 export function mayContainReIncluded(dirRelPath, patterns) {
-    const segments = toSegments(dirRelPath, "path");
-    if (segments === null || segments.some(isNeverSegment))
+    const dir = toSegments(dirRelPath, "path");
+    if (dir === null || dir.segments.some(isNeverSegment))
         return false;
-    for (const pattern of parsePatterns(patterns)) {
-        if (pattern.length === 1)
-            return true; // bare: can match at any depth below
+    const segments = dir.segments;
+    for (const { segments: pattern, rooted } of parsePatterns(patterns)) {
+        if (!rooted && pattern.length === 1)
+            return true; // bare: any depth below
         if (pattern.length > segments.length &&
             segments.every((s, i) => matchesSegment(pattern[i], s))) {
             return true;
@@ -261,17 +276,66 @@ export function mayContainReIncluded(dirRelPath, patterns) {
 }
 /** One pattern segment against one path segment, with `isExcluded`'s glob rules. */
 function matchesSegment(pattern, segment) {
-    return isExcluded(segment, [pattern]);
+    return globMatch(pattern, segment);
+}
+/**
+ * `*`-glob match of ONE pattern against ONE name, in linear-ish time.
+ *
+ * This used to compile the pattern to `^…\.\*…$` and hand it to `RegExp`, which
+ * is where the cost lived: a segment like `*a*a*a*a*a*a*a*b` against a run of
+ * `a`s makes the backtracking engine explore ~n^7 paths. Measured through the
+ * shipped `isReIncluded`, at eight wildcards — inside the wildcard cap that was
+ * supposed to prevent exactly this — a 56-character name took 4.7 s and a
+ * 64-character one 13.7 s; filenames go to 255 bytes, and `hubignore` had no
+ * cap at all (a ten-star line against a 44-character name measured 9.6 s).
+ *
+ * The two-pointer form below is the standard one: walk both strings, remember
+ * the last `*` and how far the name had been consumed, and on a mismatch resume
+ * from there having let the `*` swallow one more character. Each `*` can only
+ * advance the name pointer forward, so the work is bounded by
+ * `len(pattern) * len(name)` — 255x255 in the worst case a filesystem can
+ * produce — with no configuration-dependent cliff. That is why there is no
+ * wildcard cap any more: the cap was the mitigation for the regex, and a cap of
+ * 8 did not even hold the line it documented.
+ *
+ * The `*` branch is tested BEFORE the literal comparison so that a name
+ * containing a literal `*` cannot consume the pattern's wildcard (`*` vs `*b`
+ * must match). One deliberate behaviour change: `*` now crosses a newline,
+ * where `RegExp`'s `.` did not. A filename may legitimately contain one, and an
+ * ignore pattern that silently stopped matching such a name was the unsafe
+ * direction; for `hubinclude` it changes nothing about the hard exclusions,
+ * which are decided per segment by `isNeverSegment`, not by the glob.
+ */
+function globMatch(pattern, name) {
+    let p = 0;
+    let n = 0;
+    let starP = -1;
+    let starN = 0;
+    while (n < name.length) {
+        if (p < pattern.length && pattern[p] === "*") {
+            starP = p++;
+            starN = n;
+        }
+        else if (p < pattern.length && pattern.charCodeAt(p) === name.charCodeAt(n)) {
+            p++;
+            n++;
+        }
+        else if (starP !== -1) {
+            // Backtrack: the last `*` swallows one more character of the name.
+            p = starP + 1;
+            n = ++starN;
+        }
+        else {
+            return false;
+        }
+    }
+    while (p < pattern.length && pattern[p] === "*")
+        p++;
+    return p === pattern.length;
 }
 export function isExcluded(name, patterns) {
     for (const pattern of patterns) {
-        if (!pattern.includes("*")) {
-            if (name === pattern)
-                return true;
-            continue;
-        }
-        const re = new RegExp("^" + pattern.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
-        if (re.test(name))
+        if (pattern.includes("*") ? globMatch(pattern, name) : name === pattern)
             return true;
     }
     return false;
@@ -324,13 +388,23 @@ export function classifyDestination(targetDir, rel, expect = "file") {
     return { ok: true };
 }
 /**
- * Copy a project's working tree into `destDir`, minus the excluded paths and
- * plus whatever `hubinclude` names back in (design §5, §6.0).
+ * Walk a tree and visit every file the hub's carry rules admit — ONE definition
+ * of "carried", used by the snapshot that builds a payload and by the merge that
+ * applies one.
+ *
+ * It is shared rather than duplicated because the two disagreed in production:
+ * `mergeWorkspaceTrees` filtered its three trees through the excludes while
+ * knowing nothing about `hubinclude`, so a file the user had explicitly listed
+ * was snapshotted, archived, uploaded, downloaded — and then dropped on the
+ * ordinary pull path with no report row, while a `--force-workspace` unpack of
+ * the same bundle applied it. Given the same rule files on both machines (they
+ * live in the project and are meant to be committed), this function is what
+ * makes "the payload" and "what an apply path considers" the same set.
  *
  * The invariant the walk maintains, and the reason it tracks a relative path
  * and an "inside an excluded subtree" flag rather than deciding entry by entry:
  *
- *   **every file copied out of an excluded subtree is individually matched by
+ *   **every file admitted out of an excluded subtree is individually matched by
  *   `isReIncluded`, and therefore individually passed the `NEVER_INCLUDABLE`
  *   segment check.**
  *
@@ -338,49 +412,119 @@ export function classifyDestination(targetDir, rel, expect = "file") {
  * are re-admitted one at a time, never wholesale — so re-including
  * `build/keep.txt` cannot drag `build/other.txt` along, and re-including a
  * subtree (`docs/`) still cannot drag a nested `.git` along.
+ *
+ * `onDropped` fires at the point the walk gives up on something, so a pruned
+ * DIRECTORY is reported once instead of enumerating a subtree that was never
+ * opened. Symlinks are never followed and never visited.
+ *
+ * `admitPaths` admits a known set of relative paths (and opens the directories
+ * on the way to them) whatever the exclude rules say — everything except the
+ * `NEVER_INCLUDABLE` floor, which nothing overrides. `mergeWorkspaceTrees` uses
+ * it to scan the LOCAL tree for exactly the paths an incoming payload names,
+ * so a local file under an excluded directory is never invisible to the merge
+ * while its incoming counterpart is being applied.
+ */
+export function forEachCarriedFile(root, rules, visit, hooks) {
+    const { excludePatterns, includePatterns } = rules;
+    const admit = hooks?.admitPaths;
+    // Directories on the way to an admitted path, so the walk opens them even
+    // when the exclude rules prune them.
+    const admitPrefixes = new Set();
+    if (admit) {
+        for (const p of admit) {
+            let cut = p.indexOf("/");
+            while (cut !== -1) {
+                admitPrefixes.add(p.slice(0, cut));
+                cut = p.indexOf("/", cut + 1);
+            }
+        }
+    }
+    const walk = (dir, rel, insideExcluded) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+            // Hard exclusions first, and independently of `excludePatterns`:
+            // isExcluded compares case-SENSITIVELY, but macOS and Windows filesystems
+            // do not, so a git store renamed `.GIT` still works there and still
+            // readdirs as ".GIT" — and it used to land in the payload, hubinclude or
+            // not, because an entry the excludes never matched never reached a
+            // re-include check.
+            if (isNeverSegment(entry.name)) {
+                // Counted as a skipped symlink too: a symlink NAMED `.git` is still a
+                // symlink we declined to follow, and leaving it out of that count made
+                // the snapshot's own report quietly incomplete.
+                if (entry.isSymbolicLink())
+                    hooks?.onSymlinkSkipped?.(childRel);
+                hooks?.onDropped?.(childRel, "never-includable", entry.isDirectory());
+                continue;
+            }
+            const excluded = insideExcluded || isExcluded(entry.name, excludePatterns);
+            const carried = !excluded || isReIncluded(childRel, includePatterns) || admit?.has(childRel) === true;
+            if (!carried) {
+                // Not carried, but a pattern (or an admitted path) may still name
+                // something below it. Only a real directory is worth opening; a
+                // symlink never is.
+                if (!entry.isDirectory() ||
+                    (!mayContainReIncluded(childRel, includePatterns) && !admitPrefixes.has(childRel))) {
+                    hooks?.onDropped?.(childRel, "excluded", entry.isDirectory());
+                    continue;
+                }
+            }
+            const srcPath = join(dir, entry.name);
+            if (entry.isSymbolicLink()) {
+                hooks?.onSymlinkSkipped?.(childRel); // never follow: loop/escape safety
+                continue;
+            }
+            if (entry.isDirectory())
+                walk(srcPath, childRel, excluded);
+            else if (entry.isFile() && carried)
+                visit(childRel, srcPath);
+        }
+    };
+    if (existsSync(root))
+        walk(root, "", false);
+}
+/** Entry names in a directory, or `[]` if it cannot be read (missing, EACCES). */
+function listDirSafely(dir) {
+    try {
+        return readdirSync(dir);
+    }
+    catch {
+        return [];
+    }
+}
+/**
+ * Copy a project's working tree into `destDir`, minus the excluded paths and
+ * plus whatever `hubinclude` names back in (design §5, §6.0). The rules
+ * themselves live in `forEachCarriedFile`, which the apply side shares.
+ *
+ * `warnings` carries anything the user would otherwise have to infer from an
+ * empty or surprising payload: a `hubinclude` big enough to be ignored, a
+ * truncated pattern list, or an exclude set that swallowed the whole tree.
  */
 export async function snapshotWorkspace(projectPath, destDir) {
-    const patterns = [...DEFAULT_WORKSPACE_EXCLUDES, ...readHubignore(projectPath)];
-    const includePatterns = readHubinclude(projectPath);
+    const warnings = [];
+    const rules = {
+        excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES, ...readHubignore(projectPath)],
+        includePatterns: readHubinclude(projectPath, warnings),
+    };
     let fileCount = 0;
     let byteSize = 0;
     let symlinksSkipped = 0;
-    const walk = (srcDir, outDir, rel, insideExcluded) => {
-        for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
-            // Hard exclusions first, and independently of `patterns`: isExcluded
-            // compares case-SENSITIVELY, but macOS and Windows filesystems do not, so
-            // a git store renamed `.GIT` still works there and still readdirs as
-            // ".GIT" — and it used to land in the payload, hubinclude or not, because
-            // an entry the excludes never matched never reached a re-include check.
-            if (isNeverSegment(entry.name))
-                continue;
-            const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-            const excluded = insideExcluded || isExcluded(entry.name, patterns);
-            const carried = !excluded || isReIncluded(childRel, includePatterns);
-            if (!carried) {
-                // Not carried, but a pattern may still name something below it. Only
-                // a real directory is worth opening; a symlink never is.
-                if (!entry.isDirectory() || !mayContainReIncluded(childRel, includePatterns))
-                    continue;
-            }
-            const srcPath = join(srcDir, entry.name);
-            if (entry.isSymbolicLink()) {
-                symlinksSkipped++; // never follow: loop/escape safety (archiver posture)
-                continue;
-            }
-            if (entry.isDirectory()) {
-                walk(srcPath, join(outDir, entry.name), childRel, excluded);
-            }
-            else if (entry.isFile()) {
-                mkdirSync(outDir, { recursive: true });
-                copyFileSync(srcPath, join(outDir, entry.name));
-                fileCount++;
-                byteSize += statSync(srcPath).size;
-            }
-        }
-    };
-    walk(projectPath, destDir, "", false);
-    return { fileCount, byteSize, symlinksSkipped };
+    forEachCarriedFile(projectPath, rules, (relPath, srcPath) => {
+        const outPath = join(destDir, ...relPath.split("/"));
+        mkdirSync(dirname(outPath), { recursive: true });
+        copyFileSync(srcPath, outPath);
+        fileCount++;
+        byteSize += statSync(srcPath).size;
+    }, { onSymlinkSkipped: () => { symlinksSkipped++; } });
+    // An empty payload is a legitimate outcome (an empty project), but it is also
+    // what one over-broad line produces: `*/` in hubignore excludes every
+    // top-level directory, so the snapshot silently carried nothing. Say so
+    // whenever there WAS something to carry.
+    if (fileCount === 0 && listDirSafely(projectPath).some((n) => n !== ".claude-sesh-mover")) {
+        warnings.push("The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by .claude-sesh-mover/hubignore, so this push carries no project files. Check hubignore for an over-broad pattern (`*` and `*/` match everything at a level), or push with --no-workspace if that is what you meant.");
+    }
+    return { fileCount, byteSize, symlinksSkipped, warnings };
 }
 /**
  * Apply a workspace payload by copying it over `targetPath`, overwriting on
@@ -393,13 +537,16 @@ export async function snapshotWorkspace(projectPath, destDir) {
  * successful copy look identical from the outside.
  *
  * `refused` reports paths dropped because the PAYLOAD named plugin or VCS
- * internals (`NEVER_INCLUDABLE`). A bundle this codebase produced never
- * contains them — `snapshotWorkspace` hard-excludes both and `mergeWorkspaceTrees`
- * lists neither — so a payload that does is malformed or hostile, and the one
- * it would most want is `.claude-sesh-mover/hubinclude`: the file deciding what
- * the NEXT push ships. Refusing here is what keeps the two apply paths (merge
- * and unpack) saying the same thing, the same argument that moved
- * `classifyDestination` into this module.
+ * internals (`NEVER_INCLUDABLE`). A CURRENT sesh-mover never produces such a
+ * bundle — `snapshotWorkspace` hard-excludes both and `mergeWorkspaceTrees`
+ * lists neither — but three things reach this branch, and only one is an
+ * attack: a hand-made or damaged bundle; a bundle written by a version older
+ * than this guard, on a case-insensitive filesystem where a store spelled
+ * `.GIT` slipped past the case-sensitive exclude list; and a deliberately
+ * planted payload, whose prize is `.claude-sesh-mover/hubinclude` — the file
+ * deciding what the NEXT push ships. Callers must not name a culprit. Refusing
+ * here is what keeps the two apply paths (merge and unpack) saying the same
+ * thing, the same argument that moved `classifyDestination` into this module.
  */
 export async function unpackWorkspace(srcDir, targetPath, opts) {
     if (existsSync(targetPath) && readdirSync(targetPath).length > 0 && !opts.force) {

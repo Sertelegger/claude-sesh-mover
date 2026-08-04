@@ -1,9 +1,9 @@
-import { chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, isExcluded, isNeverIncludable, readHubignore, } from "./workspace.js";
+import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readHubignore, readHubinclude, } from "./workspace.js";
 /**
  * Thrown when `mergeWorkspaceTrees` is called without an ancestor tree.
  *
@@ -152,30 +152,21 @@ function sameContent(a, b) {
  * Every path in a `WorkspaceMergeReport` is workspace-relative and
  * forward-slash separated, on every platform — the same convention the hub's
  * own layout uses. `join()` normalizes them back to native separators.
+ *
+ * The rules are `forEachCarriedFile`'s, i.e. the SAME ones that built the
+ * payload: excludes, `hubinclude` re-includes on top of them, and the
+ * `NEVER_INCLUDABLE` floor under all of it. Filtering by excludes alone (what
+ * this used to do) meant a file the user had explicitly re-included was
+ * snapshotted and shipped and then dropped here, unreported, while an unpack of
+ * the same bundle applied it.
+ *
+ * `onDropped` is passed only for the INCOMING tree: dropping a local or
+ * ancestor path is bookkeeping, dropping an incoming one is a decision about a
+ * file that arrived and did not land, which the user has to be able to see.
  */
-function listTree(root, patterns) {
+function listTree(root, rules, hooks) {
     const out = [];
-    const walk = (dir, rel) => {
-        for (const entry of readdirSync(dir, { withFileTypes: true })) {
-            if (isExcluded(entry.name, patterns))
-                continue;
-            // Caller-supplied excludePatterns can omit the defaults, and isExcluded
-            // is case-sensitive while the filesystem often is not — so the hard
-            // exclusions get their own check here, in the one function that decides
-            // what any of the three trees may contribute to a merge.
-            if (isNeverIncludable(entry.name))
-                continue;
-            if (entry.isSymbolicLink())
-                continue; // never follow (archiver/workspace posture)
-            const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-            if (entry.isDirectory())
-                walk(join(dir, entry.name), childRel);
-            else if (entry.isFile())
-                out.push(childRel);
-        }
-    };
-    if (existsSync(root))
-        walk(root, "");
+    forEachCarriedFile(root, rules, (rel) => out.push(rel), hooks);
     return out;
 }
 /**
@@ -285,9 +276,18 @@ function writeSidecar(targetDir, rel, incomingPath, stamp) {
  * written near it — see `SkipReason` for why parking a copy there would
  * reproduce the very hazard the skip exists to avoid.
  *
- * Excludes default to the standard workspace excludes plus the *target's*
- * `.claude-sesh-mover/hubignore` — so a file this machine deliberately keeps
- * out of the hub can never be overwritten by an incoming copy of the same name.
+ * **What a payload is filtered by here** (the rule split is argued at the call
+ * site): the `NEVER_INCLUDABLE` floor, and the *target's* own
+ * `.claude-sesh-mover/hubignore` minus whatever its `hubinclude` names back —
+ * so a file this machine deliberately keeps out of the hub can never be
+ * overwritten by an incoming copy of the same name. The built-in convenience
+ * excludes take no part: they are the sender's to apply, and re-applying them
+ * discarded files a `hubinclude` had explicitly carried. Everything this
+ * function does drop is reported in `skipped` (`locally-excluded`, or
+ * `payload-internals` for the hard floor) rather than vanishing, so the two
+ * apply paths differ only by that one explicit, visible veto — which
+ * `--force-workspace` unpack deliberately does not honor, since that flag means
+ * "give me the hub's copy wholesale".
  *
  * `git merge-file` is spawned once per file that needs a real 3-way merge, and
  * spawned synchronously: the merge writes into the user's working tree in a
@@ -301,11 +301,54 @@ export async function mergeWorkspaceTrees(opts) {
         merged: [], conflicted: [], sidecars: [], upstreamDeleted: [], skipped: [],
         gitUnavailable: false,
     };
-    const patterns = opts.excludePatterns
-        ?? [...DEFAULT_WORKSPACE_EXCLUDES, ...readHubignore(opts.targetDir)];
-    const ancestorFiles = new Set(listTree(opts.ancestorDir, patterns));
-    const incomingFiles = new Set(listTree(opts.incomingDir, patterns));
-    const localFiles = new Set(listTree(opts.targetDir, patterns));
+    // Which rules a PAYLOAD tree (incoming, and the ancestor generation, which is
+    // a payload of the same lineage) is filtered by on the apply side:
+    //
+    // - The `NEVER_INCLUDABLE` floor, always. Nothing overrides it.
+    // - The target's own `hubignore`, minus whatever its `hubinclude` names back.
+    //   That is an explicit local statement — "this path is not the hub's
+    //   business" — and honoring it is what keeps a file this machine
+    //   deliberately keeps out of the hub from being overwritten by an incoming
+    //   copy of the same name.
+    // - The built-in convenience excludes deliberately do NOT apply here. They
+    //   are a CARRY-side default that the sender already applied, and re-applying
+    //   them on the apply side silently discarded exactly the files a user had
+    //   listed in `hubinclude` in order to get them carried (measured: an
+    //   incoming `node_modules/local-pkg/lib/index.js` that the snapshot proves
+    //   is carried never landed, with no report row, while a `--force-workspace`
+    //   unpack of the same bundle applied it).
+    //
+    // Re-deciding the sender's carry rules here is not even possible: `hubignore`
+    // and `hubinclude` live under `.claude-sesh-mover`, which never travels in a
+    // payload, and a workspace payload exists only for a project with no git
+    // remote — so the receiving tree usually has NO copy of the rules that built
+    // the bundle it just received. Consulting the target's `hubinclude` alone
+    // would therefore have fixed the defect only in the rare case where the user
+    // had written that file on both machines by hand.
+    const payloadRules = {
+        excludePatterns: opts.excludePatterns ?? readHubignore(opts.targetDir),
+        includePatterns: opts.includePatterns ?? readHubinclude(opts.targetDir),
+    };
+    const incomingFiles = new Set(listTree(opts.incomingDir, payloadRules, {
+        onDropped: (rel, reason, isDirectory) => {
+            report.skipped.push({
+                path: rel,
+                reason: reason === "never-includable" ? "payload-internals" : "locally-excluded",
+                ...(isDirectory ? { detail: "a directory in the payload, and everything under it" } : {}),
+            });
+        },
+    }));
+    const ancestorFiles = new Set(listTree(opts.ancestorDir, payloadRules));
+    // The local tree is this machine's own, so the built-in excludes DO prune it
+    // — walking a local `node_modules` on every pull would be pure cost — but
+    // every path the payload names is admitted regardless. Without that, an
+    // incoming file would meet an invisible local counterpart, be treated as a
+    // creation, and land in `skipped` as a name collision it could never resolve:
+    // pull once and the file appears, pull again and it can never be updated.
+    const localFiles = new Set(listTree(opts.targetDir, {
+        excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES, ...payloadRules.excludePatterns],
+        includePatterns: payloadRules.includePatterns,
+    }, { admitPaths: incomingFiles }));
     const all = new Set([...ancestorFiles, ...incomingFiles, ...localFiles]);
     // One stamp for the whole run, so every sidecar from one pull sorts together.
     const stamp = opts.__sidecarStamp ?? new Date().toISOString().replace(/[:.]/g, "-");

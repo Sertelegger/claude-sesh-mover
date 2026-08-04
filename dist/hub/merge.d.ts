@@ -46,7 +46,23 @@ export type SkipReason =
  *  (case-insensitive filesystem fold, or a concurrent create). */
  | "name-collision"
 /** Reading or writing this one file failed; the rest of the merge continued. */
- | "io-error";
+ | "io-error"
+/**
+ * The incoming tree named plugin or VCS internals (`NEVER_INCLUDABLE`) — the
+ * merge counterpart of `unpackWorkspace`'s `refused`. Reported rather than
+ * silently ignored so a bundle that carries them is visible on BOTH apply
+ * paths; a directory row stands for everything beneath it, which was never
+ * opened.
+ */
+ | "payload-internals"
+/**
+ * The incoming tree carried a path THIS machine's rules exclude — its
+ * `hubignore`, or a built-in exclude its `hubinclude` does not name back.
+ * A payload built from the same (committed) rule files never contains one,
+ * so this row means the two machines' rule files disagree. The local copy,
+ * if any, is deliberately left alone; the incoming one stays on the hub.
+ */
+ | "locally-excluded";
 export interface WorkspaceMergeReport {
     /** incoming changed, local didn't -> incoming written */
     taken: string[];
@@ -180,9 +196,18 @@ export declare function isBinaryFile(path: string): boolean;
  * written near it — see `SkipReason` for why parking a copy there would
  * reproduce the very hazard the skip exists to avoid.
  *
- * Excludes default to the standard workspace excludes plus the *target's*
- * `.claude-sesh-mover/hubignore` — so a file this machine deliberately keeps
- * out of the hub can never be overwritten by an incoming copy of the same name.
+ * **What a payload is filtered by here** (the rule split is argued at the call
+ * site): the `NEVER_INCLUDABLE` floor, and the *target's* own
+ * `.claude-sesh-mover/hubignore` minus whatever its `hubinclude` names back —
+ * so a file this machine deliberately keeps out of the hub can never be
+ * overwritten by an incoming copy of the same name. The built-in convenience
+ * excludes take no part: they are the sender's to apply, and re-applying them
+ * discarded files a `hubinclude` had explicitly carried. Everything this
+ * function does drop is reported in `skipped` (`locally-excluded`, or
+ * `payload-internals` for the hard floor) rather than vanishing, so the two
+ * apply paths differ only by that one explicit, visible veto — which
+ * `--force-workspace` unpack deliberately does not honor, since that flag means
+ * "give me the hub's copy wholesale".
  *
  * `git merge-file` is spawned once per file that needs a real 3-way merge, and
  * spawned synchronously: the merge writes into the user's working tree in a
@@ -193,8 +218,15 @@ export declare function mergeWorkspaceTrees(opts: {
     ancestorDir: string | null;
     incomingDir: string;
     targetDir: string;
-    /** Override the exclude patterns; defaults to workspace excludes + target hubignore. */
+    /**
+     * Override the apply-side veto patterns; defaults to the target's
+     * `hubignore`. The built-in workspace excludes are NOT part of this: they
+     * prune the local tree scan unconditionally and never veto a payload path
+     * (see the rule split inside).
+     */
     excludePatterns?: string[];
+    /** Override the re-include patterns; defaults to the target's `hubinclude`. */
+    includePatterns?: string[];
     /**
      * Test seam: the timestamp baked into sidecar names, defaulting to now.
      * Never set in production code.

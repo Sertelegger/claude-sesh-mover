@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import {
   isBinaryFile, isGitMergeFileAvailable, mergeWorkspaceTrees, MergeAncestorRequiredError,
 } from "../src/hub/merge.js";
+import { snapshotWorkspace, unpackWorkspace } from "../src/hub/workspace.js";
 import { overridePath } from "./helpers/env.js";
 
 const isWindows = platform() === "win32";
@@ -21,6 +22,20 @@ function put(dir: string, rel: string, content: string | Buffer): void {
   const p = join(dir, rel);
   mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, content);
+}
+
+/** Every file under `root`, workspace-relative and forward-slash separated. */
+function listAll(root: string): string[] {
+  const out: string[] = [];
+  const walk = (dir: string, rel: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(join(dir, e.name), childRel);
+      else out.push(childRel);
+    }
+  };
+  if (existsSync(root)) walk(root, "");
+  return out;
 }
 
 /** Three sibling trees under one disposable root. */
@@ -468,7 +483,15 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
     }
   });
 
-  it("honors the default workspace excludes and the target's hubignore", async () => {
+  it("the target's hubignore vetoes an incoming path — the BUILT-IN excludes do not", async () => {
+    // The two are different kinds of rule. `hubignore` is an explicit local
+    // statement ("this path is not the hub's business"), so it still keeps an
+    // incoming copy off that path — and now says so instead of dropping it
+    // silently. The built-in convenience excludes are a CARRY-side default the
+    // sender already applied: re-applying them here is what discarded files a
+    // `hubinclude` had explicitly carried, so a payload path under one of them
+    // is applied. A payload only contains such a path because the sender chose
+    // to share it.
     const { root, a, i, t } = trees();
     try {
       mkdirSync(join(t, ".claude-sesh-mover"), { recursive: true });
@@ -476,21 +499,26 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
       put(a, "debug.log", "old\n");
       put(t, "debug.log", "local log\n");
       put(i, "debug.log", "remote log\n");
-      put(a, join("node_modules", "x.js"), "old\n");
-      put(t, join("node_modules", "x.js"), "local\n");
+      put(a, join("node_modules", "x.js"), "shared\n");
+      put(t, join("node_modules", "x.js"), "shared\n");
       put(i, join("node_modules", "x.js"), "remote\n");
       put(a, "kept.txt", "v1\n");
       put(t, "kept.txt", "v1\n");
       put(i, "kept.txt", "v2\n");
       const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
-      expect(r.taken).toEqual(["kept.txt"]);
+      expect(r.taken.sort()).toEqual(["kept.txt", "node_modules/x.js"]);
+      // Vetoed: untouched, and nothing written near it.
       expect(readFileSync(join(t, "debug.log"), "utf-8")).toBe("local log\n");
-      expect(readFileSync(join(t, "node_modules", "x.js"), "utf-8")).toBe("local\n");
-      const everything = [
+      // Not vetoed: the sender shared it, so this machine gets it.
+      expect(readFileSync(join(t, "node_modules", "x.js"), "utf-8")).toBe("remote\n");
+      const applied = [
         ...r.taken, ...r.kept, ...r.created, ...r.merged, ...r.conflicted,
-        ...r.upstreamDeleted, ...r.sidecars.map((s) => s.path), ...r.skipped.map((s) => s.path),
-      ];
-      expect(everything).toEqual(["kept.txt"]);
+        ...r.upstreamDeleted, ...r.sidecars.map((s) => s.path),
+      ].sort();
+      expect(applied).toEqual(["kept.txt", "node_modules/x.js"]);
+      // The one path this machine's rules rejected is REPORTED rather than
+      // vanishing — the user can only act on it if they hear about it.
+      expect(r.skipped).toEqual([{ path: "debug.log", reason: "locally-excluded" }]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -505,6 +533,127 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
         mergeWorkspaceTrees({ ancestorDir: null, incomingDir: i, targetDir: t })
       ).rejects.toBeInstanceOf(MergeAncestorRequiredError);
       expect(readFileSync(join(t, "f.txt"), "utf-8")).toBe("mine\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", () => {
+  it("applies what hubinclude deliberately carried, with NO rule files on the receiving machine", async () => {
+    // The merge filtered its three trees through the excludes while knowing
+    // nothing about hubinclude, so a file the user had explicitly listed was
+    // snapshotted, archived, uploaded, downloaded — and then discarded here,
+    // with no report row, on the ROUTINE pull path, while a --force-workspace
+    // unpack of the same bundle applied it. Newly reachable in this milestone:
+    // before hubinclude, nothing excluded could ever be in an incoming tree.
+    //
+    // The target deliberately has NO rule files, which is the real product
+    // shape: `hubinclude`/`hubignore` live under `.claude-sesh-mover`, which
+    // never travels in a payload, and a workspace payload only exists for a
+    // project with no git remote — so the receiving tree came from the hub and
+    // has no copy of the rules that built the bundle. Consulting the target's
+    // own `hubinclude` would have fixed this only where the user had written
+    // that file on both machines by hand.
+    const { root, a, i, t } = trees();
+    try {
+      put(i, join("node_modules", "local-pkg", "lib", "index.js"), "mine\n");
+      put(i, join("docs", ".DS_Store"), "junk\n");
+      put(i, "README.md", "hello\n");
+      expect(existsSync(join(t, ".claude-sesh-mover"))).toBe(false);
+
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.created.sort()).toEqual([
+        "README.md", "docs/.DS_Store", "node_modules/local-pkg/lib/index.js",
+      ]);
+      expect(existsSync(join(t, "node_modules", "local-pkg", "lib", "index.js"))).toBe(true);
+      expect(existsSync(join(t, "docs", ".DS_Store"))).toBe(true);
+      expect(r.skipped).toEqual([]);
+
+      // Pull it AGAIN, now that the file exists locally under a directory the
+      // built-in excludes prune: it must still be visible to the merge, or it
+      // could never be updated (invisible local counterpart -> reported as a
+      // name collision, forever).
+      put(i, join("node_modules", "local-pkg", "lib", "index.js"), "mine v2\n");
+      put(a, join("node_modules", "local-pkg", "lib", "index.js"), "mine\n");
+      const r2 = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r2.taken).toEqual(["node_modules/local-pkg/lib/index.js"]);
+      expect(readFileSync(join(t, "node_modules", "local-pkg", "lib", "index.js"), "utf-8"))
+        .toBe("mine v2\n");
+      expect(r2.skipped).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("the two apply paths agree file-for-file with the payload the snapshot built", async () => {
+    // The property that makes "one meaning in the product" checkable, and it
+    // holds with NO rule files on the receiving side: snapshotWorkspace's
+    // payload, unpackWorkspace's applied set and mergeWorkspaceTrees' applied
+    // set are the SAME set. The sender's rules decide what the payload is;
+    // both apply paths then apply the payload minus the NEVER floor, and the
+    // merge's one extra veto (the target's own hubignore) is absent here
+    // because the target has none.
+    const root = tmp("sesh-parity-");
+    try {
+      const src = join(root, "src");
+      const payload = join(root, "payload");
+      const unpackTarget = join(root, "unpacked");
+      const mergeTarget = join(root, "merged");
+      const ancestor = join(root, "ancestor");
+      for (const d of [src, unpackTarget, mergeTarget, ancestor]) mkdirSync(d, { recursive: true });
+
+      put(src, join(".claude-sesh-mover", "hubinclude"), "build/\n*.keepme\nnode_modules/local-pkg/\n");
+      put(src, join(".claude-sesh-mover", "hubignore"), "*.log\nbuild\n");
+      put(src, "app.ts", "code\n");
+      put(src, "debug.log", "noise\n");                      // hubignore'd
+      put(src, join("build", "keep.js"), "generated\n");      // build/ re-included
+      put(src, join("build", "sub", "deep.js"), "deep\n");
+      put(src, join("node_modules", "local-pkg", "i.js"), "vendored\n");
+      put(src, join("node_modules", "other-pkg", "i.js"), "theirs\n"); // stays out
+      put(src, join("logs", "x.keepme"), "kept\n");           // bare pattern, any depth
+      put(src, join(".git", "config"), "[remote]\n");         // never
+      // The receiving trees have NO rule files — the real shape, since
+      // `.claude-sesh-mover` never travels in a payload.
+
+      const snap = await snapshotWorkspace(src, payload);
+      const payloadFiles = listAll(payload).sort();
+      expect(payloadFiles).toEqual([
+        "app.ts", "build/keep.js", "build/sub/deep.js",
+        "logs/x.keepme", "node_modules/local-pkg/i.js",
+      ]);
+      expect(snap.fileCount).toBe(payloadFiles.length);
+
+      const unpacked = await unpackWorkspace(payload, unpackTarget, { force: true });
+      expect(unpacked.refused).toEqual([]);
+      expect(listAll(unpackTarget).filter((f) => !f.startsWith(".claude-sesh-mover")).sort())
+        .toEqual(payloadFiles);
+
+      const merged = await mergeWorkspaceTrees({
+        ancestorDir: ancestor, incomingDir: payload, targetDir: mergeTarget,
+      });
+      expect(merged.created.sort()).toEqual(payloadFiles);
+      expect(merged.skipped).toEqual([]);
+      expect(listAll(mergeTarget).filter((f) => !f.startsWith(".claude-sesh-mover")).sort())
+        .toEqual(payloadFiles);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a payload's plugin/VCS internals on the merge path too, like unpack's refused[]", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      put(i, join(".git", "config"), "[remote]\n");
+      put(i, join(".claude-sesh-mover", "hubinclude"), "*\n");
+      put(i, "ok.txt", "fine\n");
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.created).toEqual(["ok.txt"]);
+      expect(r.skipped.map((s) => ({ path: s.path, reason: s.reason })).sort((x, y) => x.path.localeCompare(y.path)))
+        .toEqual([
+          { path: ".claude-sesh-mover", reason: "payload-internals" },
+          { path: ".git", reason: "payload-internals" },
+        ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -289,6 +289,31 @@ describe("hubinclude", () => {
     expect(isReIncluded("a/b/secrets/x.txt", ["secrets"])).toBe(true); // bare literal, any depth
   });
 
+  it("a trailing slash roots a one-segment pattern — `docs/` is not the bare form", () => {
+    // The single commonest hubinclude line there is: `push.md` offers
+    // `ignoredNotCarried` entries to be pasted VERBATIM and forbids widening
+    // one, and `git ls-files --directory` spells a wholly-ignored top-level
+    // directory as exactly `dist/`. Read as bare (the shipped bug — the empty
+    // tail segment is dropped, so the pattern looked one-segment-long), it also
+    // carried every nested `dist`, which is the permissive direction.
+    expect(isReIncluded("docs/x.md", ["docs/"])).toBe(true);
+    expect(isReIncluded("docs/sub/x.md", ["docs/"])).toBe(true);   // its subtree
+    expect(isReIncluded("a/b/docs/x.md", ["docs/"])).toBe(false);  // NOT at any depth
+    expect(isReIncluded("packages/one/dist/x.js", ["dist/"])).toBe(false);
+    expect(isReIncluded("dist/x.js", ["dist/"])).toBe(true);
+    // Every other spelling that carries a separator roots the same way…
+    for (const rooted of ["docs/", "/docs", "/docs/", "./docs", "docs\\"]) {
+      expect(isReIncluded("docs/x.md", [rooted])).toBe(true);
+      expect(isReIncluded("a/b/docs/x.md", [rooted])).toBe(false);
+    }
+    // …and only a pattern with no separator at all is the any-depth form.
+    expect(isReIncluded("a/b/docs/x.md", ["docs"])).toBe(true);
+    // The walker has to agree, or the payload and the predicate diverge.
+    expect(mayContainReIncluded("a/b", ["docs/"])).toBe(false);
+    expect(mayContainReIncluded("a/b", ["docs"])).toBe(true);
+    expect(mayContainReIncluded("docs", ["docs/sub/"])).toBe(true);
+  });
+
   it("says no to an empty path, an empty pattern list, and patterns that normalize to nothing", () => {
     expect(isReIncluded("a.txt", [])).toBe(false);
     expect(isReIncluded("", ["*"])).toBe(false);
@@ -349,23 +374,106 @@ describe("hubinclude", () => {
     expect(isReIncluded(".git\\config", ["*"])).toBe(false);
   });
 
-  it("survives a pattern built to blow up the matcher", () => {
-    const bomb = "*a*a*a*a*a*a*a*a*a*a*a*b";
-    const victim = "a".repeat(64);
+  it("matches globs in linear-ish time, at and past every boundary a filesystem can reach", () => {
+    // The regex matcher this replaced backtracked ~n^7 on these. Measured
+    // through the shipped isReIncluded at EIGHT wildcards — inside the wildcard
+    // cap that was supposed to prevent exactly this — a 56-char name took
+    // 4.7 s and a 64-char one 13.7 s; hubignore had no cap at all (10 stars vs
+    // a 44-char name: 9.6 s). The old test used a 12-star bomb, which the cap
+    // DROPPED, so it passed without ever running the matcher it was testing.
+    const a = (n: number): string => "a".repeat(n);
+    const stars = (n: number): string => "*a".repeat(n) + "b"; // n wildcards
     const started = Date.now();
-    expect(isReIncluded(victim, [bomb])).toBe(false);
-    expect(isReIncluded(`dir/${victim}`, [`dir/${bomb}`])).toBe(false);
+    for (const n of [3, 8, 9, 12, 127]) {          // at, over, and far over the old cap of 8
+      for (const len of [32, 64, 128, 255]) {      // 255 = the longest name a filesystem gives us
+        expect(isReIncluded(a(len), [stars(n)])).toBe(false);
+        expect(isExcluded(a(len), [stars(n)])).toBe(false);      // hubignore shares the matcher
+        expect(isReIncluded(`dir/${a(len)}`, [`dir/${stars(n)}`])).toBe(false);
+      }
+    }
+    // The full hostile load the caps still permit: 500 patterns x one path.
+    const many = Array.from({ length: 500 }, () => stars(127));
+    expect(isReIncluded(a(255), many)).toBe(false);
     expect(Date.now() - started).toBeLessThan(1000);
+
+    // And they are no longer DROPPED, which is what the cap used to do: a
+    // many-star pattern is honest, just unusual, and it has to still match.
+    expect(isReIncluded(a(64) + "b", [stars(12)])).toBe(true);
+    expect(isExcluded("axxbxxc", ["*a*b*c*"])).toBe(true);
+    // A name containing a literal `*` must not eat the pattern's wildcard.
+    expect(isExcluded("*b", ["*"])).toBe(true);
+    expect(isExcluded("a*b", ["a*b"])).toBe(true);
+    // `*` now crosses a newline, where RegExp's `.` did not — an ignore
+    // pattern that silently stopped matching such a name was the unsafe way
+    // round, and the hard exclusions never depended on the glob.
+    expect(isExcluded("evil\nx.log", ["*.log"])).toBe(true);
+    expect(isReIncluded(".git\nfoo/x", ["*"])).toBe(true); // a genuinely different name
+    expect(isReIncluded(".git/x", ["*"])).toBe(false);     // …and the real one still cannot travel
   });
 
-  it("caps an enormous pattern file instead of carrying it into every path test", () => {
+  it("caps an enormous pattern file instead of carrying it into every path test, and SAYS it did", () => {
+    // Both caps fail closed — fewer re-includes — which from the outside is
+    // indistinguishable from "my files just stopped syncing". A caller with
+    // somewhere to put it gets a sentence naming the file, the limit and the
+    // consequence; a caller that passes nothing still gets the same patterns.
     const dir = tmp("sesh-inc-");
     try {
       writeInclude(dir, Array.from({ length: 5000 }, (_, i) => `p${i}`).join("\n"));
-      expect(readHubinclude(dir).length).toBeLessThanOrEqual(500);
+      const overCount: string[] = [];
+      expect(readHubinclude(dir, overCount).length).toBe(500);
+      expect(overCount).toHaveLength(1);
+      expect(overCount[0]).toContain("5000 patterns");
+      expect(overCount[0]).toContain("only the first 500");
+
       writeInclude(dir, "x".repeat(200_000));
-      expect(readHubinclude(dir)).toEqual([]); // over the byte cap: no re-includes at all
+      const overBytes: string[] = [];
+      expect(readHubinclude(dir, overBytes)).toEqual([]); // over the byte cap: nothing at all
+      expect(overBytes).toHaveLength(1);
+      expect(overBytes[0]).toContain("200000 bytes");
+      expect(overBytes[0]).toContain("ENTIRELY");
+
+      // A file inside both caps is silent.
+      const quiet: string[] = [];
+      writeInclude(dir, "docs/\n");
+      expect(readHubinclude(dir, quiet)).toEqual(["docs/"]);
+      expect(quiet).toEqual([]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("warns when the exclude rules swallowed the whole snapshot", async () => {
+    // `*/` in hubignore matches every directory entry at every level, so the
+    // payload came out empty and nothing said so. It fails safe (an empty
+    // payload can delete nothing downstream — upstreamDeleted is report-only)
+    // but a silently empty push is not something a user can diagnose.
+    const src = tmp("sesh-inc-src-");
+    const dest = tmp("sesh-inc-dest-");
+    try {
+      writeIgnore(src, "*/\n*\n");
+      mkdirSync(join(src, "sub"), { recursive: true });
+      writeFileSync(join(src, "sub", "a.ts"), "x");
+      writeFileSync(join(src, "b.ts"), "y");
+      const r = await snapshotWorkspace(src, dest);
+      expect(r.fileCount).toBe(0);
+      expect(r.warnings.some((w) => w.includes("workspace snapshot is empty"))).toBe(true);
+    } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("an empty project produces no empty-snapshot warning, and cap diagnostics reach the snapshot", async () => {
+    const empty = tmp("sesh-inc-src-");
+    const dest = tmp("sesh-inc-dest-");
+    try {
+      expect((await snapshotWorkspace(empty, dest)).warnings).toEqual([]);
+      writeInclude(empty, "x".repeat(200_000)); // only .claude-sesh-mover exists
+      const r = await snapshotWorkspace(empty, dest);
+      expect(r.warnings).toHaveLength(1);       // the cap, not the emptiness
+      expect(r.warnings[0]).toContain("hubinclude");
+    } finally { for (const d of [empty, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("NEVER_INCLUDABLE is frozen, not just readonly at compile time", () => {
+    expect(Object.isFrozen(NEVER_INCLUDABLE)).toBe(true);
+    expect(() => (NEVER_INCLUDABLE as string[]).push(".env")).toThrow();
+    expect(NEVER_INCLUDABLE).toEqual([".git", ".claude-sesh-mover"]);
   });
 
   it("mayContainReIncluded only descends where a pattern can actually reach", () => {
@@ -511,6 +619,27 @@ describe("hubinclude", () => {
       expect(existsSync(join(dest, "linked"))).toBe(false);
       expect(r.symlinksSkipped).toBe(1);
       expect(r.fileCount).toBe(1);
+    } finally { for (const d of [src, dest, outside]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(isWindows)("a symlink NAMED .git is skipped AND counted, not silently dropped", async () => {
+    // The hard-exclusion check fires before the symlink branch, so this one
+    // link was invisible in the snapshot's own report: right outcome, wrong
+    // accounting. It is still never followed.
+    const src = tmp("sesh-inc-src-");
+    const dest = tmp("sesh-inc-dest-");
+    const outside = tmp("sesh-inc-outside-");
+    try {
+      mkdirSync(join(outside, "objects"), { recursive: true });
+      writeFileSync(join(outside, "config"), "[remote]\n  url = SECRET\n");
+      symlinkSync(outside, join(src, ".git"));
+      writeInclude(src, "*\n.git\n");
+      writeFileSync(join(src, "app.ts"), "ok");
+
+      const r = await snapshotWorkspace(src, dest);
+      expect(existsSync(join(dest, ".git"))).toBe(false);
+      expect(r.fileCount).toBe(1);
+      expect(r.symlinksSkipped).toBe(1);
     } finally { for (const d of [src, dest, outside]) rmSync(d, { recursive: true, force: true }); }
   });
 

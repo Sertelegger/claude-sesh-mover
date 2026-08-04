@@ -177,6 +177,10 @@ export async function hubPush(opts) {
             const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));
             if (ws.symlinksSkipped > 0)
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
+            // Rule-level diagnostics (a hubinclude past a cap, an exclude set that
+            // swallowed the whole tree). Every one of them fails CLOSED — fewer files
+            // — which is invisible from the outside without this.
+            warnings.push(...ws.warnings);
             const manifestPath = join(bundleStaging, "manifest.json");
             const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
             // Declare what this snapshot descends from — read BEFORE the new

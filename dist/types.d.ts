@@ -411,6 +411,24 @@ export interface HubPullResult {
      * path); this field is the detail.
      */
     workspaceMerge?: WorkspaceMergeReport;
+    /**
+     * Paths the workspace payload carried that can NEVER be applied, whatever a
+     * pattern says — `.git` and `.claude-sesh-mover` at any depth and in any
+     * casing (see `NEVER_INCLUDABLE`). Absent on every ordinary pull.
+     *
+     * It is a result FIELD rather than warning prose because a skill layer has to
+     * be able to branch on it: a payload naming `.claude-sesh-mover/hubinclude`
+     * is trying to rewrite the list that decides what this machine's NEXT push
+     * ships, which is the strongest signal this command produces, and warning
+     * text is not an interface (see `commands/pull.md`). Nothing from these paths
+     * was written; a directory entry stands for everything under it, which was
+     * never opened.
+     *
+     * Its presence is not by itself proof of an attack — a sesh-mover older than
+     * the guard, on a case-insensitive filesystem, legitimately shipped a `.GIT`
+     * store — so callers must report it without naming a culprit.
+     */
+    workspaceRefused?: string[];
     appended?: Array<{
         threadId: string;
         baseSessionId: string;

@@ -439,6 +439,16 @@ describe("hub pull", () => {
       expect(
         p.warnings.some((w) => w.includes("refused") && w.includes(".claude-sesh-mover"))
       ).toBe(true);
+      // A RESULT FIELD, not just prose: this is the strongest signal the
+      // command produces, and the milestone's cross-layer rule is that a skill
+      // discriminator keys on fields, never on warning text.
+      expect(p.workspaceRefused?.slice().sort()).toEqual([".claude-sesh-mover", ".git"]);
+      // …and the warning does not accuse the sender: a sesh-mover older than
+      // this guard, on a case-insensitive filesystem, legitimately shipped a
+      // `.GIT` store, which is exactly the leak the guard closed.
+      const refusalWarning = p.warnings.find((w) => w.includes("refused"))!;
+      expect(refusalWarning).not.toContain("hand-made");
+      expect(refusalWarning).toContain("older version");
     } finally {
       restore.restore();
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });

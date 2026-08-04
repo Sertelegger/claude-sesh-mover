@@ -738,6 +738,7 @@ export async function hubPull(
 
     let workspaceUnpacked: HubPullResult["workspaceUnpacked"] = null;
     let workspaceMerge: WorkspaceMergeReport | undefined;
+    let workspaceRefused: string[] | undefined;
     // Which bundle in this chain carries the workspace generation to apply:
     // the NEWEST one that has a payload, not needed[0].
     //
@@ -926,8 +927,14 @@ export async function hubPull(
               warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
             }
             if (ws.refused.length > 0) {
+              workspaceRefused = ws.refused;
+              // Deliberately does NOT accuse the sender. A bundle written by a
+              // sesh-mover older than this guard, on a case-insensitive
+              // filesystem, legitimately carried a `.GIT` store — the very leak
+              // the guard closed — so "hand-made or damaged" would be a false
+              // accusation in the commonest case that reaches here.
               warnings.push(
-                `${ws.refused.length} path(s) in the workspace payload were refused because they name plugin or VCS internals that never travel (${ws.refused.slice(0, 5).join(", ")}). A bundle produced by sesh-mover never contains those, so this one was hand-made or damaged — nothing from them was written here.`
+                `${ws.refused.length} path(s) in the workspace payload were refused because they name plugin or VCS internals that never travel (${ws.refused.slice(0, 5).join(", ")}). Nothing from them was written here. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`
               );
             }
             if (ws.blocked.length > 0) {
@@ -1390,6 +1397,7 @@ export async function hubPull(
       localSessionId,
       workspaceUnpacked,
       workspaceMerge,
+      workspaceRefused,
       appended: appended.length > 0 ? appended : undefined,
       divergence: lastDivergence,
       warnings,
