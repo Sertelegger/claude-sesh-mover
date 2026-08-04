@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
   rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -1493,7 +1493,7 @@ describe("applyCarry", () => {
       expect(r.reason).toBe("not-requested");
       const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
       // The RECEIVER's prefix, read here, not the sender's `meta.repoPrefix`.
-      expect(readme).toContain('--directory="pkg/app/"');
+      expect(readme).toContain("--directory='pkg/app/'");
 
       const command = readme.match(/```bash\n(git [^\n]*)\n```/)?.[1];
       expect(command).toBeTruthy();
@@ -1923,6 +1923,316 @@ describe("applyCarry", () => {
       expect(saved).not.toContain("carry-2026-01-01T00-00-00-000Z");
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
+
+  // --- Round 2: the floor's OTHER source-path blind spot, and the split
+  // between "this machine's git failed" and "the payload is hostile" ---
+
+  /** The same seeded project at either layout: the repo root, or `pkg/app`. */
+  function layoutRepo(name: string, layout: "root" | "subdir"): {
+    repo: string; project: string; head: string;
+  } {
+    const repo = gitRepo(name);
+    const project = layout === "root" ? repo : join(repo, "pkg", "app");
+    mkdirSync(join(project, ".claude-sesh-mover"), { recursive: true });
+    writeFileSync(join(project, ".claude-sesh-mover", "hubinclude"), "docs/\n");
+    writeFileSync(join(project, "f.txt"), "v1\n");
+    git(repo, ["add", "-A", "-f"]);
+    git(repo, ["commit", "-q", "-m", "seed"]);
+    return { repo, project, head: git(repo, ["rev-parse", "HEAD"]).trim() };
+  }
+
+  /** A patch that changes `f.txt` and nothing else — the innocent payload. */
+  const BENIGN_PATCH =
+    "diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n" +
+    "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-v1\n+v2\n";
+
+  const COPY_OUT_PATCH =
+    "diff --git a/.claude-sesh-mover/hubinclude b/stolen.txt\nsimilarity index 100%\n" +
+    "copy from .claude-sesh-mover/hubinclude\ncopy to stolen.txt\n";
+
+  it("refuses a patch that COPIES a plugin-internal file out, at BOTH layouts", async () => {
+    // `git apply --numstat` prints only the DESTINATION of a COPY, exactly as
+    // it does for a rename (measured), and the raw scan read `rename from` but
+    // not `copy from` — so the two-source floor had a hole at the very shape it
+    // claims to cover. Measured against the pre-fix build: `applied: true,
+    // filesChanged: 1` at BOTH layouts, with `stolen.txt` holding the
+    // RECEIVER's own bytes, from where the next auto-push carries this
+    // machine's plugin internals to the hub.
+    for (const layout of ["root", "subdir"] as const) {
+      const { repo, project, head } = layoutRepo(`apply-copyout-${layout}`, layout);
+      let dir: string | undefined;
+      try {
+        const payload = handPayload(COPY_OUT_PATCH, {
+          baseCommit: head, repoPrefix: layout === "subdir" ? "pkg/app/" : "",
+        });
+        dir = payload.dir;
+
+        const r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+        expect(r.applied, layout).toBe(false);
+        if (r.applied) return;
+        expect(r.reason, layout).toBe("unsafe-payload");
+        expect(existsSync(join(project, "stolen.txt")), layout).toBe(false);
+        expect(readFileSync(join(project, ".claude-sesh-mover", "hubinclude"), "utf-8")).toBe("docs/\n");
+        // Refused whole: the saved copy carries no command to finish the job.
+        expect(readFileSync(join(r.savedTo!, "README.md"), "utf-8")).not.toContain("git apply");
+      } finally {
+        cleanup(repo, dir ?? "");
+      }
+    }
+  });
+
+  it("still applies an ordinary rename, whose `diff --git` halves differ", async () => {
+    // The header scan added for the mode-only/binary shapes must not turn every
+    // rename into a refusal: the two halves of `diff --git a/<old> b/<new>` are
+    // identical for everything EXCEPT a rename or a copy, and those carry their
+    // own `rename from`/`copy from` lines, so the header contributes nothing
+    // when they disagree.
+    const repo = gitRepo("apply-rename-ok");
+    let twin: string | undefined;
+    try {
+      twin = cleanTwin(repo);
+      const head = git(twin, ["rev-parse", "HEAD"]).trim();
+      const payload = handPayload(
+        "diff --git a/tracked.txt b/renamed.txt\nsimilarity index 100%\n" +
+          "rename from tracked.txt\nrename to renamed.txt\n",
+        { baseCommit: head }
+      );
+      const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+      expect(r.applied).toBe(true);
+      expect(existsSync(join(twin, "renamed.txt"))).toBe(true);
+      expect(existsSync(join(twin, "tracked.txt"))).toBe(false);
+      rmSync(payload.dir, { recursive: true, force: true });
+    } finally {
+      cleanup(repo, twin ?? "");
+    }
+  });
+
+  it("refuses header-only shapes with NO runnable git, where the byte scan is the whole floor", async () => {
+    if (process.platform === "win32") return; // PATH override + shell stub
+    // Three shapes carry no `---`/`+++` and no rename/copy lines at all — a
+    // mode-only change, a new binary file, and (for its source) a copy — so
+    // their ONLY path reference is the `diff --git` line. `--numstat` sees them,
+    // but `--numstat` needs a git to run: on a machine with none, the raw scan
+    // is the entire floor, and it was blind to all three. Measured against the
+    // pre-fix build, every one came back `not-requested` WITH an apply command
+    // recommending a patch that writes this machine's plugin internals.
+    const { repo, project, head } = layoutRepo("apply-nogit-header", "root");
+    let empty: string | undefined;
+    try {
+      writeFileSync(join(project, ".claude-sesh-mover", "hubinclude"), Buffer.from([0, 1, 2, 0, 255]));
+      git(repo, ["add", "-A", "-f"]);
+      const binary = git(repo, ["diff", "HEAD", "--binary", "--src-prefix=a/", "--dst-prefix=b/"]);
+      git(repo, ["reset", "-q", "--hard", "HEAD"]);
+      expect(binary).toContain("GIT binary patch");
+      expect(binary).not.toContain("+++ b/");
+      const shapes: Array<[string, string]> = [
+        ["binary entry", binary],
+        [
+          "mode-only change",
+          "diff --git a/.claude-sesh-mover/hubinclude b/.claude-sesh-mover/hubinclude\n" +
+            "old mode 100644\nnew mode 100755\n",
+        ],
+        [
+          "empty-file creation",
+          "diff --git a/.claude-sesh-mover/config.json b/.claude-sesh-mover/config.json\n" +
+            "new file mode 100644\nindex 0000000..e69de29\n",
+        ],
+        ["copy source", COPY_OUT_PATCH],
+      ];
+
+      empty = mkdtempSync(join(tmpdir(), "sesh-nopath3-"));
+      const restore = overridePath(empty);
+      try {
+        for (const [label, patch] of shapes) {
+          const payload = handPayload(patch, { baseCommit: head });
+          const r = await applyCarry({
+            carryDir: payload.dir, targetPath: project, meta: payload.meta, saveOnly: true,
+          });
+          expect(r.applied, label).toBe(false);
+          if (r.applied) return;
+          expect(r.reason, label).toBe("unsafe-payload");
+          expect(readFileSync(join(r.savedTo!, "README.md"), "utf-8"), label)
+            .not.toContain("git apply");
+          rmSync(payload.dir, { recursive: true, force: true });
+        }
+      } finally {
+        restore.restore();
+      }
+    } finally {
+      cleanup(repo, empty ?? "");
+    }
+  });
+
+  it("blames this machine's broken git, not the payload, at BOTH layouts", async () => {
+    // A `.git/config` git refuses to parse stands in for every receiver-side
+    // git failure — `safe.directory` ownership, an unreadable `.git`, the 15s
+    // timeout, EACCES on the binary: git answers every command in this
+    // directory with the same words. Reading that refusal as a verdict on the
+    // PATCH is what the round-1 fix did (measured: `unsafe-payload: the patch
+    // could not be parsed (fatal: bad config line 12 …)`, with the security
+    // README and no apply command, on the routine no-flag path as well).
+    for (const layout of ["root", "subdir"] as const) {
+      const { repo, project, head } = layoutRepo(`apply-brokengit-${layout}`, layout);
+      let dir: string | undefined;
+      try {
+        appendFileSync(join(repo, ".git", "config"), "\nthis is not valid config\n");
+        const payload = handPayload(BENIGN_PATCH, {
+          baseCommit: head, repoPrefix: layout === "subdir" ? "pkg/app/" : "",
+        });
+        dir = payload.dir;
+
+        // Asked to apply: the receiver's own state, in git's own words.
+        const applied = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+        expect(applied.applied, layout).toBe(false);
+        if (applied.applied) return;
+        expect(applied.reason, layout).toBe("not-git");
+        expect(applied.detail, layout).toMatch(/bad config/);
+        const appliedReadme = readFileSync(join(applied.savedTo!, "README.md"), "utf-8");
+        expect(appliedReadme, layout).toContain("git -c apply.ignoreWhitespace=no apply");
+        expect(appliedReadme, layout).not.toContain("refused, not merely deferred");
+
+        // The routine no-flag path, which never ran this check at all before.
+        const saved = await applyCarry({
+          carryDir: dir, targetPath: project, meta: payload.meta, saveOnly: true,
+        });
+        expect(saved.applied, layout).toBe(false);
+        if (saved.applied) return;
+        expect(saved.reason, layout).toBe("not-requested");
+        const savedReadme = readFileSync(join(saved.savedTo!, "README.md"), "utf-8");
+        expect(savedReadme, layout).toContain("git -c apply.ignoreWhitespace=no apply");
+        // And the prefix it could NOT measure is not silently claimed to be
+        // empty: at subdirectory layout that would hand over a command which
+        // exits 0 and writes nothing the moment they fix their config.
+        expect(savedReadme, layout).toContain("git rev-parse --show-prefix");
+        expect(savedReadme.match(/```bash\n(git [^\n]*)\n```/)?.[1], layout)
+          .not.toContain("--directory=");
+        expect(readFileSync(join(project, "f.txt"), "utf-8")).toBe("v1\n");
+      } finally {
+        cleanup(repo, dir ?? "");
+      }
+    }
+  });
+
+  it("calls an unreadable patch damaged, not hostile, when git works here", async () => {
+    // The other side of the same split: a working git that refuses THIS patch
+    // is evidence about the payload — but the floor did not fire, so nothing
+    // unsafe was named. It declines (an un-inspected patch is not applied) with
+    // git's own words and a README that says the bundle looks damaged, instead
+    // of the security paragraph accusing the sender.
+    for (const layout of ["root", "subdir"] as const) {
+      const { repo, project, head } = layoutRepo(`apply-corrupt-${layout}`, layout);
+      let dir: string | undefined;
+      try {
+        const payload = handPayload("this is not a patch at all\n", {
+          baseCommit: head, repoPrefix: layout === "subdir" ? "pkg/app/" : "",
+        });
+        dir = payload.dir;
+
+        for (const saveOnly of [false, true]) {
+          const r = await applyCarry({
+            carryDir: dir, targetPath: project, meta: payload.meta, saveOnly,
+          });
+          expect(r.applied, layout).toBe(false);
+          if (r.applied) return;
+          expect(r.reason, `${layout} saveOnly=${saveOnly}`).toBe("apply-failed");
+          expect(r.detail, layout).toMatch(/could not be parsed/);
+          const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+          // No command — the checks could not finish — but no accusation either.
+          expect(readme, layout).not.toContain("git -c apply.ignoreWhitespace=no apply");
+          expect(readme, layout).not.toContain("refused, not merely deferred");
+          expect(readme, layout).toContain("damaged or truncated rather than hostile");
+        }
+
+        // ...unless the unparseable bytes also carry a header naming plugin
+        // internals. Hostile outranks damaged: that user gets the security
+        // wording, not "looks damaged".
+        const hostile = handPayload(
+          "this is not a patch at all\nrename from .claude-sesh-mover/hubinclude\n",
+          { baseCommit: head }
+        );
+        const h = await applyCarry({
+          carryDir: hostile.dir, targetPath: project, meta: hostile.meta,
+        });
+        expect(h.applied, layout).toBe(false);
+        if (h.applied) return;
+        expect(h.reason, layout).toBe("unsafe-payload");
+        expect(readFileSync(join(h.savedTo!, "README.md"), "utf-8"), layout)
+          .toContain("refused, not merely deferred");
+        rmSync(hostile.dir, { recursive: true, force: true });
+      } finally {
+        cleanup(repo, dir ?? "");
+      }
+    }
+  });
+
+  it("emits an apply command that survives a hostile project path", async () => {
+    if (process.platform === "win32") return; // runs the README's POSIX line verbatim
+    // The README's command is the sole remedy on every declining path, and every
+    // path in it comes from the project's own location. Interpolated into `"…"`
+    // (what shipped), a project under `pk$g`+backticks emitted a line whose
+    // `$g` the shell expanded away and whose backticks RAN — measured: the
+    // command failed with `can't open patch …/pk'x/…` and left a `pwned` file
+    // in the project. This runs the emitted line verbatim at SUBDIRECTORY
+    // layout, so both interpolations — `--directory=` and the patch path — are
+    // hostile.
+    const outer = mkdtempSync(join(tmpdir(), "sesh-quote-"));
+    const repo = join(outer, "repo");
+    let twin: string | undefined;
+    try {
+      mkdirSync(repo);
+      git(repo, ["init", "-q"]);
+      git(repo, ["config", "user.email", "t@example.com"]);
+      git(repo, ["config", "user.name", "Test"]);
+      const hostile = "pk$g`touch pwned`'x";
+      mkdirSync(join(repo, hostile, "app"), { recursive: true });
+      writeFileSync(join(repo, hostile, "app", "f.txt"), "v1\n");
+      git(repo, ["add", "-A"]);
+      git(repo, ["commit", "-q", "-m", "init"]);
+      writeFileSync(join(repo, hostile, "app", "f.txt"), "v2\n");
+      writeFileSync(join(repo, hostile, "app", "fresh.txt"), "new\n");
+      const payload = await capturePayload(join(repo, hostile, "app"));
+      twin = cleanTwin(repo);
+      const project = join(twin, hostile, "app");
+
+      const r = await applyCarry({
+        carryDir: payload.dir, targetPath: project, meta: payload.meta, saveOnly: true,
+      });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      const command = readme.match(/```bash\n(git [^\n]*)\n```/)?.[1];
+      expect(command).toBeTruthy();
+      const run = spawnSync("sh", ["-c", command!], { cwd: project, encoding: "utf-8" });
+      expect(run.stderr).toBe("");
+      expect(run.status).toBe(0);
+      expect(readFileSync(join(project, "f.txt"), "utf-8")).toBe("v2\n");
+      // Nothing the path spelled was executed, anywhere the shell could have
+      // run it from.
+      expect(existsSync(join(project, "pwned"))).toBe(false);
+      expect(existsSync(join(twin, "pwned"))).toBe(false);
+
+      // The untracked copy line is the second interpolation site, so it is run
+      // verbatim too rather than pattern-matched.
+      const copy = readme.match(/```bash\n# macOS \/ Linux\n(cp [^\n]*)\n```/)?.[1];
+      expect(copy).toBeTruthy();
+      const copyRun = spawnSync("sh", ["-c", copy!], { cwd: project, encoding: "utf-8" });
+      expect(copyRun.stderr).toBe("");
+      expect(copyRun.status).toBe(0);
+      expect(readFileSync(join(project, "fresh.txt"), "utf-8")).toBe("new\n");
+      expect(existsSync(join(project, "pwned"))).toBe(false);
+
+      // PowerShell cannot be run here, but its quoting is its own dialect: the
+      // path's single quote is DOUBLED, not backslash-escaped, and nothing is
+      // left in double quotes for `$`/backtick to expand.
+      const ps = readme.match(/```powershell\n# Windows \(PowerShell\)\n(Copy-Item [^\n]*)\n```/)?.[1];
+      expect(ps).toBeTruthy();
+      expect(ps).toContain("''x");
+      expect(ps).not.toContain('"');
+      rmSync(payload.dir, { recursive: true, force: true });
+    } finally {
+      cleanup(outer, twin ?? "");
     }
   });
 

@@ -635,7 +635,9 @@ const APPLY_CONFIG = ["-c", "apply.ignoreWhitespace=no"];
  *   trailing whitespace (measured), so an unhardened `--numstat` turned an
  *   innocent payload on a receiver with that config into a SECURITY refusal
  *   (`unsafe-payload`, "could not be parsed") — with the security README text
- *   and no apply command.
+ *   and no apply command. The flags are the fix; the floor check's split of
+ *   "git failed" from "the payload failed" (see `applyCarry`) is the second
+ *   line, for the receiver-side failures no flag can pre-empt.
  *
  * `mode` is what distinguishes them (`["--numstat", "-z"]`, `["--check"]`, or
  * nothing at all); everything else is shared by construction.
@@ -711,6 +713,42 @@ function patchHeaderPath(rest) {
         return null;
     return path.replace(/^[ab]\//, "");
 }
+/** `patchHeaderPath` as a 0-or-1 element list, for the scan's flat collection. */
+function headerPath(rest) {
+    const path = patchHeaderPath(rest);
+    return path === null ? [] : [path];
+}
+/**
+ * The path a `diff --git a/<p> b/<p>` line names — the ONLY path reference some
+ * entries have.
+ *
+ * Three shapes carry no `---`/`+++` lines and no `rename`/`copy` lines at all,
+ * so before this the raw scan saw nothing in them (all measured, and all three
+ * were APPLIED on a machine with no runnable `git`, where `--numstat` — the
+ * other source — cannot run either):
+ *
+ * - a mode-only change (`old mode` / `new mode`, and `git apply` writes the
+ *   mode to the filesystem regardless of `core.fileMode`),
+ * - a new or changed BINARY file (`GIT binary patch`, the documented blind spot
+ *   of this source),
+ * - a deletion of a binary file.
+ *
+ * The two halves are IDENTICAL for everything except a rename or a copy, and
+ * those carry their own `rename from`/`copy from` lines — so the midpoint split
+ * below does not need to handle them, and refusing to guess when the halves
+ * disagree is what keeps a path containing spaces from being mis-split. Git
+ * separates the two paths with a bare space and quotes each half independently
+ * (`"a/caf\303\251" "b/caf\303\251"`), so the halves are compared AFTER
+ * unquoting and prefix-stripping rather than as raw bytes.
+ */
+function diffGitHeaderPath(rest) {
+    const half = (rest.length - 1) / 2;
+    if (!Number.isInteger(half) || half < 1 || rest[half] !== " ")
+        return [];
+    const left = patchHeaderPath(rest.slice(0, half));
+    const right = patchHeaderPath(rest.slice(half + 1));
+    return left !== null && left === right ? [left] : [];
+}
 /**
  * Everything the apply side has to know about a patch before it may run.
  *
@@ -737,20 +775,27 @@ function patchHeaderPath(rest) {
  *
  * Two sources, because neither is complete alone:
  *
- * - `git apply --numstat -z` is git's own parse — authoritative, unquoted,
- *   and it covers binary entries, which carry no `---`/`+++` lines at all. But
- *   for a RENAME it prints only the destination (measured), so the path being
- *   DELETED is invisible to it.
- * - A raw scan of the patch bytes covers `rename from`, and the `index …
- *   120000` line of a re-pointed symlink — which `--summary` does NOT print
- *   (measured: nothing at all for that shape) — and it works with no `git` at
- *   all, so the saved README can still refuse to recommend applying a patch on
- *   a machine where git is missing.
+ * - `git apply --numstat -z` is git's own parse — authoritative and unquoted.
+ *   But for a RENAME **or a COPY** it prints only the DESTINATION (measured
+ *   both), so the source path is invisible to it: `copy from
+ *   .claude-sesh-mover/hubinclude` / `copy to stolen.txt` materialises the
+ *   RECEIVER's own plugin internals at an ordinary path, from where the next
+ *   auto-push carries them to the hub. It also cannot run at all on a machine
+ *   with no `git`, or on one whose `git` cannot read this repository.
+ * - A raw scan of the patch bytes covers every path git can name in a header:
+ *   `---`/`+++`, `rename from`/`to`, `copy from`/`to`, the `diff --git` line
+ *   itself (the only reference a mode-only change or a binary entry has), and
+ *   the `index … 120000` line of a re-pointed symlink — which `--summary` does
+ *   NOT print (measured: nothing at all for that shape). It needs no `git`, so
+ *   it is the whole floor on a machine where the other source cannot run, and
+ *   the saved README's recommendation rests on it there.
  *
  * A body line cannot be mistaken for a header: every one carries a leading
- * ` `, `+`, `-`, `@` or `\`. The residual is a patch that DELETES a line
- * spelled `-- a/…`, which reads as a header path — a false positive, i.e. a
- * refusal, which is the safe direction.
+ * ` `, `+`, `-`, `@` or `\`, and no base85 line inside a `GIT binary patch`
+ * block can contain a space (it is not in the alphabet), so none of the header
+ * spellings below can occur inside one. The residual is a patch that DELETES a
+ * line spelled `-- a/…`, which reads as a header path — a false positive, i.e.
+ * a refusal, which is the safe direction.
  */
 function scanPatchBytes(patchPath) {
     let size;
@@ -780,17 +825,22 @@ function scanPatchBytes(patchPath) {
             symlink ??= line;
             continue;
         }
-        let rest = null;
+        let found = [];
         if (line.startsWith("--- ") || line.startsWith("+++ "))
-            rest = line.slice(4);
+            found = headerPath(line.slice(4));
         else if (line.startsWith("rename from "))
-            rest = line.slice(12);
+            found = headerPath(line.slice(12));
         else if (line.startsWith("rename to "))
-            rest = line.slice(10);
-        if (rest === null)
-            continue;
-        const path = patchHeaderPath(Buffer.from(rest, "latin1").toString("latin1"));
-        if (path !== null)
+            found = headerPath(line.slice(10));
+        else if (line.startsWith("copy from "))
+            found = headerPath(line.slice(10));
+        else if (line.startsWith("copy to "))
+            found = headerPath(line.slice(8));
+        else if (line.startsWith("diff --git "))
+            found = diffGitHeaderPath(line.slice(11));
+        // Read as latin1 above, so a path's bytes are intact and re-decode as UTF-8
+        // here — the spelling `isNeverIncludable` has to fold.
+        for (const path of found)
             paths.push(Buffer.from(path, "latin1").toString("utf-8"));
     }
     return { paths, symlink };
@@ -949,6 +999,53 @@ function saveCarryPayload(opts) {
     return null;
 }
 /**
+ * A POSIX-shell single-quoted literal.
+ *
+ * The README's command block is copy-paste bait — it is the sole remedy on
+ * every declining path — and every path in it is interpolated from the
+ * project's own location. Unquoted inside `"…"`, a project at `<repo>/dol$lar`
+ * emitted `--directory="dol$lar/"`, which the shell expands to `--directory=
+ * "dol/"` (measured: the command then fails, or worse, applies somewhere else),
+ * and a backtick or `$( )` in a directory name makes the line
+ * command-injection-capable against the user pasting it. Self-inflicted — it is
+ * the user's own path — but this is documentation of a command, and a command
+ * we print has to be correct for the path it is printed for.
+ *
+ * Single quotes rather than escaping inside double quotes: nothing at all is
+ * special inside them, so the only case to handle is the quote itself.
+ */
+function shQuote(raw) {
+    return `'${raw.split("'").join(`'\\''`)}'`;
+}
+/** The same, for the PowerShell line: single quotes, doubled to escape. */
+function psQuote(raw) {
+    return `'${raw.split("'").join("''")}'`;
+}
+/**
+ * Is there a `.git` at this path or above it?
+ *
+ * Used for exactly one judgment: when `git rev-parse` refuses, does that mean
+ * "not a repository" (an empty apply prefix is then correct) or "this git
+ * cannot read this repository" (the prefix is unknown and the README must say
+ * so)? A linked worktree's `.git` is a FILE, so `existsSync` rather than a
+ * directory test. Wrong in the safe direction on both sides: a stray `.git`
+ * above an ordinary directory only adds the README's "find your prefix" note,
+ * and a repository with no discoverable `.git` (a bare `GIT_DIR`, which this
+ * module scrubs from the environment anyway) only omits it.
+ */
+function hasGitAncestor(start) {
+    let dir = start;
+    for (let depth = 0; depth < 64; depth++) {
+        if (existsSync(join(dir, ".git")))
+            return true;
+        const parent = dirname(dir);
+        if (parent === dir)
+            return false;
+        dir = parent;
+    }
+    return false;
+}
+/**
  * The manual-steps note that ships beside every saved payload.
  *
  * The command in here is the SOLE remedy on every declining path — a pull
@@ -966,7 +1063,7 @@ function renderSavedReadme(opts) {
     const { meta } = opts;
     const patch = join(opts.dir, "changes.patch");
     const untracked = join(opts.dir, "untracked");
-    const directory = opts.applyPrefix ? ` --directory="${opts.applyPrefix}"` : "";
+    const directory = opts.applyPrefix ? ` --directory=${shQuote(opts.applyPrefix)}` : "";
     const lines = [
         "# Carried uncommitted changes (not applied)",
         "",
@@ -979,18 +1076,26 @@ function renderSavedReadme(opts) {
     if (meta.inProgress) {
         lines.push(`The other machine was in the middle of a \`${meta.inProgress}\` when this was captured, so the patch contains conflict markers as ordinary content and the ${meta.inProgress} itself did not travel.`, "");
     }
-    if (!opts.recommendApply) {
+    if (opts.advice === "unsafe") {
         lines.push("**This payload was refused, not merely deferred.** It names paths that can never be written by sesh-mover (`.git` or `.claude-sesh-mover` at some depth) or it carries symbolic links. Read it before you do anything with it — `.claude-sesh-mover/hubinclude` decides what this machine's next push uploads, and the project-scope `config.json` decides where the hub is. No apply command is given here on purpose.", "");
         return lines.join("\n") + "\n";
     }
-    lines.push("To apply it by hand, from the project directory:", "", "```bash", `git -c apply.ignoreWhitespace=no apply --whitespace=nowarn${directory} "${patch}"`, "```", "", "Both settings matter: `apply.whitespace=fix` silently strips whitespace the patch adds, and `apply.ignoreWhitespace=change` will apply a patch whose context does not match and rewrite your indentation to it.", "");
+    if (opts.advice === "unparseable") {
+        // Deliberately NOT the paragraph above: this payload named nothing unsafe.
+        // `git apply` on this machine could not parse it at all, so the checks that
+        // decide whether it is safe to apply could not finish — which is a reason
+        // to withhold the command, not a reason to accuse the sender.
+        lines.push("**`git apply` on this machine could not read this patch**, so sesh-mover could not finish checking it and gives no apply command here. Nothing about it was found to be unsafe — the bundle looks damaged or truncated rather than hostile. The patch is beside this file if you want to inspect it; the surer fix is to have the other machine push again.", "");
+        return lines.join("\n") + "\n";
+    }
+    lines.push("To apply it by hand, from the project directory:", "", "```bash", `git -c apply.ignoreWhitespace=no apply --whitespace=nowarn${directory} ${shQuote(patch)}`, "```", "", "Both settings matter: `apply.whitespace=fix` silently strips whitespace the patch adds, and `apply.ignoreWhitespace=change` will apply a patch whose context does not match and rewrite your indentation to it.", "");
     if (!opts.prefixKnown) {
-        lines.push("This machine could not be asked where the project sits inside its repository, so the command above has no `--directory`. **If this project directory is inside a git repository but is not its root, add one** — from the project directory, `git rev-parse --show-prefix` prints exactly what it needs (for example `--directory=\"pkg/app/\"`). Without it `git apply` resolves the patch's paths against the repository root, ignores everything outside your current directory, and exits 0 having written nothing.", "");
+        lines.push("This machine could not be asked where the project sits inside its repository, so the command above has no `--directory`. **If this project directory is inside a git repository but is not its root, add one** — from the project directory, `git rev-parse --show-prefix` prints exactly what it needs (for example `--directory='pkg/app/'`). Without it `git apply` resolves the patch's paths against the repository root, ignores everything outside your current directory, and exits 0 having written nothing.", "");
     }
     else if (opts.applyPrefix) {
         lines.push(`\`--directory\` is not optional here: this project is the subdirectory \`${opts.applyPrefix}\` of its repository, and \`git apply\` resolves patch paths against the repository ROOT. Without it the command exits 0 and writes nothing at all.`, "");
     }
-    lines.push("The untracked files are under `untracked/`. Copying them OVERWRITES same-named files — sesh-mover's own apply never does that — so check first:", "", "```bash", `# macOS / Linux`, `cp -R "${untracked}/." .`, "```", "", "```powershell", `# Windows (PowerShell)`, `Copy-Item -Recurse -Force "${join(untracked, "*")}" .`, "```", "", "Delete this directory once you are done; nothing else reads it, and sesh-mover keeps only the most recent few.");
+    lines.push("The untracked files are under `untracked/`. Copying them OVERWRITES same-named files — sesh-mover's own apply never does that — so check first:", "", "```bash", `# macOS / Linux`, `cp -R ${shQuote(`${untracked}/.`)} .`, "```", "", "```powershell", `# Windows (PowerShell)`, `Copy-Item -Recurse -Force ${psQuote(join(untracked, "*"))} .`, "```", "", "Delete this directory once you are done; nothing else reads it, and sesh-mover keeps only the most recent few.");
     return lines.join("\n") + "\n";
 }
 /**
@@ -1045,23 +1150,28 @@ export async function applyCarry(opts) {
     // included the routine `not-requested` one.
     let applyPrefix = "";
     let prefixKnown = false;
-    const decline = (reason, detail) => ({
+    const decline = (reason, detail, 
+    // Defaulted rather than passed at every call site: "did the floor fire?" is
+    // the question, and only the one caller that knows better overrides it.
+    advice = scanUnsafe || reason === "unsafe-payload" ? "unsafe" : "apply") => ({
         applied: false,
         reason,
         detail,
         savedTo: saveCarryPayload({
-            carryDir, targetPath, meta, detail, stamp, applyPrefix, prefixKnown,
-            recommendApply: !scanUnsafe && reason !== "unsafe-payload",
+            carryDir, targetPath, meta, detail, stamp, applyPrefix, prefixKnown, advice,
         }),
     });
-    if (scanUnsafe) {
-        const detail = scan === null
-            ? "the patch could not be read or is too large to inspect"
-            : scan.symlink !== null
-                ? `the patch creates or changes a symbolic link (${scan.symlink}), which is never applied`
-                : `the patch writes paths that never travel (${scan.paths.filter((p) => isNeverIncludable(p)).slice(0, 3).join(", ")})`;
-        return decline("unsafe-payload", detail);
-    }
+    /**
+     * The byte scan's own refusal, deferred so that git's parse — which names the
+     * path with the prefix it would REALLY have applied — gets to speak first
+     * when both sources see the same entry. Nothing between here and the call
+     * site writes anything: the prefix probe and `--numstat` are both read-only.
+     */
+    const declineScan = () => decline("unsafe-payload", scan === null
+        ? "the patch could not be read or is too large to inspect"
+        : scan.symlink !== null
+            ? `the patch creates or changes a symbolic link (${scan.symlink}), which is never applied`
+            : `the patch writes paths that never travel (${scan.paths.filter((p) => isNeverIncludable(p)).slice(0, 3).join(", ")})`);
     // Where this project sits inside its repository, measured BEFORE any decline
     // can return. Two things need it and both are load-bearing:
     //
@@ -1082,6 +1192,12 @@ export async function applyCarry(opts) {
     // missing git binary does (verified), so the directory is checked first.
     const targetExists = existsSync(targetPath);
     let gitDir = "";
+    // Did `git` actually ANSWER a question about this directory? Everything below
+    // that reads git's opinion of the PATCH depends on it: a `git` that cannot
+    // read this repository refuses every command the same way, and reading such a
+    // refusal as a verdict on the payload accuses the sender of the receiver's
+    // problem (see the floor check below).
+    let gitAnswered = false;
     if (targetExists) {
         const where = git(targetPath, ["rev-parse", "--absolute-git-dir", "--show-prefix"], 64 * 1024);
         if (where.ok) {
@@ -1089,22 +1205,55 @@ export async function applyCarry(opts) {
             gitDir = dir;
             applyPrefix = prefix;
             prefixKnown = true;
+            gitAnswered = true;
         }
-        else if (where.code !== "ENOENT") {
-            // A real `git` answered "not a repository". The empty prefix is then the
-            // RIGHT answer, not a missing one: outside a repository `git apply`
-            // resolves paths against the cwd (measured).
+        else if (where.code !== "ENOENT" && !hasGitAncestor(targetPath)) {
+            // A real `git` refused AND there is no `.git` anywhere above this
+            // directory: the answer is "not a repository", and the empty prefix is
+            // then the RIGHT answer rather than a missing one — outside a repository
+            // `git apply` resolves paths against the cwd (measured).
+            //
+            // With a `.git` present the same refusal means git could not READ the
+            // repository (an unparseable `.git/config`, `safe.directory` ownership,
+            // an unreadable `.git`), and claiming an empty prefix there would hand a
+            // SUBDIRECTORY project a command that exits 0 and writes nothing once
+            // they fix their git — the silent no-op this module exists to avoid. So
+            // the prefix stays unknown and the README says how to find it.
             prefixKnown = true;
         }
     }
-    // git's own parse of the patch, which the raw scan above cannot replace: it
-    // is the only source that covers binary entries. A failure to enumerate is a
-    // refusal — an un-inspected patch is not a safe patch.
+    // git's own parse of the patch — the second floor source, and the only one
+    // that is authoritative about how git will actually resolve each entry.
     //
     // It runs BEFORE the `saveOnly` return on purpose. Saving is the routine
     // path, its README recommends applying the patch by hand, and recommending a
     // payload that `--apply-carry` would refuse as `unsafe-payload` is exactly
     // the advice this guard exists to withhold.
+    //
+    // A FAILURE here has three readings and they must not be conflated — the
+    // whole point of the split below. `unsafe-payload` is a verdict about the
+    // SENDER: it carries the security wording, it withholds the apply command,
+    // and the skill layer relays it as "read this before you touch it". So it may
+    // only be reached when the payload is what went wrong:
+    //
+    // 1. `git` could not be run at all (ENOENT) — diagnosed as `no-git` below.
+    // 2. `git` ran but never answered a question about this directory
+    //    (`gitAnswered` false): an unparseable `.git/config`, `safe.directory`
+    //    ownership, an unreadable `.git`. It then refuses EVERY command with the
+    //    same words, so its refusal of this one is no evidence about the patch.
+    //    Measured: a `.git/config` with a bad line turned a perfectly ordinary
+    //    payload into `unsafe-payload: the patch could not be parsed (fatal: bad
+    //    config line 12 …)` — the receiver's own problem, reported as a hostile
+    //    sender, on the routine no-flag path as well as under `--apply-carry`.
+    // 3. `git` is working here and refused THIS patch (a corrupt or truncated
+    //    bundle). That is a real defect in the payload, but it is not the floor
+    //    firing — nothing unsafe was named — so it declines as `apply-failed`
+    //    with git's own words, and the saved README says the patch could not be
+    //    inspected rather than that it named paths that can never be written.
+    //
+    // (1) and (2) fall through: the guard chain below diagnoses the receiver's
+    // state in git's own words, and the raw byte scan above — which needs no git
+    // — remains the floor there.
     if (patchBytes > 0 && targetExists) {
         const numstat = git(targetPath, applyInvocation(applyPrefix, ["--numstat", "-z"], patchPath), LS_FILES_MAX_BUFFER);
         if (numstat.ok) {
@@ -1118,13 +1267,20 @@ export async function applyCarry(opts) {
                 return decline("unsafe-payload", `the patch writes paths that never travel (${unsafe.slice(0, 3).join(", ")})`);
             }
         }
-        else if (numstat.code !== "ENOENT") {
-            // `git` ran and refused to parse the patch. ENOENT means there is no git
-            // on this machine at all, which is diagnosed as `no-git` below — the raw
-            // scan above is this module's whole answer there, and it has already run.
-            return decline("unsafe-payload", `the patch could not be parsed (${numstat.stderr || String(numstat.code ?? "")})`);
+        else if (gitAnswered && numstat.status !== null && !scanUnsafe) {
+            // `status !== null` means the process ran to completion and made a
+            // judgment. A timeout, an over-budget buffer or a permission fault leave
+            // it null — those are this machine failing to ask, not git answering.
+            //
+            // `!scanUnsafe` because hostile outranks damaged: a patch git cannot
+            // parse can still carry a header naming plugin internals, and that user
+            // must get the security wording rather than "looks damaged".
+            return decline("apply-failed", `the carried patch could not be parsed here (${numstat.stderr || String(numstat.code ?? "")})`, "unparseable");
         }
     }
+    // The byte scan's verdict, second only because git's is better worded.
+    if (scanUnsafe)
+        return declineScan();
     if (opts.saveOnly) {
         return decline("not-requested", "the pull did not ask for carried changes to be applied (--apply-carry)");
     }

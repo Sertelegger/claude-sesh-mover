@@ -187,9 +187,21 @@ export type CarryApplyDeclineReason =
  | "dirty-tree"
 /** The target is mid-merge/rebase/cherry-pick/revert. */
  | "in-progress"
-/** The payload names paths that can never be written, or carries symlinks. */
+/**
+ * The payload names paths that can never be written, or carries symlinks.
+ * A verdict about the PAYLOAD, never about this machine's git — a receiver
+ * whose `git` cannot read its own repository declines through the guard that
+ * names that state instead (`not-git`/`no-git`), because the security wording
+ * this reason carries would otherwise accuse a peer of the user's own
+ * configuration problem.
+ */
  | "unsafe-payload"
-/** `git apply --check` or `git apply` refused it. */
+/**
+ * `git apply --check`, `git apply`, or the `--numstat` parse refused it —
+ * i.e. a working `git` on this machine could not use the patch. Nothing
+ * unsafe was found in it; a parse refusal means a damaged or truncated
+ * bundle, and the saved README says so rather than giving a command.
+ */
  | "apply-failed";
 /** What an applied carry did to the working tree. */
 export interface CarryApplied {
