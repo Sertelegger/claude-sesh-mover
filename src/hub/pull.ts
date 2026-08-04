@@ -13,13 +13,13 @@ import { buildIndexFile, readMachineIndex, writeMachineIndex, readAllIndexes } f
 import { resolveThreads, type ResolvedThread } from "./threads.js";
 import { shapeThreads } from "./whereis.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
-import { tryAppendContinuation } from "./append.js";
+import { readDeltaChainInfo, tryAppendContinuation } from "./append.js";
 import { extractArchive } from "../archiver.js";
 import { importSession } from "../importer.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
-import { readManifest } from "../manifest.js";
-import { countJsonlLines, readLastEntryUuid } from "../jsonl.js";
+import { computeIntegrityHashFromFile, readManifest } from "../manifest.js";
+import { countJsonlLines, readLastEntryUuid, readLastJsonlLine } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream, type RewriteContext } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
@@ -53,13 +53,101 @@ export interface HubPullOptions {
   onProgress?: (ev: ProgressEvent) => void;
 }
 
-// Reverse lookup: which local session currently carries this thread?
-function findLocalBaseForThread(state: SyncState, threadId: string): string | null {
-  const map = state.hub?.threadByLocalSession ?? {};
-  for (const [localSessionId, tid] of Object.entries(map)) {
-    if (tid === threadId) return localSessionId;
+export interface ThreadBaseCandidate {
+  localSessionId: string;
+  /** Uuid of the session's last entry, or null when it can't be read. */
+  headEntryUuid: string | null;
+  /** Timestamp of that last entry, or null when it can't be read. */
+  lastActiveAt: string | null;
+}
+
+/**
+ * Pick which of a thread's local sessions a continuation should splice onto.
+ *
+ * A thread maps to MORE THAN ONE local session as a matter of course: every
+ * time a splice is declined (a live-looking base, a chain that doesn't line
+ * up, `--no-append`) the fragment import mints a new session and maps it onto
+ * the same thread, while the older mapping stays. "Whichever key comes first"
+ * therefore returns the OLDEST session forever, and since the continuation
+ * chain has moved on, every subsequent pull chain-mismatches and forks off
+ * another fragment — a state `--force-append` cannot rescue, because force
+ * never skips the chain guard. index-file.ts:30-41 refuses the mirror-image
+ * shortcut in the forward direction for the same reason.
+ *
+ * So: the delta's anchor decides. The session whose head IS the entry this
+ * continuation follows is the one it belongs on, whatever the map's insertion
+ * order says — which is also what makes a poisoned map self-healing, since
+ * the fragment that stranded the thread is exactly the session carrying the
+ * anchor next time round.
+ *
+ * Order of preference:
+ *   1. sessions whose head uuid equals `anchorUuid` (when it's known and any
+ *      candidate matches) — otherwise every candidate stays in the running,
+ *      so the caller still gets a sensible base to name in the decline;
+ *   2. `preferred` (the session THIS pull already landed content in) if it
+ *      survived step 1;
+ *   3. most recent `lastActiveAt`, ties broken by lexically greatest session
+ *      id — a strict total order, so the answer never depends on map or
+ *      directory iteration order.
+ */
+export function selectThreadBase(
+  candidates: ThreadBaseCandidate[],
+  anchorUuid: string | null,
+  preferred: string | null
+): string | null {
+  if (candidates.length === 0) return null;
+  const anchored = anchorUuid
+    ? candidates.filter((c) => c.headEntryUuid !== null && c.headEntryUuid === anchorUuid)
+    : [];
+  const pool = anchored.length > 0 ? anchored : candidates;
+
+  if (preferred && pool.some((c) => c.localSessionId === preferred)) return preferred;
+
+  return pool.reduce((best, c) => {
+    const a = best.lastActiveAt ?? "";
+    const b = c.lastActiveAt ?? "";
+    if (a !== b) return b > a ? c : best;
+    return c.localSessionId > best.localSessionId ? c : best;
+  }).localSessionId;
+}
+
+/** Head uuid + last-entry timestamp from one bounded tail read. */
+function readSessionTail(path: string): Omit<ThreadBaseCandidate, "localSessionId"> {
+  const line = readLastJsonlLine(path);
+  if (!line) return { headEntryUuid: null, lastActiveAt: null };
+  try {
+    const e = JSON.parse(line) as { uuid?: string; timestamp?: string };
+    return { headEntryUuid: e.uuid ?? null, lastActiveAt: e.timestamp ?? null };
+  } catch {
+    return { headEntryUuid: null, lastActiveAt: null };
   }
-  return null;
+}
+
+/**
+ * Every local session currently mapped to `threadId`, plus the one this pull
+ * has already landed content in (which isn't in the map yet — thread mappings
+ * are only written once the whole chain has been applied). Sessions whose
+ * file is gone are dropped: a mapping outlives the file it points at.
+ */
+function threadBaseCandidates(
+  state: SyncState,
+  threadId: string,
+  pendingSessionId: string | null,
+  targetProjectDir: string
+): ThreadBaseCandidate[] {
+  const ids = new Set<string>();
+  for (const [localSessionId, tid] of Object.entries(state.hub?.threadByLocalSession ?? {})) {
+    if (tid === threadId) ids.add(localSessionId);
+  }
+  if (pendingSessionId) ids.add(pendingSessionId);
+
+  const candidates: ThreadBaseCandidate[] = [];
+  for (const localSessionId of ids) {
+    const p = join(targetProjectDir, `${localSessionId}.jsonl`);
+    if (!existsSync(p)) continue;
+    candidates.push({ localSessionId, ...readSessionTail(p) });
+  }
+  return candidates;
 }
 
 /**
@@ -67,12 +155,14 @@ function findLocalBaseForThread(state: SyncState, threadId: string): string | nu
  * land in the base's directories rather than under the bundle's (now
  * discarded) session id.
  *
- * Subagent JSONL is rewritten through the same context as the transcript
- * (mirroring importer.ts) — it carries the source machine's `cwd` and tool
- * output just like the main transcript does; a plain copy would leave foreign
- * paths behind in exactly the place nobody looks. Existing files are never
- * overwritten: layer files are uuid-named, so a collision means the same
- * artifact already arrived.
+ * Subagent JSONL — and ONLY subagent JSONL — is rewritten through the same
+ * context as the transcript, exactly as importer.ts does it: those files are
+ * Claude Code transcripts carrying the source machine's `cwd` and tool output,
+ * so a plain copy would leave foreign paths behind in the one place nobody
+ * looks. tool-results and file-history are opaque user data (a file-history
+ * backup of a `.jsonl` the user was editing is NOT a transcript) and are
+ * copied byte-for-byte. Existing files are never overwritten: layer files are
+ * uuid-named, so a collision means the same artifact already arrived.
  */
 async function copyLayerDirs(
   extractDir: string,
@@ -82,20 +172,32 @@ async function copyLayerDirs(
   targetConfigDir: string,
   ctx: RewriteContext
 ): Promise<void> {
-  const pairs: Array<[string, string]> = [
-    [join(extractDir, "sessions", bundleSessionId, "subagents"), join(targetProjectDir, baseSessionId, "subagents")],
-    [join(extractDir, "sessions", bundleSessionId, "tool-results"), join(targetProjectDir, baseSessionId, "tool-results")],
-    [join(extractDir, "file-history", bundleSessionId), join(targetConfigDir, "file-history", baseSessionId)],
+  const pairs: Array<{ from: string; to: string; rewriteJsonl: boolean }> = [
+    {
+      from: join(extractDir, "sessions", bundleSessionId, "subagents"),
+      to: join(targetProjectDir, baseSessionId, "subagents"),
+      rewriteJsonl: true,
+    },
+    {
+      from: join(extractDir, "sessions", bundleSessionId, "tool-results"),
+      to: join(targetProjectDir, baseSessionId, "tool-results"),
+      rewriteJsonl: false,
+    },
+    {
+      from: join(extractDir, "file-history", bundleSessionId),
+      to: join(targetConfigDir, "file-history", baseSessionId),
+      rewriteJsonl: false,
+    },
   ];
-  for (const [from, to] of pairs) {
+  for (const { from, to, rewriteJsonl } of pairs) {
     if (!existsSync(from)) continue;
     mkdirSync(to, { recursive: true });
     for (const f of readdirSync(from)) {
       const dest = join(to, f);
       if (existsSync(dest)) continue;
-      if (f.endsWith(".jsonl")) {
-        // Subagent transcripts get the path rewrite (never version adapters —
-        // same rule importer.ts follows) and the base's session id.
+      if (rewriteJsonl && f.endsWith(".jsonl")) {
+        // Path rewrite + the base's session id, never version adapters —
+        // the same rule importer.ts follows for subagents.
         await rewriteJsonlStream(join(from, f), dest, ctx, { newSessionId: baseSessionId });
       } else {
         copyFileSync(join(from, f), dest);
@@ -284,11 +386,11 @@ export async function hubPull(
     const appended: NonNullable<HubPullResult["appended"]> = [];
     let lastImportedNewId: string | null = null;
     let lastBundleManifest: ExportManifest | null = null;
-    // Which local session currently carries this thread. Seeded from the
-    // existing mapping and updated as the chain is applied, so a continuation
-    // later in the SAME pull can splice onto a base this pull just imported —
-    // the thread mapping itself isn't written until the loop is done.
-    let threadBaseSessionId: string | null = findLocalBaseForThread(state, target.threadId);
+    // The local session THIS pull has landed content in (imported or extended)
+    // — null until something lands. It is both the thread mapping written at
+    // the end and the preferred splice target for later bundles in the same
+    // chain, since the mapping itself isn't written until the loop is done.
+    let threadLandedSessionId: string | null = null;
 
     for (const [i, record] of needed.entries()) {
       const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
@@ -366,110 +468,155 @@ export async function hubPull(
         }
       }
 
-      // Append path: a continuation whose chain matches the local session
-      // already carrying this thread splices onto it, so the conversation
-      // stays one resumable transcript. Every guard lives in append.ts and
-      // ANY decline falls through to the import below — content always
-      // arrives, at worst as the Slice-1 fragment.
+      // Append path: a continuation whose chain matches one of this thread's
+      // local sessions splices onto that session, so the conversation stays
+      // one resumable transcript. Every guard lives in append.ts and ANY
+      // decline falls through to the import below — content always arrives,
+      // at worst as the Slice-1 fragment.
       const bundleSession = bundleManifest.sessions.find(
         (s) => s.sessionId === record.sessionIdInBundle
       );
-      const basePath = threadBaseSessionId
-        ? join(targetProjectDir, `${threadBaseSessionId}.jsonl`)
-        : null;
-      if (
-        record.type === "continuation" &&
-        !opts.noAppend &&
-        bundleSession &&
-        basePath &&
-        threadBaseSessionId &&
-        existsSync(basePath)
-      ) {
-        const baseSessionId = threadBaseSessionId;
-        // Identical derivation to importSession's — same manifest, same
-        // target — so a spliced continuation and an imported fragment carry
-        // byte-identical rewrites.
-        const ctx = buildImportRewriteContext(
-          bundleManifest,
-          effectiveProjectPath,
-          opts.configDir
-        );
-        const outcome = await tryAppendContinuation({
-          basePath,
-          baseSessionId,
-          deltaPath: join(extractDir, "sessions", `${record.sessionIdInBundle}.jsonl`),
-          ctx,
-          adapters: getApplicableAdapters(bundleManifest.sourceClaudeVersion, opts.claudeVersion),
-          opNowMs,
-          force: !!opts.forceAppend,
-        });
-
-        if (outcome.kind === "appended") {
-          await copyLayerDirs(
-            extractDir, record.sessionIdInBundle,
-            targetProjectDir, baseSessionId, opts.configDir, ctx
+      const deltaPath = join(extractDir, "sessions", `${record.sessionIdInBundle}.jsonl`);
+      if (record.type === "continuation" && !opts.noAppend && bundleSession && existsSync(deltaPath)) {
+        // Integrity parity with importSession (importer.ts step 3), and the
+        // reason it is a REFUSAL here rather than the importer's warning: a
+        // splice mutates a transcript the user already owns, and nothing
+        // rolls that back once it is verified and committed. A truncated
+        // delta that still gunzips and still chains (a half-synced hub file)
+        // would otherwise be welded into their session silently. Declining
+        // hands the bundle to the fragment path, which lands it in a NEW file
+        // and emits the importer's own "Data may be corrupted" warning — the
+        // content still arrives, the user still hears about it, and the file
+        // they already had is untouched.
+        const actualHash = await computeIntegrityHashFromFile(deltaPath);
+        if (actualHash !== bundleSession.integrityHash) {
+          warnings.push(
+            `Continuation for thread ${target.threadId} failed its integrity check (bundle content doesn't match the manifest hash) — not spliced into the existing session; importing it as a separate session instead.`
+          );
+        } else {
+          // Which of this thread's local sessions does this delta continue?
+          // Decided by the delta's own anchor, never by map order — see
+          // selectThreadBase. Re-read state because importSession rewrites it
+          // between iterations.
+          const anchorUuid = (await readDeltaChainInfo(deltaPath)).firstEntryParentUuid;
+          const baseSessionId = selectThreadBase(
+            threadBaseCandidates(
+              readSyncState(effectiveProjectPath),
+              target.threadId,
+              threadLandedSessionId,
+              targetProjectDir
+            ),
+            anchorUuid,
+            threadLandedSessionId
           );
 
-          // Bookkeeping importSession would normally do. It has to happen
-          // here because the append path deliberately bypasses it: no new
-          // session was created, so there is nothing for the importer to
-          // record — but without these entries the very same bundle is
-          // "needed" again on the next pull (selectNeededBundles reads
-          // peers[...].received) and a push back to the hub would re-upload
-          // the whole session as a full bundle.
-          //
-          // Deliberately NOT written: state.lineage[baseSessionId]. The base
-          // already has lineage describing where the SESSION came from;
-          // overwriting it with this splice's provenance would destroy that
-          // and claim the whole transcript arrived as a continuation.
-          const now = new Date().toISOString();
-          const messageCount = countJsonlLines(basePath);
-          const st = readSyncState(effectiveProjectPath);
-          const peerId = sourceCopy.machineId;
-          st.peers[peerId] ??= {
-            name: bundleManifest.sourceMachineName ?? peerId,
-            lastSentAt: null, lastReceivedAt: null, sent: {}, received: {},
-          };
-          const peer = st.peers[peerId];
-          if (bundleManifest.sourceMachineName) peer.name = bundleManifest.sourceMachineName;
-          peer.lastReceivedAt = now;
-          peer.received[record.sessionIdInBundle] = {
-            localSessionId: baseSessionId,
-            type: "continuation",
-            importedAt: now,
-          };
-          // This machine is now level with that peer on this session.
-          peer.sent[baseSessionId] = {
-            headEntryUuid: outcome.newHeadUuid,
-            messageCount,
-            sentAsType: "continuation",
-            sentAsSessionId: record.sessionIdInBundle,
-          };
-          st.imported[bundleSession.integrityHash] = {
-            localSessionId: baseSessionId,
-            importedAt: now,
-            registered: true,
-          };
-          writeSyncState(st);
-          // ...and so is the hub, which is where this content came from.
-          recordSentToPeer(effectiveProjectPath, { id: hubPeerId, name: "hub" }, baseSessionId, {
-            headEntryUuid: outcome.newHeadUuid,
-            messageCount,
-            sentAsType: "continuation",
-            sentAsSessionId: record.sessionIdInBundle,
-          });
+          if (baseSessionId) {
+            const basePath = join(targetProjectDir, `${baseSessionId}.jsonl`);
+            // Identical derivation to importSession's — same manifest, same
+            // target — so a spliced continuation and an imported fragment
+            // carry byte-identical rewrites.
+            const ctx = buildImportRewriteContext(
+              bundleManifest,
+              effectiveProjectPath,
+              opts.configDir
+            );
+            const outcome = await tryAppendContinuation({
+              basePath,
+              baseSessionId,
+              deltaPath,
+              ctx,
+              adapters: getApplicableAdapters(bundleManifest.sourceClaudeVersion, opts.claudeVersion),
+              opNowMs,
+              force: !!opts.forceAppend,
+            });
 
-          appended.push({
-            threadId: target.threadId,
-            baseSessionId,
-            entriesAppended: outcome.entriesAppended,
-          });
-          continue; // bundle handled — no fragment import
+            if (outcome.kind === "appended") {
+              // Bookkeeping importSession would normally do. It has to happen
+              // here because the append path deliberately bypasses it: no new
+              // session was created, so there is nothing for the importer to
+              // record — but without these entries the very same bundle is
+              // "needed" again on the next pull (selectNeededBundles reads
+              // peers[...].received) and a push back to the hub would
+              // re-upload the whole session as a full bundle.
+              //
+              // It runs BEFORE the layer copy, not after: the base is already
+              // extended at this point, so a layer-copy fault must not leave
+              // the splice unrecorded — the next pull would re-need the
+              // bundle, chain-mismatch against the now-longer base, and land
+              // the very same entries a second time as a fragment.
+              //
+              // Deliberately NOT written: state.lineage[baseSessionId]. The
+              // base already has lineage describing where the SESSION came
+              // from; overwriting it with this splice's provenance would
+              // destroy that and claim the whole transcript arrived as a
+              // continuation.
+              const now = new Date().toISOString();
+              const messageCount = countJsonlLines(basePath);
+              const st = readSyncState(effectiveProjectPath);
+              const peerId = sourceCopy.machineId;
+              st.peers[peerId] ??= {
+                name: bundleManifest.sourceMachineName ?? peerId,
+                lastSentAt: null, lastReceivedAt: null, sent: {}, received: {},
+              };
+              const peer = st.peers[peerId];
+              if (bundleManifest.sourceMachineName) peer.name = bundleManifest.sourceMachineName;
+              peer.lastReceivedAt = now;
+              peer.received[record.sessionIdInBundle] = {
+                localSessionId: baseSessionId,
+                type: "continuation",
+                importedAt: now,
+              };
+              // This machine is now level with that peer on this session.
+              peer.sent[baseSessionId] = {
+                headEntryUuid: outcome.newHeadUuid,
+                messageCount,
+                sentAsType: "continuation",
+                sentAsSessionId: record.sessionIdInBundle,
+              };
+              st.imported[bundleSession.integrityHash] = {
+                localSessionId: baseSessionId,
+                importedAt: now,
+                registered: true,
+              };
+              writeSyncState(st);
+              // ...and so is the hub, which is where this content came from.
+              recordSentToPeer(effectiveProjectPath, { id: hubPeerId, name: "hub" }, baseSessionId, {
+                headEntryUuid: outcome.newHeadUuid,
+                messageCount,
+                sentAsType: "continuation",
+                sentAsSessionId: record.sessionIdInBundle,
+              });
+
+              // Best effort by design: layers are auxiliary artifacts
+              // (subagent transcripts, tool-result blobs, file-history
+              // backups). Losing them costs detail, never transcript
+              // integrity — and the splice above is already committed, so a
+              // throw here would be strictly worse than a warning.
+              try {
+                await copyLayerDirs(
+                  extractDir, record.sessionIdInBundle,
+                  targetProjectDir, baseSessionId, opts.configDir, ctx
+                );
+              } catch (e) {
+                warnings.push(
+                  `Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${(e as Error).message}) — the transcript is complete; those side files are missing.`
+                );
+              }
+
+              appended.push({
+                threadId: target.threadId,
+                baseSessionId,
+                entriesAppended: outcome.entriesAppended,
+              });
+              threadLandedSessionId = baseSessionId;
+              continue; // bundle handled — no fragment import
+            }
+
+            warnings.push(
+              `Continuation for thread ${target.threadId} could not be appended to the local session (${outcome.detail}) — imported as a separate session instead.`
+            );
+          }
         }
-
-        warnings.push(
-          `Continuation for thread ${target.threadId} could not be appended to the local session (${outcome.detail}) — imported as a separate session instead.`
-        );
       }
 
       const importResult = await importSession({
@@ -490,7 +637,7 @@ export async function hubPull(
         // continuation in this same chain must splice onto IT, not onto
         // whatever older session the mapping still points at. Its mtime is
         // inside this operation, so the liveness guard exempts it.
-        threadBaseSessionId = lastImportedNewId;
+        threadLandedSessionId = lastImportedNewId;
         // The hub is the origin of this bundle's content, so as far as this
         // machine's OWN sync-state is concerned the hub already has it up to
         // this head — record that against the hub's own peer id (not the
@@ -507,14 +654,13 @@ export async function hubPull(
     }
 
     // Thread mapping: prefer the session this pull actually landed content
-    // in (imported fragment, appended base, or — when nothing changed — the
-    // base the thread was already mapped to); if every bundle in the chain
-    // was skipped and the thread was never mapped here, fall back to (1) the
-    // local session id an earlier receipt from this peer was recorded
-    // against, then (2) the imported-hash registry — the cross-route
-    // duplicate case, where identical content arrived earlier via a plain
-    // import (no peer bookkeeping) and the importer skipped it via
-    // state.imported[integrityHash] rather than peers[...].received.
+    // in (an imported fragment or an appended base); if every bundle in the
+    // chain was skipped, fall back to (1) the local session id an earlier
+    // receipt from this peer was recorded against, then (2) the imported-hash
+    // registry — the cross-route duplicate case, where identical content
+    // arrived earlier via a plain import (no peer bookkeeping) and the
+    // importer skipped it via state.imported[integrityHash] rather than
+    // peers[...].received.
     const lastRecord = needed[needed.length - 1];
     const stateAfter = readSyncState(effectiveProjectPath);
     const lastSessionManifest =
@@ -523,7 +669,7 @@ export async function hubPull(
       ? stateAfter.imported[lastSessionManifest.integrityHash]?.localSessionId
       : undefined;
     const localSessionId: string | null =
-      threadBaseSessionId ??
+      threadLandedSessionId ??
       stateAfter.peers[sourceCopy.machineId]?.received[lastRecord.sessionIdInBundle]?.localSessionId ??
       hashRegistryFallback ??
       null;

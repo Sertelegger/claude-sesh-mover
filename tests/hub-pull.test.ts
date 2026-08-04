@@ -9,7 +9,7 @@ import { overrideHome } from "./helpers/env.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
-import { hubPull, selectNeededBundles } from "../src/hub/pull.js";
+import { hubPull, selectNeededBundles, selectThreadBase } from "../src/hub/pull.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes } from "../src/hub/index-file.js";
@@ -17,6 +17,7 @@ import { writeLocalProjectId } from "../src/hub/identity.js";
 import { createArchive, extractArchive } from "../src/archiver.js";
 import { importSession } from "../src/importer.js";
 import { readSyncState, getThreadId } from "../src/sync-state.js";
+import { readLastEntryUuid } from "../src/jsonl.js";
 import { encodeProjectPath } from "../src/platform.js";
 import type { HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
 
@@ -723,6 +724,24 @@ const win32Entries: EntryMaker = (parentUuid, sessionId) => [
   },
 ];
 
+/** Two further entries, for a second continuation on top of the first. */
+const moreEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
+  {
+    uuid: "b-entry-6", parentUuid, timestamp: "2026-04-12T09:00:00Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "user",
+    message: { role: "user", content: "and a bit more" },
+  },
+  {
+    uuid: "b-entry-7", parentUuid: "b-entry-6", timestamp: "2026-04-12T09:00:05Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "assistant",
+    message: { model: "claude-opus-4-6", id: "msg_cont2", content: [{ type: "text", text: "Done." }] },
+  },
+];
+
+function appendEntries(path: string, entries: Array<Record<string, unknown>>): void {
+  appendFileSync(path, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+}
+
 /** Push the base session out of the append liveness window. */
 function ageOutOfLiveWindow(path: string): void {
   const old = new Date(Date.now() - 60 * 60 * 1000);
@@ -747,9 +766,17 @@ interface ContinuationArrangement {
   projectA: string;
   projectDirA: string;
   projectB: string;
+  configDirB: string;
+  /** B's local session id for the thread (its layer dirs hang off this). */
+  bSessionId: string;
   projectId: string;
   baseSessionId: string;
   basePath: string;
+  /**
+   * Append more entries on machine B (chained onto B's current head) and push
+   * them as a further continuation, leaving HOME back on machine A.
+   */
+  pushMoreFromB(makeEntries: EntryMaker): Promise<void>;
   cleanup(): void;
 }
 
@@ -810,17 +837,23 @@ async function arrangeContinuation(
     if (!localB) throw new Error("arrange: B's pull identified no local session");
 
     const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${localB}.jsonl`);
-    const entries = makeEntries(FIXTURE_HEAD_UUID, localB, projectB);
-    appendFileSync(bJsonl, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
 
-    const pushB = await hubPush({
-      configDir: configDirB, projectPath: projectB, hubPath: hub,
-      noWorkspace: true, claudeVersion: "2.1.81",
-    });
-    if (!pushB.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(pushB)}`);
-    if (pushB.pushedSessions[0]?.type !== "continuation") {
-      throw new Error("arrange: B pushed a full bundle, not a continuation");
-    }
+    const bProjectPath = projectB;
+    const pushFromB = async (make: EntryMaker): Promise<void> => {
+      const anchor = readLastEntryUuid(bJsonl);
+      if (!anchor) throw new Error("arrange: B's session has no head entry");
+      appendEntries(bJsonl, make(anchor, localB, bProjectPath));
+      const push = await hubPush({
+        configDir: configDirB, projectPath: bProjectPath, hubPath: hub,
+        noWorkspace: true, claudeVersion: "2.1.81",
+      });
+      if (!push.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(push)}`);
+      if (push.pushedSessions[0]?.type !== "continuation") {
+        throw new Error("arrange: B pushed a full bundle, not a continuation");
+      }
+    };
+
+    await pushFromB(makeEntries);
 
     restore.restore();
     restore = overrideHome(homeA);
@@ -830,8 +863,18 @@ async function arrangeContinuation(
     ageOutOfLiveWindow(basePath);
 
     return {
-      hub, configDirA, projectA, projectDirA, projectB,
+      hub, configDirA, projectA, projectDirA, projectB, configDirB, bSessionId: localB,
       projectId: pushA.projectId, baseSessionId: FIXTURE_SESSION_ID, basePath, cleanup,
+      async pushMoreFromB(make: EntryMaker): Promise<void> {
+        restore.restore();
+        restore = overrideHome(homeB);
+        try {
+          await pushFromB(make);
+        } finally {
+          restore.restore();
+          restore = overrideHome(homeA);
+        }
+      },
     };
   } catch (e) {
     cleanup();
@@ -840,21 +883,24 @@ async function arrangeContinuation(
 }
 
 /**
- * Rewrite the continuation bundle already sitting on the hub so it claims to
- * have been pushed from a Windows machine. Only manifest METADATA changes —
- * the session JSONL is untouched, so its manifest integrity hash stays valid
- * and the bundle is indistinguishable from a genuine cross-platform push.
+ * Unpack the most recently pushed continuation bundle on the hub, hand its
+ * directory to `mutate`, and put it back under the same hub path.
  */
-async function repointBundleAtWindows(hubPath: string, projectId: string): Promise<void> {
+async function mutateContinuationBundle(
+  hubPath: string,
+  projectId: string,
+  mutate: (bundleDir: string) => void
+): Promise<void> {
   const backend = createFsBackend(hubPath);
   const { indexes } = await readAllIndexes(backend, projectId);
-  const record = indexes
+  const continuations = indexes
     .flatMap((i) => Object.values(i.threads))
     .flatMap((t) => t.bundles)
-    .find((b) => b.type === "continuation");
-  if (!record) throw new Error("no continuation bundle on the hub to repoint");
+    .filter((b) => b.type === "continuation");
+  const record = continuations[continuations.length - 1];
+  if (!record) throw new Error("no continuation bundle on the hub to mutate");
 
-  const stage = mkdtempSync(join(tmpdir(), "sesh-app-repoint-"));
+  const stage = mkdtempSync(join(tmpdir(), "sesh-app-mutate-"));
   try {
     const tarPath = join(stage, "in.tar.gz");
     writeFileSync(tarPath, await backend.read(record.file));
@@ -865,12 +911,7 @@ async function repointBundleAtWindows(hubPath: string, projectId: string): Promi
     mkdirSync(dir, { recursive: true });
     await extractArchive(tarPath, dir);
 
-    const manifestPath = join(dir, "manifest.json");
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
-    manifest.sourcePlatform = "win32";
-    manifest.sourceProjectPath = WIN_PROJECT;
-    manifest.sourceConfigDir = WIN_CONFIG;
-    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+    mutate(dir);
 
     const outPath = join(stage, "out.tar.gz");
     await createArchive(dir, outPath, "gzip");
@@ -879,6 +920,68 @@ async function repointBundleAtWindows(hubPath: string, projectId: string): Promi
     rmSync(stage, { recursive: true, force: true });
   }
 }
+
+/**
+ * Make the pushed continuation claim it came from a Windows machine. Only
+ * manifest METADATA changes — the session JSONL is untouched, so its manifest
+ * integrity hash stays valid and the bundle is indistinguishable from a
+ * genuine cross-platform push.
+ */
+async function repointBundleAtWindows(hubPath: string, projectId: string): Promise<void> {
+  await mutateContinuationBundle(hubPath, projectId, (dir) => {
+    const manifestPath = join(dir, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    manifest.sourcePlatform = "win32";
+    manifest.sourceProjectPath = WIN_PROJECT;
+    manifest.sourceConfigDir = WIN_CONFIG;
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+  });
+}
+
+describe("selectThreadBase (pure)", () => {
+  const cand = (localSessionId: string, headEntryUuid: string | null, lastActiveAt: string | null) =>
+    ({ localSessionId, headEntryUuid, lastActiveAt });
+
+  // The poisoned map: a declined splice leaves the stale base AND the
+  // fragment both mapped to the thread, base first. Insertion order would
+  // pick the base forever and every later pull would fork another fragment.
+  const stale = cand("base", "entry-3", "2026-04-10T12:01:00Z");
+  const fragment = cand("fragment", "b-entry-5", "2026-04-11T09:00:05Z");
+
+  it("picks the session whose head IS the delta's anchor, not the first-mapped one", () => {
+    expect(selectThreadBase([stale, fragment], "b-entry-5", null)).toBe("fragment");
+  });
+
+  it("falls back to the most recent when nothing carries the anchor", () => {
+    expect(selectThreadBase([stale, fragment], "no-such-uuid", null)).toBe("fragment");
+    expect(selectThreadBase([stale, fragment], null, null)).toBe("fragment");
+  });
+
+  it("prefers the session this pull already landed content in", () => {
+    expect(selectThreadBase([stale, fragment], null, "base")).toBe("base");
+  });
+
+  it("but the anchor still outranks the preferred session", () => {
+    expect(selectThreadBase([stale, fragment], "b-entry-5", "base")).toBe("fragment");
+  });
+
+  it("a candidate whose head could not be read is never an anchor match", () => {
+    const unreadable = cand("broken", null, "2026-04-30T00:00:00Z"); // newest of the three
+    expect(selectThreadBase([unreadable, fragment], "b-entry-5", null)).toBe("fragment");
+    // ...but with no anchor to go on it is simply the most recent candidate
+    expect(selectThreadBase([unreadable, fragment], null, null)).toBe("broken");
+  });
+
+  it("is a total order: the answer never depends on input order", () => {
+    const a = cand("aaa", "same-head", "2026-04-10T12:00:00Z");
+    const b = cand("bbb", "same-head", "2026-04-10T12:00:00Z");
+    expect(selectThreadBase([a, b], "same-head", null)).toBe(selectThreadBase([b, a], "same-head", null));
+  });
+
+  it("returns null when there is nothing to pick", () => {
+    expect(selectThreadBase([], "anything", null)).toBeNull();
+  });
+});
 
 describe("hub pull — continuation append", () => {
   it("pulling a continuation appends to the local base instead of creating a fragment", async () => {
@@ -1015,6 +1118,106 @@ describe("hub pull — continuation append", () => {
     }
   });
 
+  it("recovers from a thread mapped to several sessions: the NEXT continuation appends to the fragment, not the stale base", async () => {
+    const a = await arrangeContinuation();
+    try {
+      // Pull 1 declines (the base looks live) and forks a fragment. The
+      // thread is now mapped to TWO local sessions — the stale base first,
+      // the fragment second. This is the routine shape, not an exotic one:
+      // any base written by a previous pull is "recently active" for five
+      // minutes.
+      makeLookLive(a.basePath);
+      const first = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      expect((first as HubPullResult).appended ?? []).toHaveLength(0);
+      const twoFiles = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      expect(twoFiles).toHaveLength(2);
+
+      const state = readSyncState(a.projectA);
+      const mapped = Object.entries(state.hub?.threadByLocalSession ?? {})
+        .filter(([, t]) => t === (first as HubPullResult).threadId)
+        .map(([id]) => id);
+      expect(mapped).toHaveLength(2); // the poisoned map, as reproduced in review
+      expect(mapped[0]).toBe(a.baseSessionId); // ...and the STALE one is first
+
+      // B carries the conversation further; the new continuation's anchor is
+      // the fragment's head, not the base's.
+      await a.pushMoreFromB(moreEntries);
+      for (const f of twoFiles) ageOutOfLiveWindow(join(a.projectDirA, f));
+
+      const second = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      const p = second as HubPullResult;
+
+      // No third file: the append found the fragment by its anchor.
+      expect(readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"))).toEqual(twoFiles);
+      expect(p.appended).toHaveLength(1);
+      expect(p.appended![0].baseSessionId).not.toBe(a.baseSessionId);
+      expect(p.appended![0].entriesAppended).toBe(2);
+
+      // The stale base is untouched, and the fragment now carries the tail.
+      expect(readFileSync(a.basePath, "utf-8").trim().split("\n")).toHaveLength(3);
+      const fragmentId = p.appended![0].baseSessionId;
+      const fragment = readFileSync(join(a.projectDirA, `${fragmentId}.jsonl`), "utf-8");
+      const uuids = fragment.trim().split("\n").map((l) => JSON.parse(l).uuid);
+      expect(uuids.slice(1)).toEqual(["b-entry-4", "b-entry-5", "b-entry-6", "b-entry-7"]);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("a continuation whose content fails its integrity check is never spliced into an existing session", async () => {
+    const a = await arrangeContinuation();
+    try {
+      // Corrupt the bundle's session JSONL while leaving the manifest hash
+      // alone: a half-synced hub file that still gunzips and still chains.
+      await mutateContinuationBundle(a.hub, a.projectId, (dir) => {
+        const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf-8"));
+        const sessionFile = join(dir, "sessions", `${manifest.sessions[0].sessionId}.jsonl`);
+        appendEntries(sessionFile, [
+          {
+            uuid: "smuggled", parentUuid: "b-entry-5", timestamp: "2026-04-11T09:09:09Z",
+            sessionId: manifest.sessions[0].sessionId, cwd: "/x", version: "2.1.81",
+            type: "user", message: { role: "user", content: "not in the hash" },
+          },
+        ]);
+      });
+
+      const before = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      expect(p.appended ?? []).toHaveLength(0);
+      // The user's existing transcript is byte-identical...
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      // ...the content still arrived, in a new file...
+      expect(readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"))).toHaveLength(
+        before.length + 1
+      );
+      // ...and the user is told, twice: once by the refusal, once by the
+      // importer's own corruption warning.
+      expect(p.warnings.join(" ")).toContain("not spliced");
+      expect(p.warnings.join(" ")).toContain("integrity check failed");
+    } finally {
+      a.cleanup();
+    }
+  });
+
   it("--force-append splices onto a live-looking base anyway", async () => {
     const a = await arrangeContinuation();
     try {
@@ -1034,6 +1237,174 @@ describe("hub pull — continuation append", () => {
       expect(readFileSync(a.basePath, "utf-8").trim().split("\n")).toHaveLength(5);
     } finally {
       a.cleanup();
+    }
+  });
+
+  it("rewrites spliced subagent transcripts but copies file-history backups verbatim", async () => {
+    const a = await arrangeContinuation();
+    try {
+      // Layer files planted on B, carried by its next continuation bundle.
+      const subagentDir = join(
+        a.configDirB, "projects", encodeProjectPath(a.projectB), a.bSessionId, "subagents"
+      );
+      mkdirSync(subagentDir, { recursive: true });
+      writeFileSync(
+        join(subagentDir, "agent-x.jsonl"),
+        JSON.stringify({
+          uuid: "sub-x-1", sessionId: a.bSessionId, cwd: a.projectB, type: "user",
+          message: { role: "user", content: "explore the src directory" }, isSidechain: true,
+        }) + "\n"
+      );
+
+      // A file-history backup that happens to be named .jsonl — a snapshot of
+      // the USER's own data file, not a Claude transcript. It must survive
+      // byte-for-byte: rewriting it would corrupt their backup and stamp it
+      // with a session id that means nothing in that file.
+      const fhDir = join(a.configDirB, "file-history", a.bSessionId);
+      mkdirSync(fhDir, { recursive: true });
+      const backup = JSON.stringify({ sessionId: "user-data", cwd: a.projectB }) + "\n";
+      writeFileSync(join(fhDir, "notes.jsonl"), backup);
+
+      await a.pushMoreFromB(moreEntries);
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect((result as HubPullResult).appended?.length).toBeGreaterThanOrEqual(1);
+
+      const landedSubagent = JSON.parse(
+        readFileSync(join(a.projectDirA, a.baseSessionId, "subagents", "agent-x.jsonl"), "utf-8")
+      );
+      expect(landedSubagent.cwd).toBe(a.projectA); // path-rewritten
+      expect(landedSubagent.sessionId).toBe(a.baseSessionId); // re-stamped
+
+      const landedBackup = readFileSync(
+        join(a.configDirA, "file-history", a.baseSessionId, "notes.jsonl"), "utf-8"
+      );
+      expect(landedBackup).toBe(backup); // untouched, still B's paths and ids
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("a layer-copy failure after a committed splice warns but never re-lands the entries", async () => {
+    const a = await arrangeContinuation();
+    try {
+      // Make copyLayerDirs' first mkdirSync fail: the session's layer
+      // directory path is occupied by a regular file.
+      rmSync(join(a.projectDirA, a.baseSessionId), { recursive: true, force: true });
+      writeFileSync(join(a.projectDirA, a.baseSessionId), "not a directory\n");
+
+      const before = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      const first = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      const p = first as HubPullResult;
+
+      // The splice itself committed...
+      expect(p.appended).toHaveLength(1);
+      expect(readFileSync(a.basePath, "utf-8").trim().split("\n")).toHaveLength(5);
+      // ...the user hears the side files are missing...
+      expect(p.warnings.join(" ")).toContain("side files are missing");
+
+      // ...and the bookkeeping was written BEFORE the layer copy, so the
+      // bundle is not "needed" again. Without that ordering the next pull
+      // would re-fetch it, chain-mismatch against the now-longer base, and
+      // land the same two entries a second time as a fragment.
+      const second = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(second.success).toBe(false);
+      expect(readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"))).toEqual(before);
+      expect(readFileSync(a.basePath, "utf-8").trim().split("\n")).toHaveLength(5);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  // The whole reason `opNowMs` is captured once per operation rather than per
+  // bundle, and the reason the pull tracks which session it just landed
+  // content in: a machine seeing this thread for the first time pulls a full
+  // bundle plus every continuation after it, and each splice targets a base
+  // THIS operation wrote moments earlier. Get either wrong and the liveness
+  // guard re-arms against our own writes, scattering one conversation across
+  // 1 + N sessions.
+  it("a fresh machine pulling full+continuation+continuation lands ONE session, not three", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-chain-homeA-"));
+    const homeC = mkdtempSync(join(tmpdir(), "sesh-chain-homeC-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-chain-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-chain-fix-"));
+    let projectC: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+
+      const pushOpts = {
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        noWorkspace: true, claudeVersion: "2.1.81",
+      };
+      const full = await hubPush({ ...pushOpts, createProject: true });
+      expect(full.success).toBe(true);
+      if (!full.success) return;
+
+      // Two further rounds of work on A, each pushed as its own continuation,
+      // so ONE machine's index carries full + cont + cont for the thread.
+      const aJsonl = join(configDirA, "projects", encodeProjectPath(projectA), `${FIXTURE_SESSION_ID}.jsonl`);
+      appendEntries(aJsonl, plainEntries(FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID, projectA));
+      expect((await hubPush(pushOpts)).success).toBe(true);
+      appendEntries(aJsonl, moreEntries("b-entry-5", FIXTURE_SESSION_ID, projectA));
+      expect((await hubPush(pushOpts)).success).toBe(true);
+
+      restore.restore();
+      restore = overrideHome(homeC);
+
+      const configDirC = join(homeC, ".claude");
+      projectC = mkdtempSync(join(tmpdir(), "sesh-chain-projC-"));
+      writeLocalProjectId(projectC, {
+        projectId: full.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      const pull = await hubPull({
+        configDir: configDirC, projectPath: projectC, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      expect(p.importedSessions).toHaveLength(1); // the full bundle only
+      expect(p.appended).toHaveLength(2); // both continuations spliced onto it
+
+      const projectDirC = join(configDirC, "projects", encodeProjectPath(projectC));
+      const files = readdirSync(projectDirC).filter((f) => f.endsWith(".jsonl"));
+      expect(files).toHaveLength(1);
+
+      const raw = readFileSync(join(projectDirC, files[0]), "utf-8");
+      const lines = raw.trim().split("\n").map((l) => JSON.parse(l));
+      expect(lines.map((l) => l.uuid)).toEqual([
+        "entry-1", "entry-2", "entry-3", "b-entry-4", "b-entry-5", "b-entry-6", "b-entry-7",
+      ]);
+      expect(raw).not.toContain("[sesh-mover continuation]");
+      expect(new Set(lines.map((l) => l.sessionId)).size).toBe(1);
+      expect(p.localSessionId).toBe(files[0].replace(/\.jsonl$/, ""));
+      // Both spliced rounds were path-rewritten onto C. (The fixture's own
+      // first three entries carry a synthetic cwd that was never A's project
+      // path, so there is no mapping for them to match — only the entries
+      // written against projectA are in scope here.)
+      expect(lines.slice(3).every((l) => l.cwd === projectC)).toBe(true);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeC, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectC) rmSync(projectC, { recursive: true, force: true });
     }
   });
 });

@@ -62,6 +62,13 @@ export async function readDeltaChainInfo(deltaPath) {
  * and no path mappings (source and target paths are equal, so
  * `buildPathMappings` emits none). `rewriteEntry` therefore touches ONLY the
  * `sessionId` — cwd, tool results and snapshot keys pass through untouched.
+ *
+ * NOTE — no production caller. Every real splice comes off the hub, i.e. from
+ * another machine, and goes through `buildImportRewriteContext` (see
+ * `AppendAttempt.ctx`). This exists for tests and for a hypothetical
+ * same-machine splice; if you reach for it against bundle content, you are
+ * almost certainly about to embed another machine's paths in a local
+ * transcript.
  */
 export function identityRewriteContext() {
     const platform = detectPlatform();
