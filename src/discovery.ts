@@ -193,8 +193,25 @@ function parseSessionJsonl(
     // timestamp would make them `undefined` — NaN in every sort, and silently
     // absent from any JSON.stringify'd record — so mtime, which is always
     // available and is a truthful answer for "last touched", is the floor.
+    //
+    // `createdAt` falls through the LAST entry's timestamp before reaching
+    // mtime. Only the degraded shapes get that far (a transcript whose leading
+    // line is unreadable, or which holds no conversation entry at all), and
+    // without the middle step they came out with `createdAt` = now and
+    // `lastActiveAt` = the real, older conversation timestamp — i.e. created
+    // after last active. Informational only, no sort depends on the pair, but
+    // there is no reason to publish an impossible one.
+    //
+    // The mtime floor is also the one place a FILESYSTEM clock can enter
+    // `lastActiveAt`, which `resolveThreads` compares across machines to pick
+    // the latest copy. Benign in practice — it is unreachable for any
+    // non-degraded transcript (0 of 7 real ones), and an mtime is stable rather
+    // than drifting — but it is a different clock from the one every other copy
+    // is dated by, so a thread whose winner is decided on an mtime is being
+    // decided on a weaker basis than one decided on entry timestamps.
     const mtimeIso = (): string => statSync(jsonlPath).mtime.toISOString();
-    const createdAt = asString(firstEntry.timestamp) ?? mtimeIso();
+    const createdAt =
+      asString(firstEntry.timestamp) ?? asString(lastEntry.timestamp) ?? mtimeIso();
     const lastActiveAt = asString(lastEntry.timestamp) ?? createdAt;
 
     return {

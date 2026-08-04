@@ -84,7 +84,12 @@ export type AppendDeclineReason =
  | "no-delta-entries"
 /** The bundle itself is unusable. Aborted BEFORE the base was touched — it is byte- and mtime-identical. */
  | "delta-unusable"
-/** Bytes were appended, then something failed and the base was truncated back. */
+/**
+ * Bytes were appended, then something failed and the base was truncated back
+ * — and the truncate was PROVEN to remove only our own bytes before it ran.
+ * A rollback that could not be proven safe throws instead of reporting this,
+ * so this reason always means "the base is as it was".
+ */
  | "rolled-back";
 export type AppendOutcome = {
     kind: "appended";
@@ -116,16 +121,21 @@ export type AppendOutcome = {
  *    pull write a fresh base and then splice its own continuations onto it.
  *
  * The base is only ever EXTENDED, so rollback is a truncate back to its byte
- * length as re-measured at that second check — byte-exact by construction, and
- * measured late enough that it can never discard a concurrent writer's bytes.
- * Rollback also re-verifies the restored head uuid, and is skipped entirely
- * when nothing was written (so a decline never even bumps the base's mtime —
- * Claude Code orders `/resume` by mtime).
+ * length as re-measured at that second check. That re-measurement keeps the
+ * length as fresh as it can be, but it does NOT by itself make the truncate
+ * safe: bytes can still land between the measurement and our first write. So
+ * the rollback path first proves the file is exactly as long as "what was
+ * there" plus "what we wrote" and THROWS rather than truncating when it is not
+ * — a rollback that would eat another writer's line is never performed, and is
+ * never reported as a clean restore. Rollback also re-verifies the restored
+ * head uuid, and is skipped entirely when nothing was written (so a decline
+ * never even bumps the base's mtime — Claude Code orders `/resume` by mtime).
  *
  * Every anticipated failure is reported as a `declined` outcome. Raw IO faults
  * still throw: an unreadable delta path, a fault before any byte was written,
- * and — loudest of all — a rollback that itself failed, which is the one case
- * where the base may be left corrupt.
+ * a rollback that could not be proven safe, and — loudest of all — a rollback
+ * that itself failed. Those last two are the cases where the base may be left
+ * holding bytes we did not intend it to keep.
  */
 export declare function tryAppendContinuation(a: AppendAttempt): Promise<AppendOutcome>;
 export interface AdoptHubInput {
@@ -177,9 +187,13 @@ export type AdoptOutcome = {
  *
  * The distinction matters under a live writer: "restored" means restored to
  * THE SNAPSHOT, so a restore can only ever be byte-for-byte with respect to
- * the file as it was when adoption began. That is exactly why the re-check
- * exists — it makes the untouched case the only one a concurrent writer can
- * reach.
+ * the file as it was when adoption began. The re-check is what pushes a
+ * concurrent writer towards the untouched case, but it cannot cover the
+ * window between itself and the truncate/append — so before restoring, the
+ * failure path proves the file is exactly the size our own mutation left it
+ * at, and THROWS rather than restoring when it is not. A restore that would
+ * overwrite another writer's bytes is never performed, and never reported as
+ * a clean one.
  */
  | {
     kind: "failed";
@@ -219,13 +233,20 @@ export type AdoptOutcome = {
  * just before the cut; any difference abandons the adoption with nothing
  * written, leaving the concurrent writer's bytes exactly where they are.
  *
+ * That re-check cannot cover the window it opens — between itself and the
+ * truncate/append — so the failure path adds the arithmetic backstop: the
+ * restore runs only if the file is exactly the size this call's own mutation
+ * accounts for, and throws otherwise. Restoring is a whole-file overwrite, so
+ * doing it over foreign bytes would not merely mis-report, it would erase them.
+ *
  * No entry is injected into either transcript; the "preserved" labelling is
  * the caller's `history.jsonl` display name, not content.
  *
- * Anticipated failures come back as `failed`. The one case that throws is a
- * restore that itself failed — the only situation where the base may be left
- * inconsistent, and the temp backup is then deliberately NOT deleted so the
- * error can name a full copy of the user's session.
+ * Anticipated failures come back as `failed`. Two cases throw: a restore that
+ * could not be proven safe, and a restore that itself failed. Both are
+ * situations where the base may be left inconsistent, and in both the temp
+ * backup is deliberately NOT deleted so the error can name a full copy of the
+ * user's session.
  */
 export declare function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome>;
 //# sourceMappingURL=append.d.ts.map

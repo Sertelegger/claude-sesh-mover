@@ -188,6 +188,44 @@ describe("discovery", () => {
       expect(JSON.parse(JSON.stringify(s))).toHaveProperty("lastActiveAt");
     });
 
+    // The degraded shape that used to publish an impossible pair: the FORWARD
+    // scan fails where the backward one succeeds, so `firstEntry` comes from
+    // the raw-first-line fallback with no timestamp and `createdAt` fell
+    // straight to mtime (now), while `lastActiveAt` came off a real, older
+    // conversation entry — created AFTER last active.
+    //
+    // Provoked here with a leading line that is valid JSON but not an object
+    // (the forward scan's "unreadable" rule, which the raw fallback then parses
+    // happily). The same asymmetry is reached by a leading bookkeeping run
+    // longer than MAX_ENTRY_SCAN_BYTES; this is the cheap stand-in for it.
+    it("never reports a createdAt later than lastActiveAt", async () => {
+      const { discoverSessionById } = await import("../src/discovery.js");
+      const { writeFileSync } = await import("node:fs");
+      const id = "770e8400-e29b-41d4-a716-446655440000";
+      writeFileSync(
+        join(configDir, "projects", "-Users-testuser-Projects-testproject", `${id}.jsonl`),
+        "[]\n" +
+          JSON.stringify({
+            uuid: "old-1",
+            parentUuid: null,
+            sessionId: id,
+            cwd: PROJECT,
+            type: "user",
+            timestamp: "2020-01-02T03:04:05.000Z",
+            message: { role: "user", content: "ancient" },
+          }) +
+          "\n",
+        "utf-8"
+      );
+      const s = discoverSessionById(configDir, id);
+      expect(s).not.toBeNull();
+      expect(s!.lastActiveAt).toBe("2020-01-02T03:04:05.000Z");
+      expect(s!.createdAt).toBe(s!.lastActiveAt);
+      expect(new Date(s!.createdAt).getTime()).toBeLessThanOrEqual(
+        new Date(s!.lastActiveAt).getTime()
+      );
+    });
+
     it("still lists a transcript that holds no conversation entry at all", async () => {
       const { discoverSessionById } = await import("../src/discovery.js");
       const { writeFileSync } = await import("node:fs");

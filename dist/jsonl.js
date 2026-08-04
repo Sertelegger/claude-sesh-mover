@@ -13,10 +13,12 @@ const SCAN_CHUNK = 64 * 1024;
  * Sessions grow without bound (250 MB transcripts exist), so "walk until you
  * find a conversation entry" needs a ceiling. Measured across every real
  * transcript in this machine's `~/.claude/projects` (2026-08-04): the longest
- * unbroken run of uuid-less bookkeeping anywhere was 15 entries / 17 KB, the
- * longest such run at the END of a file was 2 entries / 7.5 KB, and the largest
- * single line was 124 KB. 4 MB is ~500x the worst observed run and — the reason
- * for this exact value — a whole multiple of `MAX_LINE_BYTES`, so the scan can
+ * unbroken run of uuid-less bookkeeping anywhere was 17,010 bytes (4
+ * `queue-operation` entries) — the run with the most ENTRIES was 15, but only
+ * 2,103 bytes — the longest such run at the END of a file was 2 entries / 7,497
+ * bytes, and the largest single line was 123,612 bytes. Bytes are what this cap
+ * is denominated in, so 17,010 is the figure it has to clear: 4 MB is ~240x it.
+ * The exact value is a whole multiple of `MAX_LINE_BYTES`, so the scan can
  * always cross several maximum-size lines before the window, rather than the
  * per-line cap, is what ends it.
  */
@@ -29,10 +31,23 @@ export const MAX_ENTRY_SCAN_BYTES = 4 * 1024 * 1024;
  * between releases (`last-prompt`, `mode`, `permission-mode`, `ai-title`,
  * `agent-name`, `pr-link`, `queue-operation`, `file-history-snapshot`,
  * `file-history-delta` are only the ones observed so far), and a denylist would
- * go stale the next time it ships one. What does not change is that `uuid` is
- * the chain identity: `parentUuid` only ever points at an entry that has one,
- * which makes "the last entry with a uuid" exactly "the entry a continuation
- * can chain onto".
+ * go stale the next time it ships one. `uuid` is the chain identity —
+ * `parentUuid` only ever points at an entry that has one — so this is the
+ * predicate for "is this entry part of the conversation", and it was exact on
+ * every entry of every real transcript measured (7 files / 6,187 lines / 4,284
+ * conversation entries, 2026-08-04).
+ *
+ * What it is NOT is a chain-successor predicate. "The last entry with a uuid"
+ * is not the same thing as "the entry the next one will chain onto", and the
+ * difference is measurable rather than theoretical: a transcript is written as
+ * a TREE, so 197 of 4,277 consecutive conversation-entry pairs (4.6%) have
+ * `next.parentUuid !== prev.uuid`. Mostly sibling fans written back-to-back
+ * under one parent (an `attachment` run followed by the `user` entry it belongs
+ * to), sometimes a jump as far as 59 entries back; none of the 197 involved
+ * `isSidechain`. So a continuation cut at such a boundary still fails
+ * `tryAppendContinuation`'s chain guard even though this predicate answered
+ * correctly. That residual is pre-existing and out of scope here — see the
+ * ledger's Task 7 carry — but do not read this function as closing it.
  *
  * The empty string is rejected on purpose: `""` is the sentinel hub index files
  * and sync-state records write for "head unknown", so accepting it would let
@@ -47,6 +62,17 @@ export function isConversationEntry(value) {
 function classifyLine(line) {
     if (line.length === 0)
         return { kind: "skip" };
+    // Note the reach of this one: "unreadable is fatal" used to apply only to a
+    // transcript's FINAL line, and now applies to any line in the trailing
+    // bookkeeping run. An oversized line there pins the head at `null` for that
+    // session permanently — every later append declines with `chain-mismatch`,
+    // and `lastActiveAt` falls back to mtime. `file-history-snapshot` is the type
+    // that could plausibly get there, being the one designed to embed file
+    // contents, though the largest observed anywhere is 8.6 KB against a 1 MB cap
+    // (largest line of ANY type: 124 KB). Left as-is deliberately: the safe
+    // escape hatch, if it ever becomes real, is to scan an oversized line's raw
+    // bytes for `"uuid"` and skip it when absent (a conversation entry must
+    // serialize that key), which is sound but buys nothing today.
     if (line.length > MAX_LINE_BYTES)
         return { kind: "unreadable" };
     const text = line.toString("utf-8");
@@ -183,10 +209,14 @@ export function countJsonlLines(path) {
  * entry a continuation's `parentUuid` must point at.
  *
  * Reading only the final line (what this used to do) is wrong: Claude Code
- * appends uuid-less bookkeeping entries after conversation entries, and
- * measured across this machine's real transcripts 5 of 7 sessions end with one.
- * A head derived from such a line is `null`, which no chain guard can ever
- * match and which `JSON.stringify` drops out of an index file entirely.
+ * appends uuid-less bookkeeping entries after conversation entries. "5 of 7
+ * sessions end with one" is the snapshot figure, and it is not a stable one —
+ * some of those transcripts are live, so their final line changes as they are
+ * written. The stable measurement is the share of a transcript's line
+ * boundaries whose preceding line is uuid-less, i.e. the fraction of moments at
+ * which the old derivation was wrong: 1,903 of 6,187 lines, 31%. A head derived
+ * from such a line is `null`, which no chain guard can ever match and which
+ * `JSON.stringify` drops out of an index file entirely.
  *
  * Bounded: walks backwards in `SCAN_CHUNK` blocks, holds at most one line plus
  * one block in memory, and reads at most `MAX_ENTRY_SCAN_BYTES` (rounded up to

@@ -251,6 +251,26 @@ describe("jsonl", () => {
       expect(readLastConversationEntry(join(tempDir, "nope.jsonl"))).toBeNull();
       expect(readLastConversationEntry(write("empty3.jsonl", ""))).toBeNull();
     });
+
+    // The backward scan's `pos === 0 && carry.length > 0` tail: a file whose
+    // FIRST line has no preceding newline is never closed by the `lastIndexOf`
+    // loop, so it is only classified once the scan reaches offset 0. The
+    // forward reader's equivalent case is covered below; this is its mirror.
+    it("returns a single unterminated conversation line", async () => {
+      const { readLastConversationEntry, readLastEntryUuid } = await import("../src/jsonl.js");
+      const p = write("nonl-last.jsonl", JSON.stringify(CONV_1));
+      expect(readLastConversationEntry(p)?.uuid).toBe("c1");
+      expect(readLastEntryUuid(p)).toBe("c1");
+    });
+
+    // Same tail, taken the other way: reaching offset 0 must not resurrect an
+    // unterminated FIRST line that is bookkeeping, and must not report the
+    // conversation entry above it either (nothing is above it).
+    it("returns null for a single unterminated bookkeeping line", async () => {
+      const { readLastConversationEntry } = await import("../src/jsonl.js");
+      const p = write("nonl-bk.jsonl", JSON.stringify(bookkeeping("s1")[0]));
+      expect(readLastConversationEntry(p)).toBeNull();
+    });
   });
 
   describe("readFirstConversationEntry", () => {

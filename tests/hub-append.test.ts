@@ -722,6 +722,88 @@ describe("tryAppendContinuation", () => {
     }
   });
 
+  // The residual the re-measurement CANNOT close: a writer that lands between
+  // `rollbackBytes = fresh.size` and the moment our own bytes are all in the
+  // file. Before this milestone such a write made the head read return null and
+  // the attempt decline (accidentally safe); now the head skips bookkeeping, the
+  // splice proceeds, and a blind truncate back to `rollbackBytes` would delete
+  // the other writer's line while reporting a clean restore.
+  //
+  // The injected failure writes the interloper's line and then throws, which is
+  // also the realistic production shape: a live Claude Code session appends a
+  // conversation entry right after our splice, post-append head verification
+  // fails because the head is no longer the delta's last uuid, and the rollback
+  // path is entered with foreign bytes past `rollbackBytes`.
+  it("refuses to roll back over another writer's bytes, and says so instead of claiming a clean restore", async () => {
+    const dir = tmp("sesh-append-");
+    try {
+      const base = makeBase(dir); // head b3
+      const delta = makeDelta(dir, "b3");
+      const interloper = JSON.stringify(entry("live-1", "d2", "base-sid")) + "\n";
+      const beforeSize = statSync(base).size;
+
+      let err: Error | undefined;
+      try {
+        await tryAppendContinuation({
+          basePath: base,
+          baseSessionId: "base-sid",
+          deltaPath: delta,
+          ctx: identityRewriteContext(),
+          opNowMs: Date.now(),
+          force: false,
+          __injectFailure: () => {
+            appendFileSync(base, interloper, "utf-8");
+            throw new Error("injected");
+          },
+        });
+      } catch (e) {
+        err = e as Error;
+      }
+
+      // Loud, and not mistakable for `{ reason: "rolled-back" }`.
+      expect(err).toBeDefined();
+      expect(err?.message).toContain("rollback was REFUSED");
+      expect(err?.message).toContain("injected");
+      // The interloper's line survived, and so did everything else.
+      const after = readFileSync(base, "utf-8");
+      expect(after).toContain("live-1");
+      expect(after.endsWith(interloper)).toBe(true);
+      expect(statSync(base).size).toBeGreaterThan(beforeSize);
+      // Every line is still parseable — nothing was cut mid-line.
+      for (const line of after.trim().split("\n")) JSON.parse(line);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The other half of the same guard: when the tail really is only ours, the
+  // arithmetic holds and the rollback proceeds exactly as before. Without this,
+  // the test above would pass just as well against a version that never rolls
+  // back at all.
+  it("still rolls back when every byte past the rollback point is its own", async () => {
+    const dir = tmp("sesh-append-");
+    try {
+      const base = makeBase(dir);
+      const before = readFileSync(base, "utf-8");
+      const r = await tryAppendContinuation({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: makeDelta(dir, "b3"),
+        ctx: identityRewriteContext(),
+        opNowMs: Date.now(),
+        force: false,
+        __injectFailure: () => {
+          throw new Error("injected");
+        },
+      });
+      expect(r.kind).toBe("declined");
+      if (r.kind === "declined") expect(r.reason).toBe("rolled-back");
+      expect(readFileSync(base, "utf-8")).toBe(before);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("re-throws a fault that lands before any byte is written, attempting no rollback", async () => {
     const dir = tmp("sesh-append-");
     try {
@@ -961,6 +1043,57 @@ describe("adoptHubBranch", () => {
 
       expect(readFileSync(base).equals(before)).toBe(true);
       expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The twin of tryAppendContinuation's rollback guard, and strictly worse if
+  // missing: the restore here OVERWRITES the whole file with a snapshot taken
+  // before the adoption began, so a writer that lands in the window the
+  // pre-truncate re-check cannot see would be erased outright.
+  it("refuses to restore over another writer's bytes, keeping the snapshot for the user", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const interloper = JSON.stringify(entry("live-1", "H2", "base-sid")) + "\n";
+
+      let err: Error | undefined;
+      try {
+        await adoptHubBranch({
+          basePath: base,
+          baseSessionId: "base-sid",
+          deltaPath: delta,
+          anchorOffset,
+          preservedSessionId: "preserved-sid",
+          preservedPath,
+          ctx: identityRewriteContext(),
+          __injectFailure: () => {
+            appendFileSync(base, interloper, "utf-8");
+            throw new Error("boom");
+          },
+        });
+      } catch (e) {
+        err = e as Error;
+      }
+
+      expect(err).toBeDefined();
+      expect(err?.message).toContain("restore was REFUSED");
+      expect(err?.message).toContain("boom");
+      const after = readFileSync(base, "utf-8");
+      expect(after).toContain("live-1"); // the other writer's bytes survived
+      expect(existsSync(preservedPath)).toBe(false);
+
+      // The pre-adoption snapshot is named in the error and still on disk —
+      // it is the user's only copy of the branch the truncate cut away.
+      const backupPath = /before adoption is at (.+?)\. Exit/.exec(err?.message ?? "")?.[1];
+      expect(backupPath).toBeDefined();
+      expect(existsSync(backupPath!)).toBe(true);
+      expect(readFileSync(backupPath!, "utf-8")).toContain("L2");
+      rmSync(backupPath!, { force: true });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
