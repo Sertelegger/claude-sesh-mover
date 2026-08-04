@@ -116,4 +116,53 @@ describe("jsonl", () => {
       expect(await readEntryUuids(p)).toEqual([{ uuid: "a" }, { uuid: "b" }]);
     });
   });
+
+  describe("findEntryOffsetByUuid", () => {
+    it("returns the byte offset just past the matching line", async () => {
+      const { findEntryOffsetByUuid } = await import("../src/jsonl.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-offset-"));
+      try {
+        const file = join(dir, "s.jsonl");
+        const l1 = JSON.stringify({ uuid: "a", type: "user" });
+        const l2 = JSON.stringify({ uuid: "b", type: "user" });
+        const l3 = JSON.stringify({ uuid: "c", type: "user" });
+        writeFileSync(file, `${l1}\n${l2}\n${l3}\n`, "utf-8");
+        const expected = Buffer.byteLength(`${l1}\n${l2}\n`, "utf8");
+        expect(await findEntryOffsetByUuid(file, "b")).toBe(expected);
+        expect(await findEntryOffsetByUuid(file, "a")).toBe(Buffer.byteLength(`${l1}\n`, "utf8"));
+        expect(await findEntryOffsetByUuid(file, "c")).toBe(
+          Buffer.byteLength(`${l1}\n${l2}\n${l3}\n`, "utf8")
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns null when the uuid is absent or a line is unparseable", async () => {
+      const { findEntryOffsetByUuid } = await import("../src/jsonl.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-offset-"));
+      try {
+        const file = join(dir, "s.jsonl");
+        writeFileSync(file, `{"uuid":"a"}\n{bad json\n{"uuid":"c"}\n`, "utf-8");
+        expect(await findEntryOffsetByUuid(file, "zzz")).toBeNull();
+        expect(await findEntryOffsetByUuid(file, "c")).toBeGreaterThan(0); // unparseable line skipped, scan continues
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("handles multi-byte content correctly (byte offsets, not char offsets)", async () => {
+      const { findEntryOffsetByUuid } = await import("../src/jsonl.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-offset-"));
+      try {
+        const file = join(dir, "s.jsonl");
+        const l1 = JSON.stringify({ uuid: "a", text: "héllo — ünicode" });
+        const l2 = JSON.stringify({ uuid: "b" });
+        writeFileSync(file, `${l1}\n${l2}\n`, "utf-8");
+        expect(await findEntryOffsetByUuid(file, "a")).toBe(Buffer.byteLength(`${l1}\n`, "utf8"));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });

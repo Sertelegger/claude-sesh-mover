@@ -126,3 +126,32 @@ export async function readEntryUuids(
   }
   return uuids;
 }
+
+// Byte offset just PAST the line whose entry carries `uuid`, or null if the
+// uuid never appears. Used by divergence adoption to find the common anchor
+// so the base can be truncated exactly there. Streams line-by-line (bounded
+// memory) and stops at the first match; unparseable lines are skipped, not
+// fatal. Offsets are BYTE offsets — the caller truncates a file with them.
+export async function findEntryOffsetByUuid(
+  jsonlPath: string,
+  uuid: string
+): Promise<number | null> {
+  const input = createReadStream(jsonlPath, { encoding: "utf-8" });
+  const rl = createInterface({ input, crlfDelay: Infinity });
+  let offset = 0;
+  try {
+    for await (const line of rl) {
+      offset += Buffer.byteLength(line, "utf8") + 1; // +1 for the newline
+      if (!line) continue;
+      try {
+        if ((JSON.parse(line) as { uuid?: string }).uuid === uuid) return offset;
+      } catch {
+        // unparseable line — keep scanning
+      }
+    }
+  } finally {
+    rl.close();
+    input.destroy();
+  }
+  return null;
+}

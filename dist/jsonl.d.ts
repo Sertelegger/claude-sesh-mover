@@ -5,4 +5,5 @@ export declare function readLastEntryUuid(path: string): string | null;
 export declare function readEntryUuids(jsonlPath: string): Promise<Array<{
     uuid: string;
 }>>;
+export declare function findEntryOffsetByUuid(jsonlPath: string, uuid: string): Promise<number | null>;
 //# sourceMappingURL=jsonl.d.ts.map
