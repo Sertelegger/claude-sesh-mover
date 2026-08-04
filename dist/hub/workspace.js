@@ -45,8 +45,17 @@ export class WorkspaceTargetNotEmptyError extends Error {
 // A trailing slash is stripped so `build/` and `build` mean the same thing.
 // Without that, `build/` was a SILENT NO-OP: isExcluded compares a pattern to a
 // bare directory entry name, which never carries a slash, so the directory was
-// carried anyway. hubinclude documents `dir/` as meaningful (§6.0) and calls
-// itself a sibling of this file, so the two have to agree.
+// carried anyway.
+//
+// This is where hubignore and hubinclude DELIBERATELY DIVERGE, and the asymmetry
+// is intentional rather than an oversight to be tidied away. Every hubignore
+// pattern is matched per SEGMENT, so it has no way to express rooting and a
+// trailing slash can only be decoration. hubinclude matches whole relative paths,
+// so there a trailing slash is the difference between `docs` at the top level and
+// every `docs` at any depth — and it must stay significant, because it is the
+// exact shape `ignoredNotCarried` hands the user to paste. Net: `docs/` in this
+// file excludes a `docs` anywhere; `docs/` in hubinclude names back only the top
+// -level one. Do not "harmonize" them by making one follow the other.
 export function readHubignore(projectPath) {
     const p = join(projectPath, ".claude-sesh-mover", "hubignore");
     if (!existsSync(p))
