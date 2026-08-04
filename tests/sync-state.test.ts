@@ -314,6 +314,59 @@ describe("sync-state v2 (hub)", () => {
     expect(getThreadId(again, "sess-1")).toBe("thread-1");
   });
 
+  it("setLastWorkspace records the generation and round-trips", async () => {
+    const { readSyncState, writeSyncState, setLastWorkspace } = await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw");
+    expect(s.hub?.lastWorkspace).toBeUndefined();
+    setLastWorkspace(s, "hub-1", {
+      bundleId: "bundle-1",
+      file: "projects/p/bundles/m/x.tar.gz",
+      pushedAt: "2026-04-11T10:00:00.000Z",
+    });
+    expect(s.schemaVersion).toBe(2);
+    expect(s.hub?.hubId).toBe("hub-1");
+    expect(s.hub?.lastWorkspace?.bundleId).toBe("bundle-1");
+    // pushedAt dates the GENERATION and is passed in; syncedAt dates our
+    // knowledge of it and is stamped here. Conflating them would make the
+    // cross-machine ancestor comparison meaningless.
+    expect(s.hub?.lastWorkspace?.pushedAt).toBe("2026-04-11T10:00:00.000Z");
+    expect(s.hub?.lastWorkspace?.syncedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(s.hub?.lastWorkspace?.syncedAt).not.toBe(s.hub?.lastWorkspace?.pushedAt);
+    writeSyncState(s);
+    expect(readSyncState("/tmp/proj-lw").hub?.lastWorkspace?.file).toBe(
+      "projects/p/bundles/m/x.tar.gz"
+    );
+  });
+
+  it("setLastWorkspace never disturbs existing thread mappings, and is overwritten by a newer generation", async () => {
+    const { readSyncState, writeSyncState, setLastWorkspace, setThreadId, getThreadId } =
+      await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw2");
+    setThreadId(s, "hub-1", "sess-1", "thread-1");
+    setLastWorkspace(s, "hub-1", {
+      bundleId: "bundle-1", file: "projects/p/bundles/m/1.tar.gz",
+      pushedAt: "2026-04-11T10:00:00.000Z",
+    });
+    writeSyncState(s);
+
+    const again = readSyncState("/tmp/proj-lw2");
+    expect(getThreadId(again, "sess-1")).toBe("thread-1");
+    setLastWorkspace(again, "hub-1", {
+      bundleId: "bundle-2", file: "projects/p/bundles/m/2.tar.gz",
+      pushedAt: "2026-04-12T10:00:00.000Z",
+    });
+    writeSyncState(again);
+
+    const final = readSyncState("/tmp/proj-lw2");
+    expect(getThreadId(final, "sess-1")).toBe("thread-1");
+    expect(final.hub?.lastWorkspace).toEqual({
+      bundleId: "bundle-2",
+      file: "projects/p/bundles/m/2.tar.gz",
+      pushedAt: "2026-04-12T10:00:00.000Z",
+      syncedAt: expect.any(String),
+    });
+  });
+
   it("v2 files with unknown extra fields still read (forward tolerance)", async () => {
     const { readSyncState, writeSyncState, setThreadId } = await import("../src/sync-state.js");
     const { mkdirSync, writeFileSync } = await import("node:fs");

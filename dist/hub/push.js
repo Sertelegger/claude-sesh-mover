@@ -16,7 +16,7 @@ import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
-import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId } from "../sync-state.js";
+import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, } from "../sync-state.js";
 export async function hubPush(opts) {
     // An empty array is programmatically distinct from "omitted" but must mean
     // the same thing here — otherwise it mints zero threads (the filter below
@@ -132,7 +132,19 @@ export async function hubPush(opts) {
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
             const manifestPath = join(bundleStaging, "manifest.json");
             const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
-            m.workspace = { fileCount: ws.fileCount, byteSize: ws.byteSize, snapshotAt: new Date().toISOString() };
+            // Declare what this snapshot descends from — read BEFORE the new
+            // generation is recorded below. It is what lets a puller merge against a
+            // generation that is genuinely common to both trees instead of assuming
+            // this machine was in step with it (see the field's doc in types.ts).
+            const basedOnRef = readSyncState(opts.projectPath).hub?.lastWorkspace;
+            m.workspace = {
+                fileCount: ws.fileCount,
+                byteSize: ws.byteSize,
+                snapshotAt: new Date().toISOString(),
+                basedOn: basedOnRef
+                    ? { bundleId: basedOnRef.bundleId, file: basedOnRef.file, pushedAt: basedOnRef.pushedAt }
+                    : null,
+            };
             writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
             hasWorkspace = true;
         }
@@ -152,6 +164,22 @@ export async function hubPush(opts) {
         }
         // Peer bookkeeping from the staged bundle (snapshot, never live files)
         recordSentFromBundle(opts.projectPath, { id: hubPeerId, name: "hub" }, bundleStaging);
+        // The workspace generation this machine's tree now shares with the hub —
+        // the ancestor input for the next pull's 3-way merge (design §5.2). Only
+        // recorded once the bundle is committed to the hub: a generation the hub
+        // does not hold cannot be fetched back as an ancestor.
+        //
+        // It describes the SNAPSHOT, not the live tree: anything the user edited
+        // between snapshotWorkspace above and this line is a local change against
+        // this generation, which is exactly what the next merge should see.
+        //
+        // Read AFTER recordSentFromBundle — that helper rewrites the same file, so
+        // mutating a copy read before it would be silently discarded.
+        if (hasWorkspace) {
+            const stateWs = readSyncState(opts.projectPath);
+            setLastWorkspace(stateWs, hub.hubId, { bundleId, file: hubFile, pushedAt });
+            writeSyncState(stateWs);
+        }
         // Index projection
         const stateAfter = readSyncState(opts.projectPath);
         const records = [];

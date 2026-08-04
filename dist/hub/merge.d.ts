@@ -52,8 +52,37 @@ export interface WorkspaceMergeReport {
     taken: string[];
     /** local changed, incoming didn't -> local left alone */
     kept: string[];
-    /** absent locally -> created */
+    /** absent locally AND absent from the ancestor -> created */
     created: string[];
+    /**
+     * In the ancestor, gone locally, and untouched upstream: a deliberate local
+     * deletion since the last sync, so it is **not** recreated.
+     *
+     * This is the one row that deviates from design §5.3's table (which says
+     * "absent locally | present | create" unconditionally). That rule resurrects
+     * a file on every pull for as long as any peer still has it, which the
+     * ancestor makes unnecessary: "absent locally" and "deleted locally" are only
+     * indistinguishable without one.
+     *
+     * Reported rather than silent, because two other situations reach this row
+     * and are NOT deletions: a path hidden behind a local symlink (the tree scan
+     * never follows one) and a file an earlier merge could not write. Both are
+     * then withheld, so the caller must be able to say so — and the incoming copy
+     * stays on the hub either way.
+     *
+     * A caller merging into a tree that is EMPTY or unrelated must not use this
+     * function at all: every file would read as a local deletion. That is the
+     * caller's gate (hub/pull.ts unpacks rather than merges into an empty tree),
+     * not a check this function can make.
+     */
+    localDeleted: string[];
+    /**
+     * Deleted locally, but CHANGED upstream since the ancestor — the delete/modify
+     * case. Recreated with the incoming content, because this merge never
+     * discards a change; separate from `created` so the caller can say "this one
+     * came back, delete it again if you meant it".
+     */
+    restored: string[];
     /** both changed, 3-way merged cleanly */
     merged: string[];
     /** both changed, conflict markers written — the user must resolve these */
@@ -135,7 +164,8 @@ export declare function isBinaryFile(path: string): boolean;
  * with no git repository anywhere in sight: `git merge-file` operates on three
  * plain files.
  *
- * Resolution table (design §5.3); comparison is by sha256 content hash, never
+ * Resolution table (design §5.3, with the one deliberate deviation documented
+ * on `localDeleted`); comparison is by sha256 content hash, never
  * mtime. This function **never deletes a file** and never resolves a conflict
  * by discarding one side: the worst case for any file it *resolves* is "local
  * kept, incoming parked beside it" or "both sides present between conflict

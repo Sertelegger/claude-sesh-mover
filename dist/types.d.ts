@@ -1,3 +1,4 @@
+import type { WorkspaceMergeReport } from "./hub/merge.js";
 export type Platform = "darwin" | "linux" | "wsl1" | "wsl2" | "win32";
 export type JsonlEntryType = "user" | "assistant" | "file-history-snapshot" | "system" | "progress";
 export interface JsonlEntryBase {
@@ -122,6 +123,28 @@ export interface ExportManifest {
         fileCount: number;
         byteSize: number;
         snapshotAt: string;
+        /**
+         * The workspace generation the pushing machine's tree descended from when
+         * this snapshot was taken — i.e. its own `hub.lastWorkspace` at that
+         * moment. `null` when it had none (this was its first workspace push).
+         *
+         * A puller weighs this generation against its own last-synced one and
+         * merges against whichever is OLDER — see hub/pull.ts's
+         * `chooseMergeAncestor` for why that is the one common to both trees.
+         * Without this field a puller can only assume its own generation is
+         * common, which silently reverts its newer work to the pusher's older copy
+         * whenever the two machines pushed without pulling in between — something
+         * auto-push makes routine.
+         *
+         * Optional because bundles written before this field existed do not carry
+         * it; those fall back to the puller's own generation, i.e. to the older
+         * behavior, never to a crash.
+         */
+        basedOn?: {
+            bundleId: string;
+            file: string;
+            pushedAt?: string;
+        } | null;
     };
 }
 export interface SeshMoverConfig {
@@ -359,6 +382,17 @@ export interface HubPullResult {
         path: string;
         fileCount: number;
     } | null;
+    /**
+     * Per-file outcome when the workspace payload was applied as a 3-way merge
+     * against this machine's last synced generation (design §5.2-5.5), rather
+     * than unpacked. Absent whenever no merge ran — including the bootstrap
+     * unpack into an empty tree and every no-ancestor fallback — so its presence
+     * is precisely "a merge happened, here is what it decided".
+     *
+     * `workspaceUnpacked` is set alongside it (the payload WAS applied, at that
+     * path); this field is the detail.
+     */
+    workspaceMerge?: WorkspaceMergeReport;
     appended?: Array<{
         threadId: string;
         baseSessionId: string;
@@ -507,6 +541,28 @@ export interface SyncState {
     hub?: {
         hubId: string;
         threadByLocalSession: Record<string, string>;
+        /**
+         * The workspace generation this machine last pushed or applied — the
+         * ancestor input for the 3-way merge on the next pull (design §5.2).
+         *
+         * Only a POINTER: the hub itself stores the tree, because every workspace
+         * payload is a full snapshot generation. Absent until this project first
+         * pushes or pulls a workspace payload, which is why a plain
+         * sessions-only hub user never grows the field.
+         *
+         * `pushedAt` dates the GENERATION (when its bundle was pushed to the hub);
+         * `syncedAt` dates our knowledge of it (when this machine pushed or applied
+         * it). Only the first is comparable with another machine's generation, and
+         * pull needs that comparison to pick the older of two candidate ancestors —
+         * see hub/pull.ts's `chooseMergeAncestor`. Optional so that a file written
+         * before this field existed still reads.
+         */
+        lastWorkspace?: {
+            bundleId: string;
+            file: string;
+            syncedAt: string;
+            pushedAt?: string;
+        };
     };
 }
 //# sourceMappingURL=types.d.ts.map

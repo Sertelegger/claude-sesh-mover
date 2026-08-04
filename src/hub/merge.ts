@@ -1,5 +1,5 @@
 import {
-  chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync, lstatSync,
+  chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync,
   mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync,
   rmSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
@@ -7,7 +7,9 @@ import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { DEFAULT_WORKSPACE_EXCLUDES, isExcluded, readHubignore } from "./workspace.js";
+import {
+  classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, isExcluded, readHubignore,
+} from "./workspace.js";
 
 /** A file was left alone and the incoming copy parked beside it. */
 export type SidecarReason =
@@ -65,8 +67,37 @@ export interface WorkspaceMergeReport {
   taken: string[];
   /** local changed, incoming didn't -> local left alone */
   kept: string[];
-  /** absent locally -> created */
+  /** absent locally AND absent from the ancestor -> created */
   created: string[];
+  /**
+   * In the ancestor, gone locally, and untouched upstream: a deliberate local
+   * deletion since the last sync, so it is **not** recreated.
+   *
+   * This is the one row that deviates from design §5.3's table (which says
+   * "absent locally | present | create" unconditionally). That rule resurrects
+   * a file on every pull for as long as any peer still has it, which the
+   * ancestor makes unnecessary: "absent locally" and "deleted locally" are only
+   * indistinguishable without one.
+   *
+   * Reported rather than silent, because two other situations reach this row
+   * and are NOT deletions: a path hidden behind a local symlink (the tree scan
+   * never follows one) and a file an earlier merge could not write. Both are
+   * then withheld, so the caller must be able to say so — and the incoming copy
+   * stays on the hub either way.
+   *
+   * A caller merging into a tree that is EMPTY or unrelated must not use this
+   * function at all: every file would read as a local deletion. That is the
+   * caller's gate (hub/pull.ts unpacks rather than merges into an empty tree),
+   * not a check this function can make.
+   */
+  localDeleted: string[];
+  /**
+   * Deleted locally, but CHANGED upstream since the ancestor — the delete/modify
+   * case. Recreated with the incoming content, because this merge never
+   * discards a change; separate from `created` so the caller can say "this one
+   * came back, delete it again if you meant it".
+   */
+  restored: string[];
   /** both changed, 3-way merged cleanly */
   merged: string[];
   /** both changed, conflict markers written — the user must resolve these */
@@ -258,44 +289,6 @@ function listTree(root: string, patterns: string[]): string[] {
 }
 
 /**
- * Decide whether `rel` is safe to write inside `targetDir`.
- *
- * `rel` is built from real directory entries, so it can never contain a
- * separator, `..`, or a NUL — but what already sits at that path locally is
- * another matter. Two hazards, both of which write OUTSIDE the project or
- * destroy unrelated data if ignored:
- *
- * - A symlink at the path (or at any parent) — `copyFileSync` follows symlinks
- *   on the destination, so writing "docs/note.md" through a `docs -> ~/notes`
- *   link silently overwrites a file the merge was never asked to touch.
- * - A directory where a file belongs (or a file where a directory belongs) —
- *   `copyFileSync` raises EISDIR and `mkdirSync` raises ENOTDIR/EEXIST, which
- *   without this check aborts the whole merge halfway through a tree.
- */
-function classifyDestination(
-  targetDir: string,
-  rel: string
-): { ok: true } | { ok: false; reason: SkipReason } {
-  const segments = rel.split("/");
-  let current = targetDir;
-  for (let i = 0; i < segments.length; i++) {
-    current = join(current, segments[i]!);
-    let st;
-    try {
-      st = lstatSync(current);
-    } catch {
-      return { ok: true }; // nothing there yet: we create it (and everything under it)
-    }
-    if (st.isSymbolicLink()) return { ok: false, reason: "local-symlink" };
-    const isLast = i === segments.length - 1;
-    if (isLast ? !st.isFile() : !st.isDirectory()) {
-      return { ok: false, reason: "local-not-a-file" };
-    }
-  }
-  return { ok: true };
-}
-
-/**
  * Replace `destPath`'s content with `contentFrom`'s via a same-directory
  * temp file and a rename.
  *
@@ -392,7 +385,8 @@ function writeSidecar(
  * with no git repository anywhere in sight: `git merge-file` operates on three
  * plain files.
  *
- * Resolution table (design §5.3); comparison is by sha256 content hash, never
+ * Resolution table (design §5.3, with the one deliberate deviation documented
+ * on `localDeleted`); comparison is by sha256 content hash, never
  * mtime. This function **never deletes a file** and never resolves a conflict
  * by discarding one side: the worst case for any file it *resolves* is "local
  * kept, incoming parked beside it" or "both sides present between conflict
@@ -433,8 +427,9 @@ export async function mergeWorkspaceTrees(opts: {
   if (opts.ancestorDir === null) throw new MergeAncestorRequiredError();
 
   const report: WorkspaceMergeReport = {
-    taken: [], kept: [], created: [], merged: [], conflicted: [],
-    sidecars: [], upstreamDeleted: [], skipped: [], gitUnavailable: false,
+    taken: [], kept: [], created: [], localDeleted: [], restored: [],
+    merged: [], conflicted: [], sidecars: [], upstreamDeleted: [], skipped: [],
+    gitUnavailable: false,
   };
 
   const patterns = opts.excludePatterns
@@ -476,6 +471,19 @@ export async function mergeWorkspaceTrees(opts: {
           continue;
         }
 
+        // The mirror image, and the one place this function departs from
+        // §5.3's table — see `localDeleted`. The ancestor is the generation
+        // this machine last agreed with the hub about, so a file that was in
+        // it and is gone now was deleted here. Honor that only while the peer
+        // left it alone; a change upstream outranks the deletion and comes
+        // back as `restored`, because the alternative is discarding an edit
+        // that exists nowhere else on this machine.
+        const deletedLocally = localPath === null && ancestorPath !== null;
+        if (deletedLocally && sameContent(incomingPath, ancestorPath!)) {
+          report.localDeleted.push(rel);
+          continue;
+        }
+
         const destination = classifyDestination(opts.targetDir, rel);
         if (!destination.ok) {
           report.skipped.push({ path: rel, reason: destination.reason });
@@ -496,7 +504,7 @@ export async function mergeWorkspaceTrees(opts: {
             report.skipped.push({ path: rel, reason: "name-collision" });
             continue;
           }
-          report.created.push(rel);
+          (deletedLocally ? report.restored : report.created).push(rel);
           continue;
         }
 

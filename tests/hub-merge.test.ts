@@ -340,6 +340,64 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
       expect(r.created).toEqual(["new.txt"]);
       expect(r.upstreamDeleted).toEqual(["gone.txt"]);
       expect(existsSync(join(t, "gone.txt"))).toBe(true);
+      // A file the ancestor never had is a plain create, never a resurrection.
+      expect(r.localDeleted).toEqual([]);
+      expect(r.restored).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors a local deletion instead of resurrecting the file on every pull", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      // In the ancestor (this machine had it at the last sync) and still on the
+      // peer, unchanged there — so its absence here is a deliberate deletion.
+      put(a, "dropped.txt", "v1\n");
+      put(i, "dropped.txt", "v1\n");
+      put(i, "fresh.txt", "new\n");
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.localDeleted).toEqual(["dropped.txt"]);
+      expect(r.created).toEqual(["fresh.txt"]);
+      expect(r.restored).toEqual([]);
+      expect(existsSync(join(t, "dropped.txt"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores a locally-deleted file that was CHANGED upstream, and reports it separately", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      put(a, "dropped.txt", "v1\n");
+      put(i, "dropped.txt", "v2 — edited on the other machine\n");
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.restored).toEqual(["dropped.txt"]);
+      expect(r.created).toEqual([]);
+      expect(r.localDeleted).toEqual([]);
+      expect(readFileSync(join(t, "dropped.txt"), "utf-8")).toBe(
+        "v2 — edited on the other machine\n"
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(isWindows)("reports a path hidden behind a local symlink as locally deleted rather than dropping it silently", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      // The tree scan never follows symlinks, so docs/note.md is invisible
+      // locally — indistinguishable, from the merge's side, from a deletion.
+      // It must still appear in the report: this is the one case where
+      // "honored the deletion" is the wrong story, and silence would hide it.
+      const outside = join(root, "outside");
+      mkdirSync(outside, { recursive: true });
+      symlinkSync(outside, join(t, "docs"));
+      put(a, join("docs", "note.md"), "v1\n");
+      put(i, join("docs", "note.md"), "v1\n");
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.localDeleted).toEqual(["docs/note.md"]);
+      expect(existsSync(join(outside, "note.md"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

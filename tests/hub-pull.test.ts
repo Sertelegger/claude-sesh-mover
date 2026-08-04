@@ -5,18 +5,18 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { overrideHome } from "./helpers/env.js";
+import { overrideHome, overridePath } from "./helpers/env.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
-import { hubPull, selectNeededBundles, selectThreadBase } from "../src/hub/pull.js";
+import { hubPull, selectNeededBundles, selectThreadBase, type HubPullOptions } from "../src/hub/pull.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes } from "../src/hub/index-file.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
 import { createArchive, extractArchive } from "../src/archiver.js";
 import { importSession } from "../src/importer.js";
-import { readSyncState, getThreadId } from "../src/sync-state.js";
+import { readSyncState, writeSyncState, getThreadId } from "../src/sync-state.js";
 import { readLastEntryUuid } from "../src/jsonl.js";
 import { encodeProjectPath } from "../src/platform.js";
 import type { HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
@@ -1903,6 +1903,657 @@ describe("hub pull — divergence resolution", () => {
       expect(w).toContain("exit it now");
     } finally {
       a.cleanup();
+    }
+  });
+});
+
+// --- Workspace 3-way merge (ancestor tracking) ----------------------------
+
+/** Nine well-separated lines; `edits` replaces individual 1-based lines. */
+function wsLines(edits: Record<number, string> = {}): string {
+  return Array.from({ length: 9 }, (_, i) => edits[i + 1] ?? `L${i + 1}`).join("\n") + "\n";
+}
+
+/**
+ * One entry per call, so repeated pushes from A never reuse a uuid.
+ *
+ * Timestamps are derived arithmetically rather than interpolated into a date
+ * string: the obvious `2026-04-1${n}` form silently stops being a date at
+ * n = 10 ("2026-04-110T…"), and since `resolveThreads` compares `lastActiveAt`
+ * LEXICALLY, that made A's copy sort BEFORE B's from the tenth push in the
+ * file onward — i.e. which machine counted as "latest" depended on how many
+ * earlier tests had run. Every entry here is strictly newer than the last, and
+ * every one is well before `B_FORK_AT`.
+ */
+const A_ENTRY_EPOCH = Date.parse("2026-04-11T10:00:00Z");
+/** A local fork on B, deliberately more recent than anything A pushes. */
+const B_FORK_AT = "2026-05-01T10:00:00Z";
+let aWsEntrySeq = 0;
+function aWorkspaceEntry(
+  parentUuid: string,
+  sessionId: string,
+  projectPath: string
+): Array<Record<string, unknown>> {
+  const n = ++aWsEntrySeq;
+  return [
+    {
+      uuid: `a-ws-${n}`, parentUuid,
+      timestamp: new Date(A_ENTRY_EPOCH + n * 60_000).toISOString(),
+      sessionId, cwd: projectPath, version: "2.1.81", type: "user",
+      message: { role: "user", content: `more work on A (${n})` },
+    },
+  ];
+}
+
+interface WorkspacePair {
+  hub: string;
+  configDirA: string;
+  projectA: string;
+  /** A's session file for the thread. */
+  aJsonl: string;
+  configDirB: string;
+  projectB: string;
+  /** B's local session file for the thread (absent until B has pulled). */
+  bJsonl: string;
+  projectId: string;
+  useA(): void;
+  useB(): void;
+  /** One new entry on A's session, then a push carrying a fresh snapshot. */
+  pushFromA(): Promise<{ bundleId: string }>;
+  /** Pull on B (HOME switches to B for the call and stays there). */
+  pullOnB(over?: Partial<HubPullOptions>): Promise<Awaited<ReturnType<typeof hubPull>>>;
+  cleanup(): void;
+}
+
+/**
+ * Two machines sharing one non-git project through the hub, with workspace
+ * payloads switched ON (the whole point here — `arrangeContinuation` pushes
+ * with `noWorkspace`).
+ *
+ *   A: real project dir with README.md + shared.txt, hubInit, push #1
+ *   B: linked to the same hub project, and — unless `bootstrapB` is false —
+ *      pulled once, which unpacks snapshot #1 into an otherwise empty dir and
+ *      records it as B's ancestor generation.
+ *
+ * HOME is left pointing at B, because every test's act is a pull on B.
+ */
+async function arrangeWorkspacePair(
+  opts: { bootstrapB?: boolean } = {}
+): Promise<WorkspacePair> {
+  const bootstrapB = opts.bootstrapB !== false;
+  const homeA = mkdtempSync(join(tmpdir(), "sesh-ws-homeA-"));
+  const homeB = mkdtempSync(join(tmpdir(), "sesh-ws-homeB-"));
+  const hub = mkdtempSync(join(tmpdir(), "sesh-ws-hub-"));
+  const base = mkdtempSync(join(tmpdir(), "sesh-ws-fix-"));
+  let projectB: string | undefined;
+  let restore = overrideHome(homeA);
+  const cleanup = (): void => {
+    restore.restore();
+    for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+    if (projectB) rmSync(projectB, { recursive: true, force: true });
+  };
+
+  try {
+    const { configDir: configDirA } = createFixtureTree(base);
+    const projectA = createRealProject(base, configDirA, "projA-ws");
+    writeFileSync(join(projectA, "shared.txt"), wsLines());
+    const aJsonl = join(
+      configDirA, "projects", encodeProjectPath(projectA), `${FIXTURE_SESSION_ID}.jsonl`
+    );
+    await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+    const push1 = await hubPush({
+      configDir: configDirA, projectPath: projectA, hubPath: hub,
+      createProject: true, claudeVersion: "2.1.81",
+    });
+    if (!push1.success) throw new Error(`arrange: A's push failed: ${JSON.stringify(push1)}`);
+    if (!push1.hasWorkspace) throw new Error("arrange: A's push carried no workspace payload");
+    // Pushing a workspace is one of the two ways a machine learns its ancestor.
+    if (!readSyncState(projectA).hub?.lastWorkspace) {
+      throw new Error("arrange: A's push recorded no workspace generation");
+    }
+
+    const useA = (): void => { restore.restore(); restore = overrideHome(homeA); };
+    const useB = (): void => { restore.restore(); restore = overrideHome(homeB); };
+
+    const pushFromA = async (): Promise<{ bundleId: string }> => {
+      const anchor = readLastEntryUuid(aJsonl);
+      if (!anchor) throw new Error("arrange: A's session has no head entry");
+      appendEntries(aJsonl, aWorkspaceEntry(anchor, FIXTURE_SESSION_ID, projectA));
+      const push = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub, claudeVersion: "2.1.81",
+      });
+      if (!push.success) throw new Error(`arrange: A's push failed: ${JSON.stringify(push)}`);
+      if (!push.bundleId) throw new Error("arrange: A's push produced no bundle");
+      if (!push.hasWorkspace) throw new Error("arrange: A's push carried no workspace payload");
+      return { bundleId: push.bundleId };
+    };
+
+    useB();
+    const configDirB = join(homeB, ".claude");
+    projectB = mkdtempSync(join(tmpdir(), "sesh-ws-projB-"));
+    writeLocalProjectId(projectB, {
+      projectId: push1.projectId, name: "projA-ws",
+      createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+    });
+    const bProjectPath = projectB;
+
+    let bSessionId: string | null = null;
+    const pullOnB = async (
+      over: Partial<HubPullOptions> = {}
+    ): Promise<Awaited<ReturnType<typeof hubPull>>> => {
+      useB();
+      // State the base's age explicitly rather than leaning on append.ts's
+      // self-write exemption (milestone rule: that exemption is a sub-ms clock
+      // coincidence, never a fixture). B's session was last written by an
+      // earlier pull in this same test, i.e. seconds ago.
+      if (bSessionId) {
+        const p = join(configDirB, "projects", encodeProjectPath(bProjectPath), `${bSessionId}.jsonl`);
+        if (existsSync(p)) ageOutOfLiveWindow(p);
+      }
+      const result = await hubPull({
+        configDir: configDirB, projectPath: bProjectPath, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81", ...over,
+      });
+      if (result.success && "localSessionId" in result && result.localSessionId) {
+        bSessionId = result.localSessionId;
+      }
+      return result;
+    };
+
+    if (bootstrapB) {
+      const pullB = await pullOnB();
+      if (!pullB.success) throw new Error(`arrange: B's pull failed: ${JSON.stringify(pullB)}`);
+      const p = pullB as HubPullResult;
+      if (p.workspaceUnpacked === null) throw new Error("arrange: B's bootstrap unpacked no workspace");
+      // Applying a payload is the other way a machine learns its ancestor —
+      // without this, every later pull would fall back to no-ancestor mode.
+      if (!readSyncState(bProjectPath).hub?.lastWorkspace) {
+        throw new Error("arrange: B's bootstrap recorded no workspace generation");
+      }
+    }
+
+    return {
+      hub, configDirA, projectA, aJsonl, configDirB, projectB, projectId: push1.projectId,
+      get bJsonl(): string {
+        return join(
+          configDirB, "projects", encodeProjectPath(bProjectPath), `${bSessionId ?? "none"}.jsonl`
+        );
+      },
+      useA, useB, pushFromA, pullOnB, cleanup,
+    };
+  } catch (e) {
+    cleanup();
+    throw e;
+  }
+}
+
+describe("hub pull — workspace 3-way merge", () => {
+  it("merges a workspace payload 3-way against the last synced generation", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      writeFileSync(join(w.projectA, "a-only.txt"), "new on A\n");
+      const push2 = await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      writeFileSync(join(w.projectB, "b-only.txt"), "mine\n");
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      expect(p.workspaceMerge).toBeDefined();
+      const m = p.workspaceMerge!;
+      expect(m.merged).toContain("shared.txt");
+      expect(m.conflicted).toEqual([]);
+      expect(m.created).toContain("a-only.txt");
+      expect(m.sidecars).toEqual([]);
+      expect(m.skipped).toEqual([]);
+
+      // Both machines' edits survive, with no conflict markers anywhere.
+      const merged = readFileSync(join(w.projectB, "shared.txt"), "utf-8");
+      expect(merged).toContain("A-EDIT");
+      expect(merged).toContain("B-EDIT");
+      expect(merged).not.toContain("<<<<<<<");
+      // ...and neither machine's unrelated file was touched.
+      expect(readFileSync(join(w.projectB, "b-only.txt"), "utf-8")).toBe("mine\n");
+      expect(readFileSync(join(w.projectB, "a-only.txt"), "utf-8")).toBe("new on A\n");
+
+      // The ancestor advanced to the generation just applied.
+      expect(readSyncState(w.projectB).hub?.lastWorkspace?.bundleId).toBe(push2.bundleId);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("writes conflict markers, never a silent overwrite, when both machines edit the same line", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 5: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 5: "B-EDIT" }));
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge!.conflicted).toEqual(["shared.txt"]);
+      const text = readFileSync(join(w.projectB, "shared.txt"), "utf-8");
+      expect(text).toContain("<<<<<<< local");
+      expect(text).toContain("||||||| ancestor");
+      expect(text).toContain(">>>>>>> incoming");
+      expect(text).toContain("B-EDIT");
+      expect(text).toContain("A-EDIT");
+      expect(p.warnings.join(" ")).toContain("shared.txt");
+      expect(p.warnings.join(" ")).toContain("conflict");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("does not resurrect a file this machine deleted, and says so", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useB();
+      rmSync(join(w.projectB, "README.md"));
+
+      w.useA();
+      // README.md is untouched on A and still in its snapshot.
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge!.localDeleted).toEqual(["README.md"]);
+      expect(p.workspaceMerge!.created).toEqual([]);
+      expect(existsSync(join(w.projectB, "README.md"))).toBe(false);
+      expect(p.warnings.join(" ")).toContain("README.md");
+      // The other machine's edit still arrived.
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toContain("A-EDIT");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("restores a locally-deleted file the other machine changed, and says why", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useB();
+      rmSync(join(w.projectB, "README.md"));
+
+      w.useA();
+      writeFileSync(join(w.projectA, "README.md"), "changed on A\n");
+      await w.pushFromA();
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge!.restored).toEqual(["README.md"]);
+      expect(p.workspaceMerge!.localDeleted).toEqual([]);
+      expect(readFileSync(join(w.projectB, "README.md"), "utf-8")).toBe("changed on A\n");
+      expect(p.warnings.join(" ")).toContain("README.md");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("never deletes a file the other machine removed, and reports it", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      rmSync(join(w.projectA, "README.md"));
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge!.upstreamDeleted).toEqual(["README.md"]);
+      expect(existsSync(join(w.projectB, "README.md"))).toBe(true);
+      expect(p.warnings.join(" ")).toContain("deleted on the other machine");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("falls back to no-ancestor behavior when no generation was recorded", async () => {
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    try {
+      w.useB();
+      // A pre-existing, non-empty tree on a machine that has never synced this
+      // project's workspace: no ancestor exists, so a 3-way merge is impossible.
+      writeFileSync(join(w.projectB, "local-work.txt"), "mine\n");
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.importedSessions).toHaveLength(1); // sessions still land
+      const warned = p.warnings.join(" ");
+      expect(warned).toContain("--force-workspace");
+      expect(warned.toLowerCase()).toContain("overwrit"); // §5.4: force now NAMES its semantics
+      expect(warned).toContain("--target-path");
+      // Nothing was applied, so nothing may be recorded as this machine's
+      // ancestor — otherwise the next pull would read the whole payload as
+      // "deleted here" and withhold it forever.
+      expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeUndefined();
+      expect(existsSync(join(w.projectB, "shared.txt"))).toBe(false);
+      expect(readFileSync(join(w.projectB, "local-work.txt"), "utf-8")).toBe("mine\n");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("bootstrapping an empty tree unpacks (never merges) and records the generation", async () => {
+    // Covered indirectly by every arrangement, but pinned here: an empty
+    // target must NOT go through the merge, where every file would read as a
+    // local deletion and nothing would be written at all.
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    try {
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceUnpacked).not.toBeNull();
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines());
+      expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeDefined();
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("an emptied project directory bootstraps again instead of reading as a whole-tree deletion", async () => {
+    // sync-state lives in the home dir, not the project, so a recorded
+    // ancestor outlives `rm -rf project/*` — the obvious way to ask for a
+    // clean copy from the hub. Merging there would classify EVERY file as
+    // deleted-here-and-unchanged-upstream and write nothing at all.
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useB();
+      for (const name of readdirSync(w.projectB)) {
+        if (name !== ".claude-sesh-mover") rmSync(join(w.projectB, name), { recursive: true, force: true });
+      }
+      expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeDefined();
+
+      w.useA();
+      await w.pushFromA();
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceUnpacked).not.toBeNull();
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines());
+      expect(readFileSync(join(w.projectB, "README.md"), "utf-8")).toBe("hello\n");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("merges what it can without git, parking the rest, instead of skipping the payload", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      writeFileSync(join(w.projectA, "a-only.txt"), "new on A\n");
+      await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+
+      const emptyPathDir = mkdtempSync(join(tmpdir(), "sesh-ws-nopath-"));
+      const pathOverride = overridePath(emptyPathDir);
+      let pull;
+      try {
+        pull = await w.pullOnB();
+      } finally {
+        pathOverride.restore();
+        rmSync(emptyPathDir, { recursive: true, force: true });
+      }
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      const m = p.workspaceMerge!;
+      expect(m.gitUnavailable).toBe(true);
+      // The rows that need no merge engine are still resolved correctly...
+      expect(m.created).toContain("a-only.txt");
+      expect(readFileSync(join(w.projectB, "a-only.txt"), "utf-8")).toBe("new on A\n");
+      // ...and the one that does is parked beside the local file, not lost.
+      expect(m.sidecars.map((s) => s.path)).toEqual(["shared.txt"]);
+      expect(m.sidecars[0]!.reason).toBe("git-unavailable");
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines({ 8: "B-EDIT" }));
+      const parked = readFileSync(join(w.projectB, m.sidecars[0]!.sidecar), "utf-8");
+      expect(parked).toBe(wsLines({ 2: "A-EDIT" }));
+      expect(p.warnings.join(" ")).toContain("git");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("an ancestor bundle that is gone from the hub degrades to no-ancestor mode, never a crash", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      // Prune the generation B recorded as its ancestor (hub housekeeping,
+      // a half-synced folder, a peer that re-initialised the hub).
+      const ref = readSyncState(w.projectB).hub?.lastWorkspace;
+      expect(ref).toBeDefined();
+      await createFsBackend(w.hub).delete(ref!.file);
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceUnpacked).toBeNull();
+      // Local work is untouched and the payload is still on the hub.
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines({ 8: "B-EDIT" }));
+      expect(p.warnings.join(" ")).toContain("--force-workspace");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("an unreadable ancestor archive degrades to no-ancestor mode, never a failed pull", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      // Half-written / truncated / not-a-tar: the hub is a synced folder, so
+      // a file that exists but does not gunzip is an ordinary state to be in.
+      const ref = readSyncState(w.projectB).hub?.lastWorkspace;
+      await createFsBackend(w.hub).writeAtomic(ref!.file, Buffer.from("not a tarball at all"));
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.importedSessions.length + (p.appended?.length ?? 0)).toBeGreaterThan(0);
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines({ 8: "B-EDIT" }));
+      expect(p.warnings.join(" ")).toContain("could not be read back");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("a poisoned lastWorkspace pointer is refused by the hub path guard, not followed", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      // sync-state is an ordinary JSON file in the user's home; a traversing
+      // path in it must not become a read outside the hub directory. No
+      // `pushedAt`, which is also the pre-0.6.0 shape — that puts the local
+      // (poisoned) candidate first, so the guard is genuinely exercised rather
+      // than skipped over.
+      const poisoned = readSyncState(w.projectB);
+      poisoned.hub!.lastWorkspace = {
+        bundleId: "evil", file: "../../../../etc/passwd", syncedAt: new Date().toISOString(),
+      };
+      writeSyncState(poisoned);
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      // Refused at the hub-path chokepoint, named in a warning, and the pull
+      // recovers through the OTHER candidate (the payload's declared base)
+      // rather than either following the path or giving up on the merge.
+      expect(p.warnings.join(" ")).toContain("not a safe hub-relative path");
+      expect(p.workspaceMerge!.merged).toContain("shared.txt");
+      const text = readFileSync(join(w.projectB, "shared.txt"), "utf-8");
+      expect(text).toContain("A-EDIT");
+      expect(text).toContain("B-EDIT");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("applies the NEWEST workspace generation in the chain, not the oldest", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "GEN-2" }));
+      await w.pushFromA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "GEN-3" }));
+      const push3 = await w.pushFromA();
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      // Both bundles are pulled; the tree ends up at the LATEST generation,
+      // and that is what gets recorded as the ancestor.
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines({ 2: "GEN-3" }));
+      expect(readSyncState(w.projectB).hub?.lastWorkspace?.bundleId).toBe(push3.bundleId);
+      expect(p.workspaceMerge!.taken).toContain("shared.txt");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("never reverts local work to a peer's older snapshot when both machines pushed without pulling", async () => {
+    // The shape auto-push makes routine: each machine pushes at session end,
+    // neither pulls first. B's payload is based on the generation BEFORE A's
+    // own last push, so A's recorded generation is NOT common to both trees —
+    // merging against it makes every file of A's look untouched and hands the
+    // whole tree back to B's older copy.
+    const w = await arrangeWorkspacePair();
+    try {
+      // B (already holding gen-1) edits a file A does not touch, and pushes.
+      // A session entry rides along because a workspace-only change produces
+      // no bundle at all — push returns "up to date" and uploads nothing.
+      w.useB();
+      writeFileSync(join(w.projectB, "b-note.txt"), "B's note\n");
+      appendEntries(w.bJsonl, [{
+        uuid: "b-ws-1", parentUuid: FIXTURE_HEAD_UUID, timestamp: B_FORK_AT,
+        sessionId: FIXTURE_SESSION_ID, cwd: w.projectB, version: "2.1.81", type: "user",
+        message: { role: "user", content: "work on B" },
+      }]);
+      const bPush = await hubPush({
+        configDir: w.configDirB, projectPath: w.projectB, hubPath: w.hub,
+        claudeVersion: "2.1.81",
+      });
+      expect(bPush.success).toBe(true);
+      if (!bPush.success) return;
+      expect(bPush.hasWorkspace).toBe(true);
+
+      // A, which never saw B's push, edits shared.txt and pushes gen-3.
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+      ageOutOfLiveWindow(w.aJsonl);
+
+      // Now A pulls B's copy. A's own generation (gen-3) is newer than the one
+      // B's payload descends from, so the older, genuinely common one has to
+      // win.
+      const pullA = await hubPull({
+        configDir: w.configDirA, projectPath: w.projectA, hubPath: w.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pullA.success).toBe(true);
+      if (!pullA.success) return;
+      const p = pullA as HubPullResult;
+
+      // A's edit survives, and B's new file still arrives.
+      expect(readFileSync(join(w.projectA, "shared.txt"), "utf-8")).toBe(wsLines({ 2: "A-EDIT" }));
+      expect(p.workspaceMerge!.kept).toContain("shared.txt");
+      expect(existsSync(join(w.projectA, "b-note.txt"))).toBe(true);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("a divergence skip alongside a workspace merge stays re-runnable", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      // Fork the session on B, so A's next continuation cannot chain onto it.
+      // B's branch is the MORE RECENT copy — the realistic shape (you fork by
+      // carrying on working here), and the one where republishing B's index
+      // would make B the thread's latest copy and refuse the very re-run the
+      // skip warning promises.
+      w.useB();
+      appendEntries(w.bJsonl, [{
+        uuid: "b-local-1", parentUuid: FIXTURE_HEAD_UUID, timestamp: B_FORK_AT,
+        sessionId: FIXTURE_SESSION_ID, cwd: w.projectB, version: "2.1.81", type: "user",
+        message: { role: "user", content: "meanwhile, on B" },
+      }]);
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      const skipped = await w.pullOnB({ onDivergence: "skip" });
+      expect(skipped.success).toBe(true);
+      if (!skipped.success) return;
+      const s = skipped as HubPullResult;
+      expect(s.divergence?.resolution).toBe("skip");
+      // The workspace half of the pull still happened...
+      expect(s.workspaceMerge!.merged).toContain("shared.txt");
+
+      // ...and the session half stays decidable. A workspace application
+      // changes no session, so it must not publish this machine's index and
+      // make the promised re-run impossible.
+      const rerun = await w.pullOnB({ onDivergence: "fragment" });
+      expect(rerun.success).toBe(true);
+      if (!rerun.success) return;
+      const r = rerun as HubPullResult;
+      expect(r.divergence?.resolution).toBe("fragment");
+      expect(r.importedSessions).toHaveLength(1);
+    } finally {
+      w.cleanup();
     }
   });
 });

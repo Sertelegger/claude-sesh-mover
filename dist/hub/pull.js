@@ -13,6 +13,7 @@ import { buildIndexFile, readMachineIndex, writeMachineIndex, readAllIndexes } f
 import { resolveThreads } from "./threads.js";
 import { shapeThreads } from "./whereis.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
+import { mergeWorkspaceTrees } from "./merge.js";
 import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS, } from "./append.js";
 import { extractArchive } from "../archiver.js";
 import { importSession } from "../importer.js";
@@ -23,7 +24,7 @@ import { countJsonlLines, findEntryOffsetByUuid, readLastConversationEntry, read
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
-import { readSyncState, writeSyncState, setThreadId, recordSentToPeer } from "../sync-state.js";
+import { readSyncState, writeSyncState, setThreadId, setLastWorkspace, recordSentToPeer, } from "../sync-state.js";
 /**
  * Pick which of a thread's local sessions a continuation should splice onto.
  *
@@ -247,6 +248,157 @@ function recordSplice(b) {
         sentAsSessionId: b.record.sessionIdInBundle,
     });
 }
+/**
+ * Fetch one candidate workspace generation off the hub and unpack it into a
+ * temp dir: the common-ancestor tree a 3-way merge needs (design §5.2).
+ * `chooseMergeAncestor` decides WHICH generation; this only retrieves it.
+ *
+ * The hub already stores every generation — each workspace payload is a full
+ * snapshot — so sync-state only holds a POINTER, and the tree comes back down
+ * the same validated path as any other bundle (`record.file` and this
+ * `ref.file` both go through the backend's `assertHubRelPath`, and
+ * `extractArchive` rejects absolute/traversing/symlink tar entries before
+ * anything is written).
+ *
+ * Every failure degrades to `{ dir: null }` with a warning rather than
+ * throwing, and the caller then runs no-ancestor mode (§5.4). The reasons are
+ * all ordinary: the bundle was pruned from the hub, the hub folder has not
+ * finished syncing it, an older generation predates workspace payloads, or the
+ * archive is unreadable. None of them is a reason to fail a pull whose sessions
+ * are perfectly fine — and no-ancestor mode never overwrites anything.
+ *
+ * Each attempt gets its OWN scratch directory: `chooseMergeAncestor` can call
+ * this twice, and a failed extraction may already have written part of a tree.
+ * Sharing one directory would silently hand back a blend of two generations.
+ */
+async function fetchAncestorWorkspace(backend, ref, tempRoot) {
+    if (!ref)
+        return { dir: null };
+    const degraded = (why) => ({
+        dir: null,
+        warning: `The workspace generation ${ref.bundleId}, which this pull would have merged against, ` +
+            `${why} — so that payload could not be merged 3-way against it.`,
+    });
+    try {
+        if (!(await backend.exists(ref.file))) {
+            return degraded("is no longer on the hub (pruned, or not yet synced to this machine)");
+        }
+        const work = mkdtempSync(join(tempRoot, "ancestor-"));
+        const tarPath = join(work, "ancestor.tar.gz");
+        await pipeline(await backend.readStream(ref.file), createWriteStream(tarPath));
+        const bundleDir = join(work, "bundle");
+        mkdirSync(bundleDir, { recursive: true });
+        await extractArchive(tarPath, bundleDir);
+        const tree = join(bundleDir, "workspace");
+        if (!existsSync(tree))
+            return degraded("carries no workspace tree");
+        return { dir: tree };
+    }
+    catch (e) {
+        return degraded(`could not be read back (${e.message})`);
+    }
+}
+/**
+ * Which generation to merge against, given two candidates: the one this
+ * machine last pushed or applied, and the one the INCOMING payload says it
+ * descends from. **The older wins.**
+ *
+ * Design §5.2 names only the first. That is correct exactly while both machines
+ * were in step, and silently destructive when they were not — which auto-push
+ * makes routine, since every session end pushes whether or not this machine has
+ * pulled the other's work:
+ *
+ *   gen-2 is common. A edits F and pushes gen-3, so A's recorded generation is
+ *   gen-3 and A's tree matches it exactly. B, still at gen-2, edits something
+ *   else and pushes gen-4 — whose F is still gen-2's. A pulls gen-4 with gen-3
+ *   as the ancestor: every file of A's now looks UNCHANGED since the ancestor,
+ *   and every difference in gen-4 looks like an edit of B's, so A's whole tree
+ *   is "taken" back to B's older copy. A's work is gone, reported as a clean
+ *   merge. With gen-2 — the older of {gen-3, gen-2} — F reads as changed here
+ *   and unchanged there, and A's version is correctly kept.
+ *
+ * Why older rather than "the incoming payload's base, always": being simply
+ * BEHIND is the ordinary case, and there the local generation is the older one
+ * and is the true common ancestor. Preferring the incoming base there would
+ * merge against a generation this tree never held and manufacture conflicts out
+ * of a clean fast-forward (measured — it turned "take incoming" into a
+ * whole-file conflict). Older is right in all three two-machine shapes: in
+ * step (they are equal), behind (ours), and diverged (theirs).
+ *
+ * With three machines neither candidate is provably common and the merge is
+ * guessing either way — but an older-than-necessary base fails toward "keep
+ * local" and visible conflicts, never toward silently overwriting work, which
+ * is the direction to guess in.
+ *
+ * Ordering needs each generation's own `pushedAt` (when its bundle landed on
+ * the hub), never our `syncedAt`: two machines' clocks are not comparable, but
+ * two bundles' publication times are the hub's own record. Where either stamp
+ * is missing — a bundle or sync-state written before this field existed — the
+ * local generation is used, i.e. exactly §5.2's behavior.
+ *
+ * Candidates are tried in order, so one that is no longer on the hub (pruned,
+ * not yet synced, unreadable) falls through to the other rather than dropping
+ * the pull into no-ancestor mode.
+ */
+async function chooseMergeAncestor(backend, incomingBase, localRef, tempRoot) {
+    const warnings = [];
+    const ordered = incomingBase && localRef && incomingBase.pushedAt && localRef.pushedAt
+        ? (incomingBase.pushedAt < localRef.pushedAt
+            ? [incomingBase, localRef]
+            : [localRef, incomingBase])
+        : [localRef, incomingBase].filter((r) => !!r);
+    const tried = new Set();
+    for (const ref of ordered) {
+        if (tried.has(ref.file))
+            continue;
+        tried.add(ref.file);
+        const attempt = await fetchAncestorWorkspace(backend, ref, tempRoot);
+        if (attempt.dir !== null)
+            return { dir: attempt.dir, warnings };
+        if (attempt.warning)
+            warnings.push(attempt.warning);
+    }
+    return { dir: null, warnings };
+}
+/**
+ * The merge's per-file decisions, phrased for the human reading the pull.
+ *
+ * Everything the merge *withheld* has to be said out loud, not just what it
+ * wrote: `skipped` paths park nothing at all (see merge.ts's `SkipReason`), and
+ * a `localDeleted` row can also mean "we could not see your copy" rather than
+ * "you deleted it". Silence there would look exactly like a successful sync.
+ *
+ * No remedy sentence tells the user to "re-pull to get this" — the bundle is
+ * recorded as received by the end of this pull, so a re-run finds nothing to
+ * do. Remedies here are things that change the NEXT pull's outcome.
+ */
+function describeWorkspaceMerge(r) {
+    const out = [];
+    const names = (paths) => paths.slice(0, 5).join(", ") + (paths.length > 5 ? `, and ${paths.length - 5} more` : "");
+    const count = (n) => `${n} workspace file${n === 1 ? "" : "s"}`;
+    if (r.conflicted.length > 0) {
+        out.push(`${count(r.conflicted.length)} were merged with conflict markers and need resolving by hand — search for "<<<<<<< local": ${names(r.conflicted)}. Conflicts are normal here: edits on adjacent lines conflict, and a file added independently on both machines conflicts over its whole length.`);
+    }
+    if (r.gitUnavailable) {
+        out.push("No usable `git merge-file` on this machine, so files edited on both machines could not be merged — your copies were left exactly as they are and the other machine's versions were parked beside them. Install git (or put it on PATH) to have future pulls merge them automatically.");
+    }
+    if (r.sidecars.length > 0) {
+        out.push(`${count(r.sidecars.length)} could not be merged, so your copies were kept and the other machine's were saved alongside as *.theirs-* files: ${names(r.sidecars.map((s) => s.path))}. Delete the sidecars once you've reconciled them — they are ordinary files and will be pushed to the hub otherwise.`);
+    }
+    if (r.skipped.length > 0) {
+        out.push(`${count(r.skipped.length)} were not applied at all and nothing was written near them (${[...new Set(r.skipped.map((s) => s.reason))].join(", ")}): ${names(r.skipped.map((s) => s.path))}. The incoming copies are still on the hub.`);
+    }
+    if (r.upstreamDeleted.length > 0) {
+        out.push(`${count(r.upstreamDeleted.length)} were deleted on the other machine but kept here (this merge never deletes your files): ${names(r.upstreamDeleted)}.`);
+    }
+    if (r.localDeleted.length > 0) {
+        out.push(`${count(r.localDeleted.length)} that you deleted here since the last sync were not restored: ${names(r.localDeleted)}. They are unchanged on the other machine, so they are still on the hub if you want them back.`);
+    }
+    if (r.restored.length > 0) {
+        out.push(`${count(r.restored.length)} that you had deleted here were changed on the other machine, so they came back rather than losing that work: ${names(r.restored)}. Delete them again if you still don't want them.`);
+    }
+    return out;
+}
 // Last full bundle + everything after it, minus records already received AND
 // still present locally (mirrors the importer's own dedup verification: a
 // registry/peer record can outlive the file it points at, e.g. after a
@@ -398,6 +550,24 @@ export async function hubPull(opts) {
         }
         opts.onProgress?.({ phase: "hub-pull", percent: 0 });
         let workspaceUnpacked = null;
+        let workspaceMerge;
+        // Which bundle in this chain carries the workspace generation to apply:
+        // the NEWEST one that has a payload, not needed[0].
+        //
+        // A chain is pulled in one pass and every bundle is recorded as received
+        // by the end of it, so any generation that isn't applied now is never
+        // offered again. Applying the OLDEST would therefore leave the tree
+        // permanently behind the hub after two unpulled pushes — and, worse, would
+        // record that stale generation as this machine's ancestor. Falls back to
+        // index 0 when no record claims a payload, which keeps the manifest check
+        // below the sole authority in that case (Slice-1 behavior).
+        let workspaceBundleIndex = 0;
+        for (let i = needed.length - 1; i >= 0; i--) {
+            if (needed[i].hasWorkspace) {
+                workspaceBundleIndex = i;
+                break;
+            }
+        }
         const importedSessions = [];
         const skippedSessions = [];
         const appended = [];
@@ -435,21 +605,36 @@ export async function hubPull(opts) {
             // "bundle/" to join).
             const bundleManifest = readManifest(extractDir);
             lastBundleManifest = bundleManifest;
-            // Workspace gate (first needed bundle only):
+            // Workspace gate (the chain's newest workspace-carrying bundle only).
+            // Slice 1's four branches are preserved; what changed is that the
+            // APPLICATION step is now a 3-way merge whenever this machine has an
+            // ancestor generation to merge against (design §5.5):
+            //
             // - target absent, empty, or
-            //   metadata-only                -> unpack (bootstrap; no force needed)
-            // - explicit --target-path,
-            //   has real content, no force   -> let unpackWorkspace throw, surface
+            //   metadata-only                -> unpack (bootstrap; no force needed).
+            //                                   NEVER merge: with an empty tree every
+            //                                   file reads as "deleted here" and the
+            //                                   merge would write nothing at all.
+            // - ancestor known, target has
+            //   real content                 -> 3-way MERGE, no force needed. Merging
+            //                                   cannot lose local work, so requiring
+            //                                   a destructive-sounding flag for it
+            //                                   would be backwards.
+            // - no ancestor, explicit
+            //   --target-path, has real
+            //   content, no force            -> let unpackWorkspace throw, surface
             //                                   an ErrorResult with the
             //                                   --force-workspace suggestion (the
             //                                   user asked for that destination;
             //                                   refuse loudly)
-            // - no explicit --target-path,
-            //   project dir has real content,
-            //   no force                     -> SKIP with a warning (routine repeat
+            // - no ancestor, no explicit
+            //   --target-path, project dir
+            //   has real content, no force   -> SKIP with a warning (routine repeat
             //                                   pulls of non-git projects must not
             //                                   start erroring)
-            // - --force-workspace            -> unpack with force (merge) regardless
+            // - no ancestor, --force-workspace -> unpack with force, i.e.
+            //                                   OVERWRITE-ON-COLLISION (§5.4 — the
+            //                                   warning now says so)
             //
             // ".claude-sesh-mover" counts as non-content on BOTH sides: identity
             // linking above may have just planted project.json into an otherwise
@@ -457,19 +642,78 @@ export async function hubPull(opts) {
             // --target-path), and that metadata alone must neither trigger the
             // routine-skip branch nor trip unpackWorkspace's own emptiness check —
             // hence force is also set when the dir holds nothing but our metadata.
-            if (i === 0 && bundleManifest.workspace) {
+            if (i === workspaceBundleIndex && bundleManifest.workspace) {
                 const entries = existsSync(effectiveProjectPath) ? readdirSync(effectiveProjectPath) : [];
                 const hasRealContent = entries.some((n) => n !== ".claude-sesh-mover");
-                if (hasRealContent && !opts.forceWorkspace && !opts.targetPath) {
-                    warnings.push("Bundle carries a workspace payload but the project directory already has content — pass --force-workspace to merge it here, or re-pull with --target-path <fresh-dir> to unpack it elsewhere.");
+                const incomingDir = join(extractDir, "workspace");
+                // Ancestor lookup is keyed off the EFFECTIVE project path, like every
+                // other piece of local bookkeeping here — a pull into a fresh
+                // --target-path has no sync-state there and therefore no ancestor,
+                // which is correct: that tree shares no generation with the hub.
+                let ancestorDir = null;
+                if (hasRealContent) {
+                    const ancestor = await chooseMergeAncestor(backend, bundleManifest.workspace.basedOn, readSyncState(effectiveProjectPath).hub?.lastWorkspace, tempRoot);
+                    ancestorDir = ancestor.dir;
+                    warnings.push(...ancestor.warnings);
+                }
+                if (ancestorDir !== null) {
+                    // No git probe up front, deliberately. mergeWorkspaceTrees only needs
+                    // git for files changed on BOTH sides; take/keep/create/no-op rows —
+                    // the overwhelming majority on a routine pull — are decided by
+                    // content hash alone. Falling back to no-ancestor mode because git is
+                    // missing would skip the payload outright on a non-empty tree, and
+                    // since the bundle is recorded as received by the end of this pull,
+                    // "install git and re-pull" would be advice that cannot work. The
+                    // merge degrades per file instead (sidecars + `gitUnavailable`), and
+                    // describeWorkspaceMerge says so.
+                    const report = await mergeWorkspaceTrees({
+                        ancestorDir,
+                        incomingDir,
+                        targetDir: effectiveProjectPath,
+                    });
+                    workspaceMerge = report;
+                    workspaceUnpacked = {
+                        path: effectiveProjectPath,
+                        fileCount: report.taken.length + report.created.length + report.restored.length +
+                            report.merged.length + report.conflicted.length,
+                    };
+                    // Record the new ancestor IMMEDIATELY, before the session half of
+                    // this pull can fail. The tree already reflects this generation; if a
+                    // later fault sent us back to the old one, the next pull would merge
+                    // an already-merged (possibly conflict-marked) file against a stale
+                    // base and manufacture conflicts out of work that was already done.
+                    const stateWs = readSyncState(effectiveProjectPath);
+                    setLastWorkspace(stateWs, hub.hubId, {
+                        bundleId: record.bundleId, file: record.file, pushedAt: record.pushedAt,
+                    });
+                    writeSyncState(stateWs);
+                    warnings.push(...describeWorkspaceMerge(report));
+                }
+                else if (hasRealContent && !opts.forceWorkspace && !opts.targetPath) {
+                    warnings.push("Bundle carries a workspace payload but the project directory already has content and this machine has no workspace generation recorded to merge against — pass --force-workspace to unpack it here, OVERWRITING any file of the same name, or re-pull with --target-path <fresh-dir> to unpack it elsewhere. Once this machine has pushed or applied one generation, later payloads merge 3-way instead.");
                 }
                 else {
                     try {
-                        const ws = await unpackWorkspace(join(extractDir, "workspace"), effectiveProjectPath, { force: !!opts.forceWorkspace || !hasRealContent });
+                        const ws = await unpackWorkspace(incomingDir, effectiveProjectPath, { force: !!opts.forceWorkspace || !hasRealContent });
                         workspaceUnpacked = { path: effectiveProjectPath, fileCount: ws.fileCount };
                         if (ws.symlinksSkipped > 0) {
                             warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
                         }
+                        if (ws.blocked.length > 0) {
+                            warnings.push(`${ws.blocked.length} workspace file(s) were not unpacked because of what already occupies their path here (${[...new Set(ws.blocked.map((b) => b.reason))].join(", ")}): ${ws.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them; the incoming copies are still on the hub.`);
+                        }
+                        if (hasRealContent) {
+                            warnings.push("The workspace payload was unpacked over the existing directory, overwriting any file of the same name — there was no recorded workspace generation to merge against, so nothing could be combined.");
+                        }
+                        // Both application paths record the generation: whatever was
+                        // overwritten now matches it, and anything only this machine has is
+                        // absent from it, which is exactly how the next merge should read
+                        // this tree.
+                        const stateWs = readSyncState(effectiveProjectPath);
+                        setLastWorkspace(stateWs, hub.hubId, {
+                            bundleId: record.bundleId, file: record.file, pushedAt: record.pushedAt,
+                        });
+                        writeSyncState(stateWs);
                     }
                     catch (e) {
                         if (e instanceof WorkspaceTargetNotEmptyError) {
@@ -792,10 +1036,19 @@ export async function hubPull(opts) {
         // recent copy. The re-run the skip warning promises would then be refused
         // outright ("the latest copy of this thread is already local"), turning
         // "decide later" into "decide never".
+        //
+        // A workspace application deliberately does NOT count here. The index is a
+        // projection of SESSIONS — unpacking or merging files into the project
+        // directory changes nothing it publishes — so letting it defeat the
+        // suppression would republish the local branch's head and foreclose the
+        // re-run for a reason unrelated to sessions. Before Slice 2 that pairing
+        // needed --force-workspace to reach; now that a routine pull merges a
+        // workspace automatically, it would be the common case. The index stays as
+        // it was for one pull and the next push/pull (or `hub reindex`) rewrites
+        // it — it is a derived file by design.
         const appliedNothing = importedSessions.length === 0 &&
             skippedSessions.length === 0 &&
-            appended.length === 0 &&
-            workspaceUnpacked === null;
+            appended.length === 0;
         if (!(skippedByDivergence && appliedNothing)) {
             const sessionsNow = discoverSessions(opts.configDir, effectiveProjectPath).map((s) => ({
                 sessionId: s.sessionId,
@@ -827,6 +1080,7 @@ export async function hubPull(opts) {
             skippedSessions,
             localSessionId,
             workspaceUnpacked,
+            workspaceMerge,
             appended: appended.length > 0 ? appended : undefined,
             divergence: lastDivergence,
             warnings,
