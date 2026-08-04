@@ -161,9 +161,13 @@ export declare class MergeAncestorRequiredError extends Error {
  *   `git` on PATH that is a broken wrapper rather than git.
  *
  * The marker assertions below cannot be broken by a project's own git settings.
- * `cwd` is the probe's private temp dir, so no repository-local config is in
- * scope (same reason the merge spawn in `mergeWorkspaceTrees` sets it — see the
- * comment there), and `.gitattributes`' `conflict-marker-size` does
+ * `cwd` is the probe's private temp dir AND the environment is scrubbed
+ * (`gitChildEnv`) — both are needed, and the second was missing here until
+ * Task 10 measured it: `GIT_DIR` walks straight through a scratch `cwd`, so a
+ * repo-local `merge.conflictStyle=bogusstyle` reachable that way makes the
+ * probe exit 128 and report a perfectly good git as unusable. Same pairing as
+ * the merge spawn in `mergeWorkspaceTrees` — see the comment there. And
+ * `.gitattributes`' `conflict-marker-size` does
  * not reach `git merge-file` at all — verified: `* conflict-marker-size=15` in a
  * repo still produces 7-character markers, because merge-file takes three plain
  * paths and never consults the attribute stack. Same for

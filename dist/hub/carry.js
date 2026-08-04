@@ -85,9 +85,19 @@ const PATCH_HARDENING = [
  * Two spellings per name because they answer different questions: `**\/<name>`
  * catches a plain FILE with that name at any depth, `**\/<name>\/**` catches
  * everything inside a directory with that name at any depth (the backslashes
- * are this comment's, not the pathspec's). `icase` mirrors
+ * are this comment's, not the pathspec's). `icase` mirrors the CASE half of
  * `isNeverSegment`, which folds case because a `.GIT` store works on a
- * case-folding filesystem. Verified on git 2.50.1 to compose with `--relative`
+ * case-folding filesystem.
+ *
+ * It does NOT mirror that function's other folding: `isNeverSegment` also
+ * strips trailing dots and whitespace (Win32 resolves `.git.` and `.git ` to
+ * `.git`), and no pathspec spelling expresses that without also swallowing
+ * `.claude-sesh-moverX`. So `.claude-sesh-mover./config.json` rides this patch.
+ * That is deliberate and it is the RECEIVING side's job: §6.2's `git apply`
+ * must run every path in the patch through `isNeverIncludable`, which does
+ * fold, before writing anything. Do not treat this pathspec as the boundary.
+ *
+ * Verified on git 2.50.1 to compose with `--relative`
  * (the pathspecs are cwd-relative, so a project that is a repo SUBDIRECTORY
  * excludes its own plugin directory, not the repo root's).
  *
