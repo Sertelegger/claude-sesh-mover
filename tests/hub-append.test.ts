@@ -91,10 +91,14 @@ function touchNow(path: string): void {
  * deterministically. Sanctioned targeted fake: the real rewriter still does the
  * work; the wrapper only interleaves the foreign write.
  */
-async function loadAppendWithConcurrentWrite(
+async function loadModuleWithConcurrentWrite(
   write: () => void
-): Promise<typeof import("../src/hub/append.js").tryAppendContinuation> {
+): Promise<typeof import("../src/hub/append.js")> {
   vi.resetModules();
+  // One-shot: adoptHubBranch rewrites twice (the delta, then the preserved
+  // copy). Only the FIRST call is the pre-truncate window under test; firing
+  // again afterwards would be a second, unrelated race.
+  let fired = false;
   vi.doMock("../src/rewriter.js", async () => {
     const actual = await vi.importActual<typeof import("../src/rewriter.js")>(
       "../src/rewriter.js"
@@ -105,13 +109,27 @@ async function loadAppendWithConcurrentWrite(
         ...args: Parameters<typeof actual.rewriteJsonlStream>
       ) => {
         const report = await actual.rewriteJsonlStream(...args);
-        write();
+        if (!fired) {
+          fired = true;
+          write();
+        }
         return report;
       },
     };
   });
-  const mod = await import("../src/hub/append.js");
-  return mod.tryAppendContinuation;
+  return import("../src/hub/append.js");
+}
+
+async function loadAppendWithConcurrentWrite(
+  write: () => void
+): Promise<typeof import("../src/hub/append.js").tryAppendContinuation> {
+  return (await loadModuleWithConcurrentWrite(write)).tryAppendContinuation;
+}
+
+async function loadAdoptWithConcurrentWrite(
+  write: () => void
+): Promise<typeof import("../src/hub/append.js").adoptHubBranch> {
+  return (await loadModuleWithConcurrentWrite(write)).adoptHubBranch;
 }
 
 function unloadConcurrentWriteMock(): void {
@@ -806,6 +824,121 @@ describe("adoptHubBranch", () => {
       expect(r.detail).toContain("unparseable");
       expect(readFileSync(base).equals(before)).toBe(true);
       expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The mirror of tryAppendContinuation's pre-write re-check, and the reason
+  // it matters MORE here: an append that races is merely spliced after entries
+  // it doesn't chain to, but a truncate that races DELETES them — and they are
+  // not in the backup either, because the backup predates them. Without the
+  // re-check the entry vanishes from the base AND the preserved copy, with no
+  // error anywhere.
+  it("abandons the adoption when the base grows during preparation, leaving the writer's bytes intact", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const before = readFileSync(base, "utf-8");
+
+      // A live Claude Code session extends the LOCAL branch while we prepare.
+      const concurrent = JSON.stringify(entry("L3-LIVE", "L2", "base-sid")) + "\n";
+      const run = await loadAdoptWithConcurrentWrite(() =>
+        appendFileSync(base, concurrent, "utf-8")
+      );
+      const r = await run({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("base changed during adoption");
+      expect(r.detail).toContain("nothing was written");
+
+      // The live entry is still there, in the file it was written to...
+      const after = readFileSync(base, "utf-8");
+      expect(after).toBe(before + concurrent);
+      expect(after).toContain("L3-LIVE");
+      // ...and nothing was spliced or preserved.
+      expect(after).not.toContain("H1");
+      expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      unloadConcurrentWriteMock();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Same race, head-preserving shape: a concurrent write that leaves the head
+  // uuid alone is still caught, because the size moved.
+  it("abandons the adoption when the base grows without moving its head", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const before = readFileSync(base, "utf-8");
+
+      const concurrent = JSON.stringify(entry("L2", "L1", "base-sid")) + "\n";
+      const run = await loadAdoptWithConcurrentWrite(() =>
+        appendFileSync(base, concurrent, "utf-8")
+      );
+      const r = await run({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("base changed during adoption");
+      expect(readFileSync(base, "utf-8")).toBe(before + concurrent);
+      expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      unloadConcurrentWriteMock();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the preserved path already exists, so a rollback can never delete it", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const squatter = "someone else's file\n";
+      writeFileSync(preservedPath, squatter, "utf-8");
+      const before = readFileSync(base);
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("already exists");
+      expect(readFileSync(base).equals(before)).toBe(true);
+      expect(readFileSync(preservedPath, "utf-8")).toBe(squatter); // untouched
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

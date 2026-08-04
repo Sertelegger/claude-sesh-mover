@@ -134,7 +134,11 @@ export interface AdoptHubInput {
     anchorOffset: number;
     /** Caller-minted uuid for the copy of the local branch. */
     preservedSessionId: string;
-    /** `<projectDir>/<preservedSessionId>.jsonl` — must not exist yet. */
+    /**
+     * `<projectDir>/<preservedSessionId>.jsonl` — must not exist yet, and is
+     * checked: the failure path deletes this file, so adopting onto an existing
+     * one would let a rollback destroy something that was never ours.
+     */
     preservedPath: string;
     /**
      * Source -> target rewrite context for the bundle the delta came out of.
@@ -159,7 +163,17 @@ export type AdoptOutcome = {
     newHeadUuid: string;
     preservedSessionId: string;
 }
-/** Nothing was kept: the base is byte-for-byte what it was. */
+/**
+ * Nothing was kept. Either the base was never touched (every refusal before
+ * the truncate, including the concurrent-modification re-check), or it was
+ * restored byte-for-byte from the snapshot this call took at its start.
+ *
+ * The distinction matters under a live writer: "restored" means restored to
+ * THE SNAPSHOT, so a restore can only ever be byte-for-byte with respect to
+ * the file as it was when adoption began. That is exactly why the re-check
+ * exists — it makes the untouched case the only one a concurrent writer can
+ * reach.
+ */
  | {
     kind: "failed";
     detail: string;
@@ -177,20 +191,34 @@ export type AdoptOutcome = {
  *    failure is a RESTORE rather than a reconstruction from two half-written
  *    files;
  * 2. every cheap refusal (no delta entries, an offset that isn't a line
- *    boundary) and all the O(delta) preparation happen while the base is
- *    still untouched, so the mutation window is a truncate plus one append;
- * 3. the preserved session is materialised only AFTER the splice verifies —
+ *    boundary, a preserved path that already exists) and all the O(delta)
+ *    preparation happen while the base is still untouched, so the mutation
+ *    window is a truncate plus one append;
+ * 3. the base is re-measured immediately before the truncate and the adoption
+ *    is abandoned if it moved — see below;
+ * 4. the preserved session is materialised only AFTER the splice verifies —
  *    on failure there is no orphan file, and (because the caller registers it
  *    in `history.jsonl` only once this returns `adopted`) nothing to
  *    un-register either.
  *
+ * Step 3 is the same defense `tryAppendContinuation` runs at its own step 3,
+ * and it matters MORE here. No lock of ours covers Claude Code, the
+ * preparation in step 2 is O(delta), and a live session may append in that
+ * window. An append that raced would merely be spliced after entries it does
+ * not chain to; a truncate that races DESTROYS those entries — and they would
+ * not be in the backup either, because the backup was taken before they were
+ * written. So the base's size and head uuid are captured from the BACKUP (the
+ * snapshot that is actually restorable) and re-checked against the live file
+ * just before the cut; any difference abandons the adoption with nothing
+ * written, leaving the concurrent writer's bytes exactly where they are.
+ *
  * No entry is injected into either transcript; the "preserved" labelling is
  * the caller's `history.jsonl` display name, not content.
  *
- * Anticipated failures come back as `failed` with the base restored. The one
- * case that throws is a restore that itself failed — the only situation where
- * the base may be left inconsistent, and the temp backup is then deliberately
- * NOT deleted so the error can name a full copy of the user's session.
+ * Anticipated failures come back as `failed`. The one case that throws is a
+ * restore that itself failed — the only situation where the base may be left
+ * inconsistent, and the temp backup is then deliberately NOT deleted so the
+ * error can name a full copy of the user's session.
  */
 export declare function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome>;
 //# sourceMappingURL=append.d.ts.map

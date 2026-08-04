@@ -573,12 +573,38 @@ export async function hubPull(opts) {
                                 resolution: mode,
                             };
                             lastDivergence = divergence;
+                            // The two sides of the fork, phrased for the user. When the
+                            // anchor isn't in the local session at all there IS no shared
+                            // point to count from — `localEntriesSinceAnchor` is 0 by
+                            // definition, and reporting "0 entries the hub hasn't seen"
+                            // about a session that doesn't even contain the anchor is
+                            // simply false. Say what actually happened instead.
+                            const plural = (n) => `${n} entr${n === 1 ? "y" : "ies"}`;
+                            const forkSummary = divergence.adoptAvailable
+                                ? `your session ${baseSessionId} continues ${divergence.anchorUuid} with ${plural(divergence.localEntriesSinceAnchor)} the hub hasn't seen, and the hub's copy continues the same entry with ${plural(divergence.hubEntriesSinceAnchor)} of its own`
+                                : `the hub's continuation follows entry ${divergence.anchorUuid}, which session ${baseSessionId} does not contain at all (unrelated or compacted history), so there is no shared point to splice at`;
+                            // Adoption TRUNCATES a transcript the user already owns, which
+                            // is strictly more destructive than the append that does check
+                            // liveness — and the chain guard fires first, so a diverged base
+                            // reaches here with no liveness scrutiny whatsoever. The most
+                            // likely invocation is a pull run from INSIDE the diverged
+                            // session, which is guaranteed to keep appending: its in-memory
+                            // head would be an entry the file no longer ends with, so its
+                            // next write chains onto the hub's branch instead of its own.
+                            // Refuse by default, exactly as migrator.ts refuses a
+                            // self-migration, and let --force-append be the consent.
+                            const baseAgeMs = Date.now() - baseMtimeMs;
+                            const looksLive = baseMtimeMs < opNowMs && baseAgeMs < APPEND_LIVE_WINDOW_MS;
                             if (mode === "skip") {
-                                warnings.push(`Thread ${target.threadId} has diverged: your session ${baseSessionId} continues ${divergence.anchorUuid} with ${divergence.localEntriesSinceAnchor} entr${divergence.localEntriesSinceAnchor === 1 ? "y" : "ies"} the hub hasn't seen, and the hub's copy continues the same entry with ${divergence.hubEntriesSinceAnchor} of its own — skipped, nothing changed. Re-run with --on-divergence fragment or adopt-hub to decide.`);
+                                warnings.push(`Thread ${target.threadId} has diverged: ${forkSummary} — skipped, nothing changed. Re-run with --on-divergence fragment${divergence.adoptAvailable ? " or adopt-hub" : ""} to decide.`);
                                 skippedByDivergence = true;
                                 continue; // nothing recorded, so the decision can be revisited
                             }
-                            if (mode === "adopt-hub" && divergence.adoptAvailable) {
+                            if (mode === "adopt-hub" && divergence.adoptAvailable && looksLive && !opts.forceAppend) {
+                                warnings.push(`adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Exit that session, then re-run with --on-divergence adopt-hub --force-append. The hub's branch was imported as a separate session in the meantime; nothing local was touched.`);
+                                divergence.resolution = "fragment";
+                            }
+                            else if (mode === "adopt-hub" && divergence.adoptAvailable) {
                                 const preservedSessionId = randomUUID();
                                 const preservedPath = join(targetProjectDir, `${preservedSessionId}.jsonl`);
                                 const adopt = await adoptHubBranch({
@@ -632,16 +658,11 @@ export async function hubPull(opts) {
                                         entriesAppended: adopt.entriesAppended,
                                     });
                                     warnings.push(`Adopted the hub branch for thread ${target.threadId} into session ${baseSessionId}; your local branch was preserved in full as session ${preservedSessionId}, which has no thread mapping and will therefore be published as its own thread on the next push.`);
-                                    // Unlike a plain append, adoption never consults the
-                                    // liveness guard: tryAppendContinuation checks the chain
-                                    // FIRST, so a diverged base declines before the mtime is
-                                    // ever looked at, and refusing here instead would block
-                                    // adopt-hub in its most common case (the user's local branch
-                                    // is fresh — that is why it diverged). The base is only ever
-                                    // extended by a live writer, so the risk is a confused chain
-                                    // rather than corruption. Say so instead of guessing.
-                                    if (!opts.forceAppend && baseMtimeMs < opNowMs && Date.now() - baseMtimeMs < APPEND_LIVE_WINDOW_MS) {
-                                        warnings.push(`Session ${baseSessionId} was modified ${Math.round((Date.now() - baseMtimeMs) / 1000)}s ago — if a live Claude Code session is still open on it, exit it: anything it writes from now on chains onto the adopted hub branch, not onto the local branch preserved as ${preservedSessionId}.`);
+                                    // Only reachable with --force-append (the refusal above owns
+                                    // the unforced case), so this is the consequence the user
+                                    // consented to, restated now that it is real.
+                                    if (looksLive) {
+                                        warnings.push(`Session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago and was adopted anyway because --force-append was passed. If a Claude Code session is still open on it, exit it now: anything it writes from here chains onto the adopted hub branch, not onto the local branch preserved as ${preservedSessionId}.`);
                                     }
                                     threadLandedSessionId = baseSessionId;
                                     continue; // bundle handled — no fragment import
@@ -653,8 +674,11 @@ export async function hubPull(opts) {
                                 warnings.push(`adopt-hub is unavailable for thread ${target.threadId}: the continuation's anchor ${divergence.anchorUuid} is not present in the local session ${baseSessionId} (unrelated or compacted history) — importing the hub's branch as a separate session instead.`);
                                 divergence.resolution = "fragment";
                             }
+                            else if (divergence.adoptAvailable) {
+                                warnings.push(`Thread ${target.threadId} has diverged: ${forkSummary}, so the hub's branch was imported as a separate session and nothing local was touched. Re-run with --on-divergence adopt-hub to make the hub's branch canonical and keep your branch as a second session, or --on-divergence skip to decide later.`);
+                            }
                             else {
-                                warnings.push(`Thread ${target.threadId} has diverged: session ${baseSessionId} and the hub's copy both continue ${divergence.anchorUuid} (${divergence.localEntriesSinceAnchor} local entr${divergence.localEntriesSinceAnchor === 1 ? "y" : "ies"} vs ${divergence.hubEntriesSinceAnchor} on the hub), so the hub's branch was imported as a separate session and nothing local was touched. Re-run with --on-divergence adopt-hub to make the hub's branch canonical and keep your branch as a second session, or --on-divergence skip to decide later.`);
+                                warnings.push(`Thread ${target.threadId} could not be continued locally: ${forkSummary}. The hub's branch was imported as a separate session and nothing local was touched — adopt-hub cannot help here.`);
                             }
                             // fall through to the fragment import
                         }

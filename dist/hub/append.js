@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, copyFileSync, createReadStream, createWriteStream, mkdtempSync, openSync, readSync, rmSync, statSync, truncateSync, } from "node:fs";
+import { appendFileSync, closeSync, copyFileSync, createReadStream, createWriteStream, existsSync, mkdtempSync, openSync, readSync, rmSync, statSync, truncateSync, } from "node:fs";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
@@ -241,27 +241,53 @@ export async function tryAppendContinuation(a) {
  *    failure is a RESTORE rather than a reconstruction from two half-written
  *    files;
  * 2. every cheap refusal (no delta entries, an offset that isn't a line
- *    boundary) and all the O(delta) preparation happen while the base is
- *    still untouched, so the mutation window is a truncate plus one append;
- * 3. the preserved session is materialised only AFTER the splice verifies —
+ *    boundary, a preserved path that already exists) and all the O(delta)
+ *    preparation happen while the base is still untouched, so the mutation
+ *    window is a truncate plus one append;
+ * 3. the base is re-measured immediately before the truncate and the adoption
+ *    is abandoned if it moved — see below;
+ * 4. the preserved session is materialised only AFTER the splice verifies —
  *    on failure there is no orphan file, and (because the caller registers it
  *    in `history.jsonl` only once this returns `adopted`) nothing to
  *    un-register either.
  *
+ * Step 3 is the same defense `tryAppendContinuation` runs at its own step 3,
+ * and it matters MORE here. No lock of ours covers Claude Code, the
+ * preparation in step 2 is O(delta), and a live session may append in that
+ * window. An append that raced would merely be spliced after entries it does
+ * not chain to; a truncate that races DESTROYS those entries — and they would
+ * not be in the backup either, because the backup was taken before they were
+ * written. So the base's size and head uuid are captured from the BACKUP (the
+ * snapshot that is actually restorable) and re-checked against the live file
+ * just before the cut; any difference abandons the adoption with nothing
+ * written, leaving the concurrent writer's bytes exactly where they are.
+ *
  * No entry is injected into either transcript; the "preserved" labelling is
  * the caller's `history.jsonl` display name, not content.
  *
- * Anticipated failures come back as `failed` with the base restored. The one
- * case that throws is a restore that itself failed — the only situation where
- * the base may be left inconsistent, and the temp backup is then deliberately
- * NOT deleted so the error can name a full copy of the user's session.
+ * Anticipated failures come back as `failed`. The one case that throws is a
+ * restore that itself failed — the only situation where the base may be left
+ * inconsistent, and the temp backup is then deliberately NOT deleted so the
+ * error can name a full copy of the user's session.
  */
 export async function adoptHubBranch(input) {
     const work = mkdtempSync(join(tmpdir(), "sesh-adopt-"));
     const backup = join(work, "base-backup.jsonl");
     let keepWork = false;
     try {
+        if (existsSync(input.preservedPath)) {
+            return {
+                kind: "failed",
+                detail: `preserved session path ${input.preservedPath} already exists — refusing to adopt (the failure path deletes that file)`,
+            };
+        }
         copyFileSync(input.basePath, backup);
+        // Measured off the BACKUP, not the live file: these describe exactly the
+        // snapshot we hold and could restore, so if a write lands mid-copy the
+        // re-check below sees a mismatch rather than silently trusting a torn or
+        // stale reading of the original.
+        const snapshotSize = statSync(backup).size;
+        const snapshotHead = readLastEntryUuid(backup);
         const info = await readDeltaChainInfo(input.deltaPath);
         if (!info.lastEntryUuid) {
             return { kind: "failed", detail: "continuation bundle has no entries" };
@@ -286,6 +312,28 @@ export async function adoptHubBranch(input) {
             return {
                 kind: "failed",
                 detail: `continuation contains ${report.parseFailures} unparseable JSONL line(s); refusing to adopt (the base was not modified)`,
+            };
+        }
+        // Everything above read the base BEFORE the O(delta) preparation. If a
+        // live Claude Code session appended in that window, cutting at the anchor
+        // would delete entries that are in neither the new base nor the backup —
+        // gone, with no error anywhere. Abandon instead: nothing has been written
+        // yet, so there is nothing to restore and the writer's bytes stay put.
+        const live = statSync(input.basePath);
+        const liveHead = readLastEntryUuid(input.basePath);
+        if (live.size !== snapshotSize || liveHead !== snapshotHead) {
+            return {
+                kind: "failed",
+                detail: `base changed during adoption (${snapshotSize} bytes / head ${snapshotHead ?? "(none)"} -> ${live.size} bytes / head ${liveHead ?? "(none)"}) — nothing was written`,
+            };
+        }
+        // Re-verified at the moment of truncation, not just before the prep: the
+        // one guarantee findEntryOffsetByUuid's contract asks for is that THIS
+        // offset is a line boundary in THIS file.
+        if (!isLineBoundary(input.basePath, input.anchorOffset)) {
+            return {
+                kind: "failed",
+                detail: `anchor offset ${input.anchorOffset} is no longer on a line boundary — nothing was written`,
             };
         }
         // Splice: cut the local divergence off at the anchor, append the hub's.

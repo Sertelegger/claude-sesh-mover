@@ -1609,15 +1609,30 @@ describe("hub pull — divergence resolution", () => {
     }
   });
 
-  it("adoptAvailable is false when the anchor is absent from the local base", async () => {
+  /**
+   * A base that does NOT contain the continuation's anchor: A's copy was
+   * compacted below it (or the thread mapping points at an unrelated session).
+   * There is no shared point to splice or cut at, so adopt-hub is impossible
+   * and every message about the fork has to say so rather than quoting entry
+   * counts measured from an anchor that isn't there.
+   */
+  async function arrangeAnchorAbsent(): Promise<ContinuationArrangement> {
     const a = await arrangeContinuation();
     try {
-      // A's copy no longer contains the anchor at all (compacted history, or
-      // an unrelated session that happens to carry the thread mapping).
       const kept = readFileSync(a.basePath, "utf-8").trim().split("\n").slice(0, 2);
       writeFileSync(a.basePath, kept.join("\n") + "\n", "utf-8");
       appendEntries(a.basePath, localEntries("entry-2", a.baseSessionId, a.projectA));
       ageOutOfLiveWindow(a.basePath);
+      return a;
+    } catch (e) {
+      a.cleanup();
+      throw e;
+    }
+  }
+
+  it("adoptAvailable is false when the anchor is absent from the local base", async () => {
+    const a = await arrangeAnchorAbsent();
+    try {
       const before = jsonlFiles(a.projectDirA);
       const baseBefore = readFileSync(a.basePath, "utf-8");
 
@@ -1636,6 +1651,59 @@ describe("hub pull — divergence resolution", () => {
       expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
       expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
       expect(p.appended ?? []).toHaveLength(0);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  // Regression: "your session S continues <anchor> with 0 entries the hub
+  // hasn't seen" is false when S doesn't contain <anchor> at all — and since
+  // /sesh-mover:pull always sends skip, that was the DEFAULT text for a stale
+  // or unrelated thread mapping.
+  it("never quotes entry counts from an anchor the local session doesn't contain", async () => {
+    const a = await arrangeAnchorAbsent();
+    try {
+      const skip = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(skip.success).toBe(true);
+      if (!skip.success) return;
+      const skipWarnings = (skip as HubPullResult).warnings.join(" ");
+      expect((skip as HubPullResult).divergence?.adoptAvailable).toBe(false);
+      expect(skipWarnings).toContain("does not contain");
+      expect(skipWarnings).not.toContain("0 entries");
+      // ...and adopt-hub is not offered as a way out, because it isn't one.
+      expect(skipWarnings).not.toContain("adopt-hub");
+
+      const fragment = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(fragment.success).toBe(true);
+      if (!fragment.success) return;
+      const fragmentWarnings = (fragment as HubPullResult).warnings.join(" ");
+      expect(fragmentWarnings).toContain("does not contain");
+      expect(fragmentWarnings).toContain("adopt-hub cannot help here");
+      expect(fragmentWarnings).not.toContain("0 entries");
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("the skip message quotes both sides of a real fork", async () => {
+    const a = await arrangeDivergence();
+    try {
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const w = (result as HubPullResult).warnings.join(" ");
+      expect(w).toContain("2 entries the hub hasn't seen");
+      expect(w).toContain("2 entries of its own");
+      expect(w).toContain("adopt-hub");
     } finally {
       a.cleanup();
     }
@@ -1710,10 +1778,18 @@ describe("hub pull — divergence resolution", () => {
     }
   });
 
-  it("adopting a base that looks live still adopts, but says so", async () => {
+  // Adoption truncates, so it needs at least the consent the (less
+  // destructive) plain append demands. The chain guard fires first, so a
+  // diverged base reaches the adopt path with no liveness scrutiny at all —
+  // and the likeliest invocation is a pull run from inside the very session
+  // being adopted over.
+  it("refuses to adopt a live-looking base without --force-append", async () => {
     const a = await arrangeDivergence();
     try {
+      const before = jsonlFiles(a.projectDirA);
+      const baseBefore = readFileSync(a.basePath, "utf-8");
       makeLookLive(a.basePath);
+
       const result = await hubPull({
         configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
         latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
@@ -1722,11 +1798,54 @@ describe("hub pull — divergence resolution", () => {
       if (!result.success) return;
       const p = result as HubPullResult;
 
+      // Reported as the fragment it fell back to...
+      expect(p.divergence?.resolution).toBe("fragment");
+      expect(p.divergence?.preservedSessionId).toBeUndefined();
+      expect(p.appended ?? []).toHaveLength(0);
+      // ...the local transcript is untouched, not truncated...
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      expect(uuidsOf(a.basePath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2",
+      ]);
+      // ...the content still arrived as a separate session...
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+      // ...and the refusal names the age and the way through.
+      const w = p.warnings.join(" ");
+      expect(w).toContain("adopt-hub refused");
+      expect(w).toMatch(/modified \d+s ago/);
+      expect(w).toContain("--force-append");
+      // The skill needs the age to phrase the question, and it is in the payload.
+      expect(Date.now() - new Date(p.divergence!.localLastActiveAt).getTime()).toBeLessThan(
+        5 * 60 * 1000
+      );
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("--force-append adopts a live-looking base and restates the consequence", async () => {
+    const a = await arrangeDivergence();
+    try {
+      makeLookLive(a.basePath);
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", forceAppend: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
       expect(p.divergence?.resolution).toBe("adopt-hub");
+      expect(p.divergence?.preservedSessionId).toBeTruthy();
       expect(uuidsOf(a.basePath)).toEqual([
         "entry-1", "entry-2", FIXTURE_HEAD_UUID, "b-entry-4", "b-entry-5",
       ]);
-      expect(p.warnings.join(" ")).toContain("live Claude Code session");
+      expect(uuidsOf(join(a.projectDirA, `${p.divergence!.preservedSessionId}.jsonl`))).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2",
+      ]);
+      const w = p.warnings.join(" ");
+      expect(w).toContain("--force-append was passed");
+      expect(w).toContain("exit it now");
     } finally {
       a.cleanup();
     }
