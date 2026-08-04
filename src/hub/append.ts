@@ -234,6 +234,15 @@ export async function tryAppendContinuation(a: AppendAttempt): Promise<AppendOut
   // file a live Claude Code session is probably appending to.
   const baseStat = statSync(a.basePath);
   const mtimeMs = baseStat.mtimeMs;
+  // Deliberately imprecise in the exempting direction, twice over: mtimeMs is a
+  // float but opNowMs comes from Date.now(), truncated to a whole millisecond,
+  // and opNowMs is captured once for the WHOLE pull — so a foreign write landing
+  // anywhere between op start and this guard reads as ours. Bounded by the chain
+  // guard (a foreign *conversation* entry moves the head, so the splice declines
+  // as chain-mismatch), then by the TOCTOU re-check and the rollback arithmetic.
+  // Making this exact needs a recorded write-time, not a finer clock — see the
+  // Task 7 carry in the SDD ledger. Never "fix" it by flooring mtimeMs: that
+  // widens the window to a full millisecond instead of closing it.
   const selfWritten = mtimeMs >= a.opNowMs;
   const ageMs = Date.now() - mtimeMs;
   if (!a.force && !selfWritten && ageMs < APPEND_LIVE_WINDOW_MS) {
