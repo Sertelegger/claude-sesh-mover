@@ -2231,6 +2231,14 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(warned).not.toMatch(/you deleted here/);
       expect(warned).toContain("Nothing will offer it again");
       expect(warned).toContain("--force-workspace");
+      // `--force-workspace` stopped being inert once a generation is on record,
+      // so recommending it here recommends an UNPACK over this directory — it
+      // can destroy local edits this very merge was preserving (measured). The
+      // sentence must lead with the non-destructive route and must not describe
+      // the flag as a merge.
+      expect(warned).toContain("--target-path <fresh-dir>");
+      expect(warned).toContain("OVERWRITING");
+      expect(warned).not.toMatch(/--force-workspace to merge/);
       // The other machine's edit still arrived.
       expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toContain("A-EDIT");
     } finally {

@@ -330,7 +330,17 @@ async function fetchAncestorWorkspace(backend, ref, tempRoot) {
  *
  * A generation in both was held by both trees, so it is a legal base. The
  * NEWEST such generation (smallest index in `ours`) is the tightest one, and
- * that is what wins. Empty intersection means we genuinely cannot name a common
+ * that is what wins.
+ *
+ * Read that guarantee precisely: OUR half is verified (membership in a list this
+ * machine wrote), THEIRS is asserted (`basedOn` is a self-report). A peer that
+ * lies — naming a generation of ours it never held — gets that generation used
+ * as the base, which is the silent-revert shape again. That is a residual, not a
+ * regression: a forged `pushedAt` bought the same thing before this rule
+ * existed, and an honest pusher can only ever declare its own `lastWorkspace`.
+ * Closing it needs the hub to attest what a bundle descends from, which the
+ * filesystem backend cannot do. Under Slice 1's "your own machines" threat model
+ * that is acceptable; it would not be under a shared or hostile hub. Empty intersection means we genuinely cannot name a common
  * point — so the payload degrades to no-ancestor mode (§5.4), which is loud and
  * changes nothing, rather than being merged against a guess.
  *
@@ -339,6 +349,22 @@ async function fetchAncestorWorkspace(backend, ref, tempRoot) {
  * declares a base we never held (its own previous generation) — while the
  * EARLIER bundle in the same chain declares one we do hold. Walking the chain
  * is what keeps routine repeat pulls merging instead of skipping.
+ *
+ * The chain is one machine's own pushes (a machine's index lists only bundles it
+ * pushed — `hub/pull.ts` writes its index with `newBundles: []`), so the bases
+ * within a chain are linear and every earlier one is an ancestor of the applied
+ * payload. That linearity is what makes "newest match across the chain" safe;
+ * if index writing ever starts merging other machines' bundle records into one
+ * thread list, this reasoning breaks before the code does.
+ *
+ * Known gap, three machines: C's chain declares C's generations. If this machine
+ * shares a generation with C only through A, the intersection is empty and the
+ * payload skips — even though a genuinely common older generation sits in our
+ * own history. Worse, the skip is STICKY: C's next push declares the bundle we
+ * just skipped, so every later pull skips too, until this machine pushes a
+ * generation C then pulls, or the user reaches for a flag. Fixing it means
+ * walking `basedOn` back through the hub's own bundle manifests rather than
+ * stopping at the chain; deferred, not overlooked.
  *
  * Fallback direction: candidates after the first are `ours` continued from the
  * winner, i.e. strictly OLDER generations of our own. A base older than the
@@ -413,7 +439,7 @@ function describeWorkspaceMerge(r) {
         out.push("No usable `git merge-file` on this machine, so files edited on both machines could not be merged — your copies were left exactly as they are and the other machine's versions were parked beside them. Install git (or put it on PATH) to have future pulls merge them automatically.");
     }
     if (r.sidecars.length > 0) {
-        out.push(`${count(r.sidecars.length)} could not be merged, so your ${r.sidecars.length === 1 ? "copy was" : "copies were"} kept and the other machine's saved alongside as *.theirs-* files: ${names(r.sidecars.map((s) => s.path))}. Delete the sidecars once you've reconciled them — they are ordinary files and will be pushed to the hub otherwise.`);
+        out.push(`${count(r.sidecars.length)} could not be merged, so your ${r.sidecars.length === 1 ? "copy was" : "copies were"} kept and the other machine's saved alongside as ${r.sidecars.length === 1 ? "a *.theirs-* file" : "*.theirs-* files"}: ${names(r.sidecars.map((s) => s.path))}. Delete ${r.sidecars.length === 1 ? "the sidecar" : "the sidecars"} once you've reconciled ${r.sidecars.length === 1 ? "it" : "them"} — they are ordinary files and will be pushed to the hub otherwise.`);
     }
     if (r.skipped.length > 0) {
         out.push(`${count(r.skipped.length)} ${were(r.skipped.length)} not applied at all and nothing was written near ${r.skipped.length === 1 ? "it" : "them"} (${[...new Set(r.skipped.map((s) => s.reason))].join(", ")}): ${names(r.skipped.map((s) => s.path))}. The incoming ${r.skipped.length === 1 ? "copy is" : "copies are"} still on the hub.`);
@@ -431,7 +457,7 @@ function describeWorkspaceMerge(r) {
         // these paths on every pull, so nothing will offer them again on its own.
         // Saying "you deleted them" would make the second case unrecognizable and
         // leave it with no remedy to reach for.
-        out.push(`${count(r.localDeleted.length)} that ${were(r.localDeleted.length)} in the last generation shared with the other machine ${r.localDeleted.length === 1 ? "is" : "are"} gone here and ${were(r.localDeleted.length)} not restored: ${names(r.localDeleted)}. ${they(r.localDeleted.length)} unchanged on the other machine, so this is what you asked for if you deleted ${r.localDeleted.length === 1 ? "it" : "them"} here — but an earlier sync that could not write ${r.localDeleted.length === 1 ? "that path" : "those paths"} (a symlink or a permissions failure it warned about at the time) looks identical from here. Nothing will offer ${r.localDeleted.length === 1 ? "it" : "them"} again on its own; if you did not delete ${r.localDeleted.length === 1 ? "it" : "them"}, pull the next workspace payload with --force-workspace to unpack the hub's copy over this directory.`);
+        out.push(`${count(r.localDeleted.length)} that ${were(r.localDeleted.length)} in the last generation shared with the other machine ${r.localDeleted.length === 1 ? "is" : "are"} gone here and ${were(r.localDeleted.length)} not restored: ${names(r.localDeleted)}. ${they(r.localDeleted.length)} unchanged on the other machine, so this is what you asked for if you deleted ${r.localDeleted.length === 1 ? "it" : "them"} here — but an earlier sync that could not write ${r.localDeleted.length === 1 ? "that path" : "those paths"} (a symlink or a permissions failure it warned about at the time) looks identical from here. Nothing will offer ${r.localDeleted.length === 1 ? "it" : "them"} again on its own. If you did not delete ${r.localDeleted.length === 1 ? "it" : "them"}: the non-destructive route is to re-pull the next workspace payload with --target-path <fresh-dir> and copy ${r.localDeleted.length === 1 ? "that file" : "those files"} across by hand. Passing --force-workspace instead unpacks the hub's copy over THIS directory, OVERWRITING any file of the same name — including local edits this merge has been preserving for you.`);
     }
     if (r.restored.length > 0) {
         out.push(`${count(r.restored.length)} that you had deleted here ${were(r.restored.length)} changed on the other machine, so ${r.restored.length === 1 ? "it came" : "they came"} back rather than losing that work: ${names(r.restored)}. Delete ${r.restored.length === 1 ? "it" : "them"} again if you still don't want ${r.restored.length === 1 ? "it" : "them"}.`);
