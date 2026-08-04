@@ -2,7 +2,9 @@ import { describe, it, expect, vi } from "vitest";
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   writeFileSync,
   readFileSync,
@@ -11,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { overrideTmp } from "./helpers/env.js";
 import {
   adoptHubBranch,
   tryAppendContinuation,
@@ -1095,6 +1098,64 @@ describe("adoptHubBranch", () => {
       expect(readFileSync(backupPath!, "utf-8")).toContain("L2");
       rmSync(backupPath!, { force: true });
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The mirror case of the test above, and it must NOT throw. Here the fault
+  // lands BEFORE the truncate, so the base is byte-identical to how we found
+  // it: declining to restore is right (another writer's line is in the file
+  // and a whole-file overwrite would erase it), but escalating to a throw
+  // would abort the entire pull, tell the user to reconcile a file nobody
+  // touched against a backup of itself, and strand that full transcript copy
+  // in a temp dir forever. `failed` is what pull.ts knows how to handle — it
+  // falls through to the fragment import, so the hub's branch still arrives.
+  it("reports a pre-truncate fault as failed — no restore, no throw, no leftover work dir — even when another writer landed", async () => {
+    const dir = tmp("sesh-adopt-");
+    // Private temp root so "the work dir was cleaned up" can be asserted
+    // without racing every other test that mkdtemps into the shared one.
+    const tmpRoot = join(dir, "tmproot");
+    mkdirSync(tmpRoot, { recursive: true });
+    const tmpOverride = overrideTmp(tmpRoot);
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const interloper = JSON.stringify(entry("live-1", "L2", "base-sid")) + "\n";
+      const beforeSize = statSync(base).size;
+
+      // A live Claude Code session appends during the O(delta) preparation,
+      // and the preparation itself then faults (an unreadable/corrupt delta).
+      const adopt = await loadAdoptWithConcurrentWrite(() => {
+        appendFileSync(base, interloper, "utf-8");
+        throw new Error("delta unreadable");
+      });
+      const r = await adopt({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("delta unreadable");
+
+      const after = readFileSync(base, "utf-8");
+      expect(after).toContain("live-1"); // the other writer's line stands
+      expect(after).toContain("L2"); // and so does the local branch: nothing was cut
+      expect(statSync(base).size).toBe(beforeSize + interloper.length);
+      expect(existsSync(preservedPath)).toBe(false);
+      // Nothing was worth keeping, so nothing was kept: the throw paths retain
+      // their work dir on purpose, this one must not.
+      expect(readdirSync(tmpRoot)).toEqual([]);
+    } finally {
+      tmpOverride.restore();
+      unloadConcurrentWriteMock();
       rmSync(dir, { recursive: true, force: true });
     }
   });

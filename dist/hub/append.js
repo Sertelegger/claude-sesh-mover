@@ -241,10 +241,14 @@ export async function tryAppendContinuation(a) {
             await pipeline(createReadStream(rewritten), sink);
         }
         finally {
-            // `bytesWritten` counts bytes the stream has actually handed to the fd,
-            // so it is exact whether the pipeline finished or faulted mid-file. It
-            // can only ever UNDER-count relative to what reached disk, and an
-            // undercount makes the rollback guard refuse — the safe direction.
+            // `bytesWritten` is incremented as each fs.write COMPLETES, so it never
+            // over-counts what reached disk — but it can under-count. A fault with a
+            // write still in flight (the read stream erroring mid-file, or the sink
+            // destroyed mid-write) loses up to one 64 KB chunk. The direction is the
+            // safe one: an under-count makes the rollback guard refuse to truncate
+            // rather than truncate too far. What it costs is the diagnosis — the
+            // refusal then reads like a concurrent writer when it was really our own
+            // mid-file IO fault, which is why that message hedges its attribution.
             appendedBytes += sink.bytesWritten;
         }
         a.__injectFailure?.();
@@ -283,7 +287,7 @@ export async function tryAppendContinuation(a) {
         }
         const oursToUndo = rollbackBytes + appendedBytes;
         if (liveSize !== oursToUndo) {
-            throw new Error(`append failed (${cause}) AND rollback was REFUSED — ${a.basePath} is ${liveSize} bytes but only ${oursToUndo} can be accounted for (${rollbackBytes} before the splice + ${appendedBytes} written by it), so something else wrote to this transcript mid-splice (most likely a live Claude Code session). Truncating back to ${rollbackBytes} would have deleted those bytes and called it a clean restore, so NOTHING was truncated: the file still holds everything it held, plus that writer's line(s), plus this continuation's entries. Exit any Claude Code session open on it and inspect the tail before re-running the pull.`);
+            throw new Error(`append failed (${cause}) AND rollback was REFUSED — ${a.basePath} is ${liveSize} bytes but only ${oursToUndo} can be accounted for (${rollbackBytes} before the splice + ${appendedBytes} written by it), so this rollback cannot be proven to delete only its own bytes: most likely something else wrote to this transcript mid-splice (a live Claude Code session), though a write that faulted with bytes still in flight can also leave fewer accounted for than reached disk. Truncating back to ${rollbackBytes} could therefore have deleted bytes that were not ours and called it a clean restore, so NOTHING was truncated: the file still holds everything it held, plus this continuation's entries, plus anything the other writer added. Exit any Claude Code session open on it and inspect the tail before re-running the pull.`);
         }
         try {
             truncateSync(a.basePath, rollbackBytes);
@@ -344,25 +348,24 @@ export async function tryAppendContinuation(a) {
  * No entry is injected into either transcript; the "preserved" labelling is
  * the caller's `history.jsonl` display name, not content.
  *
- * Anticipated failures come back as `failed`. Two cases throw: a restore that
- * could not be proven safe, and a restore that itself failed. Both are
- * situations where the base may be left inconsistent, and in both the temp
- * backup is deliberately NOT deleted so the error can name a full copy of the
- * user's session.
+ * Anticipated failures come back as `failed`, and so does any fault that lands
+ * BEFORE the truncate — the base is byte-identical there, so there is nothing
+ * to restore and nothing for the user to reconcile. Two cases throw, both of
+ * them after the base has been mutated: a restore that could not be proven safe,
+ * and a restore that itself failed. Those are the situations where the base may
+ * be left inconsistent, and in both the temp backup is deliberately NOT deleted
+ * so the error can name a full copy of the user's session.
  */
 export async function adoptHubBranch(input) {
     const work = mkdtempSync(join(tmpdir(), "sesh-adopt-"));
     const backup = join(work, "base-backup.jsonl");
     let keepWork = false;
     // Size the base should have if nothing but THIS call has written to it.
-    // `null` until the truncate, i.e. while the base is still untouched; from
-    // then on it is what our own mutation accounts for. The restore below is only
-    // entitled to run when the file actually has that size.
+    // `null` until the truncate — i.e. `null` means "the base is still exactly as
+    // we found it", which is why the failure path treats it as nothing to undo;
+    // from then on it is what our own mutation accounts for, and the restore is
+    // only entitled to run when the file actually has that size.
     let mutatedSize = null;
-    // Size of the snapshot we hold, i.e. the size the base should still have
-    // while nothing has been mutated. `null` until the backup exists — before
-    // that there is nothing to restore FROM, so there is nothing to guard.
-    let snapshotSize = null;
     try {
         if (existsSync(input.preservedPath)) {
             return {
@@ -375,7 +378,7 @@ export async function adoptHubBranch(input) {
         // snapshot we hold and could restore, so if a write lands mid-copy the
         // re-check below sees a mismatch rather than silently trusting a torn or
         // stale reading of the original.
-        snapshotSize = statSync(backup).size;
+        const snapshotSize = statSync(backup).size;
         const snapshotHead = readLastEntryUuid(backup);
         const info = await readDeltaChainInfo(input.deltaPath);
         if (!info.lastEntryUuid) {
@@ -433,8 +436,10 @@ export async function adoptHubBranch(input) {
             await pipeline(createReadStream(rewritten), sink);
         }
         finally {
-            // Exact whether the pipeline finished or faulted mid-file; see the same
-            // accounting in tryAppendContinuation.
+            // Never over-counts what reached disk; may under-count by up to one
+            // 64 KB chunk when a write was in flight at the fault. Same accounting,
+            // and the same consequence for the refusal message, as in
+            // tryAppendContinuation.
             mutatedSize = input.anchorOffset + sink.bytesWritten;
         }
         input.__injectFailure?.();
@@ -458,14 +463,24 @@ export async function adoptHubBranch(input) {
     }
     catch (e) {
         const cause = e.message;
-        // The restore OVERWRITES the whole base with the snapshot, so it destroys
-        // anything written to the file since — exactly the hazard the re-check
-        // above exists for, in exactly the window the re-check cannot see (between
-        // itself and the truncate/append). Same rule as tryAppendContinuation's
-        // rollback: restore only what our own mutation accounts for, and refuse
-        // loudly otherwise. `mutatedSize === null` means the failure landed before
-        // the truncate, so the base should still be at its snapshot size.
-        const expectedSize = mutatedSize ?? snapshotSize;
+        // `mutatedSize === null` means the fault landed before the truncate — an
+        // unreadable delta, a rewrite failure, an IO error during the O(delta)
+        // prep. Every one of those happens while the base is still byte-identical
+        // to the backup, so there is nothing of ours to undo: skipping the restore
+        // is the whole remedy, and a whole-file overwrite here would only bump the
+        // mtime Claude Code orders /resume by (and, if a live session appended in
+        // the meantime, erase that writer's line while reporting a clean restore).
+        // This is an ordinary `failed`, NOT a throw: the base is untouched, the
+        // user has nothing to reconcile, and pull.ts handles `failed` by falling
+        // through to the fragment import, so the hub's branch still arrives.
+        if (mutatedSize === null)
+            return { kind: "failed", detail: cause };
+        // Past here we truncated and re-appended. The restore OVERWRITES the whole
+        // base with the snapshot, so it destroys anything written to the file
+        // since — exactly the hazard the re-check above exists for, in exactly the
+        // window the re-check cannot see (between itself and the truncate/append).
+        // Same rule as tryAppendContinuation's rollback: restore only what our own
+        // mutation accounts for, and refuse loudly otherwise.
         let liveSize = null;
         try {
             liveSize = statSync(input.basePath).size;
@@ -473,7 +488,7 @@ export async function adoptHubBranch(input) {
         catch {
             liveSize = null; // unreadable — fall through and let the restore try
         }
-        if (expectedSize !== null && liveSize !== null && liveSize !== expectedSize) {
+        if (liveSize !== null && liveSize !== mutatedSize) {
             keepWork = true; // the pre-mutation snapshot is the only intact copy
             // This path is ours by construction (it was proven not to exist at the
             // start), so removing a half-written copy of it is safe and touches
@@ -484,7 +499,7 @@ export async function adoptHubBranch(input) {
             catch {
                 /* best effort — the throw below is the message that matters */
             }
-            throw new Error(`adopt failed (${cause}) AND the restore was REFUSED — ${input.basePath} is ${liveSize} bytes but this operation accounts for ${expectedSize}, so something else wrote to the transcript mid-adoption (most likely a live Claude Code session). Restoring would have overwritten those bytes and called it byte-for-byte, so the file was left exactly as it is; a complete copy of the session as it was before adoption is at ${backup}. Exit any Claude Code session open on it before reconciling the two by hand.`);
+            throw new Error(`adopt failed (${cause}) AND the restore was REFUSED — ${input.basePath} is ${liveSize} bytes but this operation accounts for ${mutatedSize}, so the restore cannot be proven to overwrite only its own bytes: most likely something else wrote to the transcript mid-adoption (a live Claude Code session), though a write that faulted with bytes still in flight can also leave fewer accounted for than reached disk. Restoring could therefore have overwritten bytes that were not ours and called it byte-for-byte, so the file was left exactly as it is; a complete copy of the session as it was before adoption is at ${backup}. Exit any Claude Code session open on it before reconciling the two by hand.`);
         }
         try {
             copyFileSync(backup, input.basePath); // byte-for-byte restore

@@ -182,8 +182,9 @@ export type AdoptOutcome = {
 }
 /**
  * Nothing was kept. Either the base was never touched (every refusal before
- * the truncate, including the concurrent-modification re-check), or it was
- * restored byte-for-byte from the snapshot this call took at its start.
+ * the truncate, the concurrent-modification re-check, and any IO fault during
+ * the O(delta) preparation), or it was restored byte-for-byte from the
+ * snapshot this call took at its start.
  *
  * The distinction matters under a live writer: "restored" means restored to
  * THE SNAPSHOT, so a restore can only ever be byte-for-byte with respect to
@@ -242,11 +243,13 @@ export type AdoptOutcome = {
  * No entry is injected into either transcript; the "preserved" labelling is
  * the caller's `history.jsonl` display name, not content.
  *
- * Anticipated failures come back as `failed`. Two cases throw: a restore that
- * could not be proven safe, and a restore that itself failed. Both are
- * situations where the base may be left inconsistent, and in both the temp
- * backup is deliberately NOT deleted so the error can name a full copy of the
- * user's session.
+ * Anticipated failures come back as `failed`, and so does any fault that lands
+ * BEFORE the truncate — the base is byte-identical there, so there is nothing
+ * to restore and nothing for the user to reconcile. Two cases throw, both of
+ * them after the base has been mutated: a restore that could not be proven safe,
+ * and a restore that itself failed. Those are the situations where the base may
+ * be left inconsistent, and in both the temp backup is deliberately NOT deleted
+ * so the error can name a full copy of the user's session.
  */
 export declare function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome>;
 //# sourceMappingURL=append.d.ts.map

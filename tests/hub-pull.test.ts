@@ -1755,7 +1755,7 @@ describe("hub pull — divergence resolution", () => {
       expect(p.divergence?.resolution).toBe("fragment");
       expect(p.divergence?.preservedSessionId).toBeUndefined();
       expect(p.appended ?? []).toHaveLength(0);
-      expect(p.warnings.join(" ")).toContain("restored unchanged");
+      expect(p.warnings.join(" ")).toContain("left unchanged");
       expect(p.warnings.join(" ")).toContain("injected adopt failure");
 
       // The local branch is exactly where it was...

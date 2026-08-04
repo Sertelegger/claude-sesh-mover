@@ -688,7 +688,14 @@ export async function hubPull(opts) {
                                     threadLandedSessionId = baseSessionId;
                                     continue; // bundle handled — no fragment import
                                 }
-                                warnings.push(`adopt-hub failed for thread ${target.threadId} and session ${baseSessionId} was restored unchanged (${adopt.detail}) — importing the hub's branch as a separate session instead.`);
+                                warnings.push(
+                                // "left unchanged", not "restored unchanged": a `failed`
+                                // adoption covers both the restored-byte-for-byte case and
+                                // the (more common) one where the fault landed before the
+                                // truncate and nothing was ever written, so nothing was
+                                // restored either. Either way the user's session is as it
+                                // was, which is the part that matters to them.
+                                `adopt-hub failed for thread ${target.threadId} and session ${baseSessionId} was left unchanged (${adopt.detail}) — importing the hub's branch as a separate session instead.`);
                                 divergence.resolution = "fragment";
                             }
                             else if (mode === "adopt-hub") {

@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
   mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync, cpSync,
+  utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { APPEND_LIVE_WINDOW_MS } from "../src/hub/append.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
@@ -46,6 +48,28 @@ function createRealProject(base: string, configDir: string, name: string): strin
 
 function sessionFilePath(configDir: string, projectPath: string, sessionId: string): string {
   return join(configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`);
+}
+
+/**
+ * Put a session's mtime far outside `APPEND_LIVE_WINDOW_MS` — i.e. state, as
+ * the fixture, the one fact the scenario depends on: nobody is writing to this
+ * transcript right now.
+ *
+ * Load-bearing, not cosmetic. A test that writes to the base with
+ * `appendFileSync` and then pulls leaves the base's mtime at "now", and the
+ * splice then only happens by accident: append.ts's self-write exemption
+ * (`mtime >= opNowMs`) is the only thing keeping the liveness guard quiet, and
+ * it holds only while the pull's `Date.now()` — truncated to a whole
+ * millisecond — is still <= that fractional mtime. The fixture write and the
+ * pull's clock read are ~110 us apart, so ~10% of runs have a millisecond
+ * boundary fall between them: the exemption misses, the base looks live, and
+ * the first continuation lands as a fragment. Same failure class, and same
+ * remedy, as `ageToLive` in hub-append.test.ts and `makeLookLive` /
+ * `ageOutOfLiveWindow` in hub-pull.test.ts.
+ */
+function ageOutOfLiveWindow(path: string): void {
+  const old = new Date(Date.now() - APPEND_LIVE_WINDOW_MS - 60_000);
+  utimesSync(path, old, old);
 }
 
 function lastUuid(path: string): string {
@@ -389,6 +413,10 @@ describe("hub keystone: multi-machine round trip", () => {
             },
           ].map((e) => JSON.stringify(e)).join("\n") + "\n"
         );
+        // A's session is one the user left and is now pulling back into — not
+        // one being written this instant. Say so, rather than racing the pull's
+        // clock for the self-write exemption (see `ageOutOfLiveWindow`).
+        ageOutOfLiveWindow(pathA);
 
         const projectDirA = join(f.configDirA, "projects", encodeProjectPath(f.projectA));
         const filesBefore = readdirSync(projectDirA).filter((n) => n.endsWith(".jsonl"));
@@ -402,7 +430,12 @@ describe("hub keystone: multi-machine round trip", () => {
         const pA = pullA as HubPullResult;
 
         // Spliced, not fragmented: both of B's bundles landed in A's own file.
-        expect(pA.appended ?? []).not.toHaveLength(0);
+        // Asserting the COUNT, not just "non-empty": if the first continuation
+        // is declined for any reason it becomes a fragment session, and the
+        // second one then legitimately splices onto that fragment — a run with
+        // one append onto the wrong base is the exact shape of the bug this
+        // test exists to catch, so it has to fail here rather than downstream.
+        expect(pA.appended ?? []).toHaveLength(2);
         expect((pA.appended ?? []).every((a) => a.baseSessionId === localA)).toBe(true);
         expect(pA.importedSessions).toHaveLength(0);
         expect(readdirSync(projectDirA).filter((n) => n.endsWith(".jsonl"))).toEqual(filesBefore);
