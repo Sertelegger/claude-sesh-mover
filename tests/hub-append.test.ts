@@ -292,6 +292,146 @@ describe("tryAppendContinuation", () => {
     }
   });
 
+  // Task 6b's headline case. Claude Code appends uuid-less bookkeeping after
+  // conversation entries, so roughly half the real transcripts on a machine end
+  // with one. Deriving the head from the literal last line made it `null`, the
+  // chain guard could never match, and pull silently fell back to a fragment
+  // session — the exact thread fragmentation this milestone exists to remove.
+  // Reverting only jsonl.ts's scan turns this back into `chain-mismatch`.
+  it("appends onto a base whose final lines are uuid-less bookkeeping", async () => {
+    const dir = tmp("sesh-append-");
+    try {
+      const base = makeBaseAt(dir, "bk-base.jsonl", [
+        entry("b1", null, "base-sid"),
+        entry("b2", "b1", "base-sid"),
+        entry("b3", "b2", "base-sid"),
+        // Real shapes, keys verbatim from live transcripts. Two of the three
+        // stacked here carry a `timestamp`; none carries a `uuid`.
+        { type: "last-prompt", lastPrompt: "go on", leafUuid: "b3", sessionId: "base-sid" },
+        {
+          type: "file-history-delta",
+          messageId: "b3",
+          snapshotMessageId: "b1",
+          trackingPath: "/p/notes.md",
+          backup: "abc123",
+          timestamp: "2026-08-02T12:00:00.000Z",
+          sessionId: "base-sid",
+        },
+        {
+          type: "pr-link",
+          sessionId: "base-sid",
+          prNumber: 9,
+          prUrl: "https://example.test/9",
+          prRepository: "o/r",
+          timestamp: "2026-08-02T12:00:01.000Z",
+        },
+      ]);
+      // The delta anchors on the real conversation head, NOT on the bookkeeping.
+      const delta = makeDelta(dir, "b3", "bk-delta.jsonl");
+      const before = readFileSync(base, "utf-8");
+
+      const r = await tryAppendContinuation({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        ctx: identityRewriteContext(),
+        opNowMs: Date.now(),
+        force: false,
+      });
+
+      expect(r.kind).toBe("appended");
+      if (r.kind !== "appended") return;
+      expect(r.entriesAppended).toBe(2);
+      expect(r.newHeadUuid).toBe("d2");
+
+      const after = readFileSync(base, "utf-8");
+      expect(after.startsWith(before)).toBe(true); // bookkeeping preserved verbatim
+      const lines = after
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(lines).toHaveLength(8); // 3 conversation + 3 bookkeeping + 2 delta
+      expect(lines[6].uuid).toBe("d1");
+      expect(lines[6].parentUuid).toBe("b3"); // chain intact across the bookkeeping
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The delta comes off a live session too, so ITS final line is bookkeeping
+  // just as often. `readDeltaChainInfo.lastEntryUuid` was `null` there, which
+  // declined as `no-delta-entries` before the base was ever consulted.
+  it("appends a delta whose own final lines are uuid-less bookkeeping", async () => {
+    const dir = tmp("sesh-append-");
+    try {
+      const base = makeBase(dir);
+      const delta = join(dir, "bk-tail-delta.jsonl");
+      writeJsonl(delta, [
+        HEADER,
+        entry("d1", "b3"),
+        entry("d2", "d1"),
+        { type: "mode", mode: "normal", sessionId: "delta-sid" },
+        { type: "permission-mode", permissionMode: "auto", sessionId: "delta-sid" },
+      ]);
+
+      const r = await tryAppendContinuation({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        ctx: identityRewriteContext(),
+        opNowMs: Date.now(),
+        force: false,
+      });
+
+      expect(r.kind).toBe("appended");
+      if (r.kind !== "appended") return;
+      expect(r.newHeadUuid).toBe("d2"); // post-append verify agrees with the delta's head
+      expect(r.entriesAppended).toBe(4); // bookkeeping is carried across, not dropped
+      const lines = readFileSync(base, "utf-8").trim().split("\n");
+      expect(JSON.parse(lines[5]).type).toBe("mode"); // 3 base + d1 + d2 + mode
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A live Claude Code session writing `mode` / `last-prompt` between the two
+  // chain checks does not move the head, so the O(delta) window no longer
+  // aborts the splice over bookkeeping. What it MUST still abort on is a real
+  // conversation entry (covered by the existing TOCTOU test below).
+  it("survives bookkeeping written into the base during the O(delta) window", async () => {
+    const dir = tmp("sesh-append-");
+    try {
+      const base = makeBase(dir);
+      const delta = makeDelta(dir, "b3");
+      const appendMod = await loadAppendWithConcurrentWrite(() => {
+        appendFileSync(
+          base,
+          JSON.stringify({ type: "mode", mode: "plan", sessionId: "base-sid" }) + "\n",
+          "utf-8"
+        );
+      });
+      try {
+        const r = await appendMod({
+          basePath: base,
+          baseSessionId: "base-sid",
+          deltaPath: delta,
+          ctx: identityRewriteContext(),
+          opNowMs: Date.now(),
+          force: true, // the concurrent write bumps mtime into the live window
+        });
+        expect(r.kind).toBe("appended");
+        const lines = readFileSync(base, "utf-8").trim().split("\n");
+        // The interloper's line survives, ahead of the spliced entries.
+        expect(JSON.parse(lines[3]).mode).toBe("plan");
+        expect(JSON.parse(lines[4]).uuid).toBe("d1");
+      } finally {
+        unloadConcurrentWriteMock();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("declines chain-mismatch and leaves the base byte-identical", async () => {
     const dir = tmp("sesh-append-");
     try {
@@ -420,6 +560,43 @@ describe("tryAppendContinuation", () => {
       }
       expect(readFileSync(base, "utf-8")).toBe(before);
       expect(statSync(base).size).toBe(beforeSize);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Call site 5 of the head reader: the rollback's own head verification. It
+  // compares the RESTORED head against the head read before the splice, and
+  // both now skip bookkeeping — so a base with a bookkeeping tail must still
+  // report a clean restore rather than "rollback could not restore the head".
+  it("verifies the restored head across a bookkeeping tail", async () => {
+    const dir = tmp("sesh-append-");
+    try {
+      const base = makeBaseAt(dir, "rb-base.jsonl", [
+        entry("b1", null, "base-sid"),
+        entry("b2", "b1", "base-sid"),
+        entry("b3", "b2", "base-sid"),
+        { type: "mode", mode: "normal", sessionId: "base-sid" },
+        { type: "last-prompt", lastPrompt: "hold", leafUuid: "b3", sessionId: "base-sid" },
+      ]);
+      const before = readFileSync(base, "utf-8");
+      const r = await tryAppendContinuation({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: makeDelta(dir, "b3", "rb-delta.jsonl"),
+        ctx: identityRewriteContext(),
+        opNowMs: Date.now(),
+        force: false,
+        __injectFailure: () => {
+          throw new Error("injected");
+        },
+      });
+      expect(r.kind).toBe("declined");
+      if (r.kind !== "declined") return;
+      expect(r.reason).toBe("rolled-back");
+      expect(r.detail).toContain("restored to");
+      expect(r.detail).not.toContain("could not restore");
+      expect(readFileSync(base, "utf-8")).toBe(before);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -684,6 +861,74 @@ describe("adoptHubBranch", () => {
       expect(preservedLines.every((l) => l.sessionId === "preserved-sid")).toBe(true);
       // No synthetic marker entry is injected into the preserved transcript.
       expect(readFileSync(preservedPath, "utf-8")).not.toContain("sesh-mover");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Call sites 6-8 of the head reader: the pre-mutation snapshot head (read
+  // off the backup), the live-file re-check head, and the post-adopt
+  // verification. All three used to be `null` on a bookkeeping-tailed base or
+  // delta — and a `null` delta head aborted adoption outright with
+  // "continuation bundle has no entries".
+  it("adopts across bookkeeping tails on both the base and the hub branch", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeBaseAt(dir, "bk-fork.jsonl", [
+        entry("b1", null, "base-sid"),
+        entry("b2", "b1", "base-sid"),
+        entry("L1", "b2", "base-sid"),
+        entry("L2", "L1", "base-sid"),
+        { type: "mode", mode: "normal", sessionId: "base-sid" },
+        { type: "last-prompt", lastPrompt: "hold", leafUuid: "L2", sessionId: "base-sid" },
+      ]);
+      const delta = join(dir, "bk-hub-branch.jsonl");
+      writeJsonl(delta, [
+        HEADER,
+        entry("H1", "b2"),
+        entry("H2", "H1"),
+        { type: "permission-mode", permissionMode: "auto", sessionId: "delta-sid" },
+      ]);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "bk-preserved.jsonl");
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+      expect(r.kind).toBe("adopted");
+      if (r.kind !== "adopted") return;
+      expect(r.newHeadUuid).toBe("H2"); // post-adopt verify saw past the delta's tail
+
+      const baseLines = readFileSync(base, "utf-8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(baseLines.map((l) => l.uuid ?? l.type)).toEqual([
+        "b1",
+        "b2",
+        "H1",
+        "H2",
+        "permission-mode",
+      ]);
+      // The preserved copy keeps the local branch AND its bookkeeping.
+      const preservedLines = readFileSync(preservedPath, "utf-8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(preservedLines.map((l) => l.uuid ?? l.type)).toEqual([
+        "b1",
+        "b2",
+        "L1",
+        "L2",
+        "mode",
+        "last-prompt",
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

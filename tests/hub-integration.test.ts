@@ -324,4 +324,105 @@ describe("hub keystone: multi-machine round trip", () => {
       cleanup(f);
     }
   });
+  // Task 6b, end to end over a REALISTIC transcript. Claude Code brackets
+  // conversation entries with uuid-less bookkeeping, so all three of these are
+  // the normal case, not edge cases:
+  //   - the local base's final line is bookkeeping (head derivation),
+  //   - the delta's FIRST unsent line is bookkeeping (slice boundary),
+  //   - the delta's final line is bookkeeping (delta head derivation).
+  // Before the bounded conversation scan the base head was `null`, the chain
+  // guard could never match, and this pull produced a second, fragmentary
+  // session file instead of one continuous transcript.
+  it("splices into ONE session when both transcripts are bracketed by uuid-less bookkeeping", async () => {
+    const f = await setupThroughAppendPush("sesh-keystone-bk");
+    try {
+      // Phase 3b (B): bookkeeping, two more messages, then more bookkeeping.
+      // The recorded head from phase 3 is `b-append-2`, so the next unsent line
+      // — where the continuation slice starts — is a uuid-less entry.
+      const localB = f.pullB1.localSessionId!;
+      const pathB = sessionFilePath(f.configDirB, f.projectB, localB);
+      appendFileSync(
+        pathB,
+        [
+          { type: "last-prompt", lastPrompt: "more", leafUuid: "b-append-2", sessionId: localB },
+          { type: "mode", mode: "normal", sessionId: localB },
+          {
+            uuid: "b-append-3", parentUuid: "b-append-2", timestamp: "2026-07-21T02:00:00Z",
+            sessionId: localB, cwd: f.projectB, version: CLAUDE_VERSION, type: "user",
+            message: { role: "user", content: "third thought" },
+          },
+          {
+            uuid: "b-append-4", parentUuid: "b-append-3", timestamp: "2026-07-21T02:00:05Z",
+            sessionId: localB, cwd: f.projectB, version: CLAUDE_VERSION, type: "user",
+            message: { role: "user", content: "fourth thought" },
+          },
+          {
+            type: "pr-link", sessionId: localB, prNumber: 12,
+            prUrl: "https://example.test/12", prRepository: "o/r",
+            timestamp: "2026-07-21T02:30:00Z",
+          },
+          { type: "permission-mode", permissionMode: "auto", sessionId: localB },
+        ].map((e) => JSON.stringify(e)).join("\n") + "\n"
+      );
+      const pushB2 = await hubPush({
+        configDir: f.configDirB, projectPath: f.projectB, hubPath: f.hub,
+        claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pushB2.success).toBe(true);
+      if (!pushB2.success) return;
+      expect(pushB2.pushedSessions[0].type).toBe("continuation");
+
+      // Phase 4 (A): give A's own base a bookkeeping tail too, then pull.
+      f.restore.restore();
+      const restoreA = overrideHome(f.homeA);
+      try {
+        const localA = f.pushA.pushedSessions[0].sessionId;
+        const pathA = sessionFilePath(f.configDirA, f.projectA, localA);
+        const headA = lastUuid(pathA);
+        appendFileSync(
+          pathA,
+          [
+            { type: "last-prompt", lastPrompt: "waiting", leafUuid: headA, sessionId: localA },
+            {
+              type: "file-history-snapshot", messageId: headA,
+              snapshot: { files: {} }, isSnapshotUpdate: false, sessionId: localA,
+            },
+          ].map((e) => JSON.stringify(e)).join("\n") + "\n"
+        );
+
+        const projectDirA = join(f.configDirA, "projects", encodeProjectPath(f.projectA));
+        const filesBefore = readdirSync(projectDirA).filter((n) => n.endsWith(".jsonl"));
+
+        const pullA = await hubPull({
+          configDir: f.configDirA, projectPath: f.projectA, hubPath: f.hub,
+          latest: true, claudeVersion: CLAUDE_VERSION,
+        });
+        expect(pullA.success).toBe(true);
+        if (!pullA.success) return;
+        const pA = pullA as HubPullResult;
+
+        // Spliced, not fragmented: both of B's bundles landed in A's own file.
+        expect(pA.appended ?? []).not.toHaveLength(0);
+        expect((pA.appended ?? []).every((a) => a.baseSessionId === localA)).toBe(true);
+        expect(pA.importedSessions).toHaveLength(0);
+        expect(readdirSync(projectDirA).filter((n) => n.endsWith(".jsonl"))).toEqual(filesBefore);
+
+        const after = readFileSync(pathA, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+        const uuids = after.map((e) => e.uuid).filter(Boolean);
+        expect(uuids).toContain("b-append-1");
+        expect(uuids).toContain("b-append-4");
+        expect(uuids[uuids.length - 1]).toBe("b-append-4"); // one continuous chain
+        // A's own pre-existing bookkeeping survived the splice untouched, and
+        // B's travelled with the delta rather than being dropped in transit.
+        expect(after.filter((e) => e.type === "file-history-snapshot")).toHaveLength(1);
+        expect(after.filter((e) => e.type === "pr-link")).toHaveLength(1);
+        // Everything spliced in belongs to A's session now.
+        expect(after.every((e) => e.sessionId === localA)).toBe(true);
+      } finally {
+        restoreA.restore();
+      }
+    } finally {
+      cleanup(f);
+    }
+  });
 });

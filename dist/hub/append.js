@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { finished, pipeline } from "node:stream/promises";
-import { readLastEntryUuid } from "../jsonl.js";
+import { isConversationEntry, readLastEntryUuid, MAX_ENTRY_SCAN_BYTES } from "../jsonl.js";
 import { rewriteJsonlStream, buildPathMappings } from "../rewriter.js";
 import { detectPlatform } from "../platform.js";
 /**
@@ -14,12 +14,19 @@ import { detectPlatform } from "../platform.js";
 export const APPEND_LIVE_WINDOW_MS = 5 * 60 * 1000;
 const CONTINUATION_MARKER = "[sesh-mover continuation]";
 /**
- * Bounded read of a continuation bundle's chain endpoints: at most the first
- * two non-empty lines plus one cheap last-line read.
+ * Bounded read of a continuation bundle's chain endpoints: the leading lines up
+ * to and including the first CONVERSATION entry (capped at
+ * `MAX_ENTRY_SCAN_BYTES`), plus one cheap tail read.
  *
  * `buildContinuationStream` slices the tail of a session from a known index, so
- * the first REAL entry's `parentUuid` is exactly the uuid the slice was cut
- * after — that value is the chain guard's input.
+ * the first entry after the cut carries a `parentUuid` equal to the uuid the
+ * slice was cut after — that value is the chain guard's input.
+ *
+ * The cut lands on the first line the peer has not seen, which is usually a
+ * uuid-less bookkeeping entry (`last-prompt` / `mode` / …, written right after
+ * each assistant turn). Those lines carry no `parentUuid` at all, so the anchor
+ * is taken from the first entry that is actually IN the chain, not from
+ * whatever line happens to sit under the header.
  */
 export async function readDeltaChainInfo(deltaPath) {
     const input = createReadStream(deltaPath, { encoding: "utf-8" });
@@ -27,10 +34,14 @@ export async function readDeltaChainInfo(deltaPath) {
     let headerPresent = false;
     let firstEntryParentUuid = null;
     let seen = 0;
+    let scanned = 0;
     try {
         for await (const line of rl) {
             if (!line)
                 continue;
+            scanned += Buffer.byteLength(line, "utf8") + 1;
+            if (scanned > MAX_ENTRY_SCAN_BYTES)
+                break; // no anchor within the window
             let obj;
             try {
                 obj = JSON.parse(line);
@@ -41,12 +52,16 @@ export async function readDeltaChainInfo(deltaPath) {
             if (seen === 0) {
                 const msg = obj.message;
                 const content = typeof msg?.content === "string" ? msg.content : "";
+                seen++;
                 if (content.startsWith(CONTINUATION_MARKER)) {
                     headerPresent = true;
-                    seen++;
-                    continue; // the real first entry is the next line
+                    continue; // the real first entry is below
                 }
             }
+            // The synthetic header has a uuid of its own, so this test only runs
+            // once the header line (if any) is behind us.
+            if (!isConversationEntry(obj))
+                continue;
             firstEntryParentUuid = obj.parentUuid ?? null;
             break;
         }
@@ -179,8 +194,17 @@ export async function tryAppendContinuation(a) {
         //    would still be the delta's last uuid. Re-measuring the size here also
         //    guarantees a later rollback can never truncate away another writer's
         //    bytes.
-        const fresh = statSync(a.basePath);
+        //
+        //    Head FIRST, size SECOND, and that order is load-bearing now that the
+        //    head skips bookkeeping. A concurrent `mode` / `last-prompt` write no
+        //    longer moves the head, so this check legitimately passes over it and
+        //    the splice proceeds — which means the rollback length must be measured
+        //    AFTER the head was read, or a size captured before that write would
+        //    truncate the other writer's line away on the rollback path. (Measuring
+        //    size first was previously harmless only because such a write made the
+        //    head read return null and the whole attempt declined.)
         const freshHead = readLastEntryUuid(a.basePath);
+        const fresh = statSync(a.basePath);
         if (freshHead !== info.firstEntryParentUuid) {
             return {
                 kind: "declined",

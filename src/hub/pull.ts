@@ -25,7 +25,7 @@ import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { computeIntegrityHashFromFile, readManifest } from "../manifest.js";
 import {
-  countJsonlLines, findEntryOffsetByUuid, readLastEntryUuid, readLastJsonlLine,
+  countJsonlLines, findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid,
 } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream, type RewriteContext } from "../rewriter.js";
@@ -123,16 +123,25 @@ export function selectThreadBase(
   }).localSessionId;
 }
 
-/** Head uuid + last-entry timestamp from one bounded tail read. */
+/**
+ * Head uuid + last-entry timestamp from one bounded tail read.
+ *
+ * Both come from the SAME entry — the last conversation entry — on purpose.
+ * `selectThreadBase` above uses them as a pair (anchor match first, then
+ * recency), and `resolveThreads` does the same across machines; taking the
+ * uuid from one line and the timestamp from a later bookkeeping line would
+ * describe two different points in the transcript and make that comparison
+ * incoherent. A `queue-operation` or `pr-link` timestamp is real wall-clock
+ * activity, but it is not conversation, and "which copy has the most
+ * conversation" is the question these fields are asked.
+ */
 function readSessionTail(path: string): Omit<ThreadBaseCandidate, "localSessionId"> {
-  const line = readLastJsonlLine(path);
-  if (!line) return { headEntryUuid: null, lastActiveAt: null };
-  try {
-    const e = JSON.parse(line) as { uuid?: string; timestamp?: string };
-    return { headEntryUuid: e.uuid ?? null, lastActiveAt: e.timestamp ?? null };
-  } catch {
-    return { headEntryUuid: null, lastActiveAt: null };
-  }
+  const e = readLastConversationEntry(path);
+  if (!e) return { headEntryUuid: null, lastActiveAt: null };
+  return {
+    headEntryUuid: typeof e.uuid === "string" ? e.uuid : null,
+    lastActiveAt: typeof e.timestamp === "string" ? e.timestamp : null,
+  };
 }
 
 /**

@@ -19,7 +19,7 @@ import { importSession } from "../importer.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { computeIntegrityHashFromFile, readManifest } from "../manifest.js";
-import { countJsonlLines, findEntryOffsetByUuid, readLastEntryUuid, readLastJsonlLine, } from "../jsonl.js";
+import { countJsonlLines, findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
@@ -70,18 +70,26 @@ export function selectThreadBase(candidates, anchorUuid, preferred) {
         return c.localSessionId > best.localSessionId ? c : best;
     }).localSessionId;
 }
-/** Head uuid + last-entry timestamp from one bounded tail read. */
+/**
+ * Head uuid + last-entry timestamp from one bounded tail read.
+ *
+ * Both come from the SAME entry — the last conversation entry — on purpose.
+ * `selectThreadBase` above uses them as a pair (anchor match first, then
+ * recency), and `resolveThreads` does the same across machines; taking the
+ * uuid from one line and the timestamp from a later bookkeeping line would
+ * describe two different points in the transcript and make that comparison
+ * incoherent. A `queue-operation` or `pr-link` timestamp is real wall-clock
+ * activity, but it is not conversation, and "which copy has the most
+ * conversation" is the question these fields are asked.
+ */
 function readSessionTail(path) {
-    const line = readLastJsonlLine(path);
-    if (!line)
+    const e = readLastConversationEntry(path);
+    if (!e)
         return { headEntryUuid: null, lastActiveAt: null };
-    try {
-        const e = JSON.parse(line);
-        return { headEntryUuid: e.uuid ?? null, lastActiveAt: e.timestamp ?? null };
-    }
-    catch {
-        return { headEntryUuid: null, lastActiveAt: null };
-    }
+    return {
+        headEntryUuid: typeof e.uuid === "string" ? e.uuid : null,
+        lastActiveAt: typeof e.timestamp === "string" ? e.timestamp : null,
+    };
 }
 /**
  * Every local session currently mapped to `threadId`, plus the one this pull

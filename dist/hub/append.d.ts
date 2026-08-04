@@ -13,12 +13,19 @@ export interface DeltaChainInfo {
     lastEntryUuid: string | null;
 }
 /**
- * Bounded read of a continuation bundle's chain endpoints: at most the first
- * two non-empty lines plus one cheap last-line read.
+ * Bounded read of a continuation bundle's chain endpoints: the leading lines up
+ * to and including the first CONVERSATION entry (capped at
+ * `MAX_ENTRY_SCAN_BYTES`), plus one cheap tail read.
  *
  * `buildContinuationStream` slices the tail of a session from a known index, so
- * the first REAL entry's `parentUuid` is exactly the uuid the slice was cut
- * after — that value is the chain guard's input.
+ * the first entry after the cut carries a `parentUuid` equal to the uuid the
+ * slice was cut after — that value is the chain guard's input.
+ *
+ * The cut lands on the first line the peer has not seen, which is usually a
+ * uuid-less bookkeeping entry (`last-prompt` / `mode` / …, written right after
+ * each assistant turn). Those lines carry no `parentUuid` at all, so the anchor
+ * is taken from the first entry that is actually IN the chain, not from
+ * whatever line happens to sit under the header.
  */
 export declare function readDeltaChainInfo(deltaPath: string): Promise<DeltaChainInfo>;
 /**

@@ -231,4 +231,153 @@ describe("continuation", () => {
       }
     });
   });
+  // Task 6b. The head recorded for a peer is now the last CONVERSATION entry,
+  // so the very next line in the live transcript is usually uuid-less
+  // bookkeeping — Claude Code writes `last-prompt` / `mode` / `permission-mode`
+  // straight after each assistant turn. That makes `fromEntryIndex` land on a
+  // uuid-less line, which is the whole incremental-push path end to end:
+  // readEntryUuids -> computeIncrementalPlan -> buildContinuationStream ->
+  // readDeltaChainInfo -> tryAppendContinuation.
+  describe("incremental push over a bookkeeping-interleaved transcript", () => {
+    const SID = "orig-session";
+    const conv = (uuid: string, parentUuid: string | null) => ({
+      uuid,
+      parentUuid,
+      timestamp: "2026-08-02T10:00:00.000Z",
+      sessionId: SID,
+      cwd: "/Users/a/proj",
+      version: "2.1.114",
+      type: "user",
+      message: { role: "user", content: `m ${uuid}` },
+    });
+    const bookkeeping = [
+      { type: "last-prompt", lastPrompt: "go", leafUuid: "c2", sessionId: SID },
+      { type: "mode", mode: "normal", sessionId: SID },
+      { type: "permission-mode", permissionMode: "auto", sessionId: SID },
+    ];
+
+    it("slices a delta that starts on bookkeeping and still chains onto the recorded head", async () => {
+      const { readEntryUuids } = await import("../src/jsonl.js");
+      const { computeIncrementalPlan } = await import("../src/diff.js");
+      const { buildContinuationStream } = await import("../src/continuation.js");
+      const { readDeltaChainInfo } = await import("../src/hub/append.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-cont-bk-"));
+      try {
+        // Snapshot at the previous push: c1, c2 (head = c2, the last
+        // conversation entry). Then bookkeeping, then new conversation.
+        const src = join(dir, `${SID}.jsonl`);
+        const all = [
+          conv("c1", null),
+          conv("c2", "c1"),
+          ...bookkeeping,
+          conv("c3", "c2"),
+          conv("c4", "c3"),
+          { type: "mode", mode: "plan", sessionId: SID },
+        ];
+        writeFileSync(src, all.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+
+        const session = {
+          sessionId: SID,
+          projectPath: "/Users/a/proj",
+          encodedProjectDir: "-Users-a-proj",
+          jsonlPath: src,
+          slug: "s",
+          createdAt: "2026-08-02T10:00:00.000Z",
+          lastActiveAt: "2026-08-02T10:00:00.000Z",
+          messageCount: all.length,
+          gitBranch: "main",
+          entrypoint: "cli",
+          hasSubagents: false,
+          hasToolResults: false,
+          hasFileHistory: false,
+        };
+        const uuids = await readEntryUuids(src);
+        const plan = computeIncrementalPlan(
+          [session],
+          {
+            [SID]: {
+              headEntryUuid: "c2",
+              messageCount: 2,
+              sentAsType: "full",
+              sentAsSessionId: SID,
+            },
+          },
+          () => uuids
+        );
+        expect(plan.warnings).toEqual([]);
+        expect(plan.continuation).toHaveLength(1);
+        const item = plan.continuation[0];
+        // Lossless: the slice starts at the first UNSENT line, bookkeeping included.
+        expect(item.fromEntryIndex).toBe(2);
+
+        const out = join(dir, "cont.jsonl");
+        await buildContinuationStream({
+          sourceJsonlPath: src,
+          outputPath: out,
+          fromEntryIndex: item.fromEntryIndex,
+          fromEntryUuid: item.fromEntryUuid,
+          newSessionId: "new-session",
+          sourceSessionId: SID,
+          sourceMachineId: "peer-id",
+          sourceMachineName: "peer-name",
+          targetProjectPath: "/Users/a/proj",
+          claudeVersion: "2.1.114",
+        });
+
+        const written = readFileSync(out, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+        expect(written).toHaveLength(7); // header + 6 unsent lines
+        expect(written[1].type).toBe("last-prompt"); // bookkeeping carried, not dropped
+
+        // The anchor the append chain guard checks must be the recorded head,
+        // even though the delta's first non-header line has no uuid at all.
+        const info = await readDeltaChainInfo(out);
+        expect(info.headerPresent).toBe(true);
+        expect(info.firstEntryParentUuid).toBe("c2");
+        expect(info.lastEntryUuid).toBe("c4");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reports a transcript whose only new lines are bookkeeping as unchanged", async () => {
+      const { readEntryUuids } = await import("../src/jsonl.js");
+      const { computeIncrementalPlan } = await import("../src/diff.js");
+      const dir = mkdtempSync(join(tmpdir(), "sesh-cont-bk-"));
+      try {
+        const src = join(dir, `${SID}.jsonl`);
+        const all = [conv("c1", null), conv("c2", "c1"), ...bookkeeping];
+        writeFileSync(src, all.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+        const session = {
+          sessionId: SID,
+          projectPath: "/Users/a/proj",
+          encodedProjectDir: "-Users-a-proj",
+          jsonlPath: src,
+          slug: "s",
+          createdAt: "2026-08-02T10:00:00.000Z",
+          lastActiveAt: "2026-08-02T10:00:00.000Z",
+          messageCount: all.length,
+          gitBranch: "main",
+          entrypoint: "cli",
+          hasSubagents: false,
+          hasToolResults: false,
+          hasFileHistory: false,
+        };
+        const uuids = await readEntryUuids(src);
+        const plan = computeIncrementalPlan(
+          [session],
+          {
+            [SID]: { headEntryUuid: "c2", messageCount: 2, sentAsType: "full", sentAsSessionId: SID },
+          },
+          () => uuids
+        );
+        // A delta of pure bookkeeping has no chain entry: it could never be
+        // appended, and would land as a content-free fragment session.
+        expect(plan.continuation).toEqual([]);
+        expect(plan.unchanged.map((s) => s.sessionId)).toEqual([SID]);
+        expect(plan.full).toEqual([]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
