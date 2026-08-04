@@ -631,7 +631,15 @@ hub
     // Code would then fail to parse. Diagnostics go to stderr, which Claude
     // Code does not show the user at exit 0.
     // ---------------------------------------------------------------------
+    // Same asynchronous-EPIPE hazard the SessionEnd endpoint has for stderr,
+    // and this is the ONE endpoint that writes stdout: if the reader of either
+    // pipe goes away before the write lands, the write EPIPEs *asynchronously*,
+    // so a try/catch cannot see it — with no 'error' listener that terminates
+    // the process with exit 1 and a stack trace, which for SessionStart is
+    // "other exit codes → show stderr to user". One listener per pipe,
+    // attached before any write, keeps the contract above true.
     process.stderr.on("error", () => { });
+    process.stdout.on("error", () => { });
     try {
         const payload = readHookPayload(await readStdin());
         const gate = evaluateHookGate(payload, "startupNotice");
@@ -654,10 +662,17 @@ hub
         if (stale.length === 0)
             return;
         const top = stale[0];
-        const where = top.latest.machineName ?? top.latest.machineId;
+        // Every field below comes out of another machine's index file, so each
+        // one is sanitized and each one has a fallback: a torn or old-format
+        // entry missing `slug` would otherwise render the literal string
+        // "undefined" as the name of the thread the user is being told to pull.
+        const what = noticeField(top.slug) || noticeField(top.threadId) || "a session";
+        const where = noticeField(top.latest.machineName) ||
+            noticeField(top.latest.machineId) ||
+            "another machine";
         const rest = stale.length > 1 ? ` (+${stale.length - 1} more)` : "";
         const context = `sesh-mover: newer work for this project exists on another machine — ` +
-            `"${top.slug}" on ${where}, ${describeAge(top.latest.lastActiveAt)}${rest}. ` +
+            `"${what}" on ${where}, ${describeAge(top.latest.lastActiveAt)}${rest}. ` +
             `Run /sesh-mover:pull to bring it here.`;
         process.stdout.write(JSON.stringify({
             hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },
@@ -996,20 +1011,53 @@ function parseTime(iso) {
 }
 // A freshness notice reads at a glance or not at all: "4320 minutes ago" is
 // noise where "3 days ago" is information.
+//
+// Every step FLOORS rather than rounds. Rounding overstates staleness — 90
+// minutes would read "2 hours ago" and 36 hours "2 days ago" — in a notice
+// whose whole job is a truthful at-a-glance read of how far behind the local
+// copy is. Flooring can only understate, which is the safe direction: it
+// never makes work sound more abandoned than it is.
 function describeAge(iso) {
     const then = parseTime(iso);
     if (then === 0)
         return "recently";
-    const minutes = Math.max(0, Math.round((Date.now() - then) / 60_000));
+    const minutes = Math.max(0, Math.floor((Date.now() - then) / 60_000));
     if (minutes < 1)
         return "just now";
     if (minutes < 60)
         return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
-    const hours = Math.round(minutes / 60);
+    const hours = Math.floor(minutes / 60);
     if (hours < 24)
         return `${hours} hour${hours === 1 ? "" : "s"} ago`;
-    const days = Math.round(hours / 24);
+    const days = Math.floor(hours / 24);
     return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+/** Longest run of index-file text allowed into an injected notice. */
+const NOTICE_FIELD_MAX = 80;
+/**
+ * Makes one field of another machine's index file safe to interpolate into
+ * the SessionStart notice.
+ *
+ * That notice is injected straight into the model's context, and a thread slug
+ * ultimately derives from a conversation-derived session title — so it is not
+ * fully machine-controlled even under the hub's "your own machines" threat
+ * model. Control characters (newlines above all) would let such a string forge
+ * structure inside the injected text, and an unbounded one would let it
+ * dominate it. Collapse whitespace, drop control characters, cap the length.
+ *
+ * Returns "" for anything absent or non-string, so every call site can fall
+ * back with `||` rather than rendering "undefined".
+ */
+function noticeField(value) {
+    if (typeof value !== "string")
+        return "";
+    // \p{C} is Unicode's "other" category: C0/C1 controls, format characters
+    // (including the bidi and zero-width overrides), surrogates and unassigned
+    // code points — i.e. everything that can move or hide text rather than show
+    // it. Nothing legible is in it, so replacing the whole category is both
+    // safer and shorter than an escape range.
+    const clean = value.replace(/\p{C}/gu, " ").replace(/\s+/g, " ").trim();
+    return clean.length > NOTICE_FIELD_MAX ? clean.slice(0, NOTICE_FIELD_MAX - 1) + "…" : clean;
 }
 // Best-effort stderr diagnostic for the hook endpoints. A hook's diagnostic
 // must never be able to change its exit code, so a failing write is swallowed
