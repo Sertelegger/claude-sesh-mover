@@ -2,11 +2,34 @@
 export type SidecarReason = 
 /** NUL byte in the first 8 KB on either side — `git merge-file` refuses these. */
 "binary"
-/** No usable `git merge-file` on this machine (missing, or too old for our invocation). */
+/**
+ * No usable `git merge-file` on this machine: missing, too old for our
+ * invocation, or unable to run at all (a broken global/system git config
+ * makes it exit 128 before it ever looks at the operands). All three are
+ * properties of the machine, not of the file, so the rest of the tree
+ * degrades with it instead of re-spawning a doomed process per file.
+ */
  | "git-unavailable"
-/** `git merge-file` was reachable but failed on this file; `detail` carries its stderr. */
+/**
+ * The 3-way merge did not complete for this one file: `git merge-file` was
+ * reachable but failed on it, or the merge succeeded and its result could not
+ * be written back. `detail` carries git's stderr, or the write's error.
+ */
  | "merge-failed";
-/** A file the merge deliberately did not touch. */
+/**
+ * A file the merge deliberately did not touch — and, unlike a sidecar case,
+ * one where **nothing at all was written near that path**.
+ *
+ * That is deliberate, not an oversight. Every reason below means the merge
+ * could not establish what actually sits at (or above) the destination, and a
+ * sidecar is written into the very same directory: parking
+ * `docs/note.md.theirs-…` beside a `docs -> ~/notes` symlink writes outside the
+ * project exactly as the original write would have, and parking beside a file
+ * that occupies a directory's path just raises `ENOTDIR` in a different place.
+ * So `skipped` means "the merge touched nothing here", and the incoming copy
+ * stays recoverable from the bundle on the hub rather than being forced into a
+ * neighbourhood the merge already judged unsafe.
+ */
 export type SkipReason = 
 /** A symlink occupies the path (or one of its parents) locally — never written through. */
 "local-symlink"
@@ -78,6 +101,15 @@ export declare class MergeAncestorRequiredError extends Error {
  * - Running the real thing also catches a git too old for `--diff3`, and a
  *   `git` on PATH that is a broken wrapper rather than git.
  *
+ * The marker assertions below cannot be broken by a project's own git settings.
+ * `cwd` is the probe's private temp dir, so no repository-local config is in
+ * scope (same reason the merge spawn in `mergeWorkspaceTrees` sets it — see the
+ * comment there), and `.gitattributes`' `conflict-marker-size` does
+ * not reach `git merge-file` at all — verified: `* conflict-marker-size=15` in a
+ * repo still produces 7-character markers, because merge-file takes three plain
+ * paths and never consults the attribute stack. Same for
+ * `merge.conflictMarkerSize`.
+ *
  * Not memoized: the caller decides how often to ask (design §5.3 probes once
  * per pull, like `isZstdAvailable`), and a module-level cache would make the
  * degraded path untestable.
@@ -98,8 +130,11 @@ export declare function isBinaryFile(path: string): boolean;
  *
  * Resolution table (design §5.3); comparison is by sha256 content hash, never
  * mtime. This function **never deletes a file** and never resolves a conflict
- * by discarding one side: the worst case for any file is "local kept, incoming
- * parked beside it" or "both sides present between conflict markers".
+ * by discarding one side: the worst case for any file it *resolves* is "local
+ * kept, incoming parked beside it" or "both sides present between conflict
+ * markers". A file it refuses to touch at all lands in `skipped` and nothing is
+ * written near it — see `SkipReason` for why parking a copy there would
+ * reproduce the very hazard the skip exists to avoid.
  *
  * Excludes default to the standard workspace excludes plus the *target's*
  * `.claude-sesh-mover/hubignore` — so a file this machine deliberately keeps
@@ -116,5 +151,19 @@ export declare function mergeWorkspaceTrees(opts: {
     targetDir: string;
     /** Override the exclude patterns; defaults to workspace excludes + target hubignore. */
     excludePatterns?: string[];
+    /**
+     * Test seam: the timestamp baked into sidecar names, defaulting to now.
+     * Never set in production code.
+     *
+     * It exists because sidecar-name collisions are unreachable from a single
+     * run — one file is sidecarred at most once, so the `-2` uniquification and
+     * the `MAX_SIDECAR_ATTEMPTS` exhaustion path can only fire against sidecars
+     * left by an *earlier* run carrying the same millisecond-precision stamp.
+     * Without a fixed stamp a test can only try to race the clock, which is not
+     * evidence: with `COPYFILE_EXCL` deleted, "two merges produce different
+     * sidecar names" still passed 8 runs in 10, because the names differed by
+     * milliseconds rather than by the guard.
+     */
+    __sidecarStamp?: string;
 }): Promise<WorkspaceMergeReport>;
 //# sourceMappingURL=merge.d.ts.map

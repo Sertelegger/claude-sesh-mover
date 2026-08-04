@@ -10,7 +10,11 @@
  * - tmpdir() reads $TMPDIR on POSIX but $TEMP/$TMP on Windows — it never
  *   consults TMPDIR there.
  * - PATH is spelled "Path" on Windows, where env var names are
- *   case-insensitive at the OS level but not in a JS object.
+ *   case-insensitive at the OS level but not in a plain JS object. Note the
+ *   asymmetry: `process.env` ITSELF is a case-insensitive proxy on Windows, so
+ *   an in-process assignment is safe; a `{ ...process.env }` SPREAD is an
+ *   ordinary object and loses that, which is where the hazard actually bites
+ *   (see prependPath).
  *
  * A no-op override is worse than a missing one: assertions fail, the code
  * under test touches the real runner's home/temp dir instead of the isolated
@@ -112,11 +116,17 @@ export interface PathOverrideHandle {
  * handle that restores the original.
  *
  * Used to prove that code shelling out to an external binary (git) degrades
- * honestly when that binary cannot be found. Same casing hazard as
- * `prependPath`: the variable may be spelled "Path" on Windows, so overwrite
- * whatever key already exists instead of adding a second one — otherwise the
- * override silently no-ops there and the "binary missing" assertions run
- * against a machine that still has the binary.
+ * honestly when that binary cannot be found, and to put a stub binary in front
+ * of the real one.
+ *
+ * The variable may be spelled "Path" on Windows, but — unlike `prependPath`,
+ * which spreads into a plain object — a bare `process.env.PATH = dir` would
+ * already be correct here: `process.env` is a case-insensitive proxy on
+ * Windows, so assigning "PATH" overwrites an existing "Path" rather than adding
+ * a second key (same reason `overrideTmp` can assign "TEMP" directly). The
+ * find-and-overwrite loop below is belt-and-braces, and it is what lets
+ * `restore()` put the value back under its ORIGINAL casing rather than leaving
+ * the process with a renamed variable.
  *
  * Like `overrideTmp`, this mutates process-wide state for the duration of one
  * test; always `.restore()` in a `finally`.

@@ -1,6 +1,6 @@
-import { closeSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
 import { execFile, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DEFAULT_WORKSPACE_EXCLUDES, isExcluded, readHubignore } from "./workspace.js";
@@ -25,6 +25,9 @@ const BINARY_SNIFF_BYTES = 8192;
 const MERGE_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 5_000;
 const MAX_SIDECAR_ATTEMPTS = 100;
+const MAX_TMP_ATTEMPTS = 10;
+/** Scratch-slot mode: readable and writable by us, and by nobody else. */
+const SCRATCH_MODE = 0o600;
 /**
  * The exact `git merge-file` invocation this module uses, minus the three file
  * operands. Every token is load-bearing:
@@ -62,6 +65,15 @@ const GIT_MERGE_ARGS = [
  * - Running the real thing also catches a git too old for `--diff3`, and a
  *   `git` on PATH that is a broken wrapper rather than git.
  *
+ * The marker assertions below cannot be broken by a project's own git settings.
+ * `cwd` is the probe's private temp dir, so no repository-local config is in
+ * scope (same reason the merge spawn in `mergeWorkspaceTrees` sets it — see the
+ * comment there), and `.gitattributes`' `conflict-marker-size` does
+ * not reach `git merge-file` at all — verified: `* conflict-marker-size=15` in a
+ * repo still produces 7-character markers, because merge-file takes three plain
+ * paths and never consults the attribute stack. Same for
+ * `merge.conflictMarkerSize`.
+ *
  * Not memoized: the caller decides how often to ask (design §5.3 probes once
  * per pull, like `isZstdAvailable`), and a module-level cache would make the
  * degraded path untestable.
@@ -82,7 +94,7 @@ export async function isGitMergeFileAvailable() {
         writeFileSync(current, "1\nLOCAL\n3\n");
         writeFileSync(other, "1\nINCOMING\n3\n");
         const status = await new Promise((resolve) => {
-            execFile("git", [...GIT_MERGE_ARGS, current, base, other], { timeout: PROBE_TIMEOUT_MS, windowsHide: true }, (err) => {
+            execFile("git", [...GIT_MERGE_ARGS, current, base, other], { cwd: dir, timeout: PROBE_TIMEOUT_MS, windowsHide: true }, (err) => {
                 if (err === null)
                     return resolve(0);
                 const code = err.code;
@@ -204,22 +216,55 @@ function classifyDestination(targetDir, rel) {
  * leaves a truncated file, and by then this module holds the only other copy
  * of the local content in a temp dir it is about to delete. Same posture as
  * the hub backend's `writeAtomic`. The temp file is created by copying, so it
- * inherits the source's mode — which for a merge result is the local file's
- * own mode, because the merge scratch copy came from the local file.
+ * inherits `contentFrom`'s mode: for `taken` that is the incoming file's, and
+ * for a merge result it is the local file's, because the caller chmods the
+ * scratch copy back to the local mode immediately before calling in.
+ *
+ * The temp path is the one write in this module that does NOT go through
+ * `classifyDestination`, so it carries its own two guards:
+ *
+ * - **`COPYFILE_EXCL`.** A plain `copyFileSync` follows a symlink at the
+ *   destination, so a symlink planted at the temp path writes straight through
+ *   it — outside the project — and then `renameSync` installs that symlink as
+ *   the user's file. Verified on macOS and by libuv's `O_CREAT | O_EXCL` on
+ *   Linux: `COPYFILE_EXCL` raises `EEXIST` on a symlink at the destination,
+ *   live or dangling, so the escape is refused rather than followed.
+ * - **A random component in the name.** A fixed `.<name>.sesh-merge.tmp` is
+ *   both predictable (so the symlink above can be planted deliberately) and
+ *   shared, so two merges into one tree would fight over one path — this layer
+ *   holds no lock. It also collided with an incoming file that happened to
+ *   carry that exact name: it was reported in `created` and then silently
+ *   consumed by the next atomic write.
+ *
+ * `EEXIST` therefore means "something else is at this name": retry under a new
+ * one rather than fail, since the name is ours to choose.
  */
 function replaceFileAtomically(destPath, contentFrom) {
-    const tmpPath = join(dirname(destPath), `.${basename(destPath)}.sesh-merge.tmp`);
-    try {
-        copyFileSync(contentFrom, tmpPath);
-        renameSync(tmpPath, destPath);
-    }
-    catch (e) {
+    const dir = dirname(destPath);
+    const stem = `.${basename(destPath)}.sesh-merge`;
+    for (let n = 0; n < MAX_TMP_ATTEMPTS; n++) {
+        const tmpPath = join(dir, `${stem}.${process.pid.toString(36)}-${randomBytes(6).toString("hex")}.tmp`);
         try {
-            unlinkSync(tmpPath);
+            copyFileSync(contentFrom, tmpPath, fsConstants.COPYFILE_EXCL);
         }
-        catch { /* best effort */ }
-        throw e;
+        catch (e) {
+            if (e.code === "EEXIST")
+                continue;
+            throw e;
+        }
+        try {
+            renameSync(tmpPath, destPath);
+        }
+        catch (e) {
+            try {
+                unlinkSync(tmpPath);
+            }
+            catch { /* best effort */ }
+            throw e;
+        }
+        return;
     }
+    throw new Error(`could not create a temp file beside ${destPath} after ${MAX_TMP_ATTEMPTS} attempts`);
 }
 /** `sub/dir/img.bin` + `img.bin.theirs-…` -> `sub/dir/img.bin.theirs-…` */
 function siblingRel(rel, name) {
@@ -255,8 +300,11 @@ function writeSidecar(targetDir, rel, incomingPath, stamp) {
  *
  * Resolution table (design §5.3); comparison is by sha256 content hash, never
  * mtime. This function **never deletes a file** and never resolves a conflict
- * by discarding one side: the worst case for any file is "local kept, incoming
- * parked beside it" or "both sides present between conflict markers".
+ * by discarding one side: the worst case for any file it *resolves* is "local
+ * kept, incoming parked beside it" or "both sides present between conflict
+ * markers". A file it refuses to touch at all lands in `skipped` and nothing is
+ * written near it — see `SkipReason` for why parking a copy there would
+ * reproduce the very hazard the skip exists to avoid.
  *
  * Excludes default to the standard workspace excludes plus the *target's*
  * `.claude-sesh-mover/hubignore` — so a file this machine deliberately keeps
@@ -280,7 +328,7 @@ export async function mergeWorkspaceTrees(opts) {
     const localFiles = new Set(listTree(opts.targetDir, patterns));
     const all = new Set([...ancestorFiles, ...incomingFiles, ...localFiles]);
     // One stamp for the whole run, so every sidecar from one pull sorts together.
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const stamp = opts.__sidecarStamp ?? new Date().toISOString().replace(/[:.]/g, "-");
     const work = mkdtempSync(join(tmpdir(), "sesh-merge-"));
     const current = join(work, "current");
     const base = join(work, "base");
@@ -358,24 +406,58 @@ export async function mergeWorkspaceTrees(opts) {
                     sidecar(rel, incomingPath, "git-unavailable", "no usable git merge-file on this machine");
                     continue;
                 }
+                // Reset the three scratch slots before every reuse. `copyFileSync`
+                // propagates the SOURCE's mode onto the destination it creates, so a
+                // single 0444 file in ANY of the three trees would otherwise leave the
+                // slot read-only for good, and every later copy into it would fail
+                // EACCES — one read-only file silently disabling the merge engine for
+                // an arbitrary suffix of the tree, in whatever order the sort produced,
+                // with the affected files landing in `skipped` (which parks nothing)
+                // and a detail string naming a temp path the user cannot act on. Modes
+                // survive snapshot -> tar -> unpack, so the trigger can arrive in a
+                // peer's bundle.
+                for (const slot of [current, base, other])
+                    rmSync(slot, { force: true });
                 copyFileSync(localPath, current);
+                // git writes the merge RESULT into `current`, so it must be writable
+                // whatever the local file's mode is — a read-only local file must not
+                // make its own merge impossible. The local file's mode is handed back
+                // below, before the result is copied into the user's tree, so this
+                // never reaches them.
+                const localMode = statSync(localPath).mode & 0o7777;
+                chmodSync(current, SCRATCH_MODE);
                 if (ancestorPath !== null)
                     copyFileSync(ancestorPath, base);
                 else
                     writeFileSync(base, "");
                 copyFileSync(incomingPath, other);
                 // Verified against git 2.50.1: exit 0 = clean, 1..127 = conflict count
-                // CLAMPED at 127 (128 hunks -> 127, 600 hunks -> 127), 129 = usage
+                // CLAMPED at 127 (128 hunks -> 127, 600 hunks -> 127), 128 = fatal
+                // (git could not run at all — e.g. a bad config variable), 129 = usage
                 // error (an option this git does not know), 255 = refusal (binary
                 // input, unreadable operand). A spawn failure surfaces as ENOENT with
                 // status null, never as an exit code — so 127 is unambiguously a
                 // conflict count here and not the shell's "command not found".
+                //
+                // `cwd` is the scratch dir, NOT the inherited one. `git merge-file`
+                // reads config from whatever repository the process is standing in even
+                // though it takes three plain paths, and the caller's cwd is normally
+                // the user's project — i.e. normally a repo. `--diff3` overrides
+                // `merge.conflictStyle`, but config is VALIDATED before the flag
+                // applies, so an invalid repo-local `merge.conflictStyle` makes
+                // merge-file exit 128 with the flag passed (verified). Standing in the
+                // scratch dir removes repo-local influence outright — the same run that
+                // exits 128 from inside the repo exits 1 and merges correctly from
+                // here — and it also closes `diff.algorithm`, which cannot be pinned by
+                // a flag (`--diff-algorithm` is far newer than `--diff3`) and which
+                // shifts hunk boundaries, i.e. the clean/conflict outcome itself.
                 let status = 0;
                 let spawnCode;
                 let signal;
                 let stderr = "";
                 try {
                     execFileSync("git", [...GIT_MERGE_ARGS, current, base, other], {
+                        cwd: work,
                         stdio: ["ignore", "ignore", "pipe"],
                         timeout: MERGE_TIMEOUT_MS,
                         windowsHide: true,
@@ -389,18 +471,39 @@ export async function mergeWorkspaceTrees(opts) {
                     stderr = (err.stderr?.toString() ?? "").split("\n")[0].trim();
                 }
                 if (status !== null && status >= 0 && status <= 127) {
-                    replaceFileAtomically(localPath, current);
+                    // Hand the local file its own mode back before the result travels
+                    // into the user's tree (replaceFileAtomically copies, so the scratch
+                    // file's mode is what the user would otherwise end up with).
+                    chmodSync(current, localMode);
+                    try {
+                        replaceFileAtomically(localPath, current);
+                    }
+                    catch (e) {
+                        // The merge itself succeeded; only the write back failed, and
+                        // `renameSync` is atomic, so the local file is exactly as it was.
+                        // Park the incoming copy rather than letting this land in
+                        // `skipped`, which parks nothing — the destination directory is one
+                        // `classifyDestination` already approved, so a sidecar is safe here
+                        // in a way it is not for a genuine skip.
+                        sidecar(rel, incomingPath, "merge-failed", `the merge succeeded but its result could not be written back: ${e.message}`);
+                        continue;
+                    }
                     (status === 0 ? report.merged : report.conflicted).push(rel);
                     continue;
                 }
-                if (spawnCode === "ENOENT" || status === 129) {
-                    // git is missing, or too old to understand our invocation. Degrade
-                    // for the rest of the tree instead of spawning once per file, and
-                    // say so in the report rather than failing opaquely.
+                if (spawnCode === "ENOENT" || status === 128 || status === 129) {
+                    // git is missing, cannot run at all (128 — a broken git config is
+                    // rejected before merge-file looks at its operands), or is too old to
+                    // understand our invocation (129). All three are properties of the
+                    // machine rather than of this file, so degrade for the rest of the
+                    // tree instead of spawning once per file, and say so in the report
+                    // rather than failing opaquely.
                     report.gitUnavailable = true;
                     sidecar(rel, incomingPath, "git-unavailable", spawnCode === "ENOENT"
                         ? "git was not found on PATH"
-                        : `git merge-file rejected our invocation: ${stderr || "usage error"}`);
+                        : status === 128
+                            ? `git merge-file could not run: ${stderr || "fatal error"}`
+                            : `git merge-file rejected our invocation: ${stderr || "usage error"}`);
                     continue;
                 }
                 sidecar(rel, incomingPath, "merge-failed", stderr

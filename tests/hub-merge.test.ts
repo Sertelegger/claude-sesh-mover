@@ -1,8 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  rmSync, statSync, symlinkSync, writeFileSync,
+  chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
+  readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -76,6 +77,25 @@ describe("merge helpers", () => {
   it("reports git merge-file as available", async () => {
     // git is a test prerequisite; the probe runs a real 3-way merge.
     expect(await isGitMergeFileAvailable()).toBe(true);
+  });
+
+  // The probe runs a real merge, so it is exposed to ambient repo config the
+  // same way the merge is: standing in a repo whose `merge.conflictStyle` is
+  // invalid, `git merge-file` exits 128 even with `--diff3` passed (config is
+  // validated before the flag applies), and the probe would report a perfectly
+  // good git as unusable. It runs in its own temp dir for that reason.
+  it("reports git merge-file as available from inside a repo with a broken config", async () => {
+    const repo = tmp("sesh-merge-badrepo-");
+    const cwdBefore = process.cwd();
+    try {
+      execFileSync("git", ["init", "-q", "."], { cwd: repo });
+      execFileSync("git", ["config", "merge.conflictStyle", "bogusstyle"], { cwd: repo });
+      process.chdir(repo);
+      expect(await isGitMergeFileAvailable()).toBe(true);
+    } finally {
+      process.chdir(cwdBefore);
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   it("reports git merge-file as unavailable when git is not on PATH", async () => {
@@ -254,20 +274,57 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
     }
   });
 
+  // The stamp is PINNED, not raced. Within one run a file is sidecarred at
+  // most once, so the uniquification branch can only fire against a sidecar
+  // left by an earlier run carrying the same stamp — and the stamp has
+  // millisecond precision. Written as "run two merges and assert the names
+  // differ", this test passed 8 runs in 10 with COPYFILE_EXCL deleted, because
+  // the names differed by clock rather than by the guard.
   it("never overwrites an existing sidecar, it uniquifies the name", async () => {
     const { root, a, i, t } = trees();
+    const stamp = "2026-01-02T03-04-05-678Z";
     try {
       put(a, "img.bin", Buffer.from([1, 0, 2]));
       put(t, "img.bin", Buffer.from([1, 0, 9]));
       put(i, "img.bin", Buffer.from([1, 0, 7]));
-      const first = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
-      // Second pull in the same run/second: the first sidecar must survive.
+      const opts = { ancestorDir: a, incomingDir: i, targetDir: t, __sidecarStamp: stamp };
+      const first = await mergeWorkspaceTrees(opts);
+      expect(first.sidecars[0]!.sidecar).toBe(`img.bin.theirs-${stamp}`);
+      // Second pull under the SAME stamp: the first sidecar must survive.
       put(i, "img.bin", Buffer.from([1, 0, 5]));
-      const second = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      const second = await mergeWorkspaceTrees(opts);
       expect(second.sidecars).toHaveLength(1);
-      expect(second.sidecars[0]!.sidecar).not.toBe(first.sidecars[0]!.sidecar);
+      expect(second.sidecars[0]!.sidecar).toBe(`img.bin.theirs-${stamp}-2`);
       expect(readFileSync(join(t, first.sidecars[0]!.sidecar))).toEqual(Buffer.from([1, 0, 7]));
       expect(readFileSync(join(t, second.sidecars[0]!.sidecar))).toEqual(Buffer.from([1, 0, 5]));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports io-error when every sidecar name is already taken", async () => {
+    const { root, a, i, t } = trees();
+    const stamp = "2026-01-02T03-04-05-678Z";
+    try {
+      put(a, "img.bin", Buffer.from([1, 0, 2]));
+      put(t, "img.bin", Buffer.from([1, 0, 9]));
+      put(i, "img.bin", Buffer.from([1, 0, 7]));
+      // Occupy the stem and every one of the 99 uniquified names.
+      const stem = `img.bin.theirs-${stamp}`;
+      put(t, stem, "taken");
+      for (let n = 2; n <= 100; n++) put(t, `${stem}-${n}`, "taken");
+      const r = await mergeWorkspaceTrees({
+        ancestorDir: a, incomingDir: i, targetDir: t, __sidecarStamp: stamp,
+      });
+      expect(r.sidecars).toEqual([]);
+      expect(r.skipped).toHaveLength(1);
+      expect(r.skipped[0]!.path).toBe("img.bin");
+      expect(r.skipped[0]!.reason).toBe("io-error");
+      expect(r.skipped[0]!.detail).toContain("100 attempts");
+      // Nothing was overwritten, and the local file is untouched.
+      expect(readFileSync(join(t, stem), "utf-8")).toBe("taken");
+      expect(readFileSync(join(t, `${stem}-100`), "utf-8")).toBe("taken");
+      expect(readFileSync(join(t, "img.bin"))).toEqual(Buffer.from([1, 0, 9]));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -477,6 +534,131 @@ describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
     }
   });
 
+  // `copyFileSync` propagates the SOURCE's mode onto the destination it
+  // creates, and the three scratch slots are reused for every file that needs a
+  // real 3-way merge. So one 0444 file anywhere in ANY of the three trees used
+  // to leave a slot read-only for the rest of the run: every later copy into it
+  // failed EACCES, and the merge silently under-delivered for an arbitrary
+  // suffix of the tree (order-dependent, so it presents as "merges randomly
+  // stop working"). Modes survive snapshot -> tar -> unpack, so the trigger
+  // arrives in a peer's bundle, not just from a local oddity.
+  //
+  // Vacuous if the suite is ever run as root, which ignores the mode bits.
+  it.skipIf(isWindows)("a read-only file does not disable merging for the rest of the tree", async () => {
+    const sortsFirst = "a.txt"; // deliberately first, so the damage lands on b/c
+    for (const which of ["incoming", "local", "ancestor"] as const) {
+      const { root, a, i, t } = trees();
+      const dirFor = { ancestor: a, incoming: i, local: t }[which];
+      try {
+        for (const name of [sortsFirst, "b.txt", "c.txt"]) {
+          // Separated edits on both sides: each of these needs the real engine.
+          put(a, name, "1\n2\n3\n4\n5\n6\n7\n");
+          put(t, name, "1\nLOCAL\n3\n4\n5\n6\n7\n");
+          put(i, name, "1\n2\n3\n4\n5\nINCOMING\n7\n");
+        }
+        chmodSync(join(dirFor, sortsFirst), 0o444);
+        const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+        expect({ which, merged: r.merged, skipped: r.skipped, sidecars: r.sidecars })
+          .toEqual({ which, merged: [sortsFirst, "b.txt", "c.txt"], skipped: [], sidecars: [] });
+        for (const name of [sortsFirst, "b.txt", "c.txt"]) {
+          const out = readFileSync(join(t, name), "utf-8");
+          expect(out).toContain("LOCAL");
+          expect(out).toContain("INCOMING");
+        }
+      } finally {
+        chmodSync(join(dirFor, sortsFirst), 0o644);
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  // git writes the merge RESULT into the scratch copy of the local file, so a
+  // read-only local file must not make its own merge impossible — and the mode
+  // it gets back must still be its own, not the scratch file's.
+  it.skipIf(isWindows)("merges a read-only local file and gives it its mode back", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      put(a, "ro.txt", "1\n2\n3\n4\n5\n6\n7\n");
+      put(t, "ro.txt", "1\nLOCAL\n3\n4\n5\n6\n7\n");
+      put(i, "ro.txt", "1\n2\n3\n4\n5\nINCOMING\n7\n");
+      chmodSync(join(t, "ro.txt"), 0o444);
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.merged).toEqual(["ro.txt"]);
+      expect(statSync(join(t, "ro.txt")).mode & 0o777).toBe(0o444);
+      expect(readFileSync(join(t, "ro.txt"), "utf-8")).toContain("INCOMING");
+    } finally {
+      chmodSync(join(t, "ro.txt"), 0o644);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The atomic write's temp path is the one write in the module that does NOT
+  // go through classifyDestination. With the old fixed `.<name>.sesh-merge.tmp`
+  // name, planting a symlink there overwrote a file outside the project AND
+  // left the project file a symlink (verified against the pre-fix build).
+  it.skipIf(isWindows)("does not write through a symlink planted at a predictable temp path", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      const outside = join(root, "outside.txt");
+      writeFileSync(outside, "PRECIOUS\n");
+      put(a, "f.txt", "v1\n");
+      put(t, "f.txt", "v1\n");
+      put(i, "f.txt", "v2\n");
+      symlinkSync(outside, join(t, ".f.txt.sesh-merge.tmp"));
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.taken).toEqual(["f.txt"]);
+      expect(readFileSync(outside, "utf-8")).toBe("PRECIOUS\n");
+      expect(lstatSync(join(t, "f.txt")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(t, "f.txt"), "utf-8")).toBe("v2\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The platform contract the temp write's COPYFILE_EXCL rests on. Once the
+  // temp name carries random bytes no test can plant a symlink on it, so pin
+  // the assumption itself: EXCL must REFUSE a symlink destination rather than
+  // follow it, live or dangling. A plain copy follows it and escapes.
+  it.skipIf(isWindows)("COPYFILE_EXCL refuses a symlink destination instead of following it", () => {
+    const dir = tmp("sesh-merge-");
+    try {
+      put(dir, "src", "SRC\n");
+      put(dir, "victim", "VICTIM\n");
+      symlinkSync(join(dir, "victim"), join(dir, "live"));
+      symlinkSync(join(dir, "nothere"), join(dir, "dangling"));
+      for (const link of ["live", "dangling"]) {
+        expect(() => copyFileSync(join(dir, "src"), join(dir, link), constants.COPYFILE_EXCL))
+          .toThrow(expect.objectContaining({ code: "EEXIST" }));
+      }
+      expect(readFileSync(join(dir, "victim"), "utf-8")).toBe("VICTIM\n");
+      // Without the flag the same call writes straight through the link.
+      copyFileSync(join(dir, "src"), join(dir, "live"));
+      expect(readFileSync(join(dir, "victim"), "utf-8")).toBe("SRC\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // An incoming file carrying the old temp name was reported in `created` and
+  // then silently eaten by the atomic write of its neighbour: report said
+  // created, disk said gone.
+  it("does not consume an incoming file named like its own temp file", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      put(a, "f.txt", "v1\n");
+      put(t, "f.txt", "v1\n");
+      put(i, "f.txt", "v2\n");
+      put(i, ".f.txt.sesh-merge.tmp", "decoy\n");
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.taken).toEqual(["f.txt"]);
+      expect(r.created).toEqual([".f.txt.sesh-merge.tmp"]);
+      expect(readFileSync(join(t, ".f.txt.sesh-merge.tmp"), "utf-8")).toBe("decoy\n");
+      expect(readFileSync(join(t, "f.txt"), "utf-8")).toBe("v2\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("leaves no scratch files behind in the target tree", async () => {
     const { root, a, i, t } = trees();
     try {
@@ -521,6 +703,83 @@ describe("mergeWorkspaceTrees — degraded merge engine", () => {
       // Resolutions that need no merge engine still happen.
       expect(r.taken).toEqual(["g.txt"]);
       expect(readFileSync(join(t, "g.txt"), "utf-8")).toBe("v2\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // `git merge-file` reads config from whatever repository the process is
+  // standing in, even though it takes three plain paths — and the caller's cwd
+  // is normally the user's project, i.e. normally a repo. `--diff3` overrides
+  // `merge.conflictStyle`, but config is VALIDATED before the flag applies, so
+  // an INVALID repo-local value makes merge-file exit 128 with the flag passed.
+  // Against the pre-fix build this produced a per-file `merge-failed` sidecar
+  // with `gitUnavailable` false, one fresh doomed spawn per file. Standing in
+  // the scratch dir removes repo-local influence outright.
+  it("is not affected by a broken git config in the repo the caller stands in", async () => {
+    const { root, a, i, t } = trees();
+    const repo = join(root, "repo");
+    const cwdBefore = process.cwd();
+    try {
+      mkdirSync(repo, { recursive: true });
+      execFileSync("git", ["init", "-q", "."], { cwd: repo });
+      execFileSync("git", ["config", "merge.conflictStyle", "bogusstyle"], { cwd: repo });
+      put(a, "f.txt", "1\n2\n3\n");
+      put(t, "f.txt", "1\nLOCAL\n3\n");
+      put(i, "f.txt", "1\nINCOMING\n3\n");
+      process.chdir(repo);
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.conflicted).toEqual(["f.txt"]);
+      expect(r.sidecars).toEqual([]);
+      expect(r.gitUnavailable).toBe(false);
+      const out = readFileSync(join(t, "f.txt"), "utf-8");
+      expect(out).toContain("<<<<<<< local");
+      expect(out).toContain("||||||| ancestor");
+    } finally {
+      process.chdir(cwdBefore);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Exit 128 is git's "fatal": it could not run at all — a broken global or
+  // system config is rejected before merge-file ever looks at its operands.
+  // That is a property of the machine, not of the file, so it must degrade the
+  // whole tree once rather than sidecar per file with a fresh doomed spawn each
+  // time. A stub `git` on PATH pins it without depending on the runner's own
+  // git config (a .cmd stub cannot be spawned without a shell on Windows).
+  it.skipIf(isWindows)("degrades for the whole tree when git exits 128", async () => {
+    const { root, a, i, t } = trees();
+    const stubDir = tmp("sesh-merge-stubgit-");
+    writeFileSync(
+      join(stubDir, "git"),
+      "#!/bin/sh\necho \"fatal: bad config variable 'merge.conflictstyle'\" >&2\nexit 128\n"
+    );
+    chmodSync(join(stubDir, "git"), 0o755);
+    const handle = overridePath(stubDir);
+    let r;
+    try {
+      for (const name of ["f.txt", "g.txt"]) {
+        put(a, name, "1\n2\n3\n");
+        put(t, name, "1\nLOCAL\n3\n");
+        put(i, name, "1\nINCOMING\n3\n");
+      }
+      r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+    } finally {
+      handle.restore();
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+    try {
+      expect(r.gitUnavailable).toBe(true);
+      expect(r.sidecars.map((s) => [s.path, s.reason])).toEqual([
+        ["f.txt", "git-unavailable"], ["g.txt", "git-unavailable"],
+      ]);
+      expect(r.sidecars[0]!.detail).toContain("could not run");
+      expect(r.sidecars[0]!.detail).toContain("bad config variable");
+      // Both files kept their local content, both incoming copies parked.
+      for (const s of r.sidecars) {
+        expect(readFileSync(join(t, s.path), "utf-8")).toBe("1\nLOCAL\n3\n");
+        expect(readFileSync(join(t, s.sidecar), "utf-8")).toBe("1\nINCOMING\n3\n");
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
