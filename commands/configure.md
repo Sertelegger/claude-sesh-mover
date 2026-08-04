@@ -35,6 +35,8 @@ Configurable keys:
 - `migrate.scope` — "current" or "all"
 - `hub.path` — absolute path to the hub directory ("" = not configured; normally set via `/sesh-mover:hub-init` rather than by hand)
 - `hub.noWorkspace` — true or false (when true, `push` skips the workspace snapshot for non-git projects by default)
+- `hub.autoPush` — true or false (default true: push this project to the hub automatically when a Claude Code session ends. Inert until a hub is configured **and** this project is linked to a hub project, so it does nothing for a user who never touches the hub.)
+- `hub.startupNotice` — true or false (default true: at session start, announce that a newer copy of one of this project's threads exists on another machine. Same "hub + linked" precondition as `hub.autoPush`; the notice never appears when this machine already has the latest copy of everything.)
 - `hub.pullAppend` — true or false (default true: `pull` splices a continuation onto the local session it continues instead of importing it as a separate session; false is the same as always passing `--no-append`)
 - `hub.onDivergence` — "fragment", "adopt-hub", or "skip" (default "fragment": what `pull` does when a thread was extended on both machines from the same point — keep both as separate sessions, make the hub's branch canonical and preserve the local branch as a new session, or apply nothing and decide later. Same as always passing `--on-divergence <mode>`. Note `/sesh-mover:pull` passes `skip` explicitly so it can ask, so this setting is about direct CLI use.)
 

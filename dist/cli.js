@@ -611,6 +611,62 @@ hub
         writeHookDiagnostic(`sesh-mover auto-push failed: ${e.message}\n`);
     }
 });
+hub
+    .command("hook-session-start")
+    .description("Internal: Claude Code SessionStart hook — announce newer sessions on other machines")
+    .action(async () => {
+    // ---------------------------------------------------------------------
+    // STDOUT CONTRACT EXCEPTION — deliberate, do not "fix".
+    //
+    // This endpoint speaks Claude Code's HOOK protocol, not sesh-mover's
+    // one-JSON-result CLI protocol. It writes either NOTHING or exactly one
+    // hook-JSON object, and ALWAYS exits 0. The object shape below was
+    // verified against the installed Claude Code build's own output schema:
+    //
+    //   E.object({ hookEventName: E.literal("SessionStart"),
+    //              additionalContext: E.string().optional(), … })
+    //
+    // Every failure mode degrades to silence: a session must never open with
+    // an error, a stack trace, or a half-written object on stdout that Claude
+    // Code would then fail to parse. Diagnostics go to stderr, which Claude
+    // Code does not show the user at exit 0.
+    // ---------------------------------------------------------------------
+    process.stderr.on("error", () => { });
+    try {
+        const payload = readHookPayload(await readStdin());
+        const gate = evaluateHookGate(payload, "startupNotice");
+        if (!gate.ok)
+            return; // no hub / unlinked / disabled / no cwd — silent no-op
+        const { hubWhereis } = await import("./hub/whereis.js");
+        const result = await hubWhereis({
+            configDir: resolveConfigDir(),
+            projectPath: gate.projectPath,
+            hubPath: gate.hubPath,
+        });
+        if (!result.success || !result.linked)
+            return;
+        // Newest first, so the one thread we name is the one most likely to be
+        // what the user came back for. resolveThreads' ordering is deterministic
+        // but is not recency ordering, so sorting here is not redundant.
+        const stale = result.threads
+            .filter((t) => t.pullNeeded)
+            .sort((a, b) => parseTime(b.latest.lastActiveAt) - parseTime(a.latest.lastActiveAt));
+        if (stale.length === 0)
+            return;
+        const top = stale[0];
+        const where = top.latest.machineName ?? top.latest.machineId;
+        const rest = stale.length > 1 ? ` (+${stale.length - 1} more)` : "";
+        const context = `sesh-mover: newer work for this project exists on another machine — ` +
+            `"${top.slug}" on ${where}, ${describeAge(top.latest.lastActiveAt)}${rest}. ` +
+            `Run /sesh-mover:pull to bring it here.`;
+        process.stdout.write(JSON.stringify({
+            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },
+        }) + "\n");
+    }
+    catch (e) {
+        writeHookDiagnostic(`sesh-mover startup notice failed: ${e.message}\n`);
+    }
+});
 // --- Push ---
 program
     .command("push")
@@ -930,6 +986,31 @@ function getClaudeVersion() {
         return "unknown";
     }
 }
+// Timestamps in a hub index file are untrusted input (another machine wrote
+// them, and the file can be torn). Date.parse returns NaN for anything it
+// can't read, which would sort unpredictably and render as "NaN minutes ago",
+// so unparseable timestamps sort last and describe as "recently".
+function parseTime(iso) {
+    const t = Date.parse(iso);
+    return Number.isNaN(t) ? 0 : t;
+}
+// A freshness notice reads at a glance or not at all: "4320 minutes ago" is
+// noise where "3 days ago" is information.
+function describeAge(iso) {
+    const then = parseTime(iso);
+    if (then === 0)
+        return "recently";
+    const minutes = Math.max(0, Math.round((Date.now() - then) / 60_000));
+    if (minutes < 1)
+        return "just now";
+    if (minutes < 60)
+        return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 24)
+        return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+    const days = Math.round(hours / 24);
+    return `${days} day${days === 1 ? "" : "s"} ago`;
+}
 // Best-effort stderr diagnostic for the hook endpoints. A hook's diagnostic
 // must never be able to change its exit code, so a failing write is swallowed
 // here: writes to a closed/broken stderr can throw synchronously (closed fd)
@@ -943,16 +1024,63 @@ function writeHookDiagnostic(message) {
         /* stderr is gone — stay silent rather than fail the hook */
     }
 }
-// Reads a hook payload from stdin. Returns "" immediately on a TTY, so an
-// operator who runs a hook endpoint by hand gets the same silent no-op as an
-// empty payload instead of a process that appears to hang.
-async function readStdin() {
-    if (process.stdin.isTTY)
+// How long a hook endpoint waits for its stdin payload before giving up and
+// proceeding with whatever arrived. Claude Code's own hook runner writes the
+// payload and calls stdin.end() immediately (verified in the installed 2.1.221
+// build: both the sync and the `async: true` spawn paths do
+// `stdin.write(json + "\n"); stdin.end()`), so in the real integration this
+// bound is never reached — a few milliseconds is the normal case. It exists
+// for every OTHER way the endpoint can be invoked.
+const HOOK_STDIN_TIMEOUT_MS = 2000;
+/**
+ * Reads a hook payload from stdin, bounded.
+ *
+ * Returns "" immediately on a TTY, so an operator who runs a hook endpoint by
+ * hand gets the same silent no-op as an empty payload instead of a process
+ * that appears to hang.
+ *
+ * The timeout is the load-bearing part. This read happens BEFORE the gate, so
+ * an un-closed stdin pipe hangs the endpoint even on a machine with no hub
+ * configured — measured at >10s and needing SIGKILL before the bound existed.
+ * That matters most at SessionEnd: Claude Code gives SessionEnd hooks a
+ * 1.5s budget (`getSessionEndHookTimeoutMs`, floor 1500ms) and then force-exits
+ * the process, so a hook that blocks on stdin is a hook that never runs.
+ * Degrading to an empty payload is always safe — an empty payload has no
+ * `cwd`, so the gate declines with "no-cwd" and the endpoint is a silent no-op.
+ */
+async function readStdin(timeoutMs = HOOK_STDIN_TIMEOUT_MS) {
+    const stdin = process.stdin;
+    if (stdin.isTTY)
         return "";
     const chunks = [];
-    for await (const chunk of process.stdin)
-        chunks.push(chunk);
-    return Buffer.concat(chunks).toString("utf-8");
+    return new Promise((resolve) => {
+        let settled = false;
+        const onData = (chunk) => {
+            chunks.push(chunk);
+        };
+        const finish = () => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            stdin.off("data", onData);
+            stdin.off("end", finish);
+            stdin.off("error", finish);
+            // Release the handle explicitly. Attaching a 'data' listener puts stdin
+            // in flowing mode, which keeps the event loop alive; if the writer never
+            // closes the pipe, resolving alone would leave the process running until
+            // something killed it — the exact hang this bound exists to prevent.
+            stdin.pause();
+            stdin.unref?.();
+            resolve(Buffer.concat(chunks).toString("utf-8"));
+        };
+        // Deliberately NOT unref'd: this timer is the guarantee that finish() runs.
+        const timer = setTimeout(finish, timeoutMs);
+        stdin.on("data", onData);
+        stdin.on("end", finish);
+        // A broken/closed stdin is "no payload", not a crash.
+        stdin.on("error", finish);
+    });
 }
 function output(result) {
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");

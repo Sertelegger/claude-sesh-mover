@@ -142,6 +142,7 @@ export interface SeshMoverConfig {
         path: string;
         noWorkspace: boolean;
         autoPush: boolean;
+        startupNotice: boolean;
         pullAppend: boolean;
         onDivergence: OnDivergenceMode;
     };

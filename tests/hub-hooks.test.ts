@@ -9,10 +9,12 @@ import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
 
 // The hook endpoints are the ONE sanctioned exception to the "every command
-// prints exactly one JSON result" contract: `hub hook-session-end` prints
+// prints exactly one JSON result" contract. `hub hook-session-end` prints
 // nothing to stdout on every path and always exits 0, because a broken hub
-// must never surface as a hook error when a user's session ends. Every CLI
-// test below asserts that pair (stdout === "", status === 0) explicitly.
+// must never surface as a hook error when a user's session ends;
+// `hub hook-session-start` prints nothing OR exactly one Claude Code hook-JSON
+// object, and also always exits 0. Every CLI test below asserts the relevant
+// pair (stdout, status === 0) explicitly.
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
@@ -33,6 +35,16 @@ function writeSeshMoverConfig(dir: string, hub: Record<string, unknown>): void {
   const configDir = join(dir, ".claude-sesh-mover");
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, "config.json"), JSON.stringify({ hub }, null, 2) + "\n");
+}
+
+/** Pin the machine identity a spawned CLI will read out of `$HOME`. */
+function writeMachineId(home: string, id: string, name: string): void {
+  const dir = join(home, ".claude-sesh-mover");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "machine-id.json"),
+    JSON.stringify({ id, name, createdAt: "2026-07-21T00:00:00Z" }, null, 2) + "\n"
+  );
 }
 
 function linkProject(projectPath: string, projectId = "11111111-1111-4111-8111-111111111111"): void {
@@ -354,4 +366,322 @@ describe("hub hook-session-end (CLI)", () => {
     expect(r.stderr.trim()).not.toBe("");
     expect(r.stderr).toMatch(/sesh-mover auto-push/);
   });
+
+  it("exits 0 without waiting forever when stdin is never closed", async () => {
+    // Claude Code itself always does `stdin.write(payload); stdin.end()` (both
+    // its sync and its async hook paths do), so in the real integration stdin
+    // closes immediately. This test pins the OTHER caller: anything that opens
+    // the pipe and doesn't close it — a wrapper script, a shell redirect from
+    // a long-lived process, an operator experimenting. Reading stdin happens
+    // BEFORE the gate, so without a bound this hangs even on a machine with no
+    // hub configured at all, and SessionEnd hooks only get a 1.5s budget
+    // before Claude Code force-exits the session.
+    const started = Date.now();
+    const child = spawn("node", [cliPath(), "hub", "hook-session-end"], {
+      env: { ...process.env, ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf-8");
+    child.stdout.on("data", (d: string) => {
+      stdout += d;
+    });
+    child.stderr.resume();
+    // Deliberately never write to and never end child.stdin.
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    expect(stdout).toBe("");
+    expect(code).toBe(0);
+    expect(Date.now() - started).toBeLessThan(15000);
+  }, 25000);
+});
+
+describe("hub hook-session-start (CLI)", () => {
+  const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
+  const ME = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const OTHER = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+  let tempDir: string;
+  let home: string;
+  let base: string;
+  let hubDir: string;
+  let configDir: string;
+  let project: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "sesh-hook-start-"));
+    home = join(tempDir, "home");
+    base = join(tempDir, "base");
+    hubDir = join(tempDir, "hub");
+    for (const d of [home, base, hubDir]) mkdirSync(d, { recursive: true });
+    const fixture = createFixtureTree(base);
+    configDir = fixture.configDir;
+    project = createRealProject(base, configDir, "proj");
+    // Pin this machine's identity so the child CLI resolves a known id rather
+    // than minting a random one — "is the latest copy mine?" is the whole
+    // question this endpoint answers.
+    writeMachineId(home, ME, "my-laptop");
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function runHook(input: string) {
+    return runCli(["hub", "hook-session-start"], {
+      env: { ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
+      input,
+    });
+  }
+
+  /** A hub index file for `machineId` holding exactly one thread. */
+  function writeIndex(
+    machineId: string,
+    threadId: string,
+    over: Partial<{
+      localSessionId: string;
+      slug: string;
+      summary: string;
+      headEntryUuid: string;
+      lastActiveAt: string;
+      messageCount: number;
+    }> = {}
+  ): void {
+    const dir = join(hubDir, "projects", PROJECT_ID, "index");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${machineId}.json`),
+      JSON.stringify(
+        {
+          schemaVersion: 1,
+          agent: "claude-code",
+          projectId: PROJECT_ID,
+          machineId,
+          updatedAt: "2026-07-21T00:00:00Z",
+          projectPath: project,
+          threads: {
+            [threadId]: {
+              localSessionId: "s-local",
+              slug: "hub-slice-two",
+              summary: "Hub slice two work",
+              headEntryUuid: "h1",
+              messageCount: 4,
+              lastActiveAt: "2026-07-21T00:00:00Z",
+              bundles: [],
+              ...over,
+            },
+          },
+        },
+        null,
+        2
+      ) + "\n"
+    );
+  }
+
+  function writeHubMachine(id: string, name: string): void {
+    const dir = join(hubDir, "machines");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${id}.json`),
+      JSON.stringify({ id, name, platform: "linux", lastSeenAt: "2026-07-21T00:00:00Z" }, null, 2) +
+        "\n"
+    );
+  }
+
+  it("exits 0 and prints NOTHING when no hub is configured", () => {
+    const r = runHook(JSON.stringify({ cwd: project, session_id: "s", source: "startup" }));
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("");
+    expect(r.status).toBe(0);
+  });
+
+  it("exits 0 and prints NOTHING when the payload is malformed or empty", () => {
+    for (const input of ["not json at all {{{", "", "null"]) {
+      const r = runHook(input);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toBe("");
+      expect(r.status).toBe(0);
+    }
+  });
+
+  it("exits 0 and prints NOTHING when the project isn't linked", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("");
+    expect(r.status).toBe(0);
+  });
+
+  it("exits 0 and prints NOTHING when hub.startupNotice is turned off", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project, PROJECT_ID);
+    writeHubMachine(ME, "my-laptop");
+    writeHubMachine(OTHER, "office-desktop");
+    // Arrangement that WOULD produce a notice, so the only thing suppressing
+    // it here is the opt-out itself.
+    writeIndex(OTHER, "t-shared", { lastActiveAt: "2026-07-21T09:00:00Z" });
+
+    writeSeshMoverConfig(project, { startupNotice: false });
+    const projectScope = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(projectScope.stdout).toBe("");
+    expect(projectScope.status).toBe(0);
+
+    rmSync(join(project, ".claude-sesh-mover", "config.json"));
+    writeSeshMoverConfig(home, { path: hubDir, startupNotice: false });
+    const userScope = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(userScope.stdout).toBe("");
+    expect(userScope.status).toBe(0);
+  });
+
+  it("exits 0 and prints NOTHING when nothing is newer elsewhere", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project, PROJECT_ID);
+    writeHubMachine(ME, "my-laptop");
+    // Only this machine has pushed: the latest copy of the only thread is
+    // already the local one, so there is nothing to announce.
+    writeIndex(ME, "t-mine");
+
+    const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("");
+    expect(r.status).toBe(0);
+  });
+
+  it("exits 0 and prints NOTHING when the other machine's copy is the one we already have", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project, PROJECT_ID);
+    writeHubMachine(ME, "my-laptop");
+    writeHubMachine(OTHER, "office-desktop");
+    // Same headEntryUuid on both copies: the remote is nominally "latest" by
+    // timestamp, but we are not behind it, so a notice would be a lie.
+    writeIndex(ME, "t-shared", { headEntryUuid: "same", lastActiveAt: "2026-07-20T00:00:00Z" });
+    writeIndex(OTHER, "t-shared", {
+      headEntryUuid: "same",
+      lastActiveAt: "2026-07-21T00:00:00Z",
+      localSessionId: "s-remote",
+    });
+
+    const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(r.stdout).toBe("");
+    expect(r.status).toBe(0);
+  });
+
+  it("emits hook JSON naming the thread and machine when a newer copy exists elsewhere", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project, PROJECT_ID);
+    writeHubMachine(ME, "my-laptop");
+    writeHubMachine(OTHER, "office-desktop");
+    writeIndex(ME, "t-mine", { slug: "local-only", lastActiveAt: "2026-07-01T00:00:00Z" });
+    writeIndex(OTHER, "t-shared", {
+      slug: "hub-slice-two",
+      localSessionId: "s-remote",
+      headEntryUuid: "h-remote",
+      lastActiveAt: new Date(Date.now() - 90 * 60_000).toISOString(),
+    });
+
+    const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(r.status).toBe(0);
+
+    // Exactly ONE hook-JSON object, in the shape Claude Code's SessionStart
+    // hook output schema accepts (verified against the installed build's own
+    // zod schema, not from memory):
+    //   {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"…"}}
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe("SessionStart");
+    const context: string = parsed.hookSpecificOutput.additionalContext;
+    expect(typeof context).toBe("string");
+    // Names the thread and the machine that holds the newer copy — a notice
+    // that says only "something is newer" is not actionable.
+    expect(context).toContain("hub-slice-two");
+    expect(context).toContain("office-desktop");
+    // Points at the command that resolves it.
+    expect(context).toMatch(/pull/i);
+    // The thread this machine already owns is not stale, so it is not named.
+    expect(context).not.toContain("local-only");
+  });
+
+  it("names the most recent stale thread and counts the rest", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project, PROJECT_ID);
+    writeHubMachine(ME, "my-laptop");
+    writeHubMachine(OTHER, "office-desktop");
+    const dir = join(hubDir, "projects", PROJECT_ID, "index");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${OTHER}.json`),
+      JSON.stringify({
+        schemaVersion: 1,
+        agent: "claude-code",
+        projectId: PROJECT_ID,
+        machineId: OTHER,
+        updatedAt: "2026-07-21T00:00:00Z",
+        projectPath: project,
+        threads: {
+          // Insertion order deliberately puts the OLDER thread first, so a
+          // naive stale[0] would name the wrong one.
+          "t-old": {
+            localSessionId: "s1", slug: "older-thread", summary: "old",
+            headEntryUuid: "h1", messageCount: 2,
+            lastActiveAt: "2026-01-01T00:00:00Z", bundles: [],
+          },
+          "t-new": {
+            localSessionId: "s2", slug: "newest-thread", summary: "new",
+            headEntryUuid: "h2", messageCount: 9,
+            lastActiveAt: new Date(Date.now() - 5 * 60_000).toISOString(), bundles: [],
+          },
+        },
+      }, null, 2) + "\n"
+    );
+
+    const r = runHook(JSON.stringify({ cwd: project, source: "resume" }));
+    expect(r.status).toBe(0);
+    const context: string = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    expect(context).toContain("newest-thread");
+    expect(context).not.toContain("older-thread");
+    expect(context).toContain("1 more");
+  });
+
+  it("prints NOTHING and exits 0 when the hub directory is unreadable", () => {
+    const notADir = join(tempDir, "hub-is-a-file");
+    writeFileSync(notADir, "this is a file, not a hub directory\n");
+    writeSeshMoverConfig(home, { path: notADir });
+    linkProject(project, PROJECT_ID);
+
+    const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    // A hub problem must degrade to silence at session start, never to a
+    // half-written object on stdout that Claude Code would fail to parse.
+    expect(r.stdout).toBe("");
+    expect(r.status).toBe(0);
+  });
+
+  it("prints NOTHING and exits 0 when an index file on the hub is corrupt", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project, PROJECT_ID);
+    writeHubMachine(ME, "my-laptop");
+    const dir = join(hubDir, "projects", PROJECT_ID, "index");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${OTHER}.json`), "{ torn");
+
+    const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(r.stdout).toBe("");
+    expect(r.status).toBe(0);
+  });
+
+  it("exits 0 without waiting forever when stdin is never closed", async () => {
+    const started = Date.now();
+    const child = spawn("node", [cliPath(), "hub", "hook-session-start"], {
+      env: { ...process.env, ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf-8");
+    child.stdout.on("data", (d: string) => {
+      stdout += d;
+    });
+    child.stderr.resume();
+    // Deliberately never write to and never end child.stdin.
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    expect(stdout).toBe("");
+    expect(code).toBe(0);
+    expect(Date.now() - started).toBeLessThan(15000);
+  }, 25000);
 });

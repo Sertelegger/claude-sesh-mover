@@ -602,6 +602,24 @@ describe("cli", () => {
       }
     });
 
+    it("sets hub.startupNotice via --set and persists it", () => {
+      // End-to-end guard for the SessionStart notice opt-out. setConfigValue
+      // only accepts dot-paths that already exist in getDefaultConfig(), so
+      // before hub.startupNotice was added to the defaults this exact command
+      // failed with "Invalid config path" — the flag the hook gates on was
+      // documented but unsettable through the supported interface.
+      const homeOverride = overrideHome(tempDir);
+      try {
+        const output = runCli(`configure --scope user --set hub.startupNotice=false --json`);
+        const result = JSON.parse(output);
+        expect(result.success).toBe(true);
+        const shown = JSON.parse(runCli("configure --show --json"));
+        expect(shown.config.hub.startupNotice).toBe(false);
+      } finally {
+        homeOverride.restore();
+      }
+    });
+
     it("returns clean ErrorResult JSON for malformed --set JSON values", () => {
       let caught: { stdout: string; status: number } | null = null;
       try {

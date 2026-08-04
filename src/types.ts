@@ -185,6 +185,10 @@ export interface SeshMoverConfig {
     // Defaults true, but inert until a hub is configured AND the project is
     // linked — linking is the consent gate (see src/hub/hooks.ts).
     autoPush: boolean;
+    // Announce, from the Claude Code SessionStart hook, that a newer copy of
+    // one of this project's threads lives on another machine. Same consent
+    // model as autoPush: default true, inert until hub + link.
+    startupNotice: boolean;
     // Splice a pulled continuation onto the local session it continues,
     // instead of importing it as a standalone fragment. Set false (or pass
     // --no-append) to keep the Slice-1 fragment behavior.

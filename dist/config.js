@@ -19,6 +19,10 @@ export function getDefaultConfig() {
             path: "",
             noWorkspace: false,
             autoPush: true,
+            // Must be present here, not just in the type: setConfigValue only
+            // accepts dot-paths that already exist in the defaults, so an absent key
+            // makes `configure --set hub.startupNotice=false` fail outright.
+            startupNotice: true,
             pullAppend: true,
             onDivergence: "fragment",
         },

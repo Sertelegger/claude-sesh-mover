@@ -121,15 +121,19 @@ describe("config", () => {
       const { getDefaultConfig, setConfigValue } = await import("../src/config.js");
       const cfg = getDefaultConfig();
       expect(cfg.hub).toEqual({
-        path: "", noWorkspace: false, autoPush: true, pullAppend: true,
-        onDivergence: "fragment",
+        path: "", noWorkspace: false, autoPush: true, startupNotice: true,
+        pullAppend: true, onDivergence: "fragment",
       });
       const updated = setConfigValue(cfg, "hub.path", "/mnt/share/hub");
       expect(updated.hub.path).toBe("/mnt/share/hub");
       // setConfigValue only accepts keys that already exist in the defaults,
-      // so this is also the guard that hub.autoPush/hub.pullAppend/
-      // hub.onDivergence are settable at all.
+      // so this is also the guard that hub.autoPush/hub.startupNotice/
+      // hub.pullAppend/hub.onDivergence are settable at all. Before
+      // hub.startupNotice was added here, `configure --set
+      // hub.startupNotice=false` threw "Invalid config path" — the flag the
+      // SessionStart hook gates on was documented but unsettable.
       expect(setConfigValue(cfg, "hub.autoPush", false).hub.autoPush).toBe(false);
+      expect(setConfigValue(cfg, "hub.startupNotice", false).hub.startupNotice).toBe(false);
       expect(setConfigValue(cfg, "hub.pullAppend", false).hub.pullAppend).toBe(false);
       expect(setConfigValue(cfg, "hub.onDivergence", "adopt-hub").hub.onDivergence).toBe(
         "adopt-hub"
