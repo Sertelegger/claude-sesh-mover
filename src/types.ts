@@ -181,6 +181,10 @@ export interface SeshMoverConfig {
   hub: {
     path: string; // "" = not configured
     noWorkspace: boolean;
+    // Push this project to the hub from the Claude Code SessionEnd hook.
+    // Defaults true, but inert until a hub is configured AND the project is
+    // linked — linking is the consent gate (see src/hub/hooks.ts).
+    autoPush: boolean;
     // Splice a pulled continuation onto the local session it continues,
     // instead of importing it as a standalone fragment. Set false (or pass
     // --no-append) to keep the Slice-1 fragment behavior.

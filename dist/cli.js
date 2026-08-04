@@ -17,6 +17,7 @@ import { createArchive, extractArchive, detectArchiveFormat, isZstdAvailable, re
 import { discoverSessionById } from "./discovery.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
+import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
 const program = new Command();
 program
     .name("sesh-mover")
@@ -560,6 +561,49 @@ hub
         outputError("hub-reindex", e);
     }
 });
+hub
+    .command("hook-session-end")
+    .description("Internal: Claude Code SessionEnd hook — auto-push this project to the hub")
+    .action(async () => {
+    // ---------------------------------------------------------------------
+    // STDOUT CONTRACT EXCEPTION — deliberate, do not "fix".
+    //
+    // Every other sesh-mover command emits exactly one JSON result object on
+    // stdout and exits non-zero on failure. The hook endpoints speak Claude
+    // Code's HOOK protocol instead: this one writes NOTHING to stdout, ever,
+    // and ALWAYS exits 0. A broken/unreachable hub must never surface as a
+    // hook error when a user's session ends. Diagnostics go to stderr only.
+    // ---------------------------------------------------------------------
+    try {
+        const payload = readHookPayload(await readStdin());
+        const gate = evaluateHookGate(payload, "autoPush");
+        if (!gate.ok)
+            return; // no hub / unlinked / disabled / no cwd — silent no-op
+        const projectPath = gate.projectPath;
+        const configDir = resolveConfigDir();
+        // Re-read the effective config for this project so the automatic push
+        // honors the same hub.noWorkspace opt-out the manual `push` does — an
+        // automated push must not snapshot a workspace the user opted out of.
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { hubPush } = await import("./hub/push.js");
+        const result = await hubPush({
+            configDir,
+            projectPath,
+            hubPath: gate.hubPath,
+            noWorkspace: config.hub.noWorkspace,
+            claudeVersion: getClaudeVersion(),
+        });
+        // lock-busy is an expected outcome, not a failure: another sesh-mover
+        // hub operation for this project is already running, so this push is
+        // redundant by definition. Everything else is worth a stderr line.
+        if (!result.success && !("reason" in result && result.reason === "lock-busy")) {
+            process.stderr.write(`sesh-mover auto-push: ${JSON.stringify(result)}\n`);
+        }
+    }
+    catch (e) {
+        process.stderr.write(`sesh-mover auto-push failed: ${e.message}\n`);
+    }
+});
 // --- Push ---
 program
     .command("push")
@@ -878,6 +922,17 @@ function getClaudeVersion() {
     catch {
         return "unknown";
     }
+}
+// Reads a hook payload from stdin. Returns "" immediately on a TTY, so an
+// operator who runs a hook endpoint by hand gets the same silent no-op as an
+// empty payload instead of a process that appears to hang.
+async function readStdin() {
+    if (process.stdin.isTTY)
+        return "";
+    const chunks = [];
+    for await (const chunk of process.stdin)
+        chunks.push(chunk);
+    return Buffer.concat(chunks).toString("utf-8");
 }
 function output(result) {
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");

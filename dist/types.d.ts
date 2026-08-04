@@ -141,6 +141,7 @@ export interface SeshMoverConfig {
     hub: {
         path: string;
         noWorkspace: boolean;
+        autoPush: boolean;
         pullAppend: boolean;
         onDivergence: OnDivergenceMode;
     };

@@ -18,6 +18,7 @@ export function getDefaultConfig() {
         hub: {
             path: "",
             noWorkspace: false,
+            autoPush: true,
             pullAppend: true,
             onDivergence: "fragment",
         },

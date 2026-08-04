@@ -20,6 +20,7 @@ export function getDefaultConfig(): SeshMoverConfig {
     hub: {
       path: "",
       noWorkspace: false,
+      autoPush: true,
       pullAppend: true,
       onDivergence: "fragment",
     },

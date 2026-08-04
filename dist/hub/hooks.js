@@ -1,0 +1,45 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { computeEffectiveConfig } from "../config.js";
+import { resolveHubPath } from "./init.js";
+import { readLocalProjectId } from "./identity.js";
+// Hook payloads arrive on stdin as JSON. A malformed payload must never crash
+// the hook — the endpoints exit 0 no matter what, so parsing failures degrade
+// to "no context" and the gate declines. The shape check is load-bearing:
+// JSON.parse("null") succeeds and `typeof null === "object"`, and
+// JSON.parse("42") yields a number — either would flow on as a "payload".
+export function readHookPayload(stdin) {
+    try {
+        const parsed = JSON.parse(stdin);
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+            ? parsed
+            : {};
+    }
+    catch {
+        return {};
+    }
+}
+// Cheapest checks first: this runs on every session start/end, so it must cost
+// approximately nothing when the hub isn't in use. Order is
+// cwd -> hub configured -> project linked -> flag enabled, and every decline
+// is a silent no-op for the caller (no stdout, no non-zero exit).
+export function evaluateHookGate(payload, key) {
+    const projectPath = payload.cwd;
+    if (!projectPath)
+        return { ok: false, reason: "no-cwd" };
+    // Same call shape hub/status.ts uses: computeEffectiveConfig reads the raw
+    // override files itself, so an absent layer contributes nothing.
+    const config = computeEffectiveConfig(join(homedir(), ".claude-sesh-mover"), join(projectPath, ".claude-sesh-mover"));
+    const hubPath = resolveHubPath(config);
+    if (!hubPath)
+        return { ok: false, reason: "no-hub" };
+    if (!readLocalProjectId(projectPath))
+        return { ok: false, reason: "unlinked" };
+    // Indexed rather than dotted so a key not yet present in SeshMoverConfig
+    // (see HookGateKey) still type-checks and reads as "not explicitly false".
+    const flags = config.hub;
+    if (flags[key] === false)
+        return { ok: false, reason: "disabled" };
+    return { ok: true, hubPath, projectPath };
+}
+//# sourceMappingURL=hooks.js.map

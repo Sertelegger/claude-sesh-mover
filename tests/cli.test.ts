@@ -17,6 +17,7 @@ import * as tar from "tar";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { overrideHome, homeEnv, prependPath, tmpEnv } from "./helpers/env.js";
+import { runCli as sharedRunCli, type RunCliResult } from "./helpers/run-cli.js";
 
 const isWindows = platform() === "win32";
 
@@ -36,33 +37,22 @@ describe("cli", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  // String form (existing call sites): shells out via execSync, returns stdout
-  // only — unchanged behavior. Array form (new): uses spawnSync without a
-  // shell so stdout/stderr are captured separately, for tests that need to
-  // assert on stderr (e.g. --progress NDJSON) without polluting the test
-  // runner's own stderr.
+  // Thin wrapper over the shared helper that pins this suite's fixture config
+  // dir (still overridable per call). String form returns stdout and throws on
+  // a non-zero exit; array form returns { stdout, stderr, status }.
   function runCli(args: string, envOverrides?: Record<string, string>): string;
   function runCli(
     args: string[],
     envOverrides?: Record<string, string>
-  ): { stdout: string; stderr: string };
+  ): RunCliResult;
   function runCli(
     args: string | string[],
     envOverrides?: Record<string, string>
-  ): string | { stdout: string; stderr: string } {
-    const cliPath = join(import.meta.dirname, "..", "dist", "cli.js");
-    const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...envOverrides };
-    if (Array.isArray(args)) {
-      const result = spawnSync("node", [cliPath, ...args], {
-        encoding: "utf-8",
-        env,
-      });
-      return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
-    }
-    return execSync(`node "${cliPath}" ${args}`, {
-      encoding: "utf-8",
-      env,
-    });
+  ): string | RunCliResult {
+    const env = { CLAUDE_CONFIG_DIR: configDir, ...envOverrides };
+    return Array.isArray(args)
+      ? sharedRunCli(args, { env })
+      : sharedRunCli(args, { env });
   }
 
   describe("export command", () => {
