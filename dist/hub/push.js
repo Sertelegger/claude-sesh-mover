@@ -11,6 +11,7 @@ import { resolveProjectIdentity, createHubProject, linkToHubProject, localGitRem
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
 import { snapshotWorkspace, hubincludePath, isNeverIncludable } from "./workspace.js";
+import { captureCarry } from "./carry.js";
 import { exportAllSessions } from "../exporter.js";
 import { createArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
@@ -178,30 +179,81 @@ export async function hubPush(opts) {
             if (ws.symlinksSkipped > 0)
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
             // Rule-level diagnostics (a hubinclude past a cap, an exclude set that
-            // swallowed the whole tree). Every one of them fails CLOSED — fewer files
-            // — which is invisible from the outside without this.
+            // swallowed the whole tree, a payload over the snapshot budget). Every
+            // one of them fails CLOSED — fewer files — which is invisible from the
+            // outside without this.
             warnings.push(...ws.warnings);
-            const manifestPath = join(bundleStaging, "manifest.json");
-            const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
-            // Declare what this snapshot descends from — read BEFORE the new
-            // generation is recorded below. A puller intersects this id with its own
-            // generation history, and only a hit makes a 3-way merge legal: it is the
-            // proof that a generation was held by both trees, which neither side can
-            // establish alone (see the field's doc in types.ts). `file` and
-            // `pushedAt` ride along as diagnostics only — the puller resolves the
-            // generation through its OWN record, so nothing here becomes a path or a
-            // comparison on the other machine.
-            const basedOnRef = readSyncState(opts.projectPath).hub?.lastWorkspace;
-            m.workspace = {
-                fileCount: ws.fileCount,
-                byteSize: ws.byteSize,
-                snapshotAt: new Date().toISOString(),
-                basedOn: basedOnRef
-                    ? { bundleId: basedOnRef.bundleId, file: basedOnRef.file, pushedAt: basedOnRef.pushedAt }
-                    : null,
-            };
-            writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
-            hasWorkspace = true;
+            // `skipped` = over the snapshot budget, nothing copied. The sessions
+            // still push; there is simply no payload to declare and — critically —
+            // no generation to record. Recording an un-applied generation is the one
+            // way this feature loses data quietly: the next merge would read the
+            // whole un-sent tree as "deleted here".
+            if (!ws.skipped) {
+                const manifestPath = join(bundleStaging, "manifest.json");
+                const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+                // Declare what this snapshot descends from — read BEFORE the new
+                // generation is recorded below. A puller intersects this id with its own
+                // generation history, and only a hit makes a 3-way merge legal: it is the
+                // proof that a generation was held by both trees, which neither side can
+                // establish alone (see the field's doc in types.ts). `file` and
+                // `pushedAt` ride along as diagnostics only — the puller resolves the
+                // generation through its OWN record, so nothing here becomes a path or a
+                // comparison on the other machine.
+                const basedOnRef = readSyncState(opts.projectPath).hub?.lastWorkspace;
+                m.workspace = {
+                    fileCount: ws.fileCount,
+                    byteSize: ws.byteSize,
+                    snapshotAt: new Date().toISOString(),
+                    basedOn: basedOnRef
+                        ? { bundleId: basedOnRef.bundleId, file: basedOnRef.file, pushedAt: basedOnRef.pushedAt }
+                        : null,
+                };
+                writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+                hasWorkspace = true;
+            }
+        }
+        // Git-diff carry — the complement of the workspace snapshot: a project WITH
+        // a remote reconstructs its committed state from git, so only the
+        // uncommitted part has to travel (design §6.1). This is also what finally
+        // gives `hubinclude` an effect on a git project: until this block existed
+        // its only reader was `snapshotWorkspace`, which runs exactly when there
+        // are NO remotes, so the discovery aid below offered a file that could not
+        // do anything for the project being offered it.
+        let carryMeta;
+        if (!opts.noCarry && gitRemotes().length > 0 && existsSync(opts.projectPath)) {
+            const diagnostics = [];
+            // Contained deliberately, unlike the workspace snapshot above: this
+            // branch runs `git` against a real user repository whose state is
+            // unbounded (mid-rebase, submodules, 200k untracked files, a filesystem
+            // that refuses a read), and no failure of the OPTIONAL half of a push may
+            // cost the user the session bundle that is the point of the operation.
+            const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), { diagnostics })
+                .catch((e) => ({ captured: false, reason: "git-failed", detail: e.message }));
+            warnings.push(...diagnostics);
+            if (cap.captured) {
+                carryMeta = cap.meta;
+                const manifestPath = join(bundleStaging, "manifest.json");
+                const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+                m.carry = cap.meta;
+                writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+                if (cap.meta.reIncludedCount > 0) {
+                    // Say what left the machine. `.gitignore` is where `.env` lives, and
+                    // `ignoredNotCarried` exists so this choice is informed — reporting
+                    // the opt-in as a silent success would undercut it.
+                    const shown = cap.meta.reIncluded.join(", ");
+                    const more = cap.meta.reIncludedCount - cap.meta.reIncluded.length;
+                    warnings.push(`Carried ${cap.meta.reIncludedCount} gitignored file(s) because .claude-sesh-mover/hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`);
+                }
+                if (cap.meta.inProgress) {
+                    warnings.push(`Uncommitted changes were captured during an in-progress ${cap.meta.inProgress}: the patch records the working tree as it stands, conflict markers included, and the ${cap.meta.inProgress} itself does not travel.`);
+                }
+            }
+            else if (cap.reason !== "clean" && cap.reason !== "not-git") {
+                // "clean" is the ordinary case and "not-git" cannot happen here (this
+                // branch already established a git remote), so everything else is a
+                // capture the user expected and did not get.
+                warnings.push(`Uncommitted changes were not carried: ${cap.detail ?? cap.reason}. They will be picked up by the next push that has new session content.`);
+            }
         }
         // Archive + stream into hub
         const pushedAt = new Date().toISOString();
@@ -287,6 +339,7 @@ export async function hubPush(opts) {
             success: true, command: "push", projectId: local.projectId,
             bundleId, pushedSessions, upToDate: false, hasWorkspace, warnings,
             ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
+            ...(carryMeta ? { carry: carryMeta } : {}),
         };
     }
     finally {

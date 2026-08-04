@@ -5,6 +5,12 @@ export interface HubPushOptions {
     hubPath: string;
     sessionIds?: string[];
     noWorkspace?: boolean;
+    /**
+     * Skip the git-diff carry (design §6.1). Off by default: for a project with
+     * a git remote the carry is the only thing that moves work-in-progress, and
+     * it never touches a gitignored file unless `hubinclude` names it.
+     */
+    noCarry?: boolean;
     projectIdOverride?: string;
     createProject?: boolean;
     claudeVersion: string;

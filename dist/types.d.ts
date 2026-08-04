@@ -1,4 +1,5 @@
 import type { WorkspaceMergeReport } from "./hub/merge.js";
+import type { CarryMeta } from "./hub/carry.js";
 export type Platform = "darwin" | "linux" | "wsl1" | "wsl2" | "win32";
 export type JsonlEntryType = "user" | "assistant" | "file-history-snapshot" | "system" | "progress";
 export interface JsonlEntryBase {
@@ -150,6 +151,14 @@ export interface ExportManifest {
             pushedAt?: string;
         } | null;
     };
+    /**
+     * Uncommitted work captured beside the sessions (design §6.1), for a project
+     * with a git remote. Absent when the tree was clean, when the payload was
+     * over budget, or when carry was off — and absent on every bundle written
+     * before this field existed, which is why the apply side must treat it as
+     * optional rather than as a promise the `carry/` directory is well-formed.
+     */
+    carry?: CarryMeta;
 }
 export interface SeshMoverConfig {
     export: {
@@ -172,6 +181,7 @@ export interface SeshMoverConfig {
         startupNotice: boolean;
         pullAppend: boolean;
         onDivergence: OnDivergenceMode;
+        carryDiff: boolean;
     };
 }
 /**
@@ -330,6 +340,13 @@ export interface HubPushResult {
      * spelling would carry more than the user pointed at.
      */
     ignoredNotCarried?: string[];
+    /**
+     * The uncommitted work this push carried (design §6.1), or absent when it
+     * carried none. `reIncluded` names the gitignored paths that travelled only
+     * because `hubinclude` lists them — the security-relevant subset, also
+     * surfaced as a warning.
+     */
+    carry?: CarryMeta;
 }
 export interface WhereisThread {
     threadId: string;

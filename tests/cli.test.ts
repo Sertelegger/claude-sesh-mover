@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execSync, spawnSync } from "node:child_process";
+import { execSync, execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   rmSync,
   mkdirSync,
   existsSync,
   writeFileSync,
+  appendFileSync,
   readFileSync,
   readdirSync,
   chmodSync,
@@ -919,6 +920,77 @@ describe("cli", () => {
         expect(again.success).toBe(true);
         expect(again.upToDate).toBe(true);
         expect(again.bundleId).toBeNull();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+
+    it("carry travels by default, and hub.carryDiff=false turns it off without a flag", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-carry-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-carry-hub-"));
+      // The project is its OWN directory here, not tempDir: the fixture config
+      // dir lives under tempDir, and a repo rooted there would carry the whole
+      // fixture as untracked files.
+      const projectPath = join(tempDir, "carryproj");
+      mkdirSync(projectPath, { recursive: true });
+      const realEncoded = encodeProjectPath(projectPath);
+      const sessionPath = join(configDir, "projects", realEncoded, `${sessionId}.jsonl`);
+      try {
+        runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", realEncoded),
+          { recursive: true }
+        );
+        const g = (args: string[]): void => {
+          execFileSync("git", args, { cwd: projectPath, stdio: "ignore" });
+        };
+        g(["init", "-q"]);
+        g(["config", "user.email", "t@example.com"]);
+        g(["config", "user.name", "Test"]);
+        g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v1\n");
+        g(["add", "-A"]);
+        g(["commit", "-q", "-m", "init"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v2 uncommitted\n");
+
+        const first = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(first.success).toBe(true);
+        expect(first.carry.baseCommit).toMatch(/^[0-9a-f]{40}$/);
+
+        // Second push, carry disabled in config only — the SessionEnd hook takes
+        // no flags, so config is the ONLY way to opt out of uploading
+        // uncommitted work and it has to be honored at the CLI boundary.
+        const homeOverride = overrideHome(home);
+        try {
+          runCli(`configure --scope user --set hub.carryDiff=false --json`, homeEnv(home));
+        } finally {
+          homeOverride.restore();
+        }
+        writeFileSync(join(projectPath, "tracked.txt"), "v3 uncommitted\n");
+        appendFileSync(
+          sessionPath,
+          JSON.stringify({
+            type: "user", uuid: "carry-cfg-1", parentUuid: null, timestamp: new Date().toISOString(),
+            cwd: projectPath, sessionId, version: "2.1.81",
+            message: { role: "user", content: "more" },
+          }) + "\n"
+        );
+        const second = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(second.success).toBe(true);
+        expect(second.upToDate).toBe(false); // a real bundle, just no carry in it
+        expect(second.carry).toBeUndefined();
       } finally {
         rmSync(home, { recursive: true, force: true });
         rmSync(hubDir, { recursive: true, force: true });

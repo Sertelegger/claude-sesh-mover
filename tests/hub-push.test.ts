@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, cpSync, existsSync } from "node:fs";
+import {
+  mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, cpSync, existsSync, truncateSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +14,8 @@ import { createFsBackend } from "../src/hub/backend.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { extractArchive } from "../src/archiver.js";
+import { readSyncState } from "../src/sync-state.js";
+import { WORKSPACE_MAX_BYTES } from "../src/hub/workspace.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
@@ -255,6 +259,164 @@ describe("hub push", () => {
   });
 });
 
+describe("hub push — git-diff carry", () => {
+  function gitCommit(cwd: string, args: string[]): void {
+    execFileSync("git", args, { cwd, stdio: "ignore" });
+  }
+
+  /** A real git project with a remote, one commit, and the fixture's sessions. */
+  function makeCommittedGitProject(base: string, configDir: string): string {
+    const projectPath = createRealProject(base, configDir);
+    gitCommit(projectPath, ["init", "-q"]);
+    gitCommit(projectPath, ["config", "user.email", "t@example.com"]);
+    gitCommit(projectPath, ["config", "user.name", "Test"]);
+    gitCommit(projectPath, ["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+    gitCommit(projectPath, ["add", "-A"]);
+    gitCommit(projectPath, ["commit", "-q", "-m", "init"]);
+    return projectPath;
+  }
+
+  async function pushAndExtract(
+    prepare: (projectPath: string) => void,
+    pushOverrides: Partial<Parameters<typeof hubPush>[0]> = {}
+  ): Promise<{ result: Awaited<ReturnType<typeof hubPush>>; extractDir: string; cleanup: () => void }> {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    const cleanup = (): void => {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    };
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = makeCommittedGitProject(base, configDir);
+      prepare(projectPath);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      const result = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true,
+        claudeVersion: "2.1.81", ...pushOverrides,
+      });
+      const extractDir = join(base, "extracted");
+      if (result.success && "bundleId" in result && result.bundleId) {
+        const backend = createFsBackend(hub);
+        const { indexes } = await readAllIndexes(backend, result.projectId);
+        const bundleFile = Object.values(indexes[0].threads)[0].bundles[0].file;
+        const archiveTmp = join(base, "bundle.tar.gz");
+        writeFileSync(archiveTmp, await backend.read(bundleFile));
+        mkdirSync(extractDir, { recursive: true });
+        await extractArchive(archiveTmp, extractDir);
+      }
+      return { result, extractDir, cleanup };
+    } catch (e) {
+      cleanup();
+      throw e;
+    }
+  }
+
+  it("a dirty git project's bundle carries the patch, and the manifest records the base commit", async () => {
+    const { result, extractDir, cleanup } = await pushAndExtract((p) => {
+      writeFileSync(join(p, "README.md"), "edited, uncommitted\n");
+      writeFileSync(join(p, "scratch.txt"), "new work\n");
+      // Names that survive git only because of `-z`; they then have to survive
+      // the tar round trip too, which is where the payload actually travels.
+      writeFileSync(join(p, "café note.txt"), "unicode\n");
+    });
+    try {
+      expect(result.success).toBe(true);
+      if (!result.success || !("carry" in result) || !result.carry) throw new Error("no carry");
+      expect(result.hasWorkspace).toBe(false); // git remote: carry, not snapshot
+      const manifest = JSON.parse(readFileSync(join(extractDir, "manifest.json"), "utf-8"));
+      expect(manifest.carry.baseCommit).toBe(result.carry.baseCommit);
+      expect(manifest.carry.baseCommit).toMatch(/^[0-9a-f]{40}$/);
+      expect(readFileSync(join(extractDir, "carry", "changes.patch"), "utf-8")).toContain("README.md");
+      expect(readFileSync(join(extractDir, "carry", "untracked", "scratch.txt"), "utf-8")).toBe("new work\n");
+      // Every hub-linked project has an untracked .claude-sesh-mover/project.json
+      // by the time carry runs — identity linking writes it earlier in this very
+      // push. Nothing about it is gitignored, so only the NEVER floor keeps the
+      // plugin's own state (and the file that decides what the NEXT push ships)
+      // out of the bundle.
+      expect(existsSync(join(extractDir, "carry", "untracked", ".claude-sesh-mover"))).toBe(false);
+      expect(result.carry.untrackedCount).toBe(2);
+      expect(readFileSync(join(extractDir, "carry", "untracked", "café note.txt"), "utf-8")).toBe("unicode\n");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("carries nothing, and says nothing, for a clean git project", async () => {
+    const { result, extractDir, cleanup } = await pushAndExtract(() => {});
+    try {
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect("carry" in result && result.carry).toBeFalsy();
+      expect(existsSync(join(extractDir, "carry"))).toBe(false);
+      expect(result.warnings.some((w) => w.includes("carr"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("--no-carry leaves uncommitted work at home", async () => {
+    const { result, extractDir, cleanup } = await pushAndExtract(
+      (p) => { writeFileSync(join(p, "scratch.txt"), "new work\n"); },
+      { noCarry: true }
+    );
+    try {
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect("carry" in result && result.carry).toBeFalsy();
+      expect(existsSync(join(extractDir, "carry"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("names the gitignored files hubinclude sent to the hub, in the warnings", async () => {
+    const { result, extractDir, cleanup } = await pushAndExtract((p) => {
+      writeFileSync(join(p, ".gitignore"), "docs/\nsecret.env\n");
+      mkdirSync(join(p, "docs"), { recursive: true });
+      writeFileSync(join(p, "docs", "spec.md"), "# spec\n");
+      writeFileSync(join(p, "secret.env"), "TOKEN=1\n");
+      mkdirSync(join(p, ".claude-sesh-mover"), { recursive: true });
+      writeFileSync(join(p, ".claude-sesh-mover", "hubinclude"), "docs/\n");
+    });
+    try {
+      expect(result.success).toBe(true);
+      if (!result.success || !("carry" in result) || !result.carry) throw new Error("no carry");
+      expect(result.carry.reIncluded).toEqual(["docs/spec.md"]);
+      expect(result.warnings.some((w) => w.includes("docs/spec.md") && w.includes("hubinclude"))).toBe(true);
+      expect(existsSync(join(extractDir, "carry", "untracked", "docs", "spec.md"))).toBe(true);
+      expect(existsSync(join(extractDir, "carry", "untracked", "secret.env"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("warns, without failing the push, when the carry busts the budget", async () => {
+    const { result, extractDir, cleanup } = await pushAndExtract((p) => {
+      writeFileSync(join(p, "huge.bin"), "x".repeat(6 * 1024 * 1024));
+    });
+    try {
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // The sessions still push — the bundle is the point of the operation.
+      expect(result.pushedSessions.length).toBeGreaterThan(0);
+      expect("carry" in result && result.carry).toBeFalsy();
+      expect(existsSync(join(extractDir, "carry"))).toBe(false);
+      const warning = result.warnings.find((w) => w.includes("not carried"));
+      expect(warning).toBeDefined();
+      expect(warning).toContain("huge.bin");
+      // The remedy has to be honest: this push already recorded its sessions as
+      // sent, so an immediate re-push is "nothing to push" and the fixed carry
+      // rides the NEXT push that has session content.
+      expect(warning).toContain("next push");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe("hub push — ignoredNotCarried discovery aid", () => {
   // A git project's payload ships tracked/untracked-but-not-ignored files only
   // (Task 10 builds it); .gitignore is also where .env lives, so an ignored
@@ -344,6 +506,54 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
     );
     expect(reported).toHaveLength(10);
     expect(reported!.some((p) => p.startsWith(".claude-sesh-mover"))).toBe(false);
+  });
+
+  it("an over-budget workspace pushes the sessions, declares no payload, and records NO generation", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      // Sparse where the filesystem supports it: statSync reports the full size
+      // without the test writing 51 MB of zeros.
+      const huge = join(projectPath, "huge.bin");
+      writeFileSync(huge, "");
+      truncateSync(huge, WORKSPACE_MAX_BYTES + 1024 * 1024);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const result = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.pushedSessions.length).toBeGreaterThan(0); // sessions still travel
+      expect(result.hasWorkspace).toBe(false);
+      expect(result.warnings.some((w) => w.includes("snapshot budget"))).toBe(true);
+
+      const backend = createFsBackend(hub);
+      const { indexes } = await readAllIndexes(backend, result.projectId);
+      const bundleFile = Object.values(indexes[0].threads)[0].bundles[0].file;
+      const archiveTmp = join(base, "bundle.tar.gz");
+      writeFileSync(archiveTmp, await backend.read(bundleFile));
+      const extractDir = join(base, "extracted");
+      mkdirSync(extractDir, { recursive: true });
+      await extractArchive(archiveTmp, extractDir);
+      const manifest = JSON.parse(readFileSync(join(extractDir, "manifest.json"), "utf-8"));
+      expect(manifest.workspace).toBeUndefined();
+      expect(existsSync(join(extractDir, "workspace"))).toBe(false);
+
+      // The load-bearing half: recording a generation the hub never received
+      // makes the next 3-way merge read the whole un-sent tree as "deleted
+      // here" (design §5.2, Task 8's ancestor rule).
+      const state = readSyncState(projectPath);
+      expect(state.hub?.lastWorkspace).toBeUndefined();
+      expect(state.hub?.workspaceGenerations ?? []).toEqual([]);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
   });
 
   it("is absent for a project with no git remote (its files travel as a workspace snapshot)", async () => {

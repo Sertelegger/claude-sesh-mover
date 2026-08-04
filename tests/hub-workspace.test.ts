@@ -6,6 +6,7 @@ import {
   snapshotWorkspace, unpackWorkspace, isExcluded, readHubignore,
   readHubinclude, isReIncluded, mayContainReIncluded, isNeverIncludable,
   WorkspaceTargetNotEmptyError, DEFAULT_WORKSPACE_EXCLUDES, NEVER_INCLUDABLE,
+  WORKSPACE_MAX_BYTES, isCarriedPath, readCarryRules, forEachCarriedFile,
 } from "../src/hub/workspace.js";
 
 function tmp(p: string): string { return mkdtempSync(join(tmpdir(), p)); }
@@ -468,6 +469,117 @@ describe("hubinclude", () => {
       expect(r.warnings).toHaveLength(1);       // the cap, not the emptiness
       expect(r.warnings[0]).toContain("hubinclude");
     } finally { for (const d of [empty, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("skips the whole snapshot, copying nothing, when the payload busts the budget", async () => {
+    const src = tmp("sesh-inc-src-");
+    const dest = tmp("sesh-inc-dest-");
+    try {
+      mkdirSync(join(src, "assets"), { recursive: true });
+      writeFileSync(join(src, "assets", "huge.bin"), "x".repeat(40_000));
+      writeFileSync(join(src, "small.txt"), "y");
+      const r = await snapshotWorkspace(src, dest, { maxBytes: 4096 });
+      expect(r.skipped).toBe(true);
+      expect(r.fileCount).toBe(0);
+      expect(r.byteSize).toBeGreaterThan(4096);
+      // All-or-nothing: a truncated payload reads on the apply side as upstream
+      // state, not as an upload that was cut short.
+      expect(existsSync(join(dest, "small.txt"))).toBe(false);
+      expect(existsSync(join(dest, "assets"))).toBe(false);
+      expect(r.warnings.some((w) => w.includes("assets/huge.bin"))).toBe(true);
+      expect(r.warnings.some((w) => w.includes("snapshot budget"))).toBe(true);
+      // The emptiness warning must not also fire: nothing was "dropped by the
+      // excludes" here, and pointing the user at hubignore for that reason
+      // would be a wrong diagnosis.
+      expect(r.warnings.some((w) => w.includes("snapshot is empty"))).toBe(false);
+    } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("bounds the one payload hubinclude made unbounded: `*` re-admitting node_modules", async () => {
+    // Before hubinclude existed the built-in excludes made an over-budget
+    // payload essentially unreachable. One line changed that, and this is the
+    // guard for it.
+    const src = tmp("sesh-inc-src-");
+    const dest = tmp("sesh-inc-dest-");
+    try {
+      writeInclude(src, "*\n");
+      mkdirSync(join(src, "node_modules", "pkg"), { recursive: true });
+      for (let i = 0; i < 20; i++) {
+        writeFileSync(join(src, "node_modules", "pkg", `f${i}.js`), "z".repeat(1000));
+      }
+      writeFileSync(join(src, "index.ts"), "real\n");
+      const unbounded = await snapshotWorkspace(src, dest);
+      expect(unbounded.skipped).toBe(false);
+      expect(unbounded.fileCount).toBe(21); // `*` really does re-admit it
+      rmSync(dest, { recursive: true, force: true });
+      mkdirSync(dest, { recursive: true });
+
+      const r = await snapshotWorkspace(src, dest, { maxBytes: 8192 });
+      expect(r.skipped).toBe(true);
+      expect(r.warnings.some((w) => w.includes("hubinclude"))).toBe(true);
+    } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("WORKSPACE_MAX_BYTES is its own budget, deliberately larger than a carry's", () => {
+    expect(WORKSPACE_MAX_BYTES).toBe(50 * 1024 * 1024);
+  });
+
+  it("counts files as well as bytes, so a tree of empty files cannot slip the budget", async () => {
+    const src = tmp("sesh-inc-src-");
+    const dest = tmp("sesh-inc-dest-");
+    try {
+      mkdirSync(join(src, "generated"), { recursive: true });
+      for (let i = 0; i < 40; i++) writeFileSync(join(src, "generated", `f${i}.txt`), "");
+      const r = await snapshotWorkspace(src, dest, { maxBytes: 4096 });
+      expect(r.skipped).toBe(true);
+      expect(r.warnings.some((w) => w.includes("40 file"))).toBe(true);
+      expect(existsSync(join(dest, "generated"))).toBe(false);
+    } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("isCarriedPath agrees with the walk it stands in for, file by file", async () => {
+    // carry.ts filters `git ls-files` output with isCarriedPath while
+    // snapshotWorkspace walks the tree with forEachCarriedFile. Two rules for
+    // one question is how the payload and the apply side drifted apart before;
+    // this is the assertion that keeps them one rule.
+    const src = tmp("sesh-inc-src-");
+    try {
+      writeIgnore(src, "build\n*.log\n");
+      writeInclude(src, "build/keep.txt\n*.keepme\n");
+      mkdirSync(join(src, "src", "deep"), { recursive: true });
+      mkdirSync(join(src, "build", "sub"), { recursive: true });
+      mkdirSync(join(src, "node_modules", "pkg"), { recursive: true });
+      mkdirSync(join(src, ".git"), { recursive: true });
+      mkdirSync(join(src, "docs"), { recursive: true });
+      const all = [
+        "a.ts", "a.log", "docs/x.md", "docs/y.keepme", "src/deep/b.ts",
+        "build/keep.txt", "build/other.txt", "build/sub/c.txt",
+        "node_modules/pkg/index.js", ".git/config",
+      ];
+      for (const rel of all) writeFileSync(join(src, ...rel.split("/")), "x");
+
+      const rules = readCarryRules(src);
+      const walked: string[] = [];
+      forEachCarriedFile(src, rules, (rel) => { walked.push(rel); });
+      const predicated = all.filter((rel) => isCarriedPath(rel, rules));
+      expect(predicated.sort()).toEqual(walked.sort());
+      // Non-vacuous: the set is a real mix of admitted, excluded and re-admitted.
+      expect(walked.sort()).toEqual(
+        ["a.ts", "build/keep.txt", "docs/x.md", "docs/y.keepme", "src/deep/b.ts"].sort()
+      );
+    } finally { rmSync(src, { recursive: true, force: true }); }
+  });
+
+  it("isCarriedPath refuses paths that escape the project or name internals", () => {
+    const rules = { excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES], includePatterns: ["*"] };
+    for (const hostile of [
+      "../escape.txt", "../../escape.txt", "/etc/hosts", "C:/Windows/system32",
+      ".git/config", "vendor/.git/config", ".claude-sesh-mover/config.json",
+      ".GIT/config", ".git./config", "..",
+    ]) {
+      expect(isCarriedPath(hostile, rules)).toBe(false);
+    }
+    expect(isCarriedPath("ok.txt", rules)).toBe(true);
   });
 
   it("NEVER_INCLUDABLE is frozen, not just readonly at compile time", () => {

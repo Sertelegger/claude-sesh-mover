@@ -25,6 +25,7 @@ export function getDefaultConfig() {
             startupNotice: true,
             pullAppend: true,
             onDivergence: "fragment",
+            carryDiff: true,
         },
     };
 }

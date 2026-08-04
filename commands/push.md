@@ -17,9 +17,11 @@ You are running the sesh-mover push command. Follow these steps:
 
 3. Run:
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" push --project-path "<cwd>" --source-config-dir "<config-dir>" [--session-id <id> ...] [--no-workspace]
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" push --project-path "<cwd>" --source-config-dir "<config-dir>" [--session-id <id> ...] [--no-workspace] [--no-carry]
    ```
    For non-git projects, push bundles a workspace snapshot (the project's files) alongside the sessions by default — offer `--no-workspace` when the user doesn't want project files uploaded to the hub (large or sensitive working directory), and carry it into any re-run in step 4.
+
+   For git projects (a remote is configured) push instead carries the **uncommitted** work: a `git diff HEAD` patch plus untracked, non-gitignored files. Offer `--no-carry` when the user doesn't want work-in-progress on the hub, and carry it into any re-run. Gitignored files are never carried unless `.claude-sesh-mover/hubinclude` names them (see step 4).
 
 4. Parse the result and branch on its shape:
    - `reason: "unlinked"` (this project isn't linked to any hub project yet): present `linkCandidates` (name + gitRemotes) as a pick-list via AskUserQuestion, with an extra "Create a new hub project for this directory" option. Then re-run the step 3 invocation with `--project-id <picked-id>` appended (if the user picked a candidate) or `--create-project` appended (if they chose to create new). Do this once automatically as part of the flow — don't ask the user to re-invoke the command themselves.
@@ -28,14 +30,16 @@ You are running the sesh-mover push command. Follow these steps:
    - `success: true` and `upToDate: false`: report `pushedSessions` (thread id, session id, `full` or `continuation`), whether `hasWorkspace` was included, and any `warnings`.
    - Any other `success: false`: report `error`/`suggestion` and stop.
 
+   If the result carries a `carry` object, say what uncommitted work went with it: `carry.untrackedCount` untracked files plus a `carry.patchBytes`-byte patch against `carry.baseCommit` on `carry.branch`. If `carry.reIncludedCount` is above zero, name the `carry.reIncluded` paths explicitly — those are gitignored files that travelled *because* `hubinclude` lists them, and the user should be told which ones are now on the hub. A carry that was declined shows up as a `warnings` entry, not as a failure; report it verbatim rather than treating the push as broken.
+
    If (and only if) the result carries a non-empty `ignoredNotCarried`, mention it once after the summary — it's present only on a git project that has no `.claude-sesh-mover/hubinclude` yet, and it lists gitignored paths this push left behind (a sample, capped at 10, spelled the way git spells them; a trailing `/` means that directory at the project root and everything under it). Tell the user these are *not* carried, and offer via AskUserQuestion to create `.claude-sesh-mover/hubinclude` listing the ones they want synced across machines. If they accept, write only the paths they picked, one per line, exactly as reported. Say plainly, before they choose:
    - `.gitignore` is also where `.env` and credential files live, so this is a security-relevant list;
    - the file is meant to be committed, so it applies on every clone and every machine;
-   - **be accurate about what it does today:** `hubinclude` currently only affects the workspace snapshot, and a git project with remotes doesn't carry one (`hasWorkspace` is false on this very result) — so listing paths records the intent and takes effect when the git-carry step ships, rather than uploading them on the next push;
+   - listing a path means it is **uploaded on the next push** of this project (it rides the git carry described above), and a later push reports it back in `carry.reIncluded`;
    - creating the file also *stops this suggestion appearing*, since its existence is what suppresses `ignoredNotCarried`.
 
    Never pre-select entries, never widen one (`docs/specs/notes.md` stays that path — don't turn it into `docs/`), and never offer `.git` or `.claude-sesh-mover`: those two can never be carried and a pattern naming them does nothing. If the user declines, don't ask again in this session.
 
 5. Report a final summary: hub project id, sessions pushed (count, and full-vs-continuation breakdown), whether a workspace snapshot was included, and whether the project was newly linked or created during this run.
 
-**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and the unlinked-retry branches, `--project-id`/`--create-project`, plus `--no-workspace`) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface. `push` also accepts `--progress` (NDJSON progress events on stderr) — it's oriented at humans running the CLI directly; don't pass it from this command flow.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and the unlinked-retry branches, `--project-id`/`--create-project`, plus `--no-workspace` and `--no-carry`) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface. `push` also accepts `--progress` (NDJSON progress events on stderr) — it's oriented at humans running the CLI directly; don't pass it from this command flow.

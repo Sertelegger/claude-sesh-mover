@@ -27,6 +27,7 @@ export function getDefaultConfig(): SeshMoverConfig {
       startupNotice: true,
       pullAppend: true,
       onDivergence: "fragment",
+      carryDiff: true,
     },
   };
 }

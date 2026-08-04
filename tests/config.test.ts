@@ -122,7 +122,7 @@ describe("config", () => {
       const cfg = getDefaultConfig();
       expect(cfg.hub).toEqual({
         path: "", noWorkspace: false, autoPush: true, startupNotice: true,
-        pullAppend: true, onDivergence: "fragment",
+        pullAppend: true, onDivergence: "fragment", carryDiff: true,
       });
       const updated = setConfigValue(cfg, "hub.path", "/mnt/share/hub");
       expect(updated.hub.path).toBe("/mnt/share/hub");
@@ -138,6 +138,9 @@ describe("config", () => {
       expect(setConfigValue(cfg, "hub.onDivergence", "adopt-hub").hub.onDivergence).toBe(
         "adopt-hub"
       );
+      // hub.carryDiff is the only way to opt the SessionEnd auto-push out of
+      // uploading uncommitted work: the hook takes no flags.
+      expect(setConfigValue(cfg, "hub.carryDiff", false).hub.carryDiff).toBe(false);
     });
   });
 

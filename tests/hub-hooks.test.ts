@@ -422,6 +422,73 @@ describe("hub hook-session-end (CLI)", () => {
     expect(await backend.exists(indexPath(projectId, machineId))).toBe(true);
   });
 
+  it("carries uncommitted work automatically, and hub.carryDiff=false stops it", async () => {
+    // The auto-push hook is how carry will actually reach the hub for most
+    // users, and it accepts no flags — hub.carryDiff is the ONLY opt-out, so
+    // the hook has to read it.
+    const { execFileSync } = await import("node:child_process");
+    const g = (args: string[]): void => {
+      execFileSync("git", args, { cwd: project, stdio: "ignore" });
+    };
+    g(["init", "-q"]);
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "Test"]);
+    g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    writeFileSync(join(project, "README.md"), "uncommitted edit\n");
+
+    const restore = overrideHome(home);
+    let projectId: string;
+    let machineId: string;
+    try {
+      const { hubInit } = await import("../src/hub/init.js");
+      await hubInit({ hubPath: hubDir, configScope: "user", cwd: home });
+      const { loadOrCreateMachineId } = await import("../src/machine.js");
+      const { createFsBackend } = await import("../src/hub/backend.js");
+      const { createHubProject } = await import("../src/hub/identity.js");
+      machineId = loadOrCreateMachineId().id;
+      projectId = (await createHubProject(createFsBackend(hubDir), project, machineId)).projectId;
+    } finally {
+      restore.restore();
+    }
+    const { createFsBackend } = await import("../src/hub/backend.js");
+    const { bundleDir } = await import("../src/hub/layout.js");
+    const { extractArchive } = await import("../src/archiver.js");
+    const backend = createFsBackend(hubDir);
+
+    const bundleContents = async (index: number): Promise<string[]> => {
+      const bundles = (await backend.list(bundleDir(projectId, machineId))).sort();
+      const archive = join(tempDir, `b${index}.tar.gz`);
+      writeFileSync(archive, await backend.read(bundles[index]!));
+      const out = join(tempDir, `x${index}`);
+      mkdirSync(out, { recursive: true });
+      await extractArchive(archive, out);
+      const { readdirSync } = await import("node:fs");
+      return readdirSync(out).sort();
+    };
+
+    expect(runHook(JSON.stringify({ cwd: project, session_id: sessionId })).status).toBe(0);
+    expect(await bundleContents(0)).toContain("carry");
+
+    // Force a second bundle (a new session entry), with carry turned off.
+    writeSeshMoverConfig(home, { path: hubDir, carryDiff: false });
+    writeFileSync(join(project, "README.md"), "another uncommitted edit\n");
+    const { appendFileSync } = await import("node:fs");
+    appendFileSync(
+      join(configDir, "projects", encodeProjectPath(project), `${sessionId}.jsonl`),
+      JSON.stringify({
+        type: "user", uuid: "hook-carry-1", parentUuid: null,
+        timestamp: new Date().toISOString(), cwd: project, sessionId, version: "2.1.81",
+        message: { role: "user", content: "more" },
+      }) + "\n"
+    );
+    expect(runHook(JSON.stringify({ cwd: project, session_id: sessionId })).status).toBe(0);
+    const second = await bundleContents(1);
+    expect(second).not.toContain("carry");
+    expect(second).toContain("sessions"); // non-vacuous: a real bundle was written
+  });
+
   it("stays completely silent when another hub operation holds the project lock", async () => {
     writeSeshMoverConfig(home, { path: hubDir });
     linkProject(project);

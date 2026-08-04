@@ -492,6 +492,42 @@ export function forEachCarriedFile(root, rules, visit, hooks) {
     if (existsSync(root))
         walk(root, "", false);
 }
+/**
+ * Do the carry rules admit this ONE relative path? The list-side counterpart of
+ * the decision `forEachCarriedFile` makes per directory entry, for enumerations
+ * that arrive as paths rather than as a walk — `git ls-files` output in
+ * `carry.ts` is the only such producer today.
+ *
+ * It deliberately re-uses the same three primitives in the same order rather
+ * than restating the rule, because a second, subtly different rule is exactly
+ * how the payload and the apply side drifted apart before `forEachCarriedFile`
+ * existed:
+ *
+ * 1. `NEVER_INCLUDABLE` on every segment — which also answers "no" for a path
+ *    that is absolute, drive-rooted, or escapes via `..`, so this doubles as
+ *    the traversal guard for paths that came from a subprocess.
+ * 2. `excludePatterns` on every segment: exclusion is sticky downward, so a
+ *    path under an excluded directory is excluded (`forEachCarriedFile` carries
+ *    the same fact in its `insideExcluded` flag).
+ * 3. `includePatterns` on the WHOLE relative path, which re-admits it.
+ *
+ * The two forms therefore agree by construction on any file both can see, which
+ * `hub-carry.test.ts` pins against a real tree.
+ */
+export function isCarriedPath(relPath, rules) {
+    const parsed = toSegments(relPath, "path");
+    if (parsed === null || parsed.segments.some(isNeverSegment))
+        return false;
+    const excluded = parsed.segments.some((s) => isExcluded(s, rules.excludePatterns));
+    return !excluded || isReIncluded(relPath, rules.includePatterns);
+}
+/** The exclude/include rule pair a project's own files are carried under. */
+export function readCarryRules(projectPath, diagnostics) {
+    return {
+        excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES, ...readHubignore(projectPath)],
+        includePatterns: readHubinclude(projectPath, diagnostics),
+    };
+}
 /** Entry names in a directory, or `[]` if it cannot be read (missing, EACCES). */
 function listDirSafely(dir) {
     try {
@@ -502,6 +538,27 @@ function listDirSafely(dir) {
     }
 }
 /**
+ * Byte budget for one workspace snapshot — the whole payload, measured before
+ * anything is copied.
+ *
+ * Deliberately NOT `CARRY_MAX_BYTES` (5 MB), and the two must not be
+ * "harmonized":
+ *
+ * - a git carry is a *diff* of uncommitted work, where 5 MB already means
+ *   generated artifacts (design §6.1);
+ * - a workspace snapshot is the *entire project* for a project git cannot
+ *   reconstruct, where 5 MB is an ordinary size. Reusing the smaller number
+ *   would silently stop syncing projects that sync today.
+ *
+ * The guard exists because `hubinclude` made an unbounded payload reachable: a
+ * single `*` line re-admits every built-in exclude, and a measured
+ * `node_modules` alone is 6,021 files. Before that the built-in excludes made
+ * an over-budget payload nearly impossible, so there was nothing to bound.
+ */
+export const WORKSPACE_MAX_BYTES = 50 * 1024 * 1024;
+/** What one carried FILE costs against a budget on top of its bytes (one tar header). */
+const PER_FILE_BYTES = 512;
+/**
  * Copy a project's working tree into `destDir`, minus the excluded paths and
  * plus whatever `hubinclude` names back in (design §5, §6.0). The rules
  * themselves live in `forEachCarriedFile`, which the apply side shares.
@@ -509,16 +566,54 @@ function listDirSafely(dir) {
  * `warnings` carries anything the user would otherwise have to infer from an
  * empty or surprising payload: a `hubinclude` big enough to be ignored, a
  * truncated pattern list, or an exclude set that swallowed the whole tree.
+ *
+ * `skipped` means the payload was over `maxBytes` and NOTHING was copied — see
+ * `WORKSPACE_MAX_BYTES`. The size is measured in a first, copy-free pass
+ * precisely so the over-budget case costs a stat walk rather than gigabytes of
+ * I/O that is then thrown away. All-or-nothing is the deliberate shape: a
+ * truncated snapshot is worse than none, because the apply side reads a missing
+ * file as an upstream state rather than as a payload that was cut short.
+ * Callers must not record a generation or set `hasWorkspace` for a skipped
+ * snapshot.
  */
-export async function snapshotWorkspace(projectPath, destDir) {
+export async function snapshotWorkspace(projectPath, destDir, opts) {
     const warnings = [];
-    const rules = {
-        excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES, ...readHubignore(projectPath)],
-        includePatterns: readHubinclude(projectPath, warnings),
-    };
+    const maxBytes = opts?.maxBytes ?? WORKSPACE_MAX_BYTES;
+    const rules = readCarryRules(projectPath, warnings);
     let fileCount = 0;
     let byteSize = 0;
     let symlinksSkipped = 0;
+    // Pass 1: measure only. `statSync` is safe here for the same reason it is in
+    // the copy below — `forEachCarriedFile` never visits a symlink.
+    //
+    // Each file also costs `PER_FILE_BYTES` against the budget: a pure byte
+    // budget bounds the wrong thing, since a tree of hundreds of thousands of
+    // tiny generated files measures near zero and still costs a copy, a tar
+    // entry, and a file the peer writes on every pull.
+    let measured = 0;
+    let cost = 0;
+    let counted = 0;
+    const largest = [];
+    forEachCarriedFile(projectPath, rules, (relPath, srcPath) => {
+        let size = 0;
+        try {
+            size = statSync(srcPath).size;
+        }
+        catch {
+            return; // unreadable now; the copy pass reports it if it is still there
+        }
+        measured += size;
+        cost += size + PER_FILE_BYTES;
+        counted++;
+        largest.push({ path: relPath, size });
+        largest.sort((a, b) => b.size - a.size);
+        if (largest.length > 3)
+            largest.pop();
+    });
+    if (cost > maxBytes) {
+        warnings.push(`The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so this push carries no project files (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with .claude-sesh-mover/hubignore — and check .claude-sesh-mover/hubinclude for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`);
+        return { fileCount: 0, byteSize: measured, symlinksSkipped: 0, skipped: true, warnings };
+    }
     forEachCarriedFile(projectPath, rules, (relPath, srcPath) => {
         const outPath = join(destDir, ...relPath.split("/"));
         mkdirSync(dirname(outPath), { recursive: true });
@@ -533,7 +628,15 @@ export async function snapshotWorkspace(projectPath, destDir) {
     if (fileCount === 0 && listDirSafely(projectPath).some((n) => n !== ".claude-sesh-mover")) {
         warnings.push("The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by .claude-sesh-mover/hubignore, so this push carries no project files. Check hubignore for an over-broad pattern (`*` and `*/` match everything at a level), or push with --no-workspace if that is what you meant.");
     }
-    return { fileCount, byteSize, symlinksSkipped, warnings };
+    return { fileCount, byteSize, symlinksSkipped, skipped: false, warnings };
+}
+/** Human-readable size for a warning a user has to act on. */
+export function formatBytes(bytes) {
+    if (bytes >= 1024 * 1024)
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    if (bytes >= 1024)
+        return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${bytes} bytes`;
 }
 /**
  * Apply a workspace payload by copying it over `targetPath`, overwriting on

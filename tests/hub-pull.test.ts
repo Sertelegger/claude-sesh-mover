@@ -144,6 +144,70 @@ describe("hub pull", () => {
     }
   });
 
+  it("imports a bundle that carries uncommitted work, without applying or choking on it", async () => {
+    // Task 10 ships the capture half; §6.2's apply half is a later task and is
+    // explicit that a carry applies ONLY on request. Until then a carry payload
+    // has to be inert on the receiving end — this is the "before" control for
+    // that work, and the guard against a bundle shape that breaks today's pull.
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let projectB: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA");
+      const { execFileSync } = await import("node:child_process");
+      const g = (args: string[]): void => {
+        execFileSync("git", args, { cwd: projectA, stdio: "ignore" });
+      };
+      g(["init", "-q"]);
+      g(["config", "user.email", "t@example.com"]);
+      g(["config", "user.name", "Test"]);
+      g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "init"]);
+      writeFileSync(join(projectA, "README.md"), "uncommitted\n");
+      writeFileSync(join(projectA, "scratch.txt"), "wip\n");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+      expect("carry" in pushResult && pushResult.carry).toBeTruthy();
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      projectB = mkdtempSync(join(tmpdir(), "sesh-pull-projB-"));
+      writeLocalProjectId(projectB, {
+        projectId: pushResult.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.importedSessions).toHaveLength(1);
+      // Nothing of the carry reached the tree, and no warning pretends otherwise.
+      expect(existsSync(join(projectB, "scratch.txt"))).toBe(false);
+      expect(readdirSync(projectB).sort()).toEqual([".claude-sesh-mover"]);
+      expect(p.warnings.join(" ")).not.toMatch(/carr/i);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectB) rmSync(projectB, { recursive: true, force: true });
+    }
+  });
+
   it("pull with neither --thread nor --latest returns a pick-required thread list", async () => {
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
     const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));

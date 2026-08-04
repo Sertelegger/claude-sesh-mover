@@ -589,8 +589,10 @@ hub
         const projectPath = gate.projectPath;
         const configDir = resolveConfigDir();
         // Re-read the effective config for this project so the automatic push
-        // honors the same hub.noWorkspace opt-out the manual `push` does — an
-        // automated push must not snapshot a workspace the user opted out of.
+        // honors the same hub.noWorkspace / hub.carryDiff opt-outs the manual
+        // `push` does — an automated push must not upload project files, or
+        // uncommitted work, that the user opted out of. This is the only place
+        // either opt-out can be expressed for the hook: it takes no flags.
         const config = loadEffectiveConfig(configDir, projectPath);
         const { hubPush } = await import("./hub/push.js");
         const result = await hubPush({
@@ -598,6 +600,7 @@ hub
             projectPath,
             hubPath: gate.hubPath,
             noWorkspace: config.hub.noWorkspace,
+            noCarry: !config.hub.carryDiff,
             // Nothing this push produces is read by a human: stdout is closed to it
             // and stderr only carries failures. `quiet` keeps it from computing the
             // ignored-path discovery aid nobody will see (and from walking the
@@ -697,6 +700,7 @@ program
     .option("--project-id <id>", "Link to an existing hub project id")
     .option("--create-project", "Mint a new hub project for this directory")
     .option("--no-workspace", "Skip the workspace snapshot for non-git projects")
+    .option("--no-carry", "Do not carry uncommitted changes (git projects)")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     try {
@@ -717,6 +721,7 @@ program
             configDir, projectPath, hubPath,
             sessionIds: opts.sessionId,
             noWorkspace: opts.workspace === false || config.hub.noWorkspace,
+            noCarry: opts.carry === false || !config.hub.carryDiff,
             projectIdOverride: opts.projectId,
             createProject: !!opts.createProject,
             claudeVersion: getClaudeVersion(),

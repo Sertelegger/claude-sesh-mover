@@ -189,6 +189,50 @@ export declare function forEachCarriedFile(root: string, rules: CarryRules, visi
     admitPaths?: ReadonlySet<string>;
 }): void;
 /**
+ * Do the carry rules admit this ONE relative path? The list-side counterpart of
+ * the decision `forEachCarriedFile` makes per directory entry, for enumerations
+ * that arrive as paths rather than as a walk — `git ls-files` output in
+ * `carry.ts` is the only such producer today.
+ *
+ * It deliberately re-uses the same three primitives in the same order rather
+ * than restating the rule, because a second, subtly different rule is exactly
+ * how the payload and the apply side drifted apart before `forEachCarriedFile`
+ * existed:
+ *
+ * 1. `NEVER_INCLUDABLE` on every segment — which also answers "no" for a path
+ *    that is absolute, drive-rooted, or escapes via `..`, so this doubles as
+ *    the traversal guard for paths that came from a subprocess.
+ * 2. `excludePatterns` on every segment: exclusion is sticky downward, so a
+ *    path under an excluded directory is excluded (`forEachCarriedFile` carries
+ *    the same fact in its `insideExcluded` flag).
+ * 3. `includePatterns` on the WHOLE relative path, which re-admits it.
+ *
+ * The two forms therefore agree by construction on any file both can see, which
+ * `hub-carry.test.ts` pins against a real tree.
+ */
+export declare function isCarriedPath(relPath: string, rules: CarryRules): boolean;
+/** The exclude/include rule pair a project's own files are carried under. */
+export declare function readCarryRules(projectPath: string, diagnostics?: string[]): CarryRules;
+/**
+ * Byte budget for one workspace snapshot — the whole payload, measured before
+ * anything is copied.
+ *
+ * Deliberately NOT `CARRY_MAX_BYTES` (5 MB), and the two must not be
+ * "harmonized":
+ *
+ * - a git carry is a *diff* of uncommitted work, where 5 MB already means
+ *   generated artifacts (design §6.1);
+ * - a workspace snapshot is the *entire project* for a project git cannot
+ *   reconstruct, where 5 MB is an ordinary size. Reusing the smaller number
+ *   would silently stop syncing projects that sync today.
+ *
+ * The guard exists because `hubinclude` made an unbounded payload reachable: a
+ * single `*` line re-admits every built-in exclude, and a measured
+ * `node_modules` alone is 6,021 files. Before that the built-in excludes made
+ * an over-budget payload nearly impossible, so there was nothing to bound.
+ */
+export declare const WORKSPACE_MAX_BYTES: number;
+/**
  * Copy a project's working tree into `destDir`, minus the excluded paths and
  * plus whatever `hubinclude` names back in (design §5, §6.0). The rules
  * themselves live in `forEachCarriedFile`, which the apply side shares.
@@ -196,13 +240,27 @@ export declare function forEachCarriedFile(root: string, rules: CarryRules, visi
  * `warnings` carries anything the user would otherwise have to infer from an
  * empty or surprising payload: a `hubinclude` big enough to be ignored, a
  * truncated pattern list, or an exclude set that swallowed the whole tree.
+ *
+ * `skipped` means the payload was over `maxBytes` and NOTHING was copied — see
+ * `WORKSPACE_MAX_BYTES`. The size is measured in a first, copy-free pass
+ * precisely so the over-budget case costs a stat walk rather than gigabytes of
+ * I/O that is then thrown away. All-or-nothing is the deliberate shape: a
+ * truncated snapshot is worse than none, because the apply side reads a missing
+ * file as an upstream state rather than as a payload that was cut short.
+ * Callers must not record a generation or set `hasWorkspace` for a skipped
+ * snapshot.
  */
-export declare function snapshotWorkspace(projectPath: string, destDir: string): Promise<{
+export declare function snapshotWorkspace(projectPath: string, destDir: string, opts?: {
+    maxBytes?: number;
+}): Promise<{
     fileCount: number;
     byteSize: number;
     symlinksSkipped: number;
+    skipped: boolean;
     warnings: string[];
 }>;
+/** Human-readable size for a warning a user has to act on. */
+export declare function formatBytes(bytes: number): string;
 /**
  * Apply a workspace payload by copying it over `targetPath`, overwriting on
  * collision. Slice-1 behavior, and still the right one when there is no

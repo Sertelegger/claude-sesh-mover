@@ -1,7 +1,10 @@
-// The one import in this module, and deliberately type-only: the merge report
-// is a hub-module concept with its own documentation, and duplicating its shape
-// here to keep this file import-free would guarantee the two drift apart.
+// The two imports in this module, and deliberately type-only: the merge report
+// and the carry metadata are hub-module concepts with their own documentation,
+// and duplicating their shapes here to keep this file import-free would
+// guarantee the copies drift apart. Type-only means nothing is imported at
+// runtime, so neither creates a module cycle.
 import type { WorkspaceMergeReport } from "./hub/merge.js";
+import type { CarryMeta } from "./hub/carry.js";
 
 // --- Platform ---
 
@@ -191,6 +194,14 @@ export interface ExportManifest {
      */
     basedOn?: { bundleId: string; file: string; pushedAt?: string } | null;
   };
+  /**
+   * Uncommitted work captured beside the sessions (design §6.1), for a project
+   * with a git remote. Absent when the tree was clean, when the payload was
+   * over budget, or when carry was off — and absent on every bundle written
+   * before this field existed, which is why the apply side must treat it as
+   * optional rather than as a promise the `carry/` directory is well-formed.
+   */
+  carry?: CarryMeta;
 }
 
 // --- Config ---
@@ -227,6 +238,11 @@ export interface SeshMoverConfig {
     // What to do when a thread was extended on BOTH machines from the same
     // anchor, so neither branch continues the other. See OnDivergenceMode.
     onDivergence: OnDivergenceMode;
+    // Carry uncommitted work (a `git diff HEAD` patch plus untracked files)
+    // alongside the sessions, for a project with a git remote. Set false (or
+    // pass --no-carry) to push sessions only. Never carries a gitignored file
+    // unless .claude-sesh-mover/hubinclude names it.
+    carryDiff: boolean;
   };
 }
 
@@ -396,6 +412,13 @@ export interface HubPushResult {
    * spelling would carry more than the user pointed at.
    */
   ignoredNotCarried?: string[];
+  /**
+   * The uncommitted work this push carried (design §6.1), or absent when it
+   * carried none. `reIncluded` names the gitignored paths that travelled only
+   * because `hubinclude` lists them — the security-relevant subset, also
+   * surfaced as a warning.
+   */
+  carry?: CarryMeta;
 }
 
 export interface WhereisThread {
