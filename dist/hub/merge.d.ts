@@ -20,15 +20,22 @@ export type SidecarReason =
  * A file the merge deliberately did not touch — and, unlike a sidecar case,
  * one where **nothing at all was written near that path**.
  *
- * That is deliberate, not an oversight. Every reason below means the merge
- * could not establish what actually sits at (or above) the destination, and a
- * sidecar is written into the very same directory: parking
+ * That is deliberate, not an oversight — but the reasons differ in strength,
+ * so don't restate this as "a sidecar would always escape too". It holds
+ * outright when the obstruction is at a PARENT segment: parking
  * `docs/note.md.theirs-…` beside a `docs -> ~/notes` symlink writes outside the
  * project exactly as the original write would have, and parking beside a file
  * that occupies a directory's path just raises `ENOTDIR` in a different place.
- * So `skipped` means "the merge touched nothing here", and the incoming copy
- * stays recoverable from the bundle on the hub rather than being forced into a
- * neighbourhood the merge already judged unsafe.
+ * When the obstruction is the destination itself — a symlinked file inside a
+ * real directory, or `name-collision`, where `classifyDestination` already
+ * approved the whole path and the `EEXIST` is itself proof of what's there —
+ * a sidecar would in fact be safe, and parking one is a defensible future
+ * change (`name-collision` is the likely one in practice: a case-folding
+ * filesystem where a peer's `README.md` meets a local `readme.md`).
+ *
+ * Uniform "park nothing" is the conservative choice while the two cases are
+ * indistinguishable in `SkipReason`: it is safe in every case, and the incoming
+ * copy stays recoverable from the bundle on the hub either way.
  */
 export type SkipReason = 
 /** A symlink occupies the path (or one of its parents) locally — never written through. */

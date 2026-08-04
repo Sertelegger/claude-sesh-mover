@@ -32,15 +32,22 @@ export type SidecarReason =
  * A file the merge deliberately did not touch — and, unlike a sidecar case,
  * one where **nothing at all was written near that path**.
  *
- * That is deliberate, not an oversight. Every reason below means the merge
- * could not establish what actually sits at (or above) the destination, and a
- * sidecar is written into the very same directory: parking
+ * That is deliberate, not an oversight — but the reasons differ in strength,
+ * so don't restate this as "a sidecar would always escape too". It holds
+ * outright when the obstruction is at a PARENT segment: parking
  * `docs/note.md.theirs-…` beside a `docs -> ~/notes` symlink writes outside the
  * project exactly as the original write would have, and parking beside a file
  * that occupies a directory's path just raises `ENOTDIR` in a different place.
- * So `skipped` means "the merge touched nothing here", and the incoming copy
- * stays recoverable from the bundle on the hub rather than being forced into a
- * neighbourhood the merge already judged unsafe.
+ * When the obstruction is the destination itself — a symlinked file inside a
+ * real directory, or `name-collision`, where `classifyDestination` already
+ * approved the whole path and the `EEXIST` is itself proof of what's there —
+ * a sidecar would in fact be safe, and parking one is a defensible future
+ * change (`name-collision` is the likely one in practice: a case-folding
+ * filesystem where a peer's `README.md` meets a local `readme.md`).
+ *
+ * Uniform "park nothing" is the conservative choice while the two cases are
+ * indistinguishable in `SkipReason`: it is safe in every case, and the incoming
+ * copy stays recoverable from the bundle on the hub either way.
  */
 export type SkipReason =
   /** A symlink occupies the path (or one of its parents) locally — never written through. */
@@ -328,6 +335,11 @@ function replaceFileAtomically(destPath: string, contentFrom: string): void {
       copyFileSync(contentFrom, tmpPath, fsConstants.COPYFILE_EXCL);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "EEXIST") continue;
+      // A failed copy leaves no partial file on the platforms measured here,
+      // but that is libuv's behaviour rather than a guarantee this code holds —
+      // and the name we would leave behind is one `snapshotWorkspace` would push
+      // to the hub. Clean up unconditionally rather than relying on it.
+      try { unlinkSync(tmpPath); } catch { /* best effort */ }
       throw e;
     }
     try {
@@ -496,7 +508,18 @@ export async function mergeWorkspaceTrees(opts: {
         const incomingChanged = ancestorPath === null || !sameContent(incomingPath, ancestorPath);
 
         if (!localChanged && incomingChanged) {
-          replaceFileAtomically(localPath, incomingPath);
+          try {
+            replaceFileAtomically(localPath, incomingPath);
+          } catch (e) {
+            // Same reasoning as the merge path's write-back failure below: the
+            // rename is atomic so the local file is exactly as it was, and the
+            // destination directory is one `classifyDestination` already
+            // approved — so park the incoming copy instead of letting this fall
+            // through to `io-error`, which parks nothing.
+            sidecar(rel, incomingPath, "merge-failed",
+              `the incoming copy could not be written back: ${(e as Error).message}`);
+            continue;
+          }
           report.taken.push(rel);
           continue;
         }
@@ -554,10 +577,15 @@ export async function mergeWorkspaceTrees(opts: {
         // the user's project — i.e. normally a repo. `--diff3` overrides
         // `merge.conflictStyle`, but config is VALIDATED before the flag
         // applies, so an invalid repo-local `merge.conflictStyle` makes
-        // merge-file exit 128 with the flag passed (verified). Standing in the
-        // scratch dir removes repo-local influence outright — the same run that
-        // exits 128 from inside the repo exits 1 and merges correctly from
-        // here — and it also closes `diff.algorithm`, which cannot be pinned by
+        // merge-file exit 128 with the flag passed (verified — and it really is
+        // repo-LOCAL only: the same bogus value in global config exits 1 and
+        // merges fine). Standing in the scratch dir removes the CALLER's
+        // repo-local influence — the same run that exits 128 from inside the
+        // repo exits 1 and merges correctly from here. It is not absolute: the
+        // scratch dir is `mkdtemp(tmpdir())`, so a `TMPDIR` pointing inside
+        // some other broken repo still reaches us. That degrades honestly
+        // rather than silently, because 128 is handled below as an
+        // engine-level failure. It also closes `diff.algorithm`, which cannot be pinned by
         // a flag (`--diff-algorithm` is far newer than `--diff3`) and which
         // shifts hunk boundaries, i.e. the clean/conflict outcome itself.
         let status: number | null = 0;

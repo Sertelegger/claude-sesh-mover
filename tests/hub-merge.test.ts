@@ -708,6 +708,130 @@ describe("mergeWorkspaceTrees — degraded merge engine", () => {
     }
   });
 
+  // Both resolutions that write into the user's tree can fail at the write
+  // back. `renameSync` is atomic, so the local file is provably as it was, and
+  // the destination directory is one `classifyDestination` already approved —
+  // so both park the incoming copy rather than falling through to `io-error`,
+  // which parks nothing. Neither branch had coverage before: the reviewer who
+  // found the asymmetry triggered it by hand with macOS `chflags uchg`.
+  //
+  // The mechanism here is a read-only PARENT directory, and it is probed at
+  // runtime rather than gated on `platform()`. A directory mode is not portable
+  // (Windows ignores it; root ignores it everywhere), and a test that silently
+  // stopped exercising the branch would be worse than one that says it skipped
+  // — the same trap as this project's tautological `sourcePlatform` assertion.
+  it("keeps local intact when the write back fails on BOTH the taken and merged paths", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      // taken: local matches the ancestor, only incoming moved.
+      put(a, "sub/taken.txt", "v1\n");
+      put(t, "sub/taken.txt", "v1\n");
+      put(i, "sub/taken.txt", "v2\n");
+      // merged: both sides moved, far enough apart to merge cleanly.
+      put(a, "sub/merged.txt", "1\n2\n3\n4\n5\n6\n7\n");
+      put(t, "sub/merged.txt", "1\nLOCAL\n3\n4\n5\n6\n7\n");
+      put(i, "sub/merged.txt", "1\n2\n3\n4\n5\nINCOMING\n7\n");
+
+      const sub = join(t, "sub");
+      chmodSync(sub, 0o500);
+      let writesReallyFail = false;
+      try {
+        writeFileSync(join(sub, ".probe"), "x");
+        rmSync(join(sub, ".probe"), { force: true });
+      } catch {
+        writesReallyFail = true;
+      }
+      if (!writesReallyFail) {
+        chmodSync(sub, 0o700);
+        return; // r/o directories are not enforced here — the branch is unreachable
+      }
+
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      chmodSync(sub, 0o700);
+
+      // Neither resolution reached the tree.
+      expect(r.taken).toEqual([]);
+      expect(r.merged).toEqual([]);
+
+      // Both write-back handlers ran and both TRIED to park a sidecar — the
+      // `.theirs-` destination inside the error is the proof, since nothing
+      // else in the module builds that name. Here the obstruction is the
+      // directory itself, so the sidecar copy fails the same way and the file
+      // degrades to `io-error`. That is Minor 5's boundary made concrete: a
+      // sidecar can only rescue a write-back failure whose cause is specific to
+      // the destination FILE. See the next test for that case.
+      expect(r.sidecars).toEqual([]);
+      expect(r.skipped.map((s) => s.path).sort()).toEqual(["sub/merged.txt", "sub/taken.txt"]);
+      expect(r.skipped.every((s) => s.reason === "io-error")).toBe(true);
+      expect(r.skipped.every((s) => s.detail?.includes(".theirs-"))).toBe(true);
+
+      // Local content is exactly what it was — the rename is atomic, so a
+      // failed write back is a no-op rather than a truncation.
+      expect(readFileSync(join(t, "sub/taken.txt"), "utf-8")).toBe("v1\n");
+      expect(readFileSync(join(t, "sub/merged.txt"), "utf-8")).toBe("1\nLOCAL\n3\n4\n5\n6\n7\n");
+      // No temp litter from either failed write.
+      expect(readdirSync(sub).filter((f) => f.includes("sesh-merge"))).toEqual([]);
+    } finally {
+      try { chmodSync(join(t, "sub"), 0o700); } catch { /* already restored */ }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The other half: the destination FILE cannot be replaced but its directory
+  // is writable, so the sidecar lands. This is the case the write-back handlers
+  // exist for, and the asymmetry a reviewer found by hand — the `taken` path
+  // used to fall through to `io-error` while the merged path parked a sidecar.
+  //
+  // Probed at runtime, not gated on `platform()`: an immutable-file flag is the
+  // only portable-ish way to fail a rename without failing its directory, and
+  // it needs both the tool and the privilege. If it doesn't take, the branch is
+  // genuinely unreachable here and the test says so by returning rather than
+  // asserting something weaker.
+  it("parks the peer's copy when only the destination file cannot be replaced", async () => {
+    const { root, a, i, t } = trees();
+    let locked: string | null = null;
+    const unlock = (): void => {
+      if (!locked) return;
+      try { execFileSync("chflags", ["nouchg", locked]); } catch { /* best effort */ }
+      locked = null;
+    };
+    try {
+      put(a, "taken.txt", "v1\n");
+      put(t, "taken.txt", "v1\n");
+      put(i, "taken.txt", "v2\n");
+
+      const dest = join(t, "taken.txt");
+      try {
+        execFileSync("chflags", ["uchg", dest], { stdio: "ignore" });
+        locked = dest;
+      } catch {
+        return; // no chflags (non-macOS, or not permitted) — branch unreachable
+      }
+      // Confirm the flag actually bites before asserting on it.
+      try {
+        writeFileSync(dest, "probe");
+        return; // flag accepted but not enforced
+      } catch { /* good: the file really is immutable */ }
+
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+
+      expect(r.taken).toEqual([]);
+      expect(r.skipped).toEqual([]);
+      expect(r.sidecars).toHaveLength(1);
+      expect(r.sidecars[0]!.path).toBe("taken.txt");
+      expect(r.sidecars[0]!.reason).toBe("merge-failed");
+      // `.theirs-` is honest: the sidecar carries the PEER's file.
+      expect(r.sidecars[0]!.sidecar).toContain(".theirs-");
+      expect(readFileSync(join(t, r.sidecars[0]!.sidecar), "utf-8")).toBe("v2\n");
+      // Local is untouched, and nothing was left behind.
+      expect(readFileSync(dest, "utf-8")).toBe("v1\n");
+      expect(readdirSync(t).filter((f) => f.includes("sesh-merge"))).toEqual([]);
+    } finally {
+      unlock();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // `git merge-file` reads config from whatever repository the process is
   // standing in, even though it takes three plain paths — and the caller's cwd
   // is normally the user's project, i.e. normally a repo. `--diff3` overrides
