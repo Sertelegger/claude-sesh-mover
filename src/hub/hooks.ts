@@ -60,8 +60,13 @@ export type HookGateKey = "autoPush" | "startupNotice";
 // cwd -> hub configured -> project linked -> flag enabled, and every decline
 // is a silent no-op for the caller (no stdout, no non-zero exit).
 export function evaluateHookGate(payload: HookPayload, key: HookGateKey): HookGate {
-  const projectPath = payload.cwd;
-  if (!projectPath) return { ok: false, reason: "no-cwd" };
+  const projectPath: unknown = payload.cwd;
+  // The typeof check is not redundant with the falsiness check: the payload is
+  // untrusted JSON, so `cwd` can be a number/object/array/boolean that is
+  // perfectly truthy and then throws ERR_INVALID_ARG_TYPE inside join(). This
+  // function is documented and consumed as a pure data result (both hook
+  // endpoints call it), so a hostile payload must decline, not throw.
+  if (typeof projectPath !== "string" || !projectPath) return { ok: false, reason: "no-cwd" };
 
   // Same call shape hub/status.ts uses: computeEffectiveConfig reads the raw
   // override files itself, so an absent layer contributes nothing.

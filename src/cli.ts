@@ -654,8 +654,15 @@ hub
     // stdout and exits non-zero on failure. The hook endpoints speak Claude
     // Code's HOOK protocol instead: this one writes NOTHING to stdout, ever,
     // and ALWAYS exits 0. A broken/unreachable hub must never surface as a
-    // hook error when a user's session ends. Diagnostics go to stderr only.
+    // hook error when a user's session ends. Diagnostics go to stderr only,
+    // through writeHookDiagnostic so they can't break that promise either.
     // ---------------------------------------------------------------------
+    // SessionEnd fires while the parent Claude Code process is tearing down,
+    // so this hook's stdio pipes can be closed out from under it. A write to
+    // a reader-less pipe EPIPEs *asynchronously*, surfacing as an 'error'
+    // event that — with no listener — terminates the process with exit 1.
+    // One listener, attached before any write, keeps the contract.
+    process.stderr.on("error", () => {});
     try {
       const payload = readHookPayload(await readStdin());
       const gate = evaluateHookGate(payload, "autoPush");
@@ -678,10 +685,10 @@ hub
       // hub operation for this project is already running, so this push is
       // redundant by definition. Everything else is worth a stderr line.
       if (!result.success && !("reason" in result && result.reason === "lock-busy")) {
-        process.stderr.write(`sesh-mover auto-push: ${JSON.stringify(result)}\n`);
+        writeHookDiagnostic(`sesh-mover auto-push: ${JSON.stringify(result)}\n`);
       }
     } catch (e) {
-      process.stderr.write(`sesh-mover auto-push failed: ${(e as Error).message}\n`);
+      writeHookDiagnostic(`sesh-mover auto-push failed: ${(e as Error).message}\n`);
     }
   });
 
@@ -1077,6 +1084,19 @@ function getClaudeVersion(): string {
     return match ? match[1] : "unknown";
   } catch {
     return "unknown";
+  }
+}
+
+// Best-effort stderr diagnostic for the hook endpoints. A hook's diagnostic
+// must never be able to change its exit code, so a failing write is swallowed
+// here: writes to a closed/broken stderr can throw synchronously (closed fd)
+// as well as emit asynchronously (EPIPE on a reader-less pipe, handled by the
+// listener the endpoints attach). The hook contract outranks the diagnostic.
+function writeHookDiagnostic(message: string): void {
+  try {
+    process.stderr.write(message);
+  } catch {
+    /* stderr is gone — stay silent rather than fail the hook */
   }
 }
 

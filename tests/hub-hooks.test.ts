@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome, homeEnv, type HomeOverrideHandle } from "./helpers/env.js";
-import { runCli } from "./helpers/run-cli.js";
+import { runCli, cliPath } from "./helpers/run-cli.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
 
@@ -98,6 +99,20 @@ describe("evaluateHookGate", () => {
   it("declines with no-cwd when the payload carries no cwd", async () => {
     const { evaluateHookGate } = await import("../src/hub/hooks.js");
     expect(evaluateHookGate({}, "autoPush")).toEqual({ ok: false, reason: "no-cwd" });
+  });
+
+  it("declines with no-cwd for a non-string cwd instead of throwing", async () => {
+    const { evaluateHookGate } = await import("../src/hub/hooks.js");
+    // A hook payload is attacker-adjacent only in the sense that it is
+    // untrusted JSON: a non-string cwd reaches join() and throws
+    // ERR_INVALID_ARG_TYPE. evaluateHookGate is documented and consumed as a
+    // pure data result (Task 6 calls it too), so it must decline, not throw.
+    for (const cwd of [123, {}, ["a"], true, null]) {
+      expect(evaluateHookGate({ cwd } as never, "autoPush")).toEqual({
+        ok: false,
+        reason: "no-cwd",
+      });
+    }
   });
 
   it("declines with no-hub when no hub is configured", async () => {
@@ -225,6 +240,56 @@ describe("hub hook-session-end (CLI)", () => {
     expect(r.stdout).toBe("");
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
+  });
+
+  it("exits 0 and prints NOTHING when hub.autoPush is turned off", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project);
+    // Project scope first, then user scope — both layers must be able to
+    // switch the automation off without the hook making a sound.
+    writeSeshMoverConfig(project, { autoPush: false });
+    const projectScope = runHook(JSON.stringify({ cwd: project }));
+    expect(projectScope.stdout).toBe("");
+    expect(projectScope.stderr).toBe("");
+    expect(projectScope.status).toBe(0);
+
+    rmSync(join(project, ".claude-sesh-mover", "config.json"));
+    writeSeshMoverConfig(home, { path: hubDir, autoPush: false });
+    const userScope = runHook(JSON.stringify({ cwd: project }));
+    expect(userScope.stdout).toBe("");
+    expect(userScope.stderr).toBe("");
+    expect(userScope.status).toBe(0);
+  });
+
+  it("still exits 0 when its stderr pipe is closed before the diagnostic is written", async () => {
+    // SessionEnd fires while the parent Claude Code process is tearing down,
+    // which is exactly when the hook's stdio pipes can be closed out from
+    // under it. A diagnostic write onto a reader-less pipe EPIPEs
+    // asynchronously; unhandled, that terminates the process with exit 1 and
+    // breaks the "always exits 0" half of the hook contract.
+    const notADir = join(tempDir, "hub-is-a-file-epipe");
+    writeFileSync(notADir, "this is a file, not a hub directory\n");
+    writeSeshMoverConfig(home, { path: notADir });
+    linkProject(project);
+
+    const child = spawn("node", [cliPath(), "hub", "hook-session-end"], {
+      env: { ...process.env, ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf-8");
+    child.stdout.on("data", (d: string) => {
+      stdout += d;
+    });
+    // Destroy the read end now: the endpoint only reaches its diagnostic
+    // write after a config read, a lock acquire and a failed hub write, so
+    // this always lands first.
+    child.stderr.destroy();
+    child.stdin.end(JSON.stringify({ cwd: project }));
+
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    expect(stdout).toBe("");
+    expect(code).toBe(0);
   });
 
   it("pushes the project to the hub, printing nothing and exiting 0", async () => {
