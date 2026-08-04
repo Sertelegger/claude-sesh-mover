@@ -330,21 +330,29 @@ export async function mergeWorkspaceTrees(opts) {
                         report.upstreamDeleted.push(rel);
                     continue;
                 }
-                // The mirror image, and the one place this function departs from
-                // §5.3's table — see `localDeleted`. The ancestor is the generation
-                // this machine last agreed with the hub about, so a file that was in
-                // it and is gone now was deleted here. Honor that only while the peer
-                // left it alone; a change upstream outranks the deletion and comes
+                // BEFORE the local-deletion decision, not after: "absent from the tree
+                // scan" and "deleted by the user" are different claims, and the scan
+                // cannot see a path hidden behind a symlink or occupied by a directory.
+                // Classifying first moves those two into `skipped` — where the report
+                // says "nothing was written near it", which is what actually happened —
+                // instead of letting them be reported as deletions the user is then
+                // told they made. What is left in `localDeleted` is genuinely
+                // indistinguishable (see that field).
+                const destination = classifyDestination(opts.targetDir, rel);
+                if (!destination.ok) {
+                    report.skipped.push({ path: rel, reason: destination.reason });
+                    continue;
+                }
+                // The mirror image of `upstreamDeleted`, and the one place this function
+                // departs from §5.3's table — see `localDeleted`. The ancestor is the
+                // generation both machines last shared, so a file that was in it and is
+                // gone now is very likely a deletion here. Honor that only while the
+                // peer left it alone; a change upstream outranks the deletion and comes
                 // back as `restored`, because the alternative is discarding an edit
                 // that exists nowhere else on this machine.
                 const deletedLocally = localPath === null && ancestorPath !== null;
                 if (deletedLocally && sameContent(incomingPath, ancestorPath)) {
                     report.localDeleted.push(rel);
-                    continue;
-                }
-                const destination = classifyDestination(opts.targetDir, rel);
-                if (!destination.ok) {
-                    report.skipped.push({ path: rel, reason: destination.reason });
                     continue;
                 }
                 if (localPath === null) {

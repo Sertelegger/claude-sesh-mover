@@ -153,9 +153,13 @@ export async function hubPush(
       const manifestPath = join(bundleStaging, "manifest.json");
       const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
       // Declare what this snapshot descends from — read BEFORE the new
-      // generation is recorded below. It is what lets a puller merge against a
-      // generation that is genuinely common to both trees instead of assuming
-      // this machine was in step with it (see the field's doc in types.ts).
+      // generation is recorded below. A puller intersects this id with its own
+      // generation history, and only a hit makes a 3-way merge legal: it is the
+      // proof that a generation was held by both trees, which neither side can
+      // establish alone (see the field's doc in types.ts). `file` and
+      // `pushedAt` ride along as diagnostics only — the puller resolves the
+      // generation through its OWN record, so nothing here becomes a path or a
+      // comparison on the other machine.
       const basedOnRef = readSyncState(opts.projectPath).hub?.lastWorkspace;
       m.workspace = {
         fileCount: ws.fileCount,

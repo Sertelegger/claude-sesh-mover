@@ -327,8 +327,9 @@ describe("sync-state v2 (hub)", () => {
     expect(s.hub?.hubId).toBe("hub-1");
     expect(s.hub?.lastWorkspace?.bundleId).toBe("bundle-1");
     // pushedAt dates the GENERATION and is passed in; syncedAt dates our
-    // knowledge of it and is stamped here. Conflating them would make the
-    // cross-machine ancestor comparison meaningless.
+    // knowledge of it and is stamped here. Both are diagnostics — no decision
+    // reads either — but conflating them would destroy the only record of when
+    // the bundle was actually published.
     expect(s.hub?.lastWorkspace?.pushedAt).toBe("2026-04-11T10:00:00.000Z");
     expect(s.hub?.lastWorkspace?.syncedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(s.hub?.lastWorkspace?.syncedAt).not.toBe(s.hub?.lastWorkspace?.pushedAt);
@@ -365,6 +366,59 @@ describe("sync-state v2 (hub)", () => {
       pushedAt: "2026-04-12T10:00:00.000Z",
       syncedAt: expect.any(String),
     });
+    // The head is replaced, but the generation it replaced is REMEMBERED: that
+    // history is what lets a pull tell "the peer built on something we held"
+    // from "the peer built on a stranger", which the head alone cannot answer.
+    expect(final.hub?.workspaceGenerations?.map((g) => g.bundleId))
+      .toEqual(["bundle-2", "bundle-1"]);
+  });
+
+  it("knownWorkspaceGenerations is most-recent-first, deduped, and bounded", async () => {
+    const { readSyncState, setLastWorkspace, knownWorkspaceGenerations, MAX_WORKSPACE_GENERATIONS } =
+      await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw3");
+    expect(knownWorkspaceGenerations(s)).toEqual([]);
+
+    for (let n = 1; n <= MAX_WORKSPACE_GENERATIONS + 5; n++) {
+      setLastWorkspace(s, "hub-1", {
+        bundleId: `b${n}`, file: `projects/p/bundles/m/${n}.tar.gz`,
+        pushedAt: `2026-04-11T10:00:${String(n % 60).padStart(2, "0")}.000Z`,
+      });
+    }
+    const known = knownWorkspaceGenerations(s);
+    expect(known).toHaveLength(MAX_WORKSPACE_GENERATIONS);
+    expect(known[0]!.bundleId).toBe(`b${MAX_WORKSPACE_GENERATIONS + 5}`);
+    // Oldest entries fall off the end, never the newest — a forgotten
+    // generation costs a merge, a forgotten HEAD would cost the tree's identity.
+    expect(known.at(-1)!.bundleId).toBe("b6");
+
+    // Re-applying a generation we already hold moves it to the head instead of
+    // taking a second slot.
+    setLastWorkspace(s, "hub-1", {
+      bundleId: "b40", file: "projects/p/bundles/m/40.tar.gz",
+      pushedAt: "2026-04-11T10:00:40.000Z",
+    });
+    const after = knownWorkspaceGenerations(s);
+    expect(after).toHaveLength(MAX_WORKSPACE_GENERATIONS);
+    expect(after[0]!.bundleId).toBe("b40");
+    expect(after.filter((g) => g.bundleId === "b40")).toHaveLength(1);
+  });
+
+  it("knownWorkspaceGenerations leads with lastWorkspace when the list predates it", async () => {
+    // A state file written before the list existed (or hand-edited) still has a
+    // head, and it must still be offered as a candidate — otherwise a machine
+    // upgrading mid-project would silently lose its only known generation.
+    const { readSyncState, knownWorkspaceGenerations } = await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw4");
+    s.hub = {
+      hubId: "hub-1",
+      threadByLocalSession: {},
+      lastWorkspace: {
+        bundleId: "legacy", file: "projects/p/bundles/m/legacy.tar.gz",
+        syncedAt: "2026-04-11T10:00:00.000Z",
+      },
+    };
+    expect(knownWorkspaceGenerations(s).map((g) => g.bundleId)).toEqual(["legacy"]);
   });
 
   it("v2 files with unknown extra fields still read (forward tolerance)", async () => {

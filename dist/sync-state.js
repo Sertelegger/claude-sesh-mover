@@ -138,27 +138,44 @@ export function setThreadId(state, hubId, localSessionId, threadId) {
     state.hub.threadByLocalSession[localSessionId] = threadId;
 }
 /**
- * Record the workspace generation this machine last pushed or applied.
+ * How many workspace generations this machine remembers having held.
  *
- * It is the ancestor input for the 3-way workspace merge on the next pull
- * (design §5.2) — a POINTER at a bundle on the hub, never a copy of the tree,
- * because every workspace payload is a full snapshot generation and the hub
- * already stores it.
+ * The list is what makes a merge base provably common to both trees (see
+ * `knownWorkspaceGenerations`), so this bound is the one place that guarantee
+ * degrades: a peer more than this many generations behind us declares a base we
+ * have forgotten, and the pull then finds no common generation and falls to
+ * no-ancestor mode — a loud skip — rather than merging against a guess. That is
+ * the safe direction to degrade in, and 50 (fifty workspace pushes or pulls on
+ * THIS machine with no sync from that peer in between) is deep enough that
+ * reaching it means the peer has effectively stopped syncing. It is bounded at
+ * all because each entry is ~200 bytes of a file rewritten on every hub
+ * operation.
+ */
+export const MAX_WORKSPACE_GENERATIONS = 50;
+/**
+ * Record a workspace generation this machine's tree now reflects — pushed or
+ * applied — as the new head of its generation history.
  *
- * Two rules the callers depend on:
+ * A generation is a POINTER at a bundle on the hub, never a copy of the tree,
+ * because every workspace payload is a full snapshot and the hub already stores
+ * it.
+ *
+ * Three rules the callers depend on:
  *
  * - **Write it only for a generation this machine's tree actually reflects.**
  *   Recording a generation that was never applied (a skipped payload, say)
  *   would make the NEXT merge read "present in the ancestor, absent locally"
  *   as a deliberate local deletion, so files the user never received would be
  *   silently withheld rather than delivered.
- * - It is per-project and singular: a newer generation replaces the older one
- *   outright. There is no history to keep — the merge only ever needs the last
- *   common point.
- * - `generation.pushedAt` must date the BUNDLE (its `pushedAt` on the hub), not
- *   this moment. Pull compares it against another machine's generation to pick
- *   the older of the two, and a locally-stamped clock would make that
- *   comparison meaningless across machines.
+ * - **The history matters, not just the head.** `lastWorkspace` alone answers
+ *   "what does our tree look like now"; choosing a legal merge base needs "did
+ *   we ever hold the generation the peer says it built on", which only the list
+ *   can answer. Keeping the head alone is what let a pull merge against a
+ *   generation one of the two trees had never held.
+ * - `generation.pushedAt` dates the BUNDLE and is DIAGNOSTIC ONLY: it is the
+ *   pushing machine's wall clock — the hub is a passive filesystem and stamps
+ *   nothing — so it must never be compared with another machine's stamp to
+ *   order two generations.
  *
  * Same v1/v2 discipline as `setThreadId`: the hub block (and with it
  * schemaVersion 2) appears only once hub data is first written.
@@ -168,11 +185,47 @@ export function setLastWorkspace(state, hubId, generation) {
         state.hub = { hubId, threadByLocalSession: {} };
         state.schemaVersion = 2;
     }
-    state.hub.lastWorkspace = {
+    const ref = {
         bundleId: generation.bundleId,
         file: generation.file,
         pushedAt: generation.pushedAt,
         syncedAt: new Date().toISOString(),
     };
+    const rest = knownWorkspaceGenerations(state).filter((g) => g.bundleId !== ref.bundleId);
+    state.hub.lastWorkspace = ref;
+    // Re-applying a generation we already hold moves it back to the head instead
+    // of duplicating it: the list is a SET ordered by recency, and a duplicate
+    // would burn one of the bounded slots for no information.
+    state.hub.workspaceGenerations = [ref, ...rest].slice(0, MAX_WORKSPACE_GENERATIONS);
+}
+/**
+ * Every workspace generation this machine's tree has passed through, most
+ * recent first.
+ *
+ * This is one half of the "common to both trees" test that a 3-way merge base
+ * must pass. The other half is what the incoming bundle chain declares it
+ * descends from (`manifest.workspace.basedOn`); the intersection is the set of
+ * legal bases, and `hub/pull.ts`'s `chooseMergeAncestor` takes the newest of
+ * them.
+ *
+ * No timestamp is involved in that decision, deliberately. `pushedAt` is the
+ * pushing machine's clock, so ordering two machines' generations by it is
+ * meaningless — and a machine whose clock ran fast could otherwise talk a peer
+ * into merging against the peer's OWN newest generation, which is precisely the
+ * shape that silently reverts the peer's work.
+ *
+ * `lastWorkspace` leads whenever it is not already the head, so a state file
+ * written before the list existed — or hand-edited — still contributes it.
+ */
+export function knownWorkspaceGenerations(state) {
+    const hub = state.hub;
+    if (!hub)
+        return [];
+    const list = hub.workspaceGenerations ?? [];
+    const head = hub.lastWorkspace;
+    if (head && list[0]?.bundleId !== head.bundleId) {
+        return [head, ...list.filter((g) => g.bundleId !== head.bundleId)];
+    }
+    return list.slice(); // never hand out the live array: callers only read
 }
 //# sourceMappingURL=sync-state.js.map

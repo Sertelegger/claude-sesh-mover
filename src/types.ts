@@ -173,17 +173,21 @@ export interface ExportManifest {
      * this snapshot was taken — i.e. its own `hub.lastWorkspace` at that
      * moment. `null` when it had none (this was its first workspace push).
      *
-     * A puller weighs this generation against its own last-synced one and
-     * merges against whichever is OLDER — see hub/pull.ts's
-     * `chooseMergeAncestor` for why that is the one common to both trees.
-     * Without this field a puller can only assume its own generation is
-     * common, which silently reverts its newer work to the pusher's older copy
-     * whenever the two machines pushed without pulling in between — something
-     * auto-push makes routine.
+     * **Only `bundleId` is ever acted on.** A puller looks that id up in its own
+     * `hub.workspaceGenerations`; a hit proves the generation is common to both
+     * trees and makes it a legal merge base, and the puller then uses ITS OWN
+     * record of that generation. `file` and `pushedAt` are diagnostics: the
+     * first never becomes a path on the puller (a forged one therefore cannot
+     * reach the filesystem at all), and the second is the pusher's wall clock,
+     * so it is not comparable with anything of ours.
      *
-     * Optional because bundles written before this field existed do not carry
-     * it; those fall back to the puller's own generation, i.e. to the older
-     * behavior, never to a crash.
+     * Without this field a puller can only assume its own generation is common,
+     * which silently reverts its newer work to the pusher's older copy whenever
+     * the two machines pushed without pulling in between — something auto-push
+     * makes routine. Optional because bundles written before this field existed
+     * do not carry it; those declare no common generation, so the payload
+     * degrades to no-ancestor mode (§5.4) rather than being merged against a
+     * guess.
      */
     basedOn?: { bundleId: string; file: string; pushedAt?: string } | null;
   };
@@ -636,6 +640,29 @@ export interface SyncStateImported {
   registered: boolean;
 }
 
+/**
+ * A pointer at one workspace generation stored on the hub.
+ *
+ * Only a pointer: the hub keeps the tree, because every workspace payload is a
+ * full snapshot generation.
+ *
+ * Neither timestamp participates in any decision. `syncedAt` is this machine's
+ * clock and `pushedAt` is the *pushing* machine's clock — the hub is a passive
+ * filesystem and stamps nothing — so no comparison between two machines'
+ * generations can be drawn from either. Which generation a merge uses is
+ * decided by SET MEMBERSHIP (`knownWorkspaceGenerations`), never by time; the
+ * stamps are diagnostics.
+ */
+export interface WorkspaceGenerationRef {
+  bundleId: string;
+  /** Hub-relative path of the bundle carrying this generation. */
+  file: string;
+  /** When this machine pushed or applied it (this machine's clock). */
+  syncedAt: string;
+  /** When the bundle was published (the PUSHING machine's clock). Diagnostic only. */
+  pushedAt?: string;
+}
+
 export interface SyncState {
   projectPath: string;
   schemaVersion: 1 | 2;
@@ -646,21 +673,25 @@ export interface SyncState {
     hubId: string;
     threadByLocalSession: Record<string, string>;
     /**
-     * The workspace generation this machine last pushed or applied — the
-     * ancestor input for the 3-way merge on the next pull (design §5.2).
+     * The workspace generation this machine last pushed or applied — i.e. the
+     * head of `workspaceGenerations`, and what a push declares as its
+     * `basedOn`.
      *
-     * Only a POINTER: the hub itself stores the tree, because every workspace
-     * payload is a full snapshot generation. Absent until this project first
-     * pushes or pulls a workspace payload, which is why a plain
-     * sessions-only hub user never grows the field.
-     *
-     * `pushedAt` dates the GENERATION (when its bundle was pushed to the hub);
-     * `syncedAt` dates our knowledge of it (when this machine pushed or applied
-     * it). Only the first is comparable with another machine's generation, and
-     * pull needs that comparison to pick the older of two candidate ancestors —
-     * see hub/pull.ts's `chooseMergeAncestor`. Optional so that a file written
-     * before this field existed still reads.
+     * Absent until this project first pushes or pulls a workspace payload,
+     * which is why a plain sessions-only hub user never grows the field.
      */
-    lastWorkspace?: { bundleId: string; file: string; syncedAt: string; pushedAt?: string };
+    lastWorkspace?: WorkspaceGenerationRef;
+    /**
+     * Every workspace generation this machine's tree has passed through, most
+     * recent first and bounded (see `MAX_WORKSPACE_GENERATIONS`), with
+     * `lastWorkspace` as its head.
+     *
+     * This is the merge's whole ancestor mechanism: a generation may be used as
+     * a 3-way merge base only if it is common to BOTH trees, and membership in
+     * this list is exactly the "we held it too" half of that test — no clocks
+     * involved. See `hub/pull.ts`'s `chooseMergeAncestor`, which intersects it
+     * with what the incoming chain declares it descends from.
+     */
+    workspaceGenerations?: WorkspaceGenerationRef[];
   };
 }

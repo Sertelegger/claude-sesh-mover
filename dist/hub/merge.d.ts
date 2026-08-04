@@ -55,8 +55,8 @@ export interface WorkspaceMergeReport {
     /** absent locally AND absent from the ancestor -> created */
     created: string[];
     /**
-     * In the ancestor, gone locally, and untouched upstream: a deliberate local
-     * deletion since the last sync, so it is **not** recreated.
+     * In the ancestor, gone locally, and untouched upstream — so it is **not**
+     * recreated.
      *
      * This is the one row that deviates from design §5.3's table (which says
      * "absent locally | present | create" unconditionally). That rule resurrects
@@ -64,11 +64,18 @@ export interface WorkspaceMergeReport {
      * ancestor makes unnecessary: "absent locally" and "deleted locally" are only
      * indistinguishable without one.
      *
-     * Reported rather than silent, because two other situations reach this row
-     * and are NOT deletions: a path hidden behind a local symlink (the tree scan
-     * never follows one) and a file an earlier merge could not write. Both are
-     * then withheld, so the caller must be able to say so — and the incoming copy
-     * stays on the hub either way.
+     * **Not the same claim as "the user deleted it", and callers must not phrase
+     * it that way.** A deliberate deletion is by far the likeliest cause, but a
+     * file an earlier merge could not write reaches this row too — it was never
+     * created here, and the ancestor has since advanced past it — and from here
+     * the two are identical. The cases this function CAN tell apart it does:
+     * a path hidden behind a local symlink, or one occupied by a directory, is
+     * classified before this row is reached and lands in `skipped` instead, where
+     * "nothing was written near it" is the accurate story.
+     *
+     * Either way the withholding is permanent as far as ordinary pulls go (the
+     * ancestor advances every time), so this row must always be surfaced, with a
+     * remedy: an unpack with `--force-workspace` is what puts the hub's copy back.
      *
      * A caller merging into a tree that is EMPTY or unrelated must not use this
      * function at all: every file would read as a local deletion. That is the

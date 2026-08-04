@@ -2087,6 +2087,49 @@ async function arrangeWorkspacePair(
   }
 }
 
+/**
+ * Rewrite one field of a bundle's manifest as it sits on the hub.
+ *
+ * The hub is a plain directory, so anything in it is peer-supplied data a
+ * hostile or merely broken machine could have written. Round-tripping the
+ * archive is how a test gets to say something the pushing code would never say
+ * — which is the only way to pin what the PULLING code does with it.
+ */
+async function patchBundleManifest(
+  hubPath: string,
+  projectId: string,
+  bundleId: string,
+  mutate: (manifest: Record<string, unknown>) => void
+): Promise<void> {
+  const backend = createFsBackend(hubPath);
+  const { indexes } = await readAllIndexes(backend, projectId);
+  let file: string | null = null;
+  for (const idx of indexes) {
+    for (const thread of Object.values(idx.threads)) {
+      for (const r of thread.bundles) if (r.bundleId === bundleId) file = r.file;
+    }
+  }
+  if (!file) throw new Error(`patchBundleManifest: no hub record for bundle ${bundleId}`);
+
+  const work = mkdtempSync(join(tmpdir(), "sesh-ws-patch-"));
+  try {
+    const tar = join(work, "in.tar.gz");
+    writeFileSync(tar, await backend.read(file));
+    const dir = join(work, "bundle");
+    mkdirSync(dir, { recursive: true });
+    await extractArchive(tar, dir);
+    const manifestPath = join(dir, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as Record<string, unknown>;
+    mutate(manifest);
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+    const out = join(work, "out.tar.gz");
+    await createArchive(dir, out, "gzip");
+    await backend.writeAtomic(file, readFileSync(out));
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
 describe("hub pull — workspace 3-way merge", () => {
   it("merges a workspace payload 3-way against the last synced generation", async () => {
     const w = await arrangeWorkspacePair();
@@ -2152,6 +2195,9 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(text).toContain("A-EDIT");
       expect(p.warnings.join(" ")).toContain("shared.txt");
       expect(p.warnings.join(" ")).toContain("conflict");
+      // Exactly one file, so the sentence has to agree with itself. n = 1 is the
+      // commonest case a user ever sees these warnings in.
+      expect(p.warnings.join(" ")).toContain("1 workspace file was merged with conflict markers");
     } finally {
       w.cleanup();
     }
@@ -2175,7 +2221,16 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(p.workspaceMerge!.localDeleted).toEqual(["README.md"]);
       expect(p.workspaceMerge!.created).toEqual([]);
       expect(existsSync(join(w.projectB, "README.md"))).toBe(false);
-      expect(p.warnings.join(" ")).toContain("README.md");
+      const warned = p.warnings.join(" ");
+      expect(warned).toContain("README.md");
+      // The withholding is permanent as far as ordinary pulls go (the shared
+      // generation advances past it every time), and this row cannot actually
+      // prove a deletion happened — a file an earlier sync could not write
+      // looks identical from here. So the sentence must not assert one, and it
+      // must name the remedy for the case where it is wrong.
+      expect(warned).not.toMatch(/you deleted here/);
+      expect(warned).toContain("Nothing will offer it again");
+      expect(warned).toContain("--force-workspace");
       // The other machine's edit still arrived.
       expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toContain("A-EDIT");
     } finally {
@@ -2229,10 +2284,24 @@ describe("hub pull — workspace 3-way merge", () => {
   it("falls back to no-ancestor behavior when no generation was recorded", async () => {
     const w = await arrangeWorkspacePair({ bootstrapB: false });
     try {
+      // The peer pushes a SECOND workspace payload before this machine ever
+      // joins, so the payload it receives declares a base (gen-1) instead of
+      // null. That distinction is the whole test: with a single push the
+      // payload declares nothing and any ancestor rule at all reaches this
+      // branch, so a one-push fixture cannot tell a working gate from a broken
+      // one — and the version of this file that had one hid a machine merging
+      // against a tree it had never held, writing conflict markers into an
+      // unrelated local README and withholding the peer's own files forever.
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
       w.useB();
       // A pre-existing, non-empty tree on a machine that has never synced this
-      // project's workspace: no ancestor exists, so a 3-way merge is impossible.
+      // project's workspace: NO generation is shared with the payload, whatever
+      // the payload says it descends from, so a 3-way merge is impossible.
       writeFileSync(join(w.projectB, "local-work.txt"), "mine\n");
+      writeFileSync(join(w.projectB, "README.md"), "B's OWN readme — precious\n");
 
       const pull = await w.pullOnB();
       expect(pull.success).toBe(true);
@@ -2250,8 +2319,74 @@ describe("hub pull — workspace 3-way merge", () => {
       // ancestor — otherwise the next pull would read the whole payload as
       // "deleted here" and withhold it forever.
       expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeUndefined();
+      expect(readSyncState(w.projectB).hub?.workspaceGenerations).toBeUndefined();
       expect(existsSync(join(w.projectB, "shared.txt"))).toBe(false);
       expect(readFileSync(join(w.projectB, "local-work.txt"), "utf-8")).toBe("mine\n");
+      // Not one byte of this machine's own tree was touched — in particular no
+      // conflict markers in a file that merely shares a name with the peer's.
+      expect(readFileSync(join(w.projectB, "README.md"), "utf-8")).toBe("B's OWN readme — precious\n");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("refuses an explicit --target-path at a non-empty dir even when the payload declares a base", async () => {
+    // The loud branch of the same gate, and the one a peer's `basedOn` used to
+    // bypass: the payload names a generation this machine has never held, so
+    // "we have an ancestor" must stay false and the ErrorResult must stand.
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    const occupied = mkdtempSync(join(tmpdir(), "sesh-ws-occupied-"));
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(occupied, "unrelated.txt"), "someone else's project\n");
+      writeFileSync(join(occupied, "README.md"), "UNRELATED readme\n");
+
+      const pull = await w.pullOnB({ targetPath: occupied });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      expect((pull as { error: string }).error).toContain("is not empty");
+      expect((pull as { suggestion?: string }).suggestion).toContain("--force-workspace");
+      expect(existsSync(join(occupied, "shared.txt"))).toBe(false);
+      expect(readFileSync(join(occupied, "README.md"), "utf-8")).toBe("UNRELATED readme\n");
+    } finally {
+      rmSync(occupied, { recursive: true, force: true });
+      w.cleanup();
+    }
+  });
+
+  it("--force-workspace overrides the merge and unpacks over the tree, so it never goes inert", async () => {
+    // Once a generation is on record every payload merges, which would leave
+    // --force-workspace unreachable forever — and with it the only way to ask
+    // for the hub's copy wholesale, which is also the only remedy named for a
+    // file the merge withheld.
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      writeFileSync(join(w.projectB, "b-only.txt"), "mine\n");
+
+      const pull = await w.pullOnB({ forceWorkspace: true });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceUnpacked).not.toBeNull();
+      // Overwritten, not combined — and said so, naming the flag rather than
+      // claiming there was nothing to merge against.
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines({ 2: "A-EDIT" }));
+      // A file only this machine has is still not deleted by an unpack.
+      expect(readFileSync(join(w.projectB, "b-only.txt"), "utf-8")).toBe("mine\n");
+      expect(p.warnings.join(" ")).toContain("--force-workspace was passed");
+      // The generation still advances, so the next pull merges normally.
+      expect(readSyncState(w.projectB).hub?.workspaceGenerations).toHaveLength(2);
     } finally {
       w.cleanup();
     }
@@ -2403,38 +2538,49 @@ describe("hub pull — workspace 3-way merge", () => {
     }
   });
 
-  it("a poisoned lastWorkspace pointer is refused by the hub path guard, not followed", async () => {
+  it("a poisoned generation pointer is refused by the hub path guard and the merge falls back to an OLDER generation", async () => {
     const w = await arrangeWorkspacePair();
     try {
+      // Build a second generation on B, so its history is [gen-2, gen-1] and
+      // there is somewhere older to fall back TO.
       w.useA();
-      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A2" }));
+      await w.pushFromA();
+      const merged1 = await w.pullOnB();
+      expect(merged1.success).toBe(true);
+      expect(readSyncState(w.projectB).hub?.workspaceGenerations).toHaveLength(2);
+
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A2", 4: "A4" }));
       await w.pushFromA();
 
       w.useB();
       // sync-state is an ordinary JSON file in the user's home; a traversing
-      // path in it must not become a read outside the hub directory. No
-      // `pushedAt`, which is also the pre-0.6.0 shape — that puts the local
-      // (poisoned) candidate first, so the guard is genuinely exercised rather
-      // than skipped over.
+      // path in it must not become a read outside the hub directory. The
+      // bundleId is left intact so the poisoned entry is still the CHOSEN
+      // ancestor — the guard is genuinely exercised rather than skipped over.
       const poisoned = readSyncState(w.projectB);
-      poisoned.hub!.lastWorkspace = {
-        bundleId: "evil", file: "../../../../etc/passwd", syncedAt: new Date().toISOString(),
-      };
+      poisoned.hub!.lastWorkspace!.file = "../../../../etc/passwd";
+      poisoned.hub!.workspaceGenerations![0]!.file = "../../../../etc/passwd";
       writeSyncState(poisoned);
-      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 2: "A2", 8: "B-EDIT" }));
 
       const pull = await w.pullOnB();
       expect(pull.success).toBe(true);
       if (!pull.success) return;
       const p = pull as HubPullResult;
       // Refused at the hub-path chokepoint, named in a warning, and the pull
-      // recovers through the OTHER candidate (the payload's declared base)
-      // rather than either following the path or giving up on the merge.
-      expect(p.warnings.join(" ")).toContain("not a safe hub-relative path");
+      // recovers by dropping to the next-OLDER generation of our own — never by
+      // following the path, never by climbing back up to a newer one (which is
+      // the direction that silently overwrites work), and never silently.
+      const warned = p.warnings.join(" ");
+      expect(warned).toContain("not a safe hub-relative path");
+      expect(warned).toContain("older workspace generation");
       expect(p.workspaceMerge!.merged).toContain("shared.txt");
       const text = readFileSync(join(w.projectB, "shared.txt"), "utf-8");
-      expect(text).toContain("A-EDIT");
-      expect(text).toContain("B-EDIT");
+      expect(text).toContain("A4");      // the other machine's new edit arrived
+      expect(text).toContain("B-EDIT");  // and this machine's survived
+      expect(text).not.toContain("<<<<<<<");
     } finally {
       w.cleanup();
     }
@@ -2510,6 +2656,165 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(readFileSync(join(w.projectA, "shared.txt"), "utf-8")).toBe(wsLines({ 2: "A-EDIT" }));
       expect(p.workspaceMerge!.kept).toContain("shared.txt");
       expect(existsSync(join(w.projectA, "b-note.txt"))).toBe(true);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("a forged basedOn.file never becomes a path: the puller resolves the generation through its OWN record", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      const push2 = await w.pushFromA();
+      // Everything but the id is decoration on the receiving side. Prove it by
+      // planting a traversal where a lazier implementation would have fetched:
+      // the id still resolves (it names a generation B genuinely holds), so the
+      // merge must run — and must run against B's own pointer, never this one.
+      await patchBundleManifest(w.hub, w.projectId, push2.bundleId, (m) => {
+        const ws = m.workspace as { basedOn: { file: string; pushedAt: string } };
+        ws.basedOn.file = "../../../../../../etc/passwd";
+        ws.basedOn.pushedAt = "1970-01-01T00:00:00.000Z";
+      });
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.warnings.join(" ")).not.toContain("not a safe hub-relative path");
+      expect(p.workspaceMerge!.merged).toContain("shared.txt");
+      const text = readFileSync(join(w.projectB, "shared.txt"), "utf-8");
+      expect(text).toContain("A-EDIT");
+      expect(text).toContain("B-EDIT");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("a forged basedOn.bundleId naming a generation we never held merges nothing at all", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      const push2 = await w.pushFromA();
+      // A peer cannot nominate a merge base of its choosing: an id this machine
+      // has never held proves nothing about what the two trees share, so the
+      // payload has to degrade to the loud no-ancestor branch rather than being
+      // merged against a stranger.
+      await patchBundleManifest(w.hub, w.projectId, push2.bundleId, (m) => {
+        (m.workspace as { basedOn: { bundleId: string } }).basedOn.bundleId =
+          "11111111-2222-3333-4444-555555555555";
+      });
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      const before = readSyncState(w.projectB).hub!.lastWorkspace!.bundleId;
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines({ 8: "B-EDIT" }));
+      expect(p.warnings.join(" ")).toContain("--force-workspace");
+      // Nothing applied, so the recorded generation must not move.
+      expect(readSyncState(w.projectB).hub!.lastWorkspace!.bundleId).toBe(before);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("no timestamp decides the merge base: hostile pushedAt stamps change nothing", async () => {
+    // `pushedAt` is the PUSHING machine's wall clock — the hub stamps nothing —
+    // so ordering two machines' generations by it is meaningless. Ordering by
+    // it anyway reinstates the silent revert exactly: with a one-hour skew on
+    // the peer, this same arrangement reported `taken` and threw A's edit away.
+    // Here every stamp in sight is inverted (ours the oldest possible, theirs
+    // the newest) and the outcome must be identical to the honest-clock run.
+    const w = await arrangeWorkspacePair();
+    try {
+      // Divergence: B pushes from gen-1 while A, also at gen-1, pushes its own.
+      w.useB();
+      writeFileSync(join(w.projectB, "b-note.txt"), "B's note\n");
+      appendEntries(w.bJsonl, [{
+        uuid: "b-ws-skew-1", parentUuid: FIXTURE_HEAD_UUID, timestamp: B_FORK_AT,
+        sessionId: FIXTURE_SESSION_ID, cwd: w.projectB, version: "2.1.81", type: "user",
+        message: { role: "user", content: "work on B" },
+      }]);
+      const bPush = await hubPush({
+        configDir: w.configDirB, projectPath: w.projectB, hubPath: w.hub, claudeVersion: "2.1.81",
+      });
+      expect(bPush.success).toBe(true);
+      if (!bPush.success || !bPush.bundleId) return;
+
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+      ageOutOfLiveWindow(w.aJsonl);
+
+      // Now make every clock lie in the direction that used to flip the choice:
+      // A's OWN newest generation stamped as the oldest thing on the hub, and
+      // the genuinely-common older one — the correct answer — stamped as the
+      // newest. Any rule that orders candidates by these stamps picks A's own
+      // and reverts A's edit; the set-membership rule cannot see them at all.
+      const skewed = readSyncState(w.projectA);
+      skewed.hub!.lastWorkspace!.pushedAt = "1970-01-01T00:00:00.000Z";
+      skewed.hub!.workspaceGenerations![0]!.pushedAt = "1970-01-01T00:00:00.000Z";
+      const common = skewed.hub!.workspaceGenerations![1]!;
+      common.pushedAt = "2099-12-31T23:59:59.999Z";
+      writeSyncState(skewed);
+      await patchBundleManifest(w.hub, w.projectId, bPush.bundleId, (m) => {
+        (m.workspace as { basedOn: { pushedAt: string } }).basedOn.pushedAt =
+          "2099-12-31T23:59:59.999Z";
+      });
+
+      const pullA = await hubPull({
+        configDir: w.configDirA, projectPath: w.projectA, hubPath: w.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pullA.success).toBe(true);
+      if (!pullA.success) return;
+      const p = pullA as HubPullResult;
+      expect(p.workspaceMerge!.kept).toContain("shared.txt");
+      expect(p.workspaceMerge!.taken).not.toContain("shared.txt");
+      expect(readFileSync(join(w.projectA, "shared.txt"), "utf-8")).toBe(wsLines({ 2: "A-EDIT" }));
+      expect(existsSync(join(w.projectA, "b-note.txt"))).toBe(true);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("a peer that pushed twice since our last sync still merges, via the chain's older base", async () => {
+    // The routine shape under auto-push: the payload we apply declares a base
+    // we never held (the peer's own previous generation), while the EARLIER
+    // bundle in the same chain declares one we do. Without walking the chain
+    // this degrades to a skip on every repeat pull.
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "GEN-2" }));
+      await w.pushFromA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "GEN-2", 4: "GEN-3" }));
+      await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(w.projectB, "b-only.txt"), "mine\n");
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeDefined();
+      expect(p.workspaceMerge!.taken).toContain("shared.txt");
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8"))
+        .toBe(wsLines({ 2: "GEN-2", 4: "GEN-3" }));
+      expect(readFileSync(join(w.projectB, "b-only.txt"), "utf-8")).toBe("mine\n");
+      // No file of the peer's was withheld as a phantom local deletion.
+      expect(p.workspaceMerge!.localDeleted).toEqual([]);
     } finally {
       w.cleanup();
     }

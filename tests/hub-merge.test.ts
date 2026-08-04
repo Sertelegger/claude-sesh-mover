@@ -383,21 +383,40 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
     }
   });
 
-  it.skipIf(isWindows)("reports a path hidden behind a local symlink as locally deleted rather than dropping it silently", async () => {
+  it.skipIf(isWindows)("reports a path hidden behind a local symlink as SKIPPED, not as a local deletion", async () => {
     const { root, a, i, t } = trees();
     try {
       // The tree scan never follows symlinks, so docs/note.md is invisible
-      // locally — indistinguishable, from the merge's side, from a deletion.
-      // It must still appear in the report: this is the one case where
-      // "honored the deletion" is the wrong story, and silence would hide it.
+      // locally — and to the deletion rule alone it is indistinguishable from
+      // a file the user removed. It is not: classifying the destination first
+      // separates them, so the caller can say "nothing was written near this"
+      // instead of telling the user about a deletion they did not make.
       const outside = join(root, "outside");
       mkdirSync(outside, { recursive: true });
       symlinkSync(outside, join(t, "docs"));
       put(a, join("docs", "note.md"), "v1\n");
       put(i, join("docs", "note.md"), "v1\n");
       const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
-      expect(r.localDeleted).toEqual(["docs/note.md"]);
+      expect(r.skipped).toEqual([{ path: "docs/note.md", reason: "local-symlink" }]);
+      expect(r.localDeleted).toEqual([]);
       expect(existsSync(join(outside, "note.md"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a path occupied by a directory as SKIPPED, not as a local deletion", async () => {
+    const { root, a, i, t } = trees();
+    try {
+      // Same separation without needing symlinks (so it runs on Windows too):
+      // a directory sits where the file goes, the tree scan lists no file at
+      // that path, and "you deleted it" would be a fabrication.
+      mkdirSync(join(t, "note.md"), { recursive: true });
+      put(a, "note.md", "v1\n");
+      put(i, "note.md", "v1\n");
+      const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
+      expect(r.skipped).toEqual([{ path: "note.md", reason: "local-not-a-file" }]);
+      expect(r.localDeleted).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
