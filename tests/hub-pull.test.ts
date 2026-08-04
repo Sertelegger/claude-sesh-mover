@@ -1798,8 +1798,11 @@ describe("hub pull — divergence resolution", () => {
       if (!result.success) return;
       const p = result as HubPullResult;
 
-      // Reported as the fragment it fell back to...
-      expect(p.divergence?.resolution).toBe("fragment");
+      // Refusing must not also foreclose: SKIP semantics, not fragment.
+      // Recording a fragment here would put the bundle in
+      // peers[...].received, and the re-run this very warning asks for would
+      // report "already up to date" — terminal, recoverable only by hand.
+      expect(p.divergence?.resolution).toBe("skip");
       expect(p.divergence?.preservedSessionId).toBeUndefined();
       expect(p.appended ?? []).toHaveLength(0);
       // ...the local transcript is untouched, not truncated...
@@ -1807,17 +1810,69 @@ describe("hub pull — divergence resolution", () => {
       expect(uuidsOf(a.basePath)).toEqual([
         "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2",
       ]);
-      // ...the content still arrived as a separate session...
-      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+      // ...nothing landed at all...
+      expect(jsonlFiles(a.projectDirA)).toEqual(before);
+      expect(p.importedSessions).toHaveLength(0);
       // ...and the refusal names the age and the way through.
       const w = p.warnings.join(" ");
       expect(w).toContain("adopt-hub refused");
       expect(w).toMatch(/modified \d+s ago/);
       expect(w).toContain("--force-append");
+      expect(w).toContain("nothing was recorded");
       // The skill needs the age to phrase the question, and it is in the payload.
       expect(Date.now() - new Date(p.divergence!.localLastActiveAt).getTime()).toBeLessThan(
         5 * 60 * 1000
       );
+
+      // The round trip the warning promises: the user exits Claude Code and
+      // re-runs with consent. THIS is what the skip semantics buy — with a
+      // fragment recorded, this second pull would return
+      // "Already up to date with the source machine."
+      const forced = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", forceAppend: true, claudeVersion: "2.1.81",
+      });
+      expect(forced.success).toBe(true);
+      if (!forced.success) return;
+      const f = forced as HubPullResult;
+      expect(f.divergence?.resolution).toBe("adopt-hub");
+      expect(f.divergence?.preservedSessionId).toBeTruthy();
+      expect(uuidsOf(a.basePath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "b-entry-4", "b-entry-5",
+      ]);
+      expect(uuidsOf(join(a.projectDirA, `${f.divergence!.preservedSessionId}.jsonl`))).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2",
+      ]);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  // The same door, from the other side: a refusal must also leave `fragment`
+  // reachable, since that is the other branch the warning offers.
+  it("a refused adoption can still be resolved as a fragment afterwards", async () => {
+    const a = await arrangeDivergence();
+    try {
+      const before = jsonlFiles(a.projectDirA);
+      makeLookLive(a.basePath);
+      const refused = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(refused.success).toBe(true);
+      if (!refused.success) return;
+      expect((refused as HubPullResult).divergence?.resolution).toBe("skip");
+
+      const kept = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(kept.success).toBe(true);
+      if (!kept.success) return;
+      const k = kept as HubPullResult;
+      expect(k.divergence?.resolution).toBe("fragment");
+      expect(k.importedSessions).toHaveLength(1);
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
     } finally {
       a.cleanup();
     }

@@ -736,11 +736,26 @@ export async function hubPull(
               }
 
               if (mode === "adopt-hub" && divergence.adoptAvailable && looksLive && !opts.forceAppend) {
+                // Refuse with SKIP semantics, never fragment. Falling through
+                // to the import would record the bundle in
+                // peers[...].received, selectNeededBundles would drop it from
+                // every later pull, and the instruction in this very warning
+                // would be impossible to carry out — "already up to date" on
+                // the re-run, recoverable only by hand-editing sync-state.
+                // Refusing an operation must never also foreclose it, and a
+                // user who asked to adopt should not be permanently handed a
+                // fragment instead. `skippedByDivergence` is what keeps the
+                // thread resolvable (it suppresses the index rewrite and the
+                // "could not be identified" warning).
                 warnings.push(
-                  `adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Exit that session, then re-run with --on-divergence adopt-hub --force-append. The hub's branch was imported as a separate session in the meantime; nothing local was touched.`
+                  `adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Nothing was applied and nothing was recorded: exit that session, then re-run with --on-divergence adopt-hub --force-append (or --on-divergence fragment to keep both as separate sessions).`
                 );
-                divergence.resolution = "fragment";
-              } else if (mode === "adopt-hub" && divergence.adoptAvailable) {
+                divergence.resolution = "skip";
+                skippedByDivergence = true;
+                continue;
+              }
+
+              if (mode === "adopt-hub" && divergence.adoptAvailable) {
                 const preservedSessionId = randomUUID();
                 const preservedPath = join(targetProjectDir, `${preservedSessionId}.jsonl`);
                 const adopt = await adoptHubBranch({
