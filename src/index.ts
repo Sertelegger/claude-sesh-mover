@@ -24,6 +24,7 @@ export * from "./hub/identity.js";
 export * from "./hub/threads.js";
 export * from "./hub/index-file.js";
 export * from "./hub/workspace.js";
+export * from "./hub/merge.js";
 export * from "./hub/lock.js";
 export * from "./hub/append.js";
 export * from "./hub/init.js";

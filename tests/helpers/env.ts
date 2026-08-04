@@ -101,6 +101,41 @@ export function overrideTmp(dir: string): TmpOverrideHandle {
   };
 }
 
+export interface PathOverrideHandle {
+  /** Restore the previous PATH value under its original casing. */
+  restore(): void;
+}
+
+/**
+ * In-process twin of `prependPath`, but *replacing* PATH rather than extending
+ * it: point this process's executable search path at `dir` alone and return a
+ * handle that restores the original.
+ *
+ * Used to prove that code shelling out to an external binary (git) degrades
+ * honestly when that binary cannot be found. Same casing hazard as
+ * `prependPath`: the variable may be spelled "Path" on Windows, so overwrite
+ * whatever key already exists instead of adding a second one — otherwise the
+ * override silently no-ops there and the "binary missing" assertions run
+ * against a machine that still has the binary.
+ *
+ * Like `overrideTmp`, this mutates process-wide state for the duration of one
+ * test; always `.restore()` in a `finally`.
+ */
+export function overridePath(dir: string): PathOverrideHandle {
+  const keys = Object.keys(process.env).filter((k) => k.toUpperCase() === "PATH");
+  const saved = keys.map((k) => [k, process.env[k]] as const);
+  for (const k of keys) delete process.env[k];
+  process.env[keys[0] ?? "PATH"] = dir;
+  return {
+    restore(): void {
+      for (const k of Object.keys(process.env).filter((n) => n.toUpperCase() === "PATH")) {
+        delete process.env[k];
+      }
+      for (const [k, value] of saved) if (value !== undefined) process.env[k] = value;
+    },
+  };
+}
+
 /**
  * Build an env object with `dir` prepended to PATH, safe to pass as a child
  * process's `env` option.
