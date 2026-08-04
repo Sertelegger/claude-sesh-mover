@@ -35,5 +35,6 @@ Configurable keys:
 - `migrate.scope` — "current" or "all"
 - `hub.path` — absolute path to the hub directory ("" = not configured; normally set via `/sesh-mover:hub-init` rather than by hand)
 - `hub.noWorkspace` — true or false (when true, `push` skips the workspace snapshot for non-git projects by default)
+- `hub.pullAppend` — true or false (default true: `pull` splices a continuation onto the local session it continues instead of importing it as a separate session; false is the same as always passing `--no-append`)
 
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional branches) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

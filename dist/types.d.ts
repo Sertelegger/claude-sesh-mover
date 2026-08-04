@@ -141,6 +141,7 @@ export interface SeshMoverConfig {
     hub: {
         path: string;
         noWorkspace: boolean;
+        pullAppend: boolean;
     };
 }
 export interface ExportResult {
@@ -344,6 +345,11 @@ export interface HubPullResult {
         path: string;
         fileCount: number;
     } | null;
+    appended?: Array<{
+        threadId: string;
+        baseSessionId: string;
+        entriesAppended: number;
+    }>;
     warnings: string[];
 }
 export interface HubPullListResult {

@@ -691,6 +691,8 @@ program
   .option("--target-path <path>", "Workspace unpack destination when the project directory doesn't exist locally yet")
   .option("--force-workspace", "Merge workspace files into a non-empty target directory")
   .option("--project-id <id>", "Link to an existing hub project id")
+  .option("--force-append", "Append a pulled continuation even if the local session looks recently active")
+  .option("--no-append", "Never append; import continuations as separate sessions")
   .option("--source-config-dir <path>", "Override Claude config dir")
   .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
@@ -715,6 +717,8 @@ program
         targetPath: opts.targetPath,
         forceWorkspace: !!opts.forceWorkspace,
         projectIdOverride: opts.projectId,
+        forceAppend: !!opts.forceAppend,
+        noAppend: opts.append === false || !config.hub.pullAppend,
         claudeVersion: getClaudeVersion(),
         onProgress,
       }));

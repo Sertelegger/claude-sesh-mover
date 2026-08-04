@@ -16,13 +16,8 @@ import {
   computeIntegrityHashFromFile,
   isSafeSessionId,
 } from "./manifest.js";
-import { rewriteJsonlStream, buildPathMappings } from "./rewriter.js";
-import {
-  encodeProjectPath,
-  detectPlatform,
-  extractUserFromPath,
-  getCurrentUser,
-} from "./platform.js";
+import { rewriteJsonlStream, buildImportRewriteContext } from "./rewriter.js";
+import { encodeProjectPath } from "./platform.js";
 import {
   getApplicableAdapters,
   classifyVersionDifference,
@@ -208,31 +203,13 @@ export async function importSession(
     );
   }
 
-  // Step 2: Build path mappings
-  const targetPlatform = detectPlatform();
-  const sourceUser =
-    extractUserFromPath(manifest.sourceProjectPath, manifest.sourcePlatform) ??
-    "unknown";
-  const targetUser = getCurrentUser();
-
-  const mappings = buildPathMappings(
-    manifest.sourcePlatform,
-    targetPlatform,
-    manifest.sourceProjectPath,
+  // Step 2: Build path mappings (shared with hub/pull.ts's append path — see
+  // buildImportRewriteContext for why this must not be re-derived locally)
+  const ctx = buildImportRewriteContext(
+    manifest,
     targetProjectPath,
-    manifest.sourceConfigDir,
-    targetConfigDir,
-    sourceUser,
-    targetUser
+    targetConfigDir
   );
-
-  const ctx = {
-    mappings,
-    sourcePlatform: manifest.sourcePlatform,
-    targetPlatform,
-    sourceUser,
-    targetUser,
-  };
 
   // Step 3: Verify per-session integrity (before any rewriting)
   const integrityFailedSessions = new Set<string>();

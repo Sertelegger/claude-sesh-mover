@@ -76,16 +76,10 @@ export function identityRewriteContext() {
 /**
  * Splices a continuation bundle onto the end of an existing local session so
  * the conversation stays ONE resumable transcript instead of a base plus a
- * truncated fragment. Strips the synthetic continuation header and rewrites
- * every appended entry's `sessionId` onto the base session.
- *
- * PRECONDITION — the delta must already be local-ready. This is a same-machine
- * splice: it rewrites `sessionId` and NOTHING else (see
- * `identityRewriteContext`), and it applies no version adapters. The CALLER
- * must hand over a bundle whose paths are already rewritten for this machine
- * and whose schema is already adapted to the local Claude Code version.
- * Splicing a raw cross-platform or cross-version continuation would embed
- * foreign paths and an un-migrated schema into a local transcript.
+ * truncated fragment. Strips the synthetic continuation header, applies
+ * `a.adapters` and `a.ctx` to every appended entry (identical treatment to
+ * what importer.ts gives a fragment, so the two paths can't diverge), and
+ * rewrites each entry's `sessionId` onto the base session.
  *
  * Two guards, in order:
  * 1. **Chain** (never skippable, not even with `force`): the delta's anchor
@@ -152,9 +146,12 @@ export async function tryAppendContinuation(a) {
         // 1. header-stripped copy
         const stripped = join(work, "stripped.jsonl");
         const entriesAppended = await stripHeader(a.deltaPath, stripped, info.headerPresent);
-        // 2. rewrite ids onto the base session
+        // 2. version-adapt + translate the source machine's paths onto this one,
+        //    and rewrite ids onto the base session — one pass, same transform
+        //    importer.ts runs over a fragment.
         const rewritten = join(work, "rewritten.jsonl");
-        const report = await rewriteJsonlStream(stripped, rewritten, identityRewriteContext(), {
+        const report = await rewriteJsonlStream(stripped, rewritten, a.ctx, {
+            adapters: a.adapters,
             newSessionId: a.baseSessionId,
         });
         // An unparseable line survives the rewrite verbatim — it would land in the

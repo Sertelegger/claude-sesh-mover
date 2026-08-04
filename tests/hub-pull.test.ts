@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, cpSync, readFileSync, readdirSync,
+  appendFileSync, utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,13 +14,16 @@ import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes } from "../src/hub/index-file.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
-import { extractArchive } from "../src/archiver.js";
+import { createArchive, extractArchive } from "../src/archiver.js";
 import { importSession } from "../src/importer.js";
 import { readSyncState, getThreadId } from "../src/sync-state.js";
 import { encodeProjectPath } from "../src/platform.js";
 import type { HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
+const FIXTURE_SESSION_ID = "550e8400-e29b-41d4-a716-446655440000";
+/** Uuid of the fixture session's last entry — every continuation's anchor. */
+const FIXTURE_HEAD_UUID = "entry-3";
 
 // Same technique hub-push.test.ts uses (see its own comment): identity
 // linking writes .claude-sesh-mover/project.json under the real project
@@ -666,6 +670,370 @@ describe("hub pull", () => {
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
       if (projectB) rmSync(projectB, { recursive: true, force: true });
       if (extractStage) rmSync(extractStage, { recursive: true, force: true });
+    }
+  });
+});
+
+// --- Continuation append path -------------------------------------------
+
+/** Source paths a "pushed from a Windows machine" bundle claims to come from. */
+const WIN_PROJECT = "C:\\Users\\alice\\projB";
+const WIN_CONFIG = "C:\\Users\\alice\\.claude";
+const WIN_FILE = "C:\\Users\\alice\\projB\\src\\index.ts";
+
+type EntryMaker = (
+  parentUuid: string,
+  sessionId: string,
+  projectPath: string
+) => Array<Record<string, unknown>>;
+
+/** Two plain entries whose only path field is the SOURCE machine's cwd. */
+const plainEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
+  {
+    uuid: "b-entry-4", parentUuid, timestamp: "2026-04-11T09:00:00Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "user",
+    message: { role: "user", content: "picking this up on the other machine" },
+  },
+  {
+    uuid: "b-entry-5", parentUuid: "b-entry-4", timestamp: "2026-04-11T09:00:05Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "assistant",
+    message: { model: "claude-opus-4-6", id: "msg_cont", content: [{ type: "text", text: "On it." }] },
+  },
+];
+
+/**
+ * Two entries carrying a Windows path in every field the rewriter is
+ * responsible for: `cwd`, a `tool_result` body, `toolUseResult.stdout`, and a
+ * `file-history-snapshot` backup key.
+ */
+const win32Entries: EntryMaker = (parentUuid, sessionId) => [
+  {
+    uuid: "b-entry-4", parentUuid, timestamp: "2026-04-11T09:00:00Z", sessionId,
+    cwd: WIN_PROJECT, version: "2.1.81", type: "user",
+    message: {
+      role: "user",
+      content: [{ tool_use_id: "toolu_cont", type: "tool_result", content: `file contents at ${WIN_FILE}` }],
+    },
+    toolUseResult: { stdout: `${WIN_FILE}: TypeScript file`, stderr: "" },
+  },
+  {
+    uuid: "b-entry-5", parentUuid: "b-entry-4", timestamp: "2026-04-11T09:00:05Z", sessionId,
+    cwd: WIN_PROJECT, version: "2.1.81", type: "file-history-snapshot",
+    snapshot: { trackedFileBackups: { [WIN_FILE]: { backupId: "abc123@v1" } } },
+  },
+];
+
+/** Push the base session out of the append liveness window. */
+function ageOutOfLiveWindow(path: string): void {
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  utimesSync(path, old, old);
+}
+
+/**
+ * Make the base look like a live Claude Code session: modified inside the
+ * liveness window but STRICTLY in the past. Stamping "now" here is a race —
+ * hubPull captures its `opNowMs` from `Date.now()` a moment later, and if
+ * both land in the same millisecond the self-write exemption (`mtime >=
+ * opNowMs`) fires and the append proceeds instead of declining.
+ */
+function makeLookLive(path: string): void {
+  const recent = new Date(Date.now() - 30_000);
+  utimesSync(path, recent, recent);
+}
+
+interface ContinuationArrangement {
+  hub: string;
+  configDirA: string;
+  projectA: string;
+  projectDirA: string;
+  projectB: string;
+  projectId: string;
+  baseSessionId: string;
+  basePath: string;
+  cleanup(): void;
+}
+
+/**
+ * The shared two-machine continuation arrangement for the append tests:
+ *
+ *   1. machine A pushes the fixture session (full bundle),
+ *   2. machine B pulls it, appends `makeEntries(...)` to its imported copy,
+ *      and pushes the resulting continuation bundle,
+ *   3. HOME is switched back to A and A's base session file is aged out of
+ *      the append liveness window (it was written seconds ago by the fixture
+ *      copy, which would otherwise make every test a "recently-active"
+ *      decline rather than a test of the behavior it names).
+ *
+ * B's appended entries deliberately carry B's OWN paths — the pull under test
+ * is what has to translate them onto A.
+ */
+async function arrangeContinuation(
+  makeEntries: EntryMaker = plainEntries
+): Promise<ContinuationArrangement> {
+  const homeA = mkdtempSync(join(tmpdir(), "sesh-app-homeA-"));
+  const homeB = mkdtempSync(join(tmpdir(), "sesh-app-homeB-"));
+  const hub = mkdtempSync(join(tmpdir(), "sesh-app-hub-"));
+  const base = mkdtempSync(join(tmpdir(), "sesh-app-fix-"));
+  let projectB: string | undefined;
+  let restore = overrideHome(homeA);
+  const cleanup = (): void => {
+    restore.restore();
+    for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+    if (projectB) rmSync(projectB, { recursive: true, force: true });
+  };
+
+  try {
+    const { configDir: configDirA } = createFixtureTree(base);
+    const projectA = createRealProject(base, configDirA, "projA");
+    await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+    const pushA = await hubPush({
+      configDir: configDirA, projectPath: projectA, hubPath: hub,
+      createProject: true, noWorkspace: true, claudeVersion: "2.1.81",
+    });
+    if (!pushA.success) throw new Error(`arrange: A's push failed: ${JSON.stringify(pushA)}`);
+
+    restore.restore();
+    restore = overrideHome(homeB);
+
+    const configDirB = join(homeB, ".claude");
+    projectB = mkdtempSync(join(tmpdir(), "sesh-app-projB-"));
+    writeLocalProjectId(projectB, {
+      projectId: pushA.projectId, name: "projA",
+      createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+    });
+    const pullB = await hubPull({
+      configDir: configDirB, projectPath: projectB, hubPath: hub,
+      latest: true, claudeVersion: "2.1.81",
+    });
+    if (!pullB.success) throw new Error(`arrange: B's pull failed: ${JSON.stringify(pullB)}`);
+    const localB = (pullB as HubPullResult).localSessionId;
+    if (!localB) throw new Error("arrange: B's pull identified no local session");
+
+    const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${localB}.jsonl`);
+    const entries = makeEntries(FIXTURE_HEAD_UUID, localB, projectB);
+    appendFileSync(bJsonl, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+
+    const pushB = await hubPush({
+      configDir: configDirB, projectPath: projectB, hubPath: hub,
+      noWorkspace: true, claudeVersion: "2.1.81",
+    });
+    if (!pushB.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(pushB)}`);
+    if (pushB.pushedSessions[0]?.type !== "continuation") {
+      throw new Error("arrange: B pushed a full bundle, not a continuation");
+    }
+
+    restore.restore();
+    restore = overrideHome(homeA);
+
+    const projectDirA = join(configDirA, "projects", encodeProjectPath(projectA));
+    const basePath = join(projectDirA, `${FIXTURE_SESSION_ID}.jsonl`);
+    ageOutOfLiveWindow(basePath);
+
+    return {
+      hub, configDirA, projectA, projectDirA, projectB,
+      projectId: pushA.projectId, baseSessionId: FIXTURE_SESSION_ID, basePath, cleanup,
+    };
+  } catch (e) {
+    cleanup();
+    throw e;
+  }
+}
+
+/**
+ * Rewrite the continuation bundle already sitting on the hub so it claims to
+ * have been pushed from a Windows machine. Only manifest METADATA changes —
+ * the session JSONL is untouched, so its manifest integrity hash stays valid
+ * and the bundle is indistinguishable from a genuine cross-platform push.
+ */
+async function repointBundleAtWindows(hubPath: string, projectId: string): Promise<void> {
+  const backend = createFsBackend(hubPath);
+  const { indexes } = await readAllIndexes(backend, projectId);
+  const record = indexes
+    .flatMap((i) => Object.values(i.threads))
+    .flatMap((t) => t.bundles)
+    .find((b) => b.type === "continuation");
+  if (!record) throw new Error("no continuation bundle on the hub to repoint");
+
+  const stage = mkdtempSync(join(tmpdir(), "sesh-app-repoint-"));
+  try {
+    const tarPath = join(stage, "in.tar.gz");
+    writeFileSync(tarPath, await backend.read(record.file));
+    // extractArchive strips the single top-level wrapper entry, and
+    // createArchive re-adds one named after the directory — so extracting
+    // into "bundle/" round-trips the archive's shape exactly.
+    const dir = join(stage, "bundle");
+    mkdirSync(dir, { recursive: true });
+    await extractArchive(tarPath, dir);
+
+    const manifestPath = join(dir, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    manifest.sourcePlatform = "win32";
+    manifest.sourceProjectPath = WIN_PROJECT;
+    manifest.sourceConfigDir = WIN_CONFIG;
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+    const outPath = join(stage, "out.tar.gz");
+    await createArchive(dir, outPath, "gzip");
+    await backend.writeAtomic(record.file, readFileSync(outPath));
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+}
+
+describe("hub pull — continuation append", () => {
+  it("pulling a continuation appends to the local base instead of creating a fragment", async () => {
+    const a = await arrangeContinuation();
+    try {
+      const before = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      const after = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      expect(after).toEqual(before); // NO new session file — appended
+      expect(p.appended).toHaveLength(1);
+      expect(p.appended![0].entriesAppended).toBe(2);
+      expect(p.appended![0].baseSessionId).toBe(a.baseSessionId);
+      expect(p.appended![0].threadId).toBe(p.threadId);
+      expect(p.localSessionId).toBe(a.baseSessionId);
+
+      const raw = readFileSync(a.basePath, "utf-8");
+      const lines = raw.trim().split("\n").map((l) => JSON.parse(l));
+      expect(lines).toHaveLength(5); // 3 original + 2 appended
+      expect(lines.every((l) => l.sessionId === a.baseSessionId)).toBe(true);
+      expect(raw).not.toContain("[sesh-mover continuation]");
+      // Same-platform, different project dir: the source machine's project
+      // path must not survive into the local transcript.
+      expect(lines[3].cwd).toBe(a.projectA);
+      expect(lines[4].cwd).toBe(a.projectA);
+      expect(raw).not.toContain(a.projectB);
+
+      // The index projection has to pick the extended base up as the thread's
+      // copy, or the append would be invisible to the other machine.
+      const whereis = await hubWhereis({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+      });
+      const thread = whereis.threads.find((t) => t.threadId === p.threadId);
+      expect(thread?.localCopy?.current).toBe(true);
+      expect(thread?.localCopy?.localSessionId).toBe(a.baseSessionId);
+      expect(thread?.pullNeeded).toBe(false);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("a cross-platform continuation lands with LOCAL paths in cwd, tool results and snapshot keys", async () => {
+    const a = await arrangeContinuation(win32Entries);
+    try {
+      await repointBundleAtWindows(a.hub, a.projectId);
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+      expect(p.appended).toHaveLength(1);
+      expect(p.appended![0].entriesAppended).toBe(2);
+
+      const raw = readFileSync(a.basePath, "utf-8");
+      const lines = raw.trim().split("\n").map((l) => JSON.parse(l));
+      expect(lines).toHaveLength(5);
+
+      const localFile = join(a.projectA, "src", "index.ts");
+      const toolEntry = lines[3];
+      const snapshotEntry = lines[4];
+
+      expect(toolEntry.cwd).toBe(a.projectA);
+      expect(toolEntry.message.content[0].content).toBe(`file contents at ${localFile}`);
+      expect(toolEntry.toolUseResult.stdout).toBe(`${localFile}: TypeScript file`);
+
+      expect(snapshotEntry.cwd).toBe(a.projectA);
+      expect(Object.keys(snapshotEntry.snapshot.trackedFileBackups)).toEqual([localFile]);
+
+      // Catch-all: nothing from the source machine's user/home survived.
+      expect(raw).not.toContain("alice");
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("--no-append keeps the Slice-1 fragment behavior", async () => {
+    const a = await arrangeContinuation();
+    try {
+      const before = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, noAppend: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      expect(p.appended ?? []).toHaveLength(0);
+      const after = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      expect(after).toHaveLength(before.length + 1);
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+
+      const fragment = after.find((f) => !before.includes(f))!;
+      const firstLine = readFileSync(join(a.projectDirA, fragment), "utf-8").split("\n")[0];
+      expect(firstLine).toContain("[sesh-mover continuation]");
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("a live-looking base declines the append and falls back to a fragment with a warning", async () => {
+    const a = await arrangeContinuation();
+    try {
+      const before = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+      makeLookLive(a.basePath);
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      expect(p.appended ?? []).toHaveLength(0);
+      const after = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      expect(after).toHaveLength(before.length + 1);
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      expect(p.warnings.join(" ")).toContain("live session");
+      expect(p.warnings.join(" ")).toContain("--force-append");
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("--force-append splices onto a live-looking base anyway", async () => {
+    const a = await arrangeContinuation();
+    try {
+      const before = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
+      makeLookLive(a.basePath);
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, forceAppend: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      expect(p.appended).toHaveLength(1);
+      expect(readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"))).toEqual(before);
+      expect(readFileSync(a.basePath, "utf-8").trim().split("\n")).toHaveLength(5);
+    } finally {
+      a.cleanup();
     }
   });
 });

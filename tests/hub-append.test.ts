@@ -17,6 +17,8 @@ import {
   identityRewriteContext,
   APPEND_LIVE_WINDOW_MS,
 } from "../src/hub/append.js";
+import { buildImportRewriteContext } from "../src/rewriter.js";
+import type { VersionAdapter } from "../src/types.js";
 
 function tmp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -189,6 +191,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: delta,
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
       });
@@ -213,6 +216,62 @@ describe("tryAppendContinuation", () => {
     }
   });
 
+  // The delta is another machine's bytes. Splicing it through the identity
+  // context would embed that machine's paths and an un-migrated schema into a
+  // local transcript, which is exactly what an ordinary import never does —
+  // so the caller-supplied ctx and adapters have to reach the rewrite pass.
+  it("applies the caller's rewrite context and version adapters to the spliced entries", async () => {
+    const dir = tmp("sesh-append-");
+    try {
+      const base = makeBase(dir);
+      const delta = join(dir, "foreign.jsonl");
+      writeJsonl(delta, [
+        HEADER,
+        { ...entry("d1", "b3"), cwd: "C:\\Users\\alice\\proj" },
+        { ...entry("d2", "d1"), cwd: "C:\\Users\\alice\\proj" },
+      ]);
+
+      const adapter: VersionAdapter = {
+        fromVersion: "2.0.0",
+        toVersion: "2.1.0",
+        description: "test adapter",
+        applies: (e) => (e as unknown as { type?: string }).type === "user",
+        transform: (e) => ({ ...e, adapted: true }) as typeof e,
+      };
+
+      const r = await tryAppendContinuation({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        ctx: buildImportRewriteContext(
+          {
+            sourcePlatform: "win32",
+            sourceProjectPath: "C:\\Users\\alice\\proj",
+            sourceConfigDir: "C:\\Users\\alice\\.claude",
+          },
+          "/local/proj",
+          "/local/.claude"
+        ),
+        adapters: [adapter],
+        opNowMs: Date.now(),
+        force: false,
+      });
+      expect(r.kind).toBe("appended");
+
+      const spliced = readFileSync(base, "utf-8")
+        .trim()
+        .split("\n")
+        .slice(3)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(spliced).toHaveLength(2);
+      expect(spliced.every((e) => e.cwd === "/local/proj")).toBe(true);
+      expect(spliced.every((e) => e.adapted === true)).toBe(true);
+      expect(readFileSync(base, "utf-8")).not.toContain("alice");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("declines chain-mismatch and leaves the base byte-identical", async () => {
     const dir = tmp("sesh-append-");
     try {
@@ -223,6 +282,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: delta,
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
       });
@@ -244,6 +304,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: makeDelta(dir, "b3"),
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
       });
@@ -265,6 +326,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: makeDelta(dir, "b3"),
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: true,
       });
@@ -279,6 +341,7 @@ describe("tryAppendContinuation", () => {
         basePath: base2,
         baseSessionId: "base-sid",
         deltaPath: makeDelta(dir, "not-z1", "delta2.jsonl"),
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: true,
       });
@@ -300,6 +363,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: makeDelta(dir, "b3"),
+        ctx: identityRewriteContext(),
         opNowMs,
         force: false,
       });
@@ -319,6 +383,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: makeDelta(dir, "b3"),
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
         // Sanctioned test seam: fires after the delta is written into the base,
@@ -352,6 +417,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: delta,
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
       });
@@ -382,6 +448,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: delta,
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
       });
@@ -411,6 +478,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: delta,
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
       });
@@ -440,6 +508,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: delta,
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
         __injectFailure: () => {
@@ -470,6 +539,7 @@ describe("tryAppendContinuation", () => {
           basePath: base,
           baseSessionId: "base-sid",
           deltaPath: delta,
+          ctx: identityRewriteContext(),
           opNowMs: Date.now(),
           force: false,
         });
@@ -501,6 +571,7 @@ describe("tryAppendContinuation", () => {
         basePath: base,
         baseSessionId: "base-sid",
         deltaPath: makeDelta(dir, "b3"),
+        ctx: identityRewriteContext(),
         opNowMs: Date.now(),
         force: false,
       });

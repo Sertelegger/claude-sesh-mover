@@ -1,4 +1,5 @@
 import { type RewriteContext } from "../rewriter.js";
+import type { VersionAdapter } from "../types.js";
 /**
  * How recently a base session must have been written for the append to be
  * treated as "a live Claude Code session is probably still appending to it".
@@ -32,6 +33,23 @@ export interface AppendAttempt {
     /** Session id every appended entry is rewritten to. */
     baseSessionId: string;
     deltaPath: string;
+    /**
+     * Source -> target rewrite context for the bundle the delta came out of.
+     * REQUIRED, and deliberately not defaulted: the delta is another machine's
+     * bytes, and splicing it in raw would embed that machine's `cwd`, tool
+     * result paths and file-history keys into a local transcript. Build it with
+     * `buildImportRewriteContext(manifest, targetProjectPath, targetConfigDir)`
+     * — the same call importer.ts makes, so a spliced continuation and an
+     * imported fragment come out identical. Pass `identityRewriteContext()`
+     * only for a genuinely same-machine splice.
+     */
+    ctx: RewriteContext;
+    /**
+     * Version adapters for source -> target Claude Code versions, from
+     * `getApplicableAdapters`. Same rationale as `ctx`: an un-migrated schema
+     * spliced into a local transcript is as wrong as a foreign path.
+     */
+    adapters?: VersionAdapter[];
     /** Pull-operation start time — enables the self-write mtime exemption. */
     opNowMs: number;
     /** `--force-append`: skips the mtime guard ONLY, never the chain guard. */
@@ -66,16 +84,10 @@ export type AppendOutcome = {
 /**
  * Splices a continuation bundle onto the end of an existing local session so
  * the conversation stays ONE resumable transcript instead of a base plus a
- * truncated fragment. Strips the synthetic continuation header and rewrites
- * every appended entry's `sessionId` onto the base session.
- *
- * PRECONDITION — the delta must already be local-ready. This is a same-machine
- * splice: it rewrites `sessionId` and NOTHING else (see
- * `identityRewriteContext`), and it applies no version adapters. The CALLER
- * must hand over a bundle whose paths are already rewritten for this machine
- * and whose schema is already adapted to the local Claude Code version.
- * Splicing a raw cross-platform or cross-version continuation would embed
- * foreign paths and an un-migrated schema into a local transcript.
+ * truncated fragment. Strips the synthetic continuation header, applies
+ * `a.adapters` and `a.ctx` to every appended entry (identical treatment to
+ * what importer.ts gives a fragment, so the two paths can't diverge), and
+ * rewrites each entry's `sessionId` onto the base session.
  *
  * Two guards, in order:
  * 1. **Chain** (never skippable, not even with `force`): the delta's anchor

@@ -10,6 +10,10 @@ export interface HubPullOptions {
     forceWorkspace?: boolean;
     projectIdOverride?: string;
     claudeVersion: string;
+    /** Splice onto a base that looks like a live session (skips the mtime guard). */
+    forceAppend?: boolean;
+    /** Never splice: import every continuation as its own session (Slice-1 behavior). */
+    noAppend?: boolean;
     onProgress?: (ev: ProgressEvent) => void;
 }
 export declare function selectNeededBundles(bundles: HubBundleRecord[], received: Record<string, {

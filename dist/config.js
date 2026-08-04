@@ -18,6 +18,7 @@ export function getDefaultConfig() {
         hub: {
             path: "",
             noWorkspace: false,
+            pullAppend: true,
         },
     };
 }

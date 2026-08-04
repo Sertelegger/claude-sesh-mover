@@ -181,6 +181,10 @@ export interface SeshMoverConfig {
   hub: {
     path: string; // "" = not configured
     noWorkspace: boolean;
+    // Splice a pulled continuation onto the local session it continues,
+    // instead of importing it as a standalone fragment. Set false (or pass
+    // --no-append) to keep the Slice-1 fragment behavior.
+    pullAppend: boolean;
   };
 }
 
@@ -383,6 +387,10 @@ export interface HubPullResult {
   // in that case no thread mapping is written (a future push re-maps it).
   localSessionId: string | null;
   workspaceUnpacked: { path: string; fileCount: number } | null;
+  // Continuations spliced onto an existing local session rather than landing
+  // as a new fragment. Absent when nothing was appended. These sessions are
+  // NOT in importedSessions — no new session was created.
+  appended?: Array<{ threadId: string; baseSessionId: string; entriesAppended: number }>;
   warnings: string[];
 }
 
