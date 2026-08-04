@@ -246,6 +246,17 @@ export interface CarryNotApplied {
      * one branch where the payload is genuinely lost and the caller must say so.
      */
     savedTo: string | null;
+    /**
+     * Whether that saved `README.md` carries the commands to finish by hand.
+     *
+     * Two declines deliberately WITHHOLD them — `unsafe-payload` (the floor or
+     * the symlink check fired) and an `apply-failed` whose patch `git apply`
+     * could not parse — so a caller that promises "a README with the exact
+     * commands" on every decline sends the user looking for something that was
+     * withheld on purpose. `false` whenever `savedTo` is `null`, since there is
+     * no README then either.
+     */
+    savedCommands: boolean;
 }
 export type ApplyResult = CarryApplied | CarryNotApplied;
 export interface ApplyCarryOptions {

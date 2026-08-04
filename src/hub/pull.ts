@@ -591,7 +591,14 @@ function describeCarryApply(
       `The uncommitted changes this pull carried (${origin}) were not applied: ${result.detail}. ` +
       (result.savedTo === null
         ? `They could not be saved beside the project either, so the only remaining copy is inside ${bundleFile} on the hub — extract that archive by hand to recover them.`
-        : `The whole payload — patch, untracked files and a README with the exact commands — is saved at ${result.savedTo}. Nothing was written to your working tree.`);
+        : `The whole payload — patch, untracked files and a README ${
+            // Two declines withhold the commands on purpose (a refused payload,
+            // and a patch git could not parse here), so promising them on every
+            // decline sends the user looking for something that is not there.
+            result.savedCommands
+              ? "with the exact commands"
+              : "explaining what was found and what was withheld"
+          } — is saved at ${result.savedTo}. Nothing was written to your working tree.`);
     out.push(
       result.reason === "not-requested"
         ? lost + " Pass --apply-carry on a future pull to have them applied straight into the tree instead."

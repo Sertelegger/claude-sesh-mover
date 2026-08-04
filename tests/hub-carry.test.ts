@@ -2262,4 +2262,309 @@ describe("applyCarry", () => {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
     }
   });
+
+  // --- Round 3: the standard is what `git apply` ACCEPTS, not what `git diff`
+  // emits. Every spelling below was measured against real git first (it prints
+  // the path under `--numstat`, `--check` exits 0, and a bare `git apply`
+  // writes the file) and only then against this module. ---
+
+  /** `diff --git` header spellings real git accepts and an earlier scan missed. */
+  const HEADER_EVASIONS: Array<[string, string]> = [
+    // The two halves have different LENGTHS, so a midpoint split lands on the
+    // `"` rather than on the separator. (Its mirror, `"a/…" b/…`, git rejects.)
+    [
+      "asymmetric quoting",
+      'diff --git a/.claude-sesh-mover/config.json "b/.claude-sesh-mover/config.json"\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    // `git diff --src-prefix=c/ --dst-prefix=d/` emits exactly this, and
+    // `diff.mnemonicPrefix` renames the prefixes for ordinary users. Stripping
+    // only `^[ab]/` leaves the halves unequal forever.
+    [
+      "non-a/b prefixes",
+      "diff --git c/.claude-sesh-mover/config.json d/.claude-sesh-mover/config.json\n" +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    // Both halves quoted, in DIFFERENT escape spellings (`\056` is `.`): equal
+    // paths, unequal bytes, unequal lengths.
+    [
+      "quoted halves, different escapes",
+      'diff --git "a/.claude-sesh-mover/config.json" "b/\\056claude-sesh-mover/config.json"\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    // Git's parser accepts a TAB between the names as readily as a space.
+    [
+      "tab separator",
+      "diff --git a/.claude-sesh-mover/config.json\tb/.claude-sesh-mover/config.json\n" +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    // `git diff --no-prefix` emits this; `git apply -p0` then writes the path
+    // verbatim, so the RAW form has to reach the floor too.
+    [
+      "no prefix at all",
+      "diff --git .claude-sesh-mover/config.json .claude-sesh-mover/config.json\n" +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+  ];
+
+  it("refuses `diff --git` spellings git accepts, at BOTH layouts, with no runnable git", async () => {
+    if (process.platform === "win32") return; // PATH override
+    // An empty-file creation carries no `---`/`+++` and no rename/copy lines,
+    // so the `diff --git` header is its ONLY path reference — and with no git
+    // on PATH the byte scan is the WHOLE floor. Measured against the shipped
+    // build at `7199c8f`, the first two came back `not-requested` at both
+    // layouts WITH an apply command in the saved README: a copy-paste line that
+    // writes `.claude-sesh-mover/config.json` (which redirects `hub.path`) the
+    // moment the user has a working git. The symmetric `a/… b/…` control was
+    // correctly refused, which is what hid them.
+    for (const layout of ["root", "subdir"] as const) {
+      const { repo, project, head } = layoutRepo(`apply-hdr-${layout}`, layout);
+      let empty: string | undefined;
+      try {
+        empty = mkdtempSync(join(tmpdir(), "sesh-nopath4-"));
+        const restore = overridePath(empty);
+        try {
+          for (const [label, patch] of HEADER_EVASIONS) {
+            const payload = handPayload(patch, {
+              baseCommit: head, repoPrefix: layout === "subdir" ? "pkg/app/" : "",
+            });
+            const r = await applyCarry({
+              carryDir: payload.dir, targetPath: project, meta: payload.meta, saveOnly: true,
+            });
+            const where = `${layout}/${label}`;
+            expect(r.applied, where).toBe(false);
+            if (r.applied) return;
+            expect(r.reason, where).toBe("unsafe-payload");
+            expect(r.savedCommands, where).toBe(false);
+            expect(readFileSync(join(r.savedTo!, "README.md"), "utf-8"), where)
+              .not.toContain("git apply");
+            expect(existsSync(join(project, ".claude-sesh-mover", "config.json")), where).toBe(false);
+            rmSync(payload.dir, { recursive: true, force: true });
+          }
+        } finally {
+          restore.restore();
+        }
+      } finally {
+        cleanup(repo, empty ?? "");
+      }
+    }
+  });
+
+  it("refuses a `diff --git` header too padded to parse exhaustively", async () => {
+    if (process.platform === "win32") return; // PATH override
+    // Trying every separator position is quadratic in their number, and the
+    // patch is attacker-supplied, so the parse is capped. The cap has to fail
+    // CLOSED, because git's own parser has none: this path puts 280 separator
+    // positions ahead of the real one (four directory components of 70 spaces
+    // each — every component stays under NAME_MAX, so it is a path git really
+    // creates), and measured against bare `git apply` it lands under
+    // `.claude-sesh-mover/`. A cap that gave up saying "no paths here" would be
+    // an evasion written with a `while` loop instead of a quote.
+    const { repo, project, head } = layoutRepo("apply-padded", "root");
+    let empty: string | undefined;
+    try {
+      const p = `.claude-sesh-mover/${[" ".repeat(70), " ".repeat(70), " ".repeat(70), " ".repeat(70)].join("/")}/x`;
+      const payload = handPayload(
+        `diff --git a/${p} b/${p}\nnew file mode 100644\nindex 0000000..e69de29\n`,
+        { baseCommit: head }
+      );
+      empty = mkdtempSync(join(tmpdir(), "sesh-nopath5-"));
+      const restore = overridePath(empty);
+      let r;
+      try {
+        r = await applyCarry({
+          carryDir: payload.dir, targetPath: project, meta: payload.meta, saveOnly: true,
+        });
+      } finally {
+        restore.restore();
+      }
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("unsafe-payload");
+      expect(readdirSync(join(project, ".claude-sesh-mover")).sort())
+        .toEqual(expect.arrayContaining(["hubinclude"]));
+      expect(existsSync(join(project, p))).toBe(false);
+      rmSync(payload.dir, { recursive: true, force: true });
+    } finally {
+      cleanup(repo, empty ?? "");
+    }
+  });
+
+  it("refuses `rename old`/`rename new`, git's legacy rename spelling", async () => {
+    // Found by re-running the blind-spot hunt against git's OWN keyword table
+    // (read out of the shipped binary): `parse_git_header` has sixteen entries
+    // and nine name a path — `rename old `/`rename new ` among them, still
+    // accepted, and `--numstat` prints only a rename's DESTINATION. So unlike
+    // the header spellings above this one was live even on a receiver with a
+    // perfectly healthy git: measured `applied: true` at BOTH layouts, with
+    // `.claude-sesh-mover/hubinclude` — the file deciding what this machine's
+    // NEXT push uploads — deleted and `moved.txt` created in its place.
+    for (const layout of ["root", "subdir"] as const) {
+      const { repo, project, head } = layoutRepo(`apply-renameold-${layout}`, layout);
+      let dir: string | undefined;
+      try {
+        const payload = handPayload(
+          "diff --git a/.claude-sesh-mover/hubinclude b/moved.txt\nsimilarity index 100%\n" +
+            "rename old .claude-sesh-mover/hubinclude\nrename new moved.txt\n",
+          { baseCommit: head, repoPrefix: layout === "subdir" ? "pkg/app/" : "" }
+        );
+        dir = payload.dir;
+        const r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+        expect(r.applied, layout).toBe(false);
+        if (r.applied) return;
+        expect(r.reason, layout).toBe("unsafe-payload");
+        expect(existsSync(join(project, "moved.txt")), layout).toBe(false);
+        expect(readFileSync(join(project, ".claude-sesh-mover", "hubinclude"), "utf-8")).toBe("docs/\n");
+      } finally {
+        cleanup(repo, dir ?? "");
+      }
+    }
+  });
+
+  it("still applies a tracked file whose name begins with the plugin directory's", async () => {
+    // The non-vacuity half of trying every separator position, and the reason
+    // the halves must still AGREE. `docs/.claude-sesh-mover notes.md` contains
+    // a space, and the split before it yields `docs/.claude-sesh-mover` — a
+    // whole segment the floor matches, though no real path here has it. Only
+    // the agreement requirement rejects that split, so dropping it turns an
+    // ordinary edit into a security refusal naming a peer.
+    const repo = gitRepo("apply-spacey");
+    let twin: string | undefined;
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    try {
+      const name = "docs/.claude-sesh-mover notes.md";
+      mkdirSync(join(repo, "docs"), { recursive: true });
+      writeFileSync(join(repo, name), "v1\n");
+      git(repo, ["add", "-A"]);
+      git(repo, ["commit", "-q", "-m", "notes"]);
+      writeFileSync(join(repo, name), "v2\n");
+      payload = await capturePayload(repo);
+      // The header really is the mis-splittable shape, straight from git.
+      expect(readFileSync(join(payload.dir, "changes.patch"), "utf-8"))
+        .toContain("diff --git a/docs/.claude-sesh-mover notes.md b/docs/.claude-sesh-mover notes.md");
+
+      twin = cleanTwin(repo);
+      const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+      expect(r.applied).toBe(true);
+      expect(readFileSync(join(twin, name), "utf-8")).toBe("v2\n");
+    } finally {
+      cleanup(repo, twin ?? "", payload?.dir ?? "");
+    }
+  });
+
+  it("finds the apply prefix unknown for a project more than 64 ancestors deep", async () => {
+    // `hasGitAncestor` decides whether a `git rev-parse` refusal means "not a
+    // repository" (an empty prefix is then RIGHT) or "this git cannot read the
+    // repository" (the prefix is unknown and the README must say so). Its depth
+    // cap of 64 was wrong in the UNSAFE direction: past that it answered
+    // "false", i.e. a KNOWN empty prefix, so a deep project on a broken-git
+    // receiver got an apply command with no `--directory` and no caveat —
+    // measured, and exactly the silent no-op the note exists to prevent.
+    const repo = gitRepo("apply-deep");
+    let dir: string | undefined;
+    try {
+      const deep = join(repo, ...Array.from({ length: 70 }, (_, i) => `d${i}`));
+      mkdirSync(deep, { recursive: true });
+      writeFileSync(join(deep, "f.txt"), "v1\n");
+      git(repo, ["add", "-A"]);
+      git(repo, ["commit", "-q", "-m", "deep"]);
+      const head = git(repo, ["rev-parse", "HEAD"]).trim();
+      appendFileSync(join(repo, ".git", "config"), "\nthis is not valid config\n");
+
+      const payload = handPayload(BENIGN_PATCH, { baseCommit: head });
+      dir = payload.dir;
+      const r = await applyCarry({
+        carryDir: dir, targetPath: deep, meta: payload.meta, saveOnly: true,
+      });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      expect(readme).toContain("git rev-parse --show-prefix");
+      expect(readme.match(/```bash\n(git [^\n]*)\n```/)?.[1]).not.toContain("--directory=");
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
+  it("still hands over the untracked files when the PATCH is the damaged half", async () => {
+    // The `unsafe` README returns early on purpose — its whole point is to give
+    // no instructions. The `unparseable` one inherited that early return by
+    // accident: a patch git cannot read says nothing whatever about the
+    // untracked files beside it, which are ordinary copies. Before, the saved
+    // README counted them in its header and then never mentioned them again.
+    const repo = gitRepo("apply-damaged-untracked");
+    let dir: string | undefined;
+    try {
+      const head = git(repo, ["rev-parse", "HEAD"]).trim();
+      const payload = handPayload("this is not a patch at all\n", {
+        baseCommit: head, untrackedCount: 2, untrackedBytes: 12,
+      });
+      dir = payload.dir;
+      mkdirSync(join(dir, "untracked"), { recursive: true });
+      writeFileSync(join(dir, "untracked", "one.txt"), "a\n");
+      writeFileSync(join(dir, "untracked", "two.txt"), "b\n");
+
+      const r = await applyCarry({ carryDir: dir, targetPath: repo, meta: payload.meta });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("apply-failed");
+      // No apply command, and the result says so rather than leaving the caller
+      // to promise one.
+      expect(r.savedCommands).toBe(false);
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      expect(readme).toContain("damaged or truncated rather than hostile");
+      expect(readme).not.toContain("git -c apply.ignoreWhitespace=no apply");
+      // ...but the untracked half is still handed over, in both dialects, and
+      // the copy line runs verbatim.
+      expect(readme).toContain("nothing above affects them");
+      const copy = readme.match(/```bash\n# macOS \/ Linux\n(cp [^\n]*)\n```/)?.[1];
+      expect(copy).toBeTruthy();
+      expect(readme).toContain("Copy-Item -Recurse -Force");
+      if (process.platform !== "win32") {
+        const run = spawnSync("sh", ["-c", copy!], { cwd: repo, encoding: "utf-8" });
+        expect(run.status).toBe(0);
+        expect(readFileSync(join(repo, "one.txt"), "utf-8")).toBe("a\n");
+      }
+      // The refused variant still says nothing at all, which is its point.
+      const hostile = handPayload(
+        "this is not a patch at all\nrename from .claude-sesh-mover/hubinclude\n",
+        { baseCommit: head, untrackedCount: 2 }
+      );
+      const h = await applyCarry({ carryDir: hostile.dir, targetPath: repo, meta: hostile.meta });
+      expect(h.applied).toBe(false);
+      if (h.applied) return;
+      expect(h.savedCommands).toBe(false);
+      const hostileReadme = readFileSync(join(h.savedTo!, "README.md"), "utf-8");
+      expect(hostileReadme).toContain("refused, not merely deferred");
+      expect(hostileReadme).not.toContain("cp -R");
+      rmSync(hostile.dir, { recursive: true, force: true });
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
+  it("reports savedCommands true exactly when the README carries them", async () => {
+    // The field pull.ts branches on: promising "a README with the exact
+    // commands" on a decline that deliberately withholds them sends the user
+    // looking for something that is not there.
+    const repo = gitRepo("apply-savedcommands");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let twin: string | undefined;
+    try {
+      writeFileSync(join(repo, "tracked.txt"), "v2\n");
+      payload = await capturePayload(repo);
+      twin = cleanTwin(repo);
+      const ok = await applyCarry({
+        carryDir: payload.dir, targetPath: twin, meta: payload.meta, saveOnly: true,
+      });
+      expect(ok.applied).toBe(false);
+      if (ok.applied) return;
+      expect(ok.reason).toBe("not-requested");
+      expect(ok.savedCommands).toBe(true);
+      expect(readFileSync(join(ok.savedTo!, "README.md"), "utf-8"))
+        .toContain("git -c apply.ignoreWhitespace=no apply");
+    } finally {
+      cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
 });

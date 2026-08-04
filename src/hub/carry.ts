@@ -921,6 +921,17 @@ export interface CarryNotApplied {
    * one branch where the payload is genuinely lost and the caller must say so.
    */
   savedTo: string | null;
+  /**
+   * Whether that saved `README.md` carries the commands to finish by hand.
+   *
+   * Two declines deliberately WITHHOLD them — `unsafe-payload` (the floor or
+   * the symlink check fired) and an `apply-failed` whose patch `git apply`
+   * could not parse — so a caller that promises "a README with the exact
+   * commands" on every decline sends the user looking for something that was
+   * withheld on purpose. `false` whenever `savedTo` is `null`, since there is
+   * no README then either.
+   */
+  savedCommands: boolean;
 }
 
 export type ApplyResult = CarryApplied | CarryNotApplied;
@@ -995,34 +1006,109 @@ function headerPath(rest: string): string[] {
 }
 
 /**
- * The path a `diff --git a/<p> b/<p>` line names — the ONLY path reference some
- * entries have.
+ * Longest `diff --git` header this scan will parse, the most separator
+ * positions it will try inside one, and a budget across the whole patch.
  *
- * Three shapes carry no `---`/`+++` lines and no `rename`/`copy` lines at all,
- * so before this the raw scan saw nothing in them (all measured, and all three
- * were APPLIED on a machine with no runnable `git`, where `--numstat` — the
- * other source — cannot run either):
- *
- * - a mode-only change (`old mode` / `new mode`, and `git apply` writes the
- *   mode to the filesystem regardless of `core.fileMode`),
- * - a new or changed BINARY file (`GIT binary patch`, the documented blind spot
- *   of this source),
- * - a deletion of a binary file.
- *
- * The two halves are IDENTICAL for everything except a rename or a copy, and
- * those carry their own `rename from`/`copy from` lines — so the midpoint split
- * below does not need to handle them, and refusing to guess when the halves
- * disagree is what keeps a path containing spaces from being mis-split. Git
- * separates the two paths with a bare space and quotes each half independently
- * (`"a/caf\303\251" "b/caf\303\251"`), so the halves are compared AFTER
- * unquoting and prefix-stripping rather than as raw bytes.
+ * The parse below is quadratic in the number of separators, and the patch is
+ * attacker-supplied, so all three are needed. Nothing git emits comes close:
+ * two paths, each bounded by the platform's `PATH_MAX` even after C-quoting
+ * expands every byte to four characters, separated by ONE space. Exceeding any
+ * of these fails the whole scan CLOSED (`unsafe-payload`) rather than parsing a
+ * prefix of the header and trusting the answer.
  */
-function diffGitHeaderPath(rest: string): string[] {
-  const half = (rest.length - 1) / 2;
-  if (!Number.isInteger(half) || half < 1 || rest[half] !== " ") return [];
-  const left = patchHeaderPath(rest.slice(0, half));
-  const right = patchHeaderPath(rest.slice(half + 1));
-  return left !== null && left === right ? [left] : [];
+const HEADER_SCAN_MAX_LEN = 16 * 1024;
+const HEADER_SCAN_MAX_SPLITS = 256;
+const HEADER_SCAN_BUDGET = 32 * 1024 * 1024;
+
+/**
+ * Unquote one half of a `diff --git` header.
+ *
+ * Surrounding whitespace is dropped only when what remains is a quoted string:
+ * git's own parser skips whitespace between a quoted first name and the second
+ * one (`"a/x"   "b/x"` is accepted, measured), while for unquoted names the
+ * padding belongs to the leading component it then strips — so an unquoted half
+ * is left byte-exact.
+ */
+function unquoteHeaderHalf(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return unquoteGitPath(trimmed);
+  }
+  return raw;
+}
+
+/** Everything past the first `/`, or `null` when there is no component to strip. */
+function stripOneComponent(path: string): string | null {
+  const slash = path.indexOf("/");
+  return slash === -1 ? null : path.slice(slash + 1);
+}
+
+/**
+ * Every path a `diff --git <a> <b>` line can name — the ONLY path reference
+ * some entries have.
+ *
+ * Four shapes carry no `---`/`+++` lines and no `rename`/`copy` lines at all,
+ * so without this the raw scan sees nothing in them (all measured, and all four
+ * were APPLIED on a machine with no runnable `git`, where `--numstat` — the
+ * other source — cannot run either): a mode-only change, a new or changed
+ * BINARY file, a deletion of a binary file, and an empty-file creation.
+ *
+ * **The standard here is what `git apply` ACCEPTS, not what `git diff` emits.**
+ * The threat model for this line is a hand-crafted payload — that is the only
+ * way `copy from .claude-sesh-mover/hubinclude` arises either — so covering
+ * git's own output is not enough. Two spellings real git accepts walked past an
+ * earlier "split at the midpoint, require the halves to match after stripping
+ * `a/`/`b/`" reading of this header, both measured end to end (`--numstat`
+ * prints the path, `--check` exits 0, `git apply` writes the file):
+ *
+ * - **asymmetric quoting**, `diff --git a/<p> "b/<p>"` — the halves have
+ *   different lengths, so the midpoint is not the separator. (Its mirror,
+ *   `"a/<p>" b/<p>`, git rejects; one direction is enough.) The same holds for
+ *   two quoted halves spelled with different escapes (`"a/.claude…"` against
+ *   `"b/\056claude…"`).
+ * - **prefixes that are not `a/`/`b/`**, `diff --git c/<p> d/<p>` — exactly what
+ *   `git diff --src-prefix=c/ --dst-prefix=d/` emits, and `diff.mnemonicPrefix`
+ *   (documented at the top of this file) renames them for ordinary users.
+ *
+ * So this mirrors git's own `git_header_name`: try EVERY separator position,
+ * unquote each half, and strip ONE leading component whatever it is spelled.
+ * Git accepts a header when some split makes the two halves agree, and that is
+ * the question asked here. Both the stripped and the raw form are collected —
+ * `git diff --no-prefix` emits a header with no component to strip and
+ * `git apply -p0` then writes the path verbatim (measured).
+ *
+ * The agreement requirement is what keeps this honest rather than a
+ * false-refusal machine: no split of `a/tracked.txt b/renamed.txt` agrees, and
+ * neither does any mis-split of a path containing spaces (`a/docs/.claude-sesh-mover
+ * notes.md b/…` agrees only at the real separator). Everything a split can
+ * still get wrong ends in a REFUSAL, never a pass.
+ *
+ * Returns `null` when the header is too large to parse exhaustively; the caller
+ * fails the whole scan closed rather than trusting a partial answer.
+ */
+function diffGitHeaderPaths(rest: string, budget: { left: number }): string[] | null {
+  if (rest.length > HEADER_SCAN_MAX_LEN) return null;
+  const out: string[] = [];
+  let splits = 0;
+  for (let i = 0; i < rest.length; i++) {
+    const ch = rest[i];
+    // Git's parser accepts a TAB here as well as a space (`case '\t': case ' '`).
+    if (ch !== " " && ch !== "\t") continue;
+    if (++splits > HEADER_SCAN_MAX_SPLITS) return null;
+    budget.left -= rest.length;
+    if (budget.left < 0) return null;
+    const left = unquoteHeaderHalf(rest.slice(0, i));
+    const right = unquoteHeaderHalf(rest.slice(i + 1));
+    const leftStripped = stripOneComponent(left);
+    const rightStripped = stripOneComponent(right);
+    const strippedAgree = leftStripped !== null && leftStripped === rightStripped;
+    if (!strippedAgree && left !== right) continue;
+    if (strippedAgree) out.push(leftStripped);
+    out.push(left, right);
+  }
+  // `/dev/null` never appears in a `diff --git` line and is not a path the
+  // floor should judge; empty strings are the residue of a `a/ b/` header.
+  return out.filter((p) => p.length > 0 && p !== "/dev/null");
 }
 
 /**
@@ -1059,12 +1145,23 @@ function diffGitHeaderPath(rest: string): string[] {
  *   auto-push carries them to the hub. It also cannot run at all on a machine
  *   with no `git`, or on one whose `git` cannot read this repository.
  * - A raw scan of the patch bytes covers every path git can name in a header:
- *   `---`/`+++`, `rename from`/`to`, `copy from`/`to`, the `diff --git` line
- *   itself (the only reference a mode-only change or a binary entry has), and
- *   the `index … 120000` line of a re-pointed symlink — which `--summary` does
- *   NOT print (measured: nothing at all for that shape). It needs no `git`, so
- *   it is the whole floor on a machine where the other source cannot run, and
- *   the saved README's recommendation rests on it there.
+ *   `---`/`+++`, `rename from`/`to`, **`rename old`/`new`**, `copy from`/`to`,
+ *   the `diff --git` line itself (the only reference a mode-only change or a
+ *   binary entry has), and the `index … 120000` line of a re-pointed symlink —
+ *   which `--summary` does NOT print (measured: nothing at all for that shape).
+ *   It needs no `git`, so it is the whole floor on a machine where the other
+ *   source cannot run, and the saved README's recommendation rests on it there.
+ *
+ * The list of spellings is not a guess and not "what `git diff` emits" — it is
+ * git's own `parse_git_header` keyword table, read out of the shipped binary
+ * (`strings`, git 2.50.1). Sixteen entries; the nine path-bearing ones are the
+ * nine above. `similarity index`, `dissimilarity index`, `index` and the four
+ * mode lines carry no path. **`rename old `/`rename new ` are git's legacy
+ * spelling of `rename from`/`to`, and it still accepts them** — measured: an
+ * otherwise identical payload deleted `.claude-sesh-mover/hubinclude` and
+ * created `moved.txt`, `applied: true`, at BOTH layouts, on a receiver with a
+ * perfectly healthy `git`, because `--numstat` prints only a rename's
+ * destination and the scan did not read the source line.
  *
  * A body line cannot be mistaken for a header: every one carries a leading
  * ` `, `+`, `-`, `@` or `\`, and no base85 line inside a `GIT binary patch`
@@ -1091,6 +1188,7 @@ function scanPatchBytes(patchPath: string): { paths: string[]; symlink: string |
   }
   const paths: string[] = [];
   let symlink: string | null = null;
+  const headerBudget = { left: HEADER_SCAN_BUDGET };
   for (const rawLine of text.split("\n")) {
     const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
     if (
@@ -1104,9 +1202,20 @@ function scanPatchBytes(patchPath: string): { paths: string[]; symlink: string |
     if (line.startsWith("--- ") || line.startsWith("+++ ")) found = headerPath(line.slice(4));
     else if (line.startsWith("rename from ")) found = headerPath(line.slice(12));
     else if (line.startsWith("rename to ")) found = headerPath(line.slice(10));
+    // Git's legacy spelling of the same two lines, still in its keyword table
+    // and still accepted (measured end to end).
+    else if (line.startsWith("rename old ")) found = headerPath(line.slice(11));
+    else if (line.startsWith("rename new ")) found = headerPath(line.slice(11));
     else if (line.startsWith("copy from ")) found = headerPath(line.slice(10));
     else if (line.startsWith("copy to ")) found = headerPath(line.slice(8));
-    else if (line.startsWith("diff --git ")) found = diffGitHeaderPath(line.slice(11));
+    else if (line.startsWith("diff --git ")) {
+      const header = diffGitHeaderPaths(line.slice(11), headerBudget);
+      // Unparseable within the budget: the floor cannot answer for this entry,
+      // and on a machine where `--numstat` cannot run this scan is the whole
+      // floor. Fail the scan closed.
+      if (header === null) return null;
+      found = header;
+    }
     // Read as latin1 above, so a path's bytes are intact and re-decode as UTF-8
     // here — the spelling `isNeverIncludable` has to fold.
     for (const path of found) paths.push(Buffer.from(path, "latin1").toString("utf-8"));
@@ -1326,16 +1435,25 @@ function psQuote(raw: string): string {
  * above an ordinary directory only adds the README's "find your prefix" note,
  * and a repository with no discoverable `.git` (a bare `GIT_DIR`, which this
  * module scrubs from the environment anyway) only omits it.
+ *
+ * That "safe in both directions" claim holds only because the walk goes all the
+ * way to the filesystem root. An earlier depth cap of 64 broke it in the UNSAFE
+ * direction: a project more than 64 directories deep answered `false`, i.e. "a
+ * known-empty prefix", so a broken-git receiver was handed a README command
+ * with no `--directory` and no caveat — the silent no-op this whole path exists
+ * to prevent (measured at depth 70). `dirname` is purely lexical and strictly
+ * shortens until it reaches a fixpoint, so the walk always terminates; the
+ * counter below is a belt-and-braces guard that gives up towards "unknown".
  */
 function hasGitAncestor(start: string): boolean {
   let dir = start;
-  for (let depth = 0; depth < 64; depth++) {
+  for (let depth = 0; depth < 4096; depth++) {
     if (existsSync(join(dir, ".git"))) return true;
     const parent = dirname(dir);
     if (parent === dir) return false;
     dir = parent;
   }
-  return false;
+  return true;
 }
 
 /**
@@ -1391,47 +1509,59 @@ function renderSavedReadme(opts: {
     // `git apply` on this machine could not parse it at all, so the checks that
     // decide whether it is safe to apply could not finish — which is a reason
     // to withhold the command, not a reason to accuse the sender.
+    //
+    // Unlike the `unsafe` branch this does NOT return early: what could not be
+    // read is the PATCH, and a damaged patch says nothing whatever about the
+    // untracked files sitting beside it. Withholding their copy command too
+    // would be an accident, not a decision.
     lines.push(
       "**`git apply` on this machine could not read this patch**, so sesh-mover could not finish checking it and gives no apply command here. Nothing about it was found to be unsafe — the bundle looks damaged or truncated rather than hostile. The patch is beside this file if you want to inspect it; the surer fix is to have the other machine push again.",
       ""
     );
-    return lines.join("\n") + "\n";
-  }
-  lines.push(
-    "To apply it by hand, from the project directory:",
-    "",
-    "```bash",
-    `git -c apply.ignoreWhitespace=no apply --whitespace=nowarn${directory} ${shQuote(patch)}`,
-    "```",
-    "",
-    "Both settings matter: `apply.whitespace=fix` silently strips whitespace the patch adds, and `apply.ignoreWhitespace=change` will apply a patch whose context does not match and rewrite your indentation to it.",
-    "",
-  );
-  if (!opts.prefixKnown) {
+  } else {
     lines.push(
-      "This machine could not be asked where the project sits inside its repository, so the command above has no `--directory`. **If this project directory is inside a git repository but is not its root, add one** — from the project directory, `git rev-parse --show-prefix` prints exactly what it needs (for example `--directory='pkg/app/'`). Without it `git apply` resolves the patch's paths against the repository root, ignores everything outside your current directory, and exits 0 having written nothing.",
+      "To apply it by hand, from the project directory:",
+      "",
+      "```bash",
+      `git -c apply.ignoreWhitespace=no apply --whitespace=nowarn${directory} ${shQuote(patch)}`,
+      "```",
+      "",
+      "Both settings matter: `apply.whitespace=fix` silently strips whitespace the patch adds, and `apply.ignoreWhitespace=change` will apply a patch whose context does not match and rewrite your indentation to it.",
       "",
     );
-  } else if (opts.applyPrefix) {
+    if (!opts.prefixKnown) {
+      lines.push(
+        "This machine could not be asked where the project sits inside its repository, so the command above has no `--directory`. **If this project directory is inside a git repository but is not its root, add one** — from the project directory, `git rev-parse --show-prefix` prints exactly what it needs (for example `--directory='pkg/app/'`). Without it `git apply` resolves the patch's paths against the repository root, ignores everything outside your current directory, and exits 0 having written nothing.",
+        "",
+      );
+    } else if (opts.applyPrefix) {
+      lines.push(
+        `\`--directory\` is not optional here: this project is the subdirectory \`${opts.applyPrefix}\` of its repository, and \`git apply\` resolves patch paths against the repository ROOT. Without it the command exits 0 and writes nothing at all.`,
+        "",
+      );
+    }
+  }
+  if (meta.untrackedCount > 0) {
     lines.push(
-      `\`--directory\` is not optional here: this project is the subdirectory \`${opts.applyPrefix}\` of its repository, and \`git apply\` resolves patch paths against the repository ROOT. Without it the command exits 0 and writes nothing at all.`,
+      (opts.advice === "unparseable"
+        ? "The untracked files travelled as ordinary copies, not in the patch, so nothing above affects them. They are under `untracked/`."
+        : "The untracked files are under `untracked/`.") +
+        " Copying them OVERWRITES same-named files — sesh-mover's own apply never does that — so check first:",
+      "",
+      "```bash",
+      `# macOS / Linux`,
+      `cp -R ${shQuote(`${untracked}/.`)} .`,
+      "```",
+      "",
+      "```powershell",
+      `# Windows (PowerShell)`,
+      `Copy-Item -Recurse -Force ${psQuote(join(untracked, "*"))} .`,
+      "```",
       "",
     );
   }
   lines.push(
-    "The untracked files are under `untracked/`. Copying them OVERWRITES same-named files — sesh-mover's own apply never does that — so check first:",
-    "",
-    "```bash",
-    `# macOS / Linux`,
-    `cp -R ${shQuote(`${untracked}/.`)} .`,
-    "```",
-    "",
-    "```powershell",
-    `# Windows (PowerShell)`,
-    `Copy-Item -Recurse -Force ${psQuote(join(untracked, "*"))} .`,
-    "```",
-    "",
-    "Delete this directory once you are done; nothing else reads it, and sesh-mover keeps only the most recent few.",
+    "Delete this directory once you are done; nothing else reads it, and sesh-mover keeps only the most recent few."
   );
   return lines.join("\n") + "\n";
 }
@@ -1497,14 +1627,21 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
     // Defaulted rather than passed at every call site: "did the floor fire?" is
     // the question, and only the one caller that knows better overrides it.
     advice: SavedAdvice = scanUnsafe || reason === "unsafe-payload" ? "unsafe" : "apply"
-  ): CarryNotApplied => ({
-    applied: false,
-    reason,
-    detail,
-    savedTo: saveCarryPayload({
+  ): CarryNotApplied => {
+    const savedTo = saveCarryPayload({
       carryDir, targetPath, meta, detail, stamp, applyPrefix, prefixKnown, advice,
-    }),
-  });
+    });
+    return {
+      applied: false,
+      reason,
+      detail,
+      savedTo,
+      // What the README actually contains, decided at the one place that knows.
+      // Callers describe the save to the user and must not offer commands the
+      // two withholding branches deliberately left out.
+      savedCommands: savedTo !== null && advice === "apply",
+    };
+  };
 
   /**
    * The byte scan's own refusal, deferred so that git's parse — which names the

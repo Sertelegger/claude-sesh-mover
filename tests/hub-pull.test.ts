@@ -377,6 +377,11 @@ describe("hub pull", () => {
         const readme = readFileSync(join(p.carryApplied.savedTo!, "README.md"), "utf-8");
         expect(readme).toContain("refused");
         expect(readme).not.toContain("apply --whitespace=nowarn");
+        // ...and the warning must not send the user there looking for the
+        // commands the README deliberately withholds.
+        expect(p.carryApplied.savedCommands).toBe(false);
+        expect(p.warnings.join(" ")).not.toContain("README with the exact commands");
+        expect(p.warnings.join(" ")).toContain("what was withheld");
       }
       expect(existsSync(join(projectB, ".claude-sesh-mover.")))
         .toBe(false);
