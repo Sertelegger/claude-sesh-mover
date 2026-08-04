@@ -2,7 +2,7 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, rmSync, writeFileSync }
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import {
-  formatBytes, isCarriedPath, isReIncluded, readCarryRules, type CarryRules,
+  formatBytes, isCarriedPath, isReIncluded, NEVER_INCLUDABLE, readCarryRules, type CarryRules,
 } from "./workspace.js";
 
 /**
@@ -52,6 +52,20 @@ const CARRY_PER_FILE_BYTES = 512;
  *   `diff.mnemonicPrefix` renames them to `c/` and `w/`, which `-p1` strips
  *   into the wrong path. Deliberately NOT `--default-prefix`, which says the
  *   same thing but only exists in git 2.41+; these two are ancient.
+ * - `-U3` — `diff.context = 0` produces hunks with no context at all
+ *   (`@@ -5 +5 @@`), and `git apply --check` REFUSES them ("while searching
+ *   for: …"); only `--unidiff-zero`, which the apply side must not be forced
+ *   into, recovers such a patch. Note `GIT_DIFF_OPTS=-u0` says the same thing
+ *   and git documents it as taking precedence over `-U`, so it is scrubbed from
+ *   the child environment instead (see `SCRUBBED_GIT_ENV`).
+ * - `--submodule=short` — `diff.submodule = log` (a widely recommended setting)
+ *   renders a submodule pointer change as prose — `Submodule sub f99b19..c9763b:`
+ *   with no `diff --git` header at all. On a patch that also touches ordinary
+ *   files `git apply --check` PASSES and the pointer change is silently
+ *   dropped; on a submodule-only change the whole patch is junk.
+ * - `--ignore-submodules=none` — `diff.ignoreSubmodules = all` makes submodule
+ *   changes vanish outright, so a tree whose only uncommitted work is a
+ *   submodule pointer move is captured as `clean`.
  *
  * Task 7 met this class with `git merge-file` and could fix it by running from
  * a directory inside no repository. That escape does not exist here — the
@@ -59,7 +73,118 @@ const CARRY_PER_FILE_BYTES = 512;
  */
 const PATCH_HARDENING = [
   "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
+  "-U3", "--submodule=short", "--ignore-submodules=none",
 ];
+
+/**
+ * The `NEVER_INCLUDABLE` floor, expressed as `git` pathspecs.
+ *
+ * `isCarriedPath` filters the UNTRACKED enumeration; nothing filtered the patch,
+ * and `git diff HEAD` happily describes changes to a TRACKED
+ * `.claude-sesh-mover/config.json` (which can redirect `hub.path`) or
+ * `.claude-sesh-mover/hubinclude` (which decides what the next push ships).
+ * Committing that directory is what this project's own docs RECOMMEND, so the
+ * shape is ordinary rather than exotic — and while today's pull ignores the
+ * carry payload entirely, §6.2's `git apply` will not, and a patch is not
+ * filtered by the untracked copy path's guard.
+ *
+ * Two spellings per name because they answer different questions: `**\/<name>`
+ * catches a plain FILE with that name at any depth, `**\/<name>\/**` catches
+ * everything inside a directory with that name at any depth (the backslashes
+ * are this comment's, not the pathspec's). `icase` mirrors
+ * `isNeverSegment`, which folds case because a `.GIT` store works on a
+ * case-folding filesystem. Verified on git 2.50.1 to compose with `--relative`
+ * (the pathspecs are cwd-relative, so a project that is a repo SUBDIRECTORY
+ * excludes its own plugin directory, not the repo root's).
+ *
+ * `:(exclude)` magic is git 1.9+ (2014), `:(icase)`/`:(glob)` 1.8.5.
+ */
+const FLOOR_PATHSPEC = [
+  "--",
+  ".",
+  ...NEVER_INCLUDABLE.flatMap((name) => [
+    `:(exclude,icase,glob)**/${name}`,
+    `:(exclude,icase,glob)**/${name}/**`,
+  ]),
+];
+
+/**
+ * Environment variables stripped from every `git` child this module spawns.
+ *
+ * The flags above pin how git RENDERS a diff, but a flag cannot answer an
+ * environment variable that git documents as beating it, and none of them
+ * answers an environment variable that points git at a different repository.
+ * Inheriting the parent environment wholesale is therefore not a neutral
+ * default, so the child's environment is decided here rather than assumed. The
+ * dividing line: strip what REDIRECTS the repository/index or ALTERS rendering,
+ * keep what merely describes the user's own configuration.
+ *
+ * Stripped, and why (all measured on git 2.50.1):
+ *
+ * - `GIT_DIFF_OPTS` — documented to take precedence over `-U`. `GIT_DIFF_OPTS=-u0`
+ *   defeats `-U3` and produces a patch `git apply` refuses. There is no flag
+ *   that beats it; removing it is the only fix.
+ * - `GIT_EXTERNAL_DIFF` — belt and braces. `--no-ext-diff` does neutralize it
+ *   (verified: a stub that prints `PWNED` is ignored with the flag, obeyed
+ *   without it), but a variable that can replace the payload wholesale should
+ *   not be one flag away from doing so.
+ * - `GIT_LITERAL_PATHSPECS` / `GIT_GLOB_PATHSPECS` / `GIT_NOGLOB_PATHSPECS` /
+ *   `GIT_ICASE_PATHSPECS` — these reinterpret `FLOOR_PATHSPEC`.
+ *   `GIT_LITERAL_PATHSPECS=1` turns off pathspec magic entirely, so
+ *   `:(exclude,icase,glob)**\/.claude-sesh-mover` reads as a literal filename and
+ *   the floor SILENTLY stops excluding anything (verified).
+ * - `GIT_DIR` / `GIT_WORK_TREE` / `GIT_COMMON_DIR` / `GIT_INDEX_FILE` /
+ *   `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` /
+ *   `GIT_NAMESPACE` / `GIT_PREFIX` — these override `cwd`, and `captureCarry`'s
+ *   entire contract is "the repository at THIS project path". Git sets several
+ *   of them in the children it spawns, so they arrive for free in anything run
+ *   from a git hook or `git rebase --exec` (verified: with `GIT_DIR` set,
+ *   `rev-parse --absolute-git-dir` answers the other repository, and a stale
+ *   `GIT_INDEX_FILE` changes which files `git diff HEAD` reports).
+ * - `GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_COUNT` + `GIT_CONFIG_KEY_<n>` /
+ *   `GIT_CONFIG_VALUE_<n>` — how git propagates `-c` into its own children, i.e.
+ *   a transient per-invocation config injection inherited from whatever ran us.
+ *
+ * Deliberately KEPT: `HOME`, `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL`,
+ * `GIT_CONFIG_SYSTEM`. They name the user's persistent configuration, and
+ * `--exclude-standard` reads `core.excludesFile` from it — dropping them would
+ * change which files count as untracked, in the direction of carrying MORE.
+ * Also kept: `GIT_CEILING_DIRECTORIES` and `GIT_DISCOVERY_ACROSS_FILESYSTEM`,
+ * which say where the user considers repositories to live and can never point
+ * us at a different one.
+ */
+const SCRUBBED_GIT_ENV: readonly string[] = Object.freeze([
+  "GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF",
+  "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+  "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
+  "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+]);
+
+/** Prefixed families that go with `GIT_CONFIG_COUNT` (`GIT_CONFIG_KEY_0`, …). */
+const SCRUBBED_GIT_ENV_PREFIXES: readonly string[] = Object.freeze([
+  "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_",
+]);
+
+/**
+ * The environment every `git` child in this codebase runs with — a copy of the
+ * parent's, minus `SCRUBBED_GIT_ENV`. Exported because the decision is about
+ * `git` children, not about carry: `identity.ts` decides carry-vs-snapshot from
+ * `git remote -v`, `push.ts` offers `ls-files --ignored` output as a
+ * `hubinclude` line to paste, and `merge.ts` runs `git merge-file` from a
+ * scratch directory precisely to escape ambient repository config — an escape
+ * `GIT_DIR` walks straight through (verified: a repo-local `merge.conflictStyle`
+ * that merge-file rejects makes it exit 128 from the scratch dir when `GIT_DIR`
+ * points at that repo).
+ */
+export function gitChildEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const name of SCRUBBED_GIT_ENV) delete env[name];
+  for (const name of Object.keys(env)) {
+    if (SCRUBBED_GIT_ENV_PREFIXES.some((p) => name.startsWith(p))) delete env[name];
+  }
+  return env;
+}
 
 /** Long enough for a huge working tree, short enough to never wedge a push. */
 const GIT_TIMEOUT_MS = 15_000;
@@ -119,8 +244,33 @@ export interface CarryMeta {
    * security-relevant subset and it is stated rather than left to be inferred.
    */
   reIncludedCount: number;
-  /** The first `MAX_REPORTED_REINCLUDED` of those paths, for the push warning. */
+  /**
+   * The first `MAX_REPORTED_REINCLUDED` of those paths, for the push warning —
+   * a sample the user can recognize, not an inventory (`reIncludedCount` is the
+   * true size). Deliberately capped rather than complete: `CarryMeta` is
+   * embedded in the bundle manifest, and `hubinclude` can legitimately name
+   * thousands of files, so a full list would put hundreds of KB of paths into
+   * every manifest. The full set is re-derivable on the sending machine from
+   * two files the user already has — `git ls-files --others --ignored
+   * --exclude-standard` filtered by `.claude-sesh-mover/hubinclude`.
+   */
   reIncluded: string[];
+  /**
+   * Gitignored files that are ALSO TRACKED and whose uncommitted changes are in
+   * `changes.patch`. Nothing re-included these and no rule can drop them: every
+   * filter this module applies — `.gitignore`, `hubignore`, the built-in
+   * excludes — governs the UNTRACKED enumeration, while `git diff HEAD`
+   * describes every tracked file that changed. A `.env` that was committed once
+   * and gitignored later (without `git rm --cached`) is the common shape, and
+   * its new value travels in plaintext in the patch.
+   *
+   * Reported separately from `reIncluded` on purpose: `reIncluded` means "you
+   * opted in via hubinclude, remove the line to stop it", which is a remedy that
+   * does nothing here. The remedy for these is `git rm --cached`, or `--no-carry`.
+   */
+  trackedIgnoredCount: number;
+  /** The first `MAX_REPORTED_REINCLUDED` of those paths, for the push warning. */
+  trackedIgnored: string[];
   /**
    * `git rev-parse --show-prefix`: non-empty when the project directory is a
    * SUBDIRECTORY of the repository. The patch is then scoped to that subtree
@@ -163,6 +313,11 @@ function git(cwd: string, args: string[], maxBuffer: number): GitResult {
   try {
     const stdout = execFileSync("git", args, {
       cwd,
+      // Not the inherited environment: see SCRUBBED_GIT_ENV. Two of the
+      // variables it removes can silently defeat the flags this module relies
+      // on (GIT_DIFF_OPTS beats -U3, GIT_LITERAL_PATHSPECS disables the floor
+      // pathspec), and several point git at a different repository entirely.
+      env: gitChildEnv(),
       timeout: GIT_TIMEOUT_MS,
       maxBuffer,
       // stderr is captured, not discarded: it is the only thing that can tell a
@@ -277,14 +432,68 @@ function collectFiles(
   return files;
 }
 
-/** `a/b.txt 4.1 MB, c.bin 1.0 MB` — the biggest contributors to an over-budget payload. */
+/**
+ * `a/b.txt 4.1 MB, c.bin 1.0 MB` — the biggest contributors to an over-budget
+ * payload, or `""` when there are none worth naming.
+ *
+ * Zero-byte entries are dropped rather than listed: a payload that busts the
+ * budget purely on the per-file term is made of empty files, and
+ * `largest: many/f1 0 bytes, many/f10 0 bytes, many/f100 0 bytes` names three
+ * arbitrary files and explains nothing. The caller omits the clause entirely in
+ * that case, leaving the file COUNT — which is the actual cause — to speak.
+ */
 function describeLargest(files: CarriedFile[], patchBytes: number): string {
   const rows = files
     .map((f) => ({ label: f.rel, size: f.size }))
     .concat(patchBytes > 0 ? [{ label: "the uncommitted diff", size: patchBytes }] : [])
+    .filter((r) => r.size > 0)
     .sort((a, b) => b.size - a.size)
     .slice(0, MAX_REPORTED_LARGEST);
   return rows.map((r) => `${r.label} ${formatBytes(r.size)}`).join(", ");
+}
+
+/**
+ * Gitignored files that are also TRACKED and that the patch actually changes.
+ *
+ * This is the honest answer to "what gitignored content left my machine", and
+ * it is not `reIncluded`: `hubinclude` had nothing to do with it and no
+ * exclusion rule in this module can drop it, because every one of them filters
+ * the untracked enumeration while the patch describes tracked files.
+ *
+ * Two `git` calls, and the second only ever runs on a repository that HAS
+ * tracked-but-ignored files — which most do not, so the common case costs one
+ * index scan. `git ls-files` is subtree-scoped and prints cwd-relative paths by
+ * default, which is exactly what `--relative` makes the diff names, so the two
+ * lists are directly comparable.
+ */
+function findTrackedIgnored(projectPath: string, diagnostics: string[]): string[] {
+  const tracked = git(
+    projectPath,
+    ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
+    LS_FILES_MAX_BUFFER
+  );
+  if (!tracked.ok) {
+    diagnostics.push(
+      "Could not determine whether any gitignored file is tracked and travelled in this push's patch " +
+        `(${tracked.stderr || String(tracked.code ?? "git failed")}).`
+    );
+    return [];
+  }
+  const ignoredTracked = new Set(splitZ(tracked.stdout));
+  if (ignoredTracked.size === 0) return [];
+  const changed = git(
+    projectPath,
+    ["diff", "HEAD", "--name-only", "-z", "--relative", ...PATCH_HARDENING, ...FLOOR_PATHSPEC],
+    LS_FILES_MAX_BUFFER
+  );
+  if (!changed.ok) {
+    diagnostics.push(
+      "Could not determine which gitignored tracked files travelled in this push's patch " +
+        `(${changed.stderr || String(changed.code ?? "git failed")}).`
+    );
+    return [];
+  }
+  return splitZ(changed.stdout).filter((rel) => ignoredTracked.has(rel));
 }
 
 /**
@@ -308,7 +517,20 @@ function describeLargest(files: CarriedFile[], patchBytes: number): string {
  *   to the cwd) describes just this subtree, and neither half applies.
  * - untracked, non-ignored files, minus what the carry rules drop.
  * - every gitignored path `hubinclude` names (design §6.0) — the deliberate,
- *   committed, reviewable exception, and the ONLY way a gitignored file travels.
+ *   committed, reviewable exception, and the only way an UNTRACKED gitignored
+ *   file travels.
+ *
+ * What the filters do and do NOT cover, stated exactly because the short version
+ * ("gitignored files never travel") is false in one direction: `.gitignore`,
+ * `hubignore`, the built-in excludes and `hubinclude` all govern the UNTRACKED
+ * enumeration. `git diff HEAD` describes every TRACKED file that changed, and no
+ * user-facing rule filters it — a file that is gitignored AND tracked (committed
+ * once, ignored later, never `git rm --cached`; or `git add -f`) carries its
+ * uncommitted changes in full. `trackedIgnored` reports exactly that set rather
+ * than leaving it to be inferred. The one filter that DOES apply to the patch is
+ * `FLOOR_PATHSPEC`, the `NEVER_INCLUDABLE` floor, because a tracked
+ * `.claude-sesh-mover/config.json` can redirect `hub.path` on the machine that
+ * applies it.
  *
  * The patch is handled as BYTES from end to end. `git diff` writes a text
  * file's raw bytes into the patch body, so a file that is not valid UTF-8 (a
@@ -339,7 +561,10 @@ export async function captureCarry(
     // whose push should say so, not one that quietly carries nothing.
     const inRepo = git(projectPath, ["rev-parse", "--absolute-git-dir"], 4096).ok;
     return inRepo
-      ? { captured: false, reason: "no-commits", detail: head.stderr }
+      // NOT git's own words here: `rev-parse --verify HEAD` says "fatal: Needed
+      // a single revision", which surfaces in a push warning as a sentence no
+      // user can act on.
+      ? { captured: false, reason: "no-commits", detail: "this repository has no commits yet" }
       : { captured: false, reason: "not-git", detail: head.stderr };
   }
   const baseCommit = head.stdout.toString("utf-8").trim();
@@ -358,7 +583,7 @@ export async function captureCarry(
 
   const diff = git(
     projectPath,
-    ["diff", "HEAD", "--binary", "--relative", ...PATCH_HARDENING],
+    ["diff", "HEAD", "--binary", "--relative", ...PATCH_HARDENING, ...FLOOR_PATHSPEC],
     // +1 so a diff that exactly fills the budget is still measurable, and
     // anything past it is refused by Node instead of being buffered.
     maxBytes + 1
@@ -433,14 +658,22 @@ export async function captureCarry(
   const untrackedBytes = files.reduce((sum, f) => sum + f.size, 0);
   const cost = patch.length + untrackedBytes + files.length * CARRY_PER_FILE_BYTES;
   if (cost > maxBytes) {
+    // Reports the REAL size AND the file count, because either one alone can be
+    // the cause: without the count a payload of empty files reads as "0 bytes
+    // exceeds 5 MB". `largest:` is omitted when every contributor measures zero
+    // — three arbitrary empty filenames explain nothing.
+    const largest = describeLargest(files, patch.length);
     return {
       captured: false,
       reason: "too-large",
-      // Reports the REAL size, then explains the per-file term — otherwise a
-      // payload of empty files reads as "0 bytes exceeds 5 MB".
-      detail: `${formatBytes(patch.length + untrackedBytes)} of uncommitted work across ${files.length} file(s) exceeds the ${formatBytes(maxBytes)} carry budget (each file also counts ${CARRY_PER_FILE_BYTES} bytes toward it; largest: ${describeLargest(files, patch.length)})`,
+      detail: `${formatBytes(patch.length + untrackedBytes)} of uncommitted work across ${files.length} file(s) exceeds the ${formatBytes(maxBytes)} carry budget (each file also counts ${CARRY_PER_FILE_BYTES} bytes toward it${largest ? `; largest: ${largest}` : ""})`,
     };
   }
+
+  // Computed only for a capture that is actually going to happen, and only
+  // reaches a second `git` call on a repository that has tracked-but-ignored
+  // files at all. See `findTrackedIgnored` for why this is not `reIncluded`.
+  const trackedIgnored = patch.length > 0 ? findTrackedIgnored(projectPath, diagnostics) : [];
 
   const preexisting = existsSync(destDir);
   const cleanupPartial = (): void => {
@@ -495,6 +728,8 @@ export async function captureCarry(
       patchBytes: patch.length,
       reIncludedCount: reIncluded.length,
       reIncluded: reIncluded.slice(0, MAX_REPORTED_REINCLUDED),
+      trackedIgnoredCount: trackedIgnored.length,
+      trackedIgnored: trackedIgnored.slice(0, MAX_REPORTED_REINCLUDED),
       repoPrefix,
     };
     writeFileSync(join(destDir, "carry.json"), JSON.stringify(meta, null, 2) + "\n", "utf-8");

@@ -14,7 +14,7 @@ import {
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
 import { snapshotWorkspace, hubincludePath, isNeverIncludable } from "./workspace.js";
-import { captureCarry, type CarryMeta } from "./carry.js";
+import { captureCarry, gitChildEnv, type CarryMeta } from "./carry.js";
 import { exportAllSessions } from "../exporter.js";
 import { createArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
@@ -35,7 +35,9 @@ export interface HubPushOptions {
   /**
    * Skip the git-diff carry (design §6.1). Off by default: for a project with
    * a git remote the carry is the only thing that moves work-in-progress, and
-   * it never touches a gitignored file unless `hubinclude` names it.
+   * it never copies a gitignored UNTRACKED file unless `hubinclude` names it.
+   * (A gitignored file that git TRACKS is a different matter: the patch carries
+   * its changes and no carry rule filters the patch — see `trackedIgnored`.)
    */
   noCarry?: boolean;
   projectIdOverride?: string;
@@ -76,6 +78,10 @@ function listTopLevelIgnored(projectPath: string): string[] {
       ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
       {
         cwd: projectPath, encoding: "utf-8", timeout: 5000,
+        // Not the inherited environment (see `gitChildEnv`): these paths are
+        // offered to the user as `hubinclude` lines to paste, so they have to
+        // come from the project's own repository and its own ignore rules.
+        env: gitChildEnv(),
         stdio: ["ignore", "pipe", "ignore"], maxBuffer: 4 * 1024 * 1024,
       }
     );
@@ -282,6 +288,18 @@ export async function hubPush(
           const more = cap.meta.reIncludedCount - cap.meta.reIncluded.length;
           warnings.push(
             `Carried ${cap.meta.reIncludedCount} gitignored file(s) because .claude-sesh-mover/hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`
+          );
+        }
+        if (cap.meta.trackedIgnoredCount > 0) {
+          // A different disclosure with a different remedy, which is why it is
+          // not folded into the one above: hubinclude did not put these on the
+          // hub and removing a hubinclude line will not take them off it. They
+          // are gitignored files that git TRACKS, so the patch carries their
+          // uncommitted contents and no carry rule filters the patch.
+          const shown = cap.meta.trackedIgnored.join(", ");
+          const more = cap.meta.trackedIgnoredCount - cap.meta.trackedIgnored.length;
+          warnings.push(
+            `The patch carries changes to ${cap.meta.trackedIgnoredCount} gitignored file(s) that git TRACKS, so .gitignore did not keep them off the hub: ${shown}${more > 0 ? `, and ${more} more` : ""}. Untrack them (git rm --cached) or push with --no-carry to stop that.`
           );
         }
         if (cap.meta.inProgress) {

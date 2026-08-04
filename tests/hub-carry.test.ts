@@ -197,6 +197,12 @@ describe("captureCarry", () => {
       if (!r.captured) {
         expect(r.reason).toBe("too-large");
         expect(r.detail).toMatch(/40 file/);
+        // The file COUNT is the cause here, and it is stated. What must NOT be
+        // stated is a "largest:" list, which degenerates to three arbitrary
+        // names measuring nothing (`generated/f1.txt 0 bytes, …`) and reads as
+        // if those files were the problem.
+        expect(r.detail).not.toContain("largest:");
+        expect(r.detail).not.toMatch(/f\d+\.txt/);
       }
     } finally {
       cleanup(repo, dest);
@@ -246,6 +252,12 @@ describe("captureCarry", () => {
       // obvious implementation reports "not-git" for a real repo that simply
       // has no commit yet — and push stays silent about it.
       if (!r.captured) expect(r.reason).toBe("no-commits");
+      // push surfaces `detail` verbatim in a warning, so it must not be git's
+      // own words — "fatal: Needed a single revision" is not actionable.
+      if (!r.captured) {
+        expect(r.detail).toBe("this repository has no commits yet");
+        expect(r.detail).not.toMatch(/fatal|revision/i);
+      }
     } finally {
       cleanup(dir, dest);
     }
@@ -299,21 +311,34 @@ describe("captureCarry — patch fidelity", () => {
     let twin = "";
     const stub = join(repo, "fakediff.sh");
     const savedExternal = process.env.GIT_EXTERNAL_DIFF;
+    const savedDiffOpts = process.env.GIT_DIFF_OPTS;
+    const before = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+    const after = "l1\nl2\nl3\nl4\nlower case edit\nl6\nl7\nl8\nl9\n";
     try {
       writeFileSync(stub, "#!/bin/sh\necho 'I AM NOT A PATCH'\n", { mode: 0o755 });
-      // Five ways an ordinary developer's own git config rewrites what `git
-      // diff` prints. Two of them (external diff, textconv) replace the CONTENT.
+      // Ways an ordinary developer's own git config rewrites what `git diff`
+      // prints. Two of them (external diff, textconv) replace the CONTENT; one
+      // (diff.context) makes the result unappliable; the rest garble the
+      // headers. Nine lines so `-U3` and `-U0` are distinguishable at all.
       writeFileSync(join(repo, ".gitattributes"), "*.txt diff=upper\n");
+      writeFileSync(join(repo, "tracked.txt"), before);
       git(repo, ["add", "-A"]);
       git(repo, ["commit", "-q", "-m", "attrs"]);
       git(repo, ["config", "diff.upper.textconv", "tr a-z A-Z <"]);
       git(repo, ["config", "color.diff", "always"]);
       git(repo, ["config", "diff.noprefix", "true"]);
       git(repo, ["config", "diff.mnemonicPrefix", "true"]);
+      // `git apply --check` REFUSES a zero-context hunk ("while searching
+      // for:"), and only --unidiff-zero recovers it — which the apply side
+      // must not be forced into.
+      git(repo, ["config", "diff.context", "0"]);
       if (process.platform !== "win32") git(repo, ["config", "diff.external", stub]);
       twin = cleanTwin(repo);
-      writeFileSync(join(repo, "tracked.txt"), "lower case edit\n");
+      writeFileSync(join(repo, "tracked.txt"), after);
       if (process.platform !== "win32") process.env.GIT_EXTERNAL_DIFF = stub;
+      // Documented to take precedence over -U, so no flag can answer it: the
+      // fix is removing it from the child's environment.
+      process.env.GIT_DIFF_OPTS = "-u0";
 
       const r = await captureCarry(repo, dest);
       expect(r.captured).toBe(true);
@@ -322,16 +347,111 @@ describe("captureCarry — patch fidelity", () => {
       expect(patch.toString("utf-8").startsWith("diff --git a/tracked.txt b/tracked.txt")).toBe(true);
       expect(patch.includes(0x1b)).toBe(false);                       // no ANSI
       expect(patch.toString("utf-8")).toContain("+lower case edit");  // not uppercased by textconv
+      // Three context lines each side, not `@@ -5 +5 @@`.
+      expect(patch.toString("utf-8")).toContain("@@ -2,7 +2,7 @@");
       cpSync(join(dest, "changes.patch"), join(twin, "c.patch"));
       const check = spawnSync("git", ["apply", "--check", "c.patch"], { cwd: twin, encoding: "utf-8" });
       expect(check.stderr.trim()).toBe("");
       expect(check.status).toBe(0);
       expect(spawnSync("git", ["apply", "c.patch"], { cwd: twin }).status).toBe(0);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("lower case edit\n");
+      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe(after);
     } finally {
       if (savedExternal === undefined) delete process.env.GIT_EXTERNAL_DIFF;
       else process.env.GIT_EXTERNAL_DIFF = savedExternal;
+      if (savedDiffOpts === undefined) delete process.env.GIT_DIFF_OPTS;
+      else process.env.GIT_DIFF_OPTS = savedDiffOpts;
       cleanup(repo, dest, twin);
+    }
+  });
+
+  it("keeps a submodule pointer change in the patch under diff.submodule / diff.ignoreSubmodules", async () => {
+    // `diff.submodule = log` is widely recommended and renders the pointer move
+    // as prose with NO `diff --git` header: on a mixed patch `git apply --check`
+    // passes and the change is silently dropped. `diff.ignoreSubmodules = all`
+    // deletes it outright, so a submodule-only change captures as "clean".
+    const inner = gitRepo("carrysubinner");
+    const repo = gitRepo("carrysubouter");
+    const dest = tempDest();
+    try {
+      writeFileSync(join(inner, "tracked.txt"), "v2\n");
+      git(inner, ["add", "-A"]);
+      git(inner, ["commit", "-q", "-m", "second"]);
+      // Local-path submodules need the protocol allowlist on modern git.
+      git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", inner, "sub"]);
+      git(repo, ["commit", "-q", "-m", "add submodule"]);
+      git(repo, ["config", "diff.submodule", "log"]);
+      git(repo, ["config", "diff.ignoreSubmodules", "all"]);
+      git(join(repo, "sub"), ["checkout", "-q", "HEAD~1"]);
+
+      const r = await captureCarry(repo, dest);
+      expect(r.captured).toBe(true);
+      if (!r.captured) return;
+      const patch = readFileSync(join(dest, "changes.patch"), "utf-8");
+      expect(patch).toContain("diff --git a/sub b/sub");
+      expect(patch).toContain("-Subproject commit");
+      expect(patch).not.toContain("Submodule sub "); // the `log` prose form
+    } finally {
+      cleanup(inner, repo, dest);
+    }
+  });
+
+  it("ignores an ambient git environment that would defeat its own flags", async () => {
+    // Two variables that no flag can answer. GIT_LITERAL_PATHSPECS turns off
+    // pathspec magic, so the NEVER floor's `:(exclude,…)` args read as literal
+    // filenames and stop excluding anything. GIT_DIR overrides repository
+    // discovery outright, so `cwd` stops deciding which repo is diffed. Both
+    // arrive for free in anything launched from a git hook or `rebase --exec`.
+    const repo = gitRepo("carryenvA");
+    const other = gitRepo("carryenvB");
+    const dest = tempDest();
+    const saved = {
+      lit: process.env.GIT_LITERAL_PATHSPECS,
+      dir: process.env.GIT_DIR,
+      idx: process.env.GIT_INDEX_FILE,
+    };
+    try {
+      mkdirSync(join(repo, ".claude-sesh-mover"), { recursive: true });
+      writeFileSync(join(repo, ".claude-sesh-mover", "config.json"), '{"hub":{"path":"/orig"}}\n');
+      git(repo, ["add", "-A", "-f"]);
+      git(repo, ["commit", "-q", "-m", "track plugin state"]);
+      writeFileSync(join(repo, ".claude-sesh-mover", "config.json"), '{"hub":{"path":"/EVIL"}}\n');
+      writeFileSync(join(repo, "tracked.txt"), "v2\n");
+      const ownHead = git(repo, ["rev-parse", "HEAD"]).trim();
+
+      // Phase 1 — pathspec magic off. The floor's `:(exclude,…)` arguments read
+      // as literal filenames, matching nothing, so the exclusion silently stops
+      // working. Nothing in the argv can detect that.
+      process.env.GIT_LITERAL_PATHSPECS = "1";
+      const r1 = await captureCarry(repo, dest);
+      expect(r1.captured).toBe(true);
+      if (!r1.captured) return;
+      const patch1 = readFileSync(join(dest, "changes.patch"), "utf-8");
+      expect(patch1).toContain("diff --git a/tracked.txt b/tracked.txt");
+      expect(patch1).not.toContain(".claude-sesh-mover");
+      expect(patch1).not.toContain("EVIL");
+      delete process.env.GIT_LITERAL_PATHSPECS;
+      rmSync(dest, { recursive: true, force: true });
+
+      // Phase 2 — repository redirection. With GIT_DIR set and no
+      // GIT_WORK_TREE, git reads ANOTHER repository's history while still
+      // walking this project's files, so the patch looks plausible and the
+      // recorded base commit is the giveaway: a carry taken against a commit
+      // the peer's repo has never heard of cannot apply anywhere.
+      process.env.GIT_DIR = join(other, ".git");
+      process.env.GIT_INDEX_FILE = join(other, ".git", "index");
+      const r2 = await captureCarry(repo, dest);
+      expect(r2.captured).toBe(true);
+      if (!r2.captured) return;
+      expect(r2.meta.baseCommit).toBe(ownHead);
+      expect(r2.meta.baseCommit).not.toBe(git(other, ["rev-parse", "HEAD"]).trim());
+    } finally {
+      for (const [k, v] of [
+        ["GIT_LITERAL_PATHSPECS", saved.lit], ["GIT_DIR", saved.dir], ["GIT_INDEX_FILE", saved.idx],
+      ] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      cleanup(repo, other, dest);
     }
   });
 
@@ -405,6 +525,82 @@ describe("captureCarry — what must never travel", () => {
       if (!r.captured) return;
       expect(listFiles(join(dest, "untracked"))).toEqual(["real.txt"]);
       expect(r.meta.untrackedCount).toBe(1);
+    } finally {
+      cleanup(repo, dest);
+    }
+  });
+
+  it("never carries plugin state in the PATCH either, when git tracks it", async () => {
+    // The untracked filter never sees a tracked file, and `git diff HEAD`
+    // describes every tracked file that changed. Committing
+    // `.claude-sesh-mover/` is what this project's own docs recommend (it is
+    // where `hubinclude` and `project.json` live), so the leak is the ordinary
+    // shape rather than an exotic one — and Task 11's `git apply` will write
+    // whatever the patch names.
+    const repo = gitRepo("carryplugintracked");
+    const dest = tempDest();
+    try {
+      mkdirSync(join(repo, ".claude-sesh-mover", "nested"), { recursive: true });
+      writeFileSync(join(repo, ".claude-sesh-mover", "config.json"), '{"hub":{"path":"/orig"}}\n');
+      writeFileSync(join(repo, ".claude-sesh-mover", "hubinclude"), "docs/\n");
+      // A nested one too: the floor is a per-segment rule at ANY depth, so the
+      // pathspec that mirrors it has to be depth-independent as well.
+      mkdirSync(join(repo, "pkg", ".claude-sesh-mover"), { recursive: true });
+      writeFileSync(join(repo, "pkg", ".claude-sesh-mover", "config.json"), "{}\n");
+      git(repo, ["add", "-A", "-f"]);
+      git(repo, ["commit", "-q", "-m", "track plugin state"]);
+      writeFileSync(join(repo, ".claude-sesh-mover", "config.json"), '{"hub":{"path":"/EVIL"}}\n');
+      writeFileSync(join(repo, ".claude-sesh-mover", "hubinclude"), "*\n");
+      writeFileSync(join(repo, "pkg", ".claude-sesh-mover", "config.json"), '{"x":"EVIL"}\n');
+      writeFileSync(join(repo, "tracked.txt"), "real work\n");
+
+      const r = await captureCarry(repo, dest);
+      expect(r.captured).toBe(true);
+      if (!r.captured) return;
+      const patch = readFileSync(join(dest, "changes.patch"), "utf-8");
+      expect(patch).toContain("diff --git a/tracked.txt b/tracked.txt");
+      expect(patch).not.toContain(".claude-sesh-mover");
+      expect(patch).not.toContain("EVIL");
+    } finally {
+      cleanup(repo, dest);
+    }
+  });
+
+  it("reports gitignored files that git TRACKS, whose changes the patch carries anyway", async () => {
+    // The disclosure the guarantee's wording used to hide: `.gitignore`,
+    // `hubignore` and the built-in excludes all filter the UNTRACKED
+    // enumeration only. A `.env` committed once and gitignored later (without
+    // `git rm --cached`) travels in full, and `reIncludedCount` stays 0 because
+    // `hubinclude` had nothing to do with it.
+    const repo = gitRepo("carrytrackedignored");
+    const dest = tempDest();
+    try {
+      writeFileSync(join(repo, ".env"), "DB_PASSWORD=old\n");
+      mkdirSync(join(repo, "secrets"), { recursive: true });
+      writeFileSync(join(repo, "secrets", "creds.txt"), "creds=v1\n");
+      git(repo, ["add", "-A"]);
+      git(repo, ["commit", "-q", "-m", "before the gitignore"]);
+      writeFileSync(join(repo, ".gitignore"), ".env\nsecrets/\n");
+      writeHubRules(repo, "hubignore", "secrets");
+      git(repo, ["add", ".gitignore"]);
+      git(repo, ["commit", "-q", "-m", "ignore them, but they stay tracked"]);
+      writeFileSync(join(repo, ".env"), "DB_PASSWORD=hunter2_NEW\n");
+      writeFileSync(join(repo, "secrets", "creds.txt"), "creds=v2\n");
+      writeFileSync(join(repo, "secrets", "other.txt"), "untracked\n"); // dropped by hubignore
+
+      const r = await captureCarry(repo, dest);
+      expect(r.captured).toBe(true);
+      if (!r.captured) return;
+      const patch = readFileSync(join(dest, "changes.patch"), "utf-8");
+      expect(patch).toContain("+DB_PASSWORD=hunter2_NEW");     // it really does travel
+      expect(patch).toContain("+creds=v2");                    // hubignore does not stop it
+      expect(existsSync(join(dest, "untracked"))).toBe(false); // …but it does stop the untracked one
+      expect(r.meta.untrackedCount).toBe(0);
+      // Named as its own set, with its own remedy — NOT folded into reIncluded,
+      // where "remove the hubinclude line" would be advice that does nothing.
+      expect(r.meta.trackedIgnored).toEqual([".env", "secrets/creds.txt"]);
+      expect(r.meta.trackedIgnoredCount).toBe(2);
+      expect(r.meta.reIncludedCount).toBe(0);
     } finally {
       cleanup(repo, dest);
     }

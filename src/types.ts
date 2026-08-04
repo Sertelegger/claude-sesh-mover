@@ -240,8 +240,11 @@ export interface SeshMoverConfig {
     onDivergence: OnDivergenceMode;
     // Carry uncommitted work (a `git diff HEAD` patch plus untracked files)
     // alongside the sessions, for a project with a git remote. Set false (or
-    // pass --no-carry) to push sessions only. Never carries a gitignored file
-    // unless .claude-sesh-mover/hubinclude names it.
+    // pass --no-carry) to push sessions only. Never carries a gitignored
+    // UNTRACKED file unless .claude-sesh-mover/hubinclude names it — but a
+    // gitignored file that git TRACKS has its changes carried in the patch
+    // regardless, since no carry rule filters the patch (reported back as
+    // `carry.trackedIgnored`).
     carryDiff: boolean;
   };
 }
@@ -414,9 +417,15 @@ export interface HubPushResult {
   ignoredNotCarried?: string[];
   /**
    * The uncommitted work this push carried (design §6.1), or absent when it
-   * carried none. `reIncluded` names the gitignored paths that travelled only
-   * because `hubinclude` lists them — the security-relevant subset, also
-   * surfaced as a warning.
+   * carried none.
+   *
+   * Two separate disclosures, both also surfaced as warnings, and deliberately
+   * not merged — they have different causes and different remedies:
+   * `reIncluded` names gitignored UNTRACKED paths that travelled only because
+   * `hubinclude` lists them (remedy: edit `hubinclude`), while `trackedIgnored`
+   * names gitignored paths that git TRACKS, whose changes the patch carries
+   * because no carry rule filters the patch at all (remedy: `git rm --cached`,
+   * or `--no-carry`).
    */
   carry?: CarryMeta;
 }

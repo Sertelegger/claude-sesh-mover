@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { HubBackend } from "./backend.js";
 import { projectJsonPath, assertSafeHubId, type HubProjectJson } from "./layout.js";
+import { gitChildEnv } from "./carry.js";
 
 export interface LocalProjectId {
   projectId: string;
@@ -56,6 +57,11 @@ export function localGitRemotes(projectPath: string): string[] {
   try {
     const out = execFileSync("git", ["remote", "-v"], {
       cwd: projectPath, encoding: "utf-8", timeout: 5000,
+      // Not the inherited environment (see `gitChildEnv`): this answer is what
+      // decides whether push takes the git-carry path or the workspace-snapshot
+      // path, and an ambient GIT_DIR would have it read a different repository's
+      // remotes than the one `captureCarry` then diffs.
+      env: gitChildEnv(),
       stdio: ["ignore", "pipe", "ignore"], // suppress git's stderr (e.g. "not a git repository")
     });
     const urls = new Set<string>();

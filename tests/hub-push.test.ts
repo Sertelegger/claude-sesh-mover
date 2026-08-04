@@ -393,6 +393,36 @@ describe("hub push — git-diff carry", () => {
     }
   });
 
+  it("names the gitignored files git TRACKS separately, with the remedy that actually works", async () => {
+    const { result, extractDir, cleanup } = await pushAndExtract((p) => {
+      // Committed first, gitignored after — the common shape, and the one the
+      // "gitignored files never travel" wording used to hide. hubinclude never
+      // touched it, so "remove the hubinclude line" is not the remedy.
+      writeFileSync(join(p, ".env"), "DB_PASSWORD=old\n");
+      execFileSync("git", ["add", ".env"], { cwd: p, stdio: "ignore" });
+      execFileSync("git", ["commit", "-q", "-m", "oops"], { cwd: p, stdio: "ignore" });
+      writeFileSync(join(p, ".gitignore"), ".env\n");
+      execFileSync("git", ["add", ".gitignore"], { cwd: p, stdio: "ignore" });
+      execFileSync("git", ["commit", "-q", "-m", "ignore it"], { cwd: p, stdio: "ignore" });
+      writeFileSync(join(p, ".env"), "DB_PASSWORD=hunter2_NEW\n");
+    });
+    try {
+      expect(result.success).toBe(true);
+      if (!result.success || !("carry" in result) || !result.carry) throw new Error("no carry");
+      expect(result.carry.trackedIgnored).toEqual([".env"]);
+      expect(result.carry.reIncludedCount).toBe(0);
+      const warning = result.warnings.find((w) => w.includes(".env"));
+      expect(warning).toBeDefined();
+      expect(warning).toContain("git rm --cached");
+      expect(warning).not.toContain("hubinclude");
+      // And it really is on the hub, in the bundle that just left the machine.
+      expect(readFileSync(join(extractDir, "carry", "changes.patch"), "utf-8"))
+        .toContain("+DB_PASSWORD=hunter2_NEW");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("warns, without failing the push, when the carry busts the budget", async () => {
     const { result, extractDir, cleanup } = await pushAndExtract((p) => {
       writeFileSync(join(p, "huge.bin"), "x".repeat(6 * 1024 * 1024));

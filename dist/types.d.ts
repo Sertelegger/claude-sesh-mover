@@ -342,9 +342,15 @@ export interface HubPushResult {
     ignoredNotCarried?: string[];
     /**
      * The uncommitted work this push carried (design §6.1), or absent when it
-     * carried none. `reIncluded` names the gitignored paths that travelled only
-     * because `hubinclude` lists them — the security-relevant subset, also
-     * surfaced as a warning.
+     * carried none.
+     *
+     * Two separate disclosures, both also surfaced as warnings, and deliberately
+     * not merged — they have different causes and different remedies:
+     * `reIncluded` names gitignored UNTRACKED paths that travelled only because
+     * `hubinclude` lists them (remedy: edit `hubinclude`), while `trackedIgnored`
+     * names gitignored paths that git TRACKS, whose changes the patch carries
+     * because no carry rule filters the patch at all (remedy: `git rm --cached`,
+     * or `--no-carry`).
      */
     carry?: CarryMeta;
 }

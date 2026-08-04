@@ -8,7 +8,9 @@ export interface HubPushOptions {
     /**
      * Skip the git-diff carry (design §6.1). Off by default: for a project with
      * a git remote the carry is the only thing that moves work-in-progress, and
-     * it never touches a gitignored file unless `hubinclude` names it.
+     * it never copies a gitignored UNTRACKED file unless `hubinclude` names it.
+     * (A gitignored file that git TRACKS is a different matter: the patch carries
+     * its changes and no carry rule filters the patch — see `trackedIgnored`.)
      */
     noCarry?: boolean;
     projectIdOverride?: string;

@@ -4,6 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readHubignore, readHubinclude, } from "./workspace.js";
+import { gitChildEnv } from "./carry.js";
 /**
  * Thrown when `mergeWorkspaceTrees` is called without an ancestor tree.
  *
@@ -517,6 +518,12 @@ export async function mergeWorkspaceTrees(opts) {
                 try {
                     execFileSync("git", [...GIT_MERGE_ARGS, current, base, other], {
                         cwd: work,
+                        // The scratch-dir cwd above is not enough on its own: `GIT_DIR`
+                        // overrides repository discovery outright, so an ambient one walks
+                        // straight through the escape (verified — a repo-local
+                        // `merge.conflictStyle` that merge-file rejects makes it exit 128
+                        // from the scratch dir when GIT_DIR points at that repo).
+                        env: gitChildEnv(),
                         stdio: ["ignore", "ignore", "pipe"],
                         timeout: MERGE_TIMEOUT_MS,
                         windowsHide: true,
