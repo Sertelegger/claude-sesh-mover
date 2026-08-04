@@ -144,11 +144,14 @@ describe("hub pull", () => {
     }
   });
 
-  it("imports a bundle that carries uncommitted work, without applying or choking on it", async () => {
-    // Task 10 ships the capture half; §6.2's apply half is a later task and is
-    // explicit that a carry applies ONLY on request. Until then a carry payload
-    // has to be inert on the receiving end — this is the "before" control for
-    // that work, and the guard against a bundle shape that breaks today's pull.
+  it("reports a carried payload and saves it, without touching the tree, when --apply-carry is absent", async () => {
+    // Design §6.2: a carry applies ONLY on request, so the working tree must be
+    // untouched here. What it does NOT do is drop the payload: this pull
+    // records its bundles as received, so a re-run with --apply-carry answers
+    // "Already up to date" and the only surviving copy would be the one inside
+    // the bundle on the hub. It is written to .claude-sesh-mover/ instead.
+    // (This test was Task 10's "before" control, which asserted the pull said
+    // nothing about a carry at all — see the task 11 report.)
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
     const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
@@ -197,14 +200,199 @@ describe("hub pull", () => {
       if (!pull.success) return;
       const p = pull as HubPullResult;
       expect(p.importedSessions).toHaveLength(1);
-      // Nothing of the carry reached the tree, and no warning pretends otherwise.
+      // Nothing of the carry reached the tree.
       expect(existsSync(join(projectB, "scratch.txt"))).toBe(false);
       expect(readdirSync(projectB).sort()).toEqual([".claude-sesh-mover"]);
-      expect(p.warnings.join(" ")).not.toMatch(/carr/i);
+      // It IS reported, and it IS recoverable.
+      expect(p.carryAvailable?.baseCommit).toBeTruthy();
+      expect(p.carryApplied?.applied).toBe(false);
+      if (p.carryApplied?.applied === false) {
+        expect(p.carryApplied.reason).toBe("not-requested");
+        const saved = p.carryApplied.savedTo!;
+        expect(readFileSync(join(saved, "untracked", "scratch.txt"), "utf-8")).toBe("wip\n");
+        expect(readFileSync(join(saved, "README.md"), "utf-8")).toContain("apply");
+      }
+      // And the warning does not name the one remedy that cannot work.
+      expect(p.warnings.join(" ")).toMatch(/were not applied/);
+      expect(p.warnings.join(" ")).not.toMatch(/re-run|run again|retry/i);
+
+      // Why it cannot work, demonstrated rather than asserted: the bundle is
+      // recorded as received by the end of the pull above, so the obvious
+      // "run it again with --apply-carry" is refused outright. This is the
+      // whole reason the payload is saved instead of merely reported.
+      const again = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, applyCarry: true, claudeVersion: "2.1.81",
+      });
+      expect(again.success).toBe(false);
+      if (!again.success) expect(again.error).toMatch(/nothing to pull|already up to date/i);
     } finally {
       restore.restore();
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
       if (projectB) rmSync(projectB, { recursive: true, force: true });
+    }
+  });
+
+  it("--apply-carry applies the carried work into a clone at the same commit", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    const cloneRoot = mkdtempSync(join(tmpdir(), "sesh-pull-clone-"));
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA");
+      const { execFileSync } = await import("node:child_process");
+      const g = (args: string[], cwd = projectA): void => {
+        execFileSync("git", args, { cwd, stdio: "ignore" });
+      };
+      g(["init", "-q"]);
+      g(["config", "user.email", "t@example.com"]);
+      g(["config", "user.name", "Test"]);
+      g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "init"]);
+      // The clone is the realistic receiving shape for a git project: same
+      // commit, clean tree, and the plugin's own project.json untracked in it.
+      const projectB = join(cloneRoot, "projB");
+      execFileSync("git", ["clone", "-q", projectA, projectB], { stdio: "ignore" });
+      writeFileSync(join(projectA, "README.md"), "uncommitted\n");
+      writeFileSync(join(projectA, "scratch.txt"), "wip\n");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      writeLocalProjectId(projectB, {
+        projectId: pushResult.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, applyCarry: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.carryApplied?.applied).toBe(true);
+      if (p.carryApplied?.applied) {
+        expect(p.carryApplied.filesChanged).toBe(1);
+        expect(p.carryApplied.untrackedCopied).toBe(1);
+        expect(p.carryApplied.refused).toEqual([]);
+      }
+      expect(readFileSync(join(projectB, "README.md"), "utf-8")).toBe("uncommitted\n");
+      expect(readFileSync(join(projectB, "scratch.txt"), "utf-8")).toBe("wip\n");
+      // Applied, therefore not also parked: no saved copy is written when the
+      // payload reached the tree.
+      expect(readdirSync(join(projectB, ".claude-sesh-mover")).some((n) => n.startsWith("carry-")))
+        .toBe(false);
+      // The sessions still arrived — the working tree is the optional half.
+      expect(p.importedSessions).toHaveLength(1);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base, cloneRoot]) {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("refuses a hostile carry payload end to end, with --apply-carry and everything else passing", async () => {
+    // The whole path, not just applyCarry: a bundle sitting on the hub is
+    // rewritten to carry a patch that writes `.claude-sesh-mover./config.json`
+    // — the trailing-dot spelling the sender's own pathspec floor cannot
+    // express — plus a planted `hubinclude`, i.e. the file deciding what THIS
+    // machine's next push uploads and the one that redirects hub.path.
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    const cloneRoot = mkdtempSync(join(tmpdir(), "sesh-pull-clone-"));
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA");
+      const { execFileSync } = await import("node:child_process");
+      const g = (args: string[], cwd = projectA): void => {
+        execFileSync("git", args, { cwd, stdio: "ignore" });
+      };
+      g(["init", "-q"]);
+      g(["config", "user.email", "t@example.com"]);
+      g(["config", "user.name", "Test"]);
+      g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "init"]);
+      const projectB = join(cloneRoot, "projB");
+      execFileSync("git", ["clone", "-q", projectA, projectB], { stdio: "ignore" });
+      writeFileSync(join(projectA, "README.md"), "uncommitted\n");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success || !pushResult.bundleId) return;
+
+      await mutateBundleTree(hub, pushResult.projectId, pushResult.bundleId, (dir) => {
+        const hostile = ".claude-sesh-mover./config.json";
+        writeFileSync(
+          join(dir, "carry", "changes.patch"),
+          `diff --git a/${hostile} b/${hostile}\nnew file mode 100644\nindex 0000000..d95f3ad\n` +
+            `--- /dev/null\n+++ b/${hostile}\n@@ -0,0 +1 @@\n+{"hub":{"path":"/tmp/attacker"}}\n`
+        );
+        mkdirSync(join(dir, "carry", "untracked", ".claude-sesh-mover"), { recursive: true });
+        writeFileSync(join(dir, "carry", "untracked", ".claude-sesh-mover", "hubinclude"), "*\n");
+      });
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      writeLocalProjectId(projectB, {
+        projectId: pushResult.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, applyCarry: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.carryApplied?.applied).toBe(false);
+      if (p.carryApplied?.applied === false) {
+        expect(p.carryApplied.reason).toBe("unsafe-payload");
+        // The saved copy exists for inspection but refuses to teach the user to
+        // apply it: following that command by hand would land exactly what the
+        // guard just refused.
+        const readme = readFileSync(join(p.carryApplied.savedTo!, "README.md"), "utf-8");
+        expect(readme).toContain("refused");
+        expect(readme).not.toContain("apply --whitespace=nowarn");
+      }
+      expect(existsSync(join(projectB, ".claude-sesh-mover.")))
+        .toBe(false);
+      expect(existsSync(join(projectB, ".claude-sesh-mover", "hubinclude"))).toBe(false);
+      expect(existsSync(join(projectB, ".claude-sesh-mover", "config.json"))).toBe(false);
+      // Only the plugin's own linking artifact and the saved payload are there.
+      expect(readdirSync(join(projectB, ".claude-sesh-mover")).sort().join(",")).toMatch(
+        /^carry-[^,]+,project\.json$/
+      );
+      // The sessions still arrived: the working tree is the optional half.
+      expect(p.importedSessions).toHaveLength(1);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base, cloneRoot]) {
+        rmSync(d, { recursive: true, force: true });
+      }
     }
   });
 

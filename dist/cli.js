@@ -741,6 +741,7 @@ program
     .option("--project-path <path>", "Override project path (default: cwd)")
     .option("--target-path <path>", "Workspace unpack destination when the project directory doesn't exist locally yet")
     .option("--force-workspace", "Merge workspace files into a non-empty target directory")
+    .option("--apply-carry", "Apply carried uncommitted changes (requires the same base commit and a clean tree)")
     .option("--project-id <id>", "Link to an existing hub project id")
     .option("--force-append", "Append a pulled continuation even if the local session looks recently active")
     .option("--no-append", "Never append; import continuations as separate sessions")
@@ -771,6 +772,7 @@ program
             latest: !!opts.latest,
             targetPath: opts.targetPath,
             forceWorkspace: !!opts.forceWorkspace,
+            applyCarry: !!opts.applyCarry,
             projectIdOverride: opts.projectId,
             forceAppend: !!opts.forceAppend,
             noAppend: opts.append === false || !config.hub.pullAppend,

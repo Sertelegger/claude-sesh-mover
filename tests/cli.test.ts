@@ -237,6 +237,71 @@ describe("cli", () => {
       expect(result.error).toMatch(/adopt-hub/);
     });
 
+    it("--apply-carry reaches the working tree, and its absence parks the payload", async () => {
+      // Exercised through the built CLI on purpose: `--apply-carry` is a
+      // src/cli.ts wiring, and a mutation there is invisible to every test that
+      // calls hubPull directly.
+      const homeA = mkdtempSync(join(tmpdir(), "sesh-cli-ac-homeA-"));
+      const homeB = mkdtempSync(join(tmpdir(), "sesh-cli-ac-homeB-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-ac-hub-"));
+      const cloneRoot = mkdtempSync(join(tmpdir(), "sesh-cli-ac-clone-"));
+      const configDirB = join(homeB, ".claude");
+      const projectPath = join(tempDir, "acproj");
+      mkdirSync(projectPath, { recursive: true });
+      const { writeLocalProjectId } = await import("../src/hub/identity.js");
+      try {
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", encodeProjectPath(projectPath)),
+          { recursive: true }
+        );
+        const g = (args: string[], cwd = projectPath): void => {
+          execFileSync("git", args, { cwd, stdio: "ignore" });
+        };
+        g(["init", "-q"]);
+        g(["config", "user.email", "t@example.com"]);
+        g(["config", "user.name", "Test"]);
+        g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v1\n");
+        g(["add", "-A"]);
+        g(["commit", "-q", "-m", "init"]);
+        const clone = join(cloneRoot, "acclone");
+        execFileSync("git", ["clone", "-q", projectPath, clone], { stdio: "ignore" });
+        writeFileSync(join(projectPath, "tracked.txt"), "v2 uncommitted\n");
+
+        runCli(["hub", "init", "--path", hubDir], homeEnv(homeA));
+        const push = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
+            homeEnv(homeA)
+          ).stdout
+        );
+        expect(push.success).toBe(true);
+
+        runCli(["hub", "init", "--path", hubDir], homeEnv(homeB));
+        writeLocalProjectId(clone, {
+          projectId: push.projectId, name: "acproj",
+          createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+        });
+
+        const pulled = JSON.parse(
+          runCli(
+            [
+              "pull", "--latest", "--apply-carry",
+              "--project-path", clone, "--source-config-dir", configDirB,
+            ],
+            { ...homeEnv(homeB), CLAUDE_CONFIG_DIR: configDirB }
+          ).stdout
+        );
+        expect(pulled.success).toBe(true);
+        expect(pulled.carryApplied.applied).toBe(true);
+        expect(readFileSync(join(clone, "tracked.txt"), "utf-8")).toBe("v2 uncommitted\n");
+      } finally {
+        for (const d of [homeA, homeB, hubDir, cloneRoot]) {
+          rmSync(d, { recursive: true, force: true });
+        }
+      }
+    });
   });
 
   describe("--progress", () => {

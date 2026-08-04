@@ -1,3 +1,4 @@
+import { type DestinationBlock } from "./workspace.js";
 /**
  * Byte budget for one carry payload: the diff plus every file copied beside it.
  *
@@ -172,4 +173,113 @@ export interface CaptureCarryOptions {
  * failure as a reason to fall back.
  */
 export declare function captureCarry(projectPath: string, destDir: string, opts?: CaptureCarryOptions): Promise<CaptureResult>;
+/** Why a carry payload was not applied to the working tree. */
+export type CarryApplyDeclineReason = 
+/** `--apply-carry` was not passed. The payload is saved, never applied. */
+"not-requested"
+/** No runnable `git`. */
+ | "no-git"
+/** The target directory is not inside a git repository. */
+ | "not-git"
+/** The target's `HEAD` is not the commit the patch was captured against. */
+ | "wrong-base"
+/** The target has uncommitted changes to tracked files. */
+ | "dirty-tree"
+/** The target is mid-merge/rebase/cherry-pick/revert. */
+ | "in-progress"
+/** The payload names paths that can never be written, or carries symlinks. */
+ | "unsafe-payload"
+/** `git apply --check` or `git apply` refused it. */
+ | "apply-failed";
+/** What an applied carry did to the working tree. */
+export interface CarryApplied {
+    applied: true;
+    /** File entries in `changes.patch`. `0` means the payload was untracked files only. */
+    filesChanged: number;
+    /** Untracked files written. Excludes collisions, refusals and blocks below. */
+    untrackedCopied: number;
+    /**
+     * Payload paths that already existed here with DIFFERENT bytes. The local
+     * file is untouched and the incoming copy sits beside it as
+     * `<name>.incoming-<stamp>`. Identical content is a silent no-op, not a
+     * collision.
+     */
+    collisions: string[];
+    /**
+     * Payload paths refused because they name plugin or VCS internals
+     * (`NEVER_INCLUDABLE`) at some segment, in some casing or dot/space spelling.
+     * Nothing from them was written. A current sesh-mover never produces such a
+     * payload; callers must report these without naming a culprit (see
+     * `unpackWorkspace`'s `refused` for the same argument).
+     */
+    refused: string[];
+    /**
+     * Payload paths not written because of what already occupies them HERE — a
+     * symlink on the path (never written through) or a directory where a file
+     * belongs — plus any that failed to copy. Nothing was written near them.
+     */
+    blocked: Array<{
+        path: string;
+        reason: DestinationBlock | "io-error";
+    }>;
+}
+export interface CarryNotApplied {
+    applied: false;
+    reason: CarryApplyDeclineReason;
+    detail: string;
+    /**
+     * Where the whole payload was written instead — patch, untracked tree,
+     * `carry.json`, a `README.md` of manual steps and a self-ignoring
+     * `.gitignore`. `null` only when even that could not be written, which is the
+     * one branch where the payload is genuinely lost and the caller must say so.
+     */
+    savedTo: string | null;
+}
+export type ApplyResult = CarryApplied | CarryNotApplied;
+export interface ApplyCarryOptions {
+    /** The extracted `<bundle>/carry` directory. */
+    carryDir: string;
+    /** Where the project lives on THIS machine. */
+    targetPath: string;
+    meta: CarryMeta;
+    /**
+     * Save the payload without touching the working tree — what a pull does when
+     * `--apply-carry` was not passed. Saving rather than reporting-and-dropping
+     * is deliberate: a pull records its bundles as received, so re-running it
+     * with the flag answers "Already up to date" and the payload would be gone
+     * for good (the extraction directory is removed when the pull returns).
+     */
+    saveOnly?: boolean;
+    /** Test seam: pin the stamp naming saved directories and sidecars. */
+    __stamp?: string;
+}
+/**
+ * Apply a pulled carry payload to this machine's working tree (design §6.2).
+ *
+ * Writing another machine's uncommitted work into a real git repository is the
+ * sharpest thing this plugin does, so every guard runs BEFORE any mutation and
+ * any doubt degrades to "here is your patch, apply it yourself" rather than to
+ * a half-applied working tree.
+ *
+ * The guards are not a checklist, they are what makes the operation
+ * REVERSIBLE: with `HEAD` equal to the captured base and no uncommitted changes
+ * to tracked files, everything this function writes can be undone with `git
+ * checkout -- .` plus deleting the files it reports copying. That is also why a
+ * patch DELETING a tracked file is safe to apply — the bytes are in `HEAD`.
+ * Weaken either guard and that stops being true.
+ *
+ * What is deliberately NOT a guard: untracked files. `git status --porcelain`
+ * lists them by default, and `pull` plants `.claude-sesh-mover/project.json`
+ * into the project earlier in the same run, so counting them as dirt would
+ * refuse every hub-linked git project that has not committed the plugin
+ * directory — permanently, since the payload is never offered twice. They are
+ * safe to leave out: `git apply` refuses to create a file that already exists
+ * (measured, and `--check` catches it), and the untracked copy path never
+ * overwrites.
+ *
+ * The patch is applied to the WORKING TREE only, never `--index`: it arrives as
+ * uncommitted work and it stays uncommitted work, which is also what keeps
+ * `git checkout -- .` a complete undo.
+ */
+export declare function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult>;
 //# sourceMappingURL=carry.d.ts.map

@@ -17,6 +17,7 @@ import { resolveThreads, type ResolvedThread } from "./threads.js";
 import { shapeThreads } from "./whereis.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
 import { mergeWorkspaceTrees, type WorkspaceMergeReport } from "./merge.js";
+import { applyCarry, type ApplyResult, type CarryMeta } from "./carry.js";
 import {
   adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS,
 } from "./append.js";
@@ -59,6 +60,12 @@ export interface HubPullOptions {
   latest?: boolean;
   targetPath?: string; // workspace unpack destination when project dir absent
   forceWorkspace?: boolean;
+  /**
+   * Apply carried uncommitted changes to the working tree (design §6.2).
+   * Without it a carried payload is still SAVED — see `applyCarry`'s
+   * `saveOnly` for why reporting it and dropping it would be a dead end.
+   */
+  applyCarry?: boolean;
   projectIdOverride?: string;
   claudeVersion: string;
   /** Splice onto a base that looks like a live session (skips the mtime guard). */
@@ -562,6 +569,70 @@ function describeWorkspaceMerge(r: WorkspaceMergeReport): string[] {
   return out;
 }
 
+/**
+ * What happened to a carried payload, in sentences a user can act on.
+ *
+ * Every branch here has to be honest about ONE fact that shapes all of them:
+ * this pull records its bundles as received before it returns, so re-running it
+ * — with or without `--apply-carry` — answers "Already up to date" and never
+ * offers this payload again. Naming that re-run as a remedy is the foreclosure
+ * this milestone keeps producing, so no branch below names it. What is named
+ * instead is the saved directory, which is a copy the user already has.
+ */
+function describeCarryApply(
+  result: ApplyResult,
+  meta: CarryMeta,
+  bundleFile: string
+): string[] {
+  const out: string[] = [];
+  const origin = `branch ${meta.branch} at commit ${meta.baseCommit.slice(0, 8)}`;
+  if (!result.applied) {
+    const lost =
+      `The uncommitted changes this pull carried (${origin}) were not applied: ${result.detail}. ` +
+      (result.savedTo === null
+        ? `They could not be saved beside the project either, so the only remaining copy is inside ${bundleFile} on the hub — extract that archive by hand to recover them.`
+        : `The whole payload — patch, untracked files and a README with the exact commands — is saved at ${result.savedTo}. Nothing was written to your working tree.`);
+    out.push(
+      result.reason === "not-requested"
+        ? lost + " Pass --apply-carry on a future pull to have them applied straight into the tree instead."
+        : lost
+    );
+    if (result.reason === "unsafe-payload") {
+      // The same disclosure `workspaceRefused` carries, and the same rule: do
+      // not accuse the sender. An older sesh-mover, on a case-insensitive
+      // filesystem, legitimately produced payloads this guard now refuses.
+      out.push(
+        "That payload tried to write paths that never travel (plugin or VCS internals such as .claude-sesh-mover/hubinclude, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it."
+      );
+    }
+    return out;
+  }
+  out.push(
+    `Applied the uncommitted changes this pull carried (${origin}): ${result.filesChanged} file(s) from the patch, ${result.untrackedCopied} untracked file(s) copied. They are uncommitted here too — \`git status\` shows them, and \`git checkout -- .\` undoes the patch half.`
+  );
+  if (meta.inProgress) {
+    out.push(
+      `Those changes were captured during an in-progress ${meta.inProgress} on the other machine, so the patch contained conflict markers as ordinary file content and the ${meta.inProgress} itself did not travel — search for <<<<<<< before working on them.`
+    );
+  }
+  if (result.collisions.length > 0) {
+    out.push(
+      `${result.collisions.length} carried file(s) already existed here with different content, so yours were left alone and the incoming copies were written beside them as *.incoming-*: ${result.collisions.slice(0, 5).join(", ")}. Reconcile and delete the sidecars — they are untracked files, so a later push would carry them too.`
+    );
+  }
+  if (result.refused.length > 0) {
+    out.push(
+      `${result.refused.length} carried file(s) were refused because they name plugin or VCS internals that never travel (${result.refused.slice(0, 5).join(", ")}). Nothing from them was written. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`
+    );
+  }
+  if (result.blocked.length > 0) {
+    out.push(
+      `${result.blocked.length} carried file(s) were not written because of what already occupies their path here (${[...new Set(result.blocked.map((b) => b.reason))].join(", ")}): ${result.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them.`
+    );
+  }
+  return out;
+}
+
 // Last full bundle + everything after it, minus records already received AND
 // still present locally (mirrors the importer's own dedup verification: a
 // registry/peer record can outlive the file it points at, e.g. after a
@@ -781,6 +852,8 @@ export async function hubPull(
     // so a later bundle's divergence supersedes an earlier one's.
     let lastDivergence: HubPullDivergence | undefined;
     let skippedByDivergence = false;
+    // The newest carry payload in this chain, if any — see the loop.
+    let lastCarry: { dir: string; meta: CarryMeta; bundleFile: string } | null = null;
 
     for (const [i, record] of needed.entries()) {
       const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
@@ -807,6 +880,19 @@ export async function hubPull(
 
       if (bundleManifest.workspace) {
         chainWorkspaceBases.push(bundleManifest.workspace.basedOn?.bundleId ?? null);
+      }
+
+      // The carry is applied AFTER the whole chain, and the newest one wins:
+      // each payload is a full `git diff HEAD` of the sender's tree at that
+      // moment, so an older one in the same chain describes a superseded
+      // working tree. Recorded here because the extraction directories only
+      // live until this function returns.
+      if (bundleManifest.carry) {
+        lastCarry = {
+          dir: join(extractDir, "carry"),
+          meta: bundleManifest.carry,
+          bundleFile: record.file,
+        };
       }
 
       // Workspace gate (the chain's newest workspace-carrying bundle only).
@@ -1300,6 +1386,35 @@ export async function hubPull(
       }
     }
 
+    // Git-diff carry (design §6.2) — after the whole chain, because the newest
+    // payload supersedes every earlier one, and after the sessions, because
+    // the working tree is the optional half: nothing here may cost the user
+    // the transcripts this pull exists to deliver.
+    //
+    // It cannot collide with the workspace step above: `hub push` writes a
+    // workspace payload only when the project has NO git remotes and a carry
+    // only when it has one, so a bundle carrying both did not come from a
+    // current sesh-mover. If one ever does, the workspace application dirties
+    // the tree and the carry declines — the safe order.
+    let carryAvailable: CarryMeta | undefined;
+    let carryApplied: ApplyResult | undefined;
+    if (lastCarry) {
+      carryAvailable = lastCarry.meta;
+      if (!existsSync(lastCarry.dir)) {
+        warnings.push(
+          "The bundle's manifest declares carried uncommitted changes but the bundle does not contain them, so there was nothing to apply. The bundle is damaged or was not produced by sesh-mover."
+        );
+      } else {
+        carryApplied = await applyCarry({
+          carryDir: lastCarry.dir,
+          targetPath: effectiveProjectPath,
+          meta: lastCarry.meta,
+          saveOnly: !opts.applyCarry,
+        });
+        warnings.push(...describeCarryApply(carryApplied, lastCarry.meta, lastCarry.bundleFile));
+      }
+    }
+
     // Thread mapping: prefer the session this pull actually landed content
     // in (an imported fragment or an appended base); if every bundle in the
     // chain was skipped, fall back to (1) the local session id an earlier
@@ -1398,6 +1513,8 @@ export async function hubPull(
       workspaceUnpacked,
       workspaceMerge,
       workspaceRefused,
+      carryAvailable,
+      carryApplied,
       appended: appended.length > 0 ? appended : undefined,
       divergence: lastDivergence,
       warnings,

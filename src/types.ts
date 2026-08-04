@@ -4,7 +4,7 @@
 // guarantee the copies drift apart. Type-only means nothing is imported at
 // runtime, so neither creates a module cycle.
 import type { WorkspaceMergeReport } from "./hub/merge.js";
-import type { CarryMeta } from "./hub/carry.js";
+import type { ApplyResult, CarryMeta } from "./hub/carry.js";
 
 // --- Platform ---
 
@@ -516,6 +516,26 @@ export interface HubPullResult {
    * store — so callers must report it without naming a culprit.
    */
   workspaceRefused?: string[];
+  /**
+   * The uncommitted work this pull's bundle chain carried (design §6.2), as the
+   * SENDING machine described it. Present whenever a bundle declared a carry,
+   * whether or not it was applied — `carryApplied` says what happened to it.
+   */
+  carryAvailable?: CarryMeta;
+  /**
+   * What became of that payload. Always present alongside `carryAvailable`
+   * (except when the bundle declared a carry it did not actually contain):
+   * `applied: true` means the working tree was changed, and every other shape
+   * carries a `reason` plus the `savedTo` directory holding the payload and its
+   * manual steps.
+   *
+   * A field rather than warning prose because there is a real decision behind
+   * it — `reason: "not-requested"` is the routine "you did not pass
+   * --apply-carry", while `"unsafe-payload"` means a bundle tried to write
+   * `.claude-sesh-mover` or a symbolic link — and warning text is not an
+   * interface (see `commands/pull.md`).
+   */
+  carryApplied?: ApplyResult;
   // Continuations spliced onto an existing local session rather than landing
   // as a new fragment. Absent when nothing was appended. These sessions are
   // NOT in importedSessions — no new session was created.

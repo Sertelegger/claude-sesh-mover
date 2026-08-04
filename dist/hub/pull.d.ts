@@ -8,6 +8,12 @@ export interface HubPullOptions {
     latest?: boolean;
     targetPath?: string;
     forceWorkspace?: boolean;
+    /**
+     * Apply carried uncommitted changes to the working tree (design §6.2).
+     * Without it a carried payload is still SAVED — see `applyCarry`'s
+     * `saveOnly` for why reporting it and dropping it would be a dead end.
+     */
+    applyCarry?: boolean;
     projectIdOverride?: string;
     claudeVersion: string;
     /** Splice onto a base that looks like a live session (skips the mtime guard). */
