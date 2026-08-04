@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, cpSync, readFileSync, readdirSync,
   appendFileSync, utimesSync,
@@ -1405,6 +1405,330 @@ describe("hub pull — continuation append", () => {
       restore.restore();
       for (const d of [homeA, homeC, hub, base]) rmSync(d, { recursive: true, force: true });
       if (projectC) rmSync(projectC, { recursive: true, force: true });
+    }
+  });
+});
+
+// --- Divergence resolution ------------------------------------------------
+
+/**
+ * The entries machine A adds to its OWN copy after pushing — the second half
+ * of a genuine fork. They hang off the same anchor B's continuation does, so
+ * neither branch is a prefix of the other and the chain guard has to refuse.
+ */
+const localEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
+  {
+    uuid: "a-local-1", parentUuid, timestamp: "2026-04-11T10:00:00Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "user",
+    message: { role: "user", content: "meanwhile, back on machine A" },
+  },
+  {
+    uuid: "a-local-2", parentUuid: "a-local-1", timestamp: "2026-04-11T10:00:05Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "assistant",
+    message: { model: "claude-opus-4-6", id: "msg_local", content: [{ type: "text", text: "Carrying on here." }] },
+  },
+];
+
+/**
+ * arrangeContinuation, then fork A's side too: A extends its base from the
+ * very entry B's continuation is anchored on, without pushing. The base is
+ * aged back out of the live window afterwards — appending just moved its
+ * mtime to now, which would otherwise make every divergence test a liveness
+ * story instead of the one it names.
+ */
+async function arrangeDivergence(): Promise<ContinuationArrangement> {
+  const a = await arrangeContinuation();
+  try {
+    appendEntries(a.basePath, localEntries(FIXTURE_HEAD_UUID, a.baseSessionId, a.projectA));
+    ageOutOfLiveWindow(a.basePath);
+    return a;
+  } catch (e) {
+    a.cleanup();
+    throw e;
+  }
+}
+
+function jsonlFiles(dir: string): string[] {
+  return readdirSync(dir).filter((f) => f.endsWith(".jsonl")).sort();
+}
+
+function uuidsOf(path: string): string[] {
+  return readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+}
+
+describe("hub pull — divergence resolution", () => {
+  it("reports divergence and defaults to fragment", async () => {
+    const a = await arrangeDivergence();
+    try {
+      const before = jsonlFiles(a.projectDirA);
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      const d = p.divergence;
+      expect(d).toBeDefined();
+      if (!d) return;
+      expect(d.threadId).toBe(p.threadId);
+      expect(d.anchorUuid).toBe(FIXTURE_HEAD_UUID);
+      expect(d.localSessionId).toBe(a.baseSessionId);
+      expect(d.localHeadUuid).toBe("a-local-2");
+      expect(d.localEntriesSinceAnchor).toBe(2);
+      expect(d.hubHeadUuid).toBe("b-entry-5");
+      expect(d.hubEntriesSinceAnchor).toBe(2); // header excluded
+      expect(d.adoptAvailable).toBe(true);
+      expect(d.resolution).toBe("fragment");
+      expect(d.preservedSessionId).toBeUndefined();
+
+      // Fragment fallback: content arrived in a NEW file, base untouched.
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      expect(p.appended ?? []).toHaveLength(0);
+      expect(p.warnings.join(" ")).toContain("diverged");
+      expect(p.warnings.join(" ")).toContain("--on-divergence");
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("--on-divergence adopt-hub yields two complete sessions", async () => {
+    const a = await arrangeDivergence();
+    try {
+      const before = jsonlFiles(a.projectDirA);
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      const d = p.divergence;
+      expect(d?.resolution).toBe("adopt-hub");
+      expect(d?.preservedSessionId).toBeTruthy();
+      const preservedId = d!.preservedSessionId!;
+
+      // Session 1: the base is now the hub's branch, common history intact.
+      expect(uuidsOf(a.basePath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "b-entry-4", "b-entry-5",
+      ]);
+      const baseLines = readFileSync(a.basePath, "utf-8")
+        .trim().split("\n").map((l) => JSON.parse(l));
+      expect(baseLines.every((l) => l.sessionId === a.baseSessionId)).toBe(true);
+      // The spliced entries went through the import rewrite context, so B's
+      // project path never lands in A's transcript.
+      expect(baseLines[3].cwd).toBe(a.projectA);
+      expect(readFileSync(a.basePath, "utf-8")).not.toContain(a.projectB);
+      expect(readFileSync(a.basePath, "utf-8")).not.toContain("[sesh-mover continuation]");
+
+      // Session 2: the local branch, with the FULL shared history in front of
+      // it — a resumable conversation, not a fragment.
+      const preservedPath = join(a.projectDirA, `${preservedId}.jsonl`);
+      expect(existsSync(preservedPath)).toBe(true);
+      expect(uuidsOf(preservedPath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2",
+      ]);
+      const preservedLines = readFileSync(preservedPath, "utf-8")
+        .trim().split("\n").map((l) => JSON.parse(l));
+      expect(preservedLines.every((l) => l.sessionId === preservedId)).toBe(true);
+
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+      expect(p.appended).toHaveLength(1);
+      expect(p.appended![0].baseSessionId).toBe(a.baseSessionId);
+      expect(p.appended![0].entriesAppended).toBe(2);
+      expect(p.localSessionId).toBe(a.baseSessionId);
+
+      // Registered, so `claude --resume` can find it, and labelled.
+      const history = readFileSync(join(a.configDirA, "history.jsonl"), "utf-8")
+        .trim().split("\n").map((l) => JSON.parse(l));
+      const preservedHistory = history.find((h) => h.sessionId === preservedId);
+      expect(preservedHistory).toBeDefined();
+      expect(preservedHistory.display).toContain("local divergence");
+      expect(preservedHistory.project).toBe(a.projectA);
+
+      // Stated consequence: no thread mapping for the preserved session.
+      const state = readSyncState(a.projectA);
+      expect(state.hub?.threadByLocalSession?.[preservedId]).toBeUndefined();
+      expect(p.warnings.join(" ")).toContain(preservedId);
+      expect(p.warnings.join(" ")).toContain("own thread");
+
+      // The hub is credited with the adopted head, so a push back does not
+      // re-ship the branch we just took from it.
+      const hubPeer = Object.entries(state.peers).find(([id]) => id.startsWith("hub:"));
+      expect(hubPeer?.[1].sent[a.baseSessionId]?.headEntryUuid).toBe("b-entry-5");
+
+      // Nothing left to pull, and the index sees the adopted base.
+      const second = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(second.success).toBe(false);
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("--on-divergence skip leaves everything untouched", async () => {
+    const a = await arrangeDivergence();
+    try {
+      const before = jsonlFiles(a.projectDirA);
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      expect(p.divergence?.resolution).toBe("skip");
+      expect(p.divergence?.adoptAvailable).toBe(true);
+      expect(jsonlFiles(a.projectDirA)).toEqual(before); // no new file
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      expect(p.importedSessions).toHaveLength(0);
+      expect(p.appended ?? []).toHaveLength(0);
+      expect(p.warnings.join(" ")).toContain("nothing changed");
+      // Nothing was recorded as received, so the decision can be revisited.
+      const again = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(again.success).toBe(true);
+      if (!again.success) return;
+      expect((again as HubPullResult).divergence?.resolution).toBe("adopt-hub");
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("adoptAvailable is false when the anchor is absent from the local base", async () => {
+    const a = await arrangeContinuation();
+    try {
+      // A's copy no longer contains the anchor at all (compacted history, or
+      // an unrelated session that happens to carry the thread mapping).
+      const kept = readFileSync(a.basePath, "utf-8").trim().split("\n").slice(0, 2);
+      writeFileSync(a.basePath, kept.join("\n") + "\n", "utf-8");
+      appendEntries(a.basePath, localEntries("entry-2", a.baseSessionId, a.projectA));
+      ageOutOfLiveWindow(a.basePath);
+      const before = jsonlFiles(a.projectDirA);
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      expect(p.divergence?.adoptAvailable).toBe(false);
+      expect(p.divergence?.resolution).toBe("fragment"); // refused, fell through
+      expect(p.divergence?.localEntriesSinceAnchor).toBe(0);
+      expect(p.warnings.join(" ")).toContain("not present in the local session");
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+      expect(p.appended ?? []).toHaveLength(0);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  /**
+   * Loads a private copy of pull.ts whose `adoptHubBranch` always reports the
+   * restore-and-give-up outcome. Sanctioned targeted fake: adoptHubBranch's
+   * OWN byte-for-byte restore is covered for real in hub-append.test.ts; what
+   * cannot be arranged from the outside is the orchestrator's reaction to it,
+   * because the preserved session id is minted inside the pull.
+   */
+  async function loadPullWithFailingAdopt(): Promise<
+    typeof import("../src/hub/pull.js").hubPull
+  > {
+    vi.resetModules();
+    vi.doMock("../src/hub/append.js", async () => {
+      const actual = await vi.importActual<typeof import("../src/hub/append.js")>(
+        "../src/hub/append.js"
+      );
+      return {
+        ...actual,
+        adoptHubBranch: async () => ({ kind: "failed", detail: "injected adopt failure" }),
+      };
+    });
+    const mod = await import("../src/hub/pull.js");
+    return mod.hubPull;
+  }
+
+  it("a failed adoption leaves no preserved session and no history entry behind", async () => {
+    const a = await arrangeDivergence();
+    let pullWithFailingAdopt: Awaited<ReturnType<typeof loadPullWithFailingAdopt>>;
+    try {
+      pullWithFailingAdopt = await loadPullWithFailingAdopt();
+      const before = jsonlFiles(a.projectDirA);
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+      const historyPath = join(a.configDirA, "history.jsonl");
+      const historyBefore = existsSync(historyPath) ? readFileSync(historyPath, "utf-8") : "";
+
+      const result = await pullWithFailingAdopt({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      // Reported as the fragment it fell back to, not as an adoption.
+      expect(p.divergence?.resolution).toBe("fragment");
+      expect(p.divergence?.preservedSessionId).toBeUndefined();
+      expect(p.appended ?? []).toHaveLength(0);
+      expect(p.warnings.join(" ")).toContain("restored unchanged");
+      expect(p.warnings.join(" ")).toContain("injected adopt failure");
+
+      // The local branch is exactly where it was...
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      // ...the hub's branch arrived as a plain fragment, and nothing else...
+      const after = jsonlFiles(a.projectDirA);
+      expect(after).toHaveLength(before.length + 1);
+      const fragment = after.find((f) => !before.includes(f))!;
+      expect(uuidsOf(join(a.projectDirA, fragment)).slice(1)).toEqual([
+        "b-entry-4", "b-entry-5",
+      ]);
+      // ...and no preserved session was ever registered.
+      const history = readFileSync(historyPath, "utf-8");
+      expect(history.startsWith(historyBefore)).toBe(true);
+      expect(history).not.toContain("local divergence");
+    } finally {
+      vi.doUnmock("../src/hub/append.js");
+      vi.resetModules();
+      a.cleanup();
+    }
+  });
+
+  it("adopting a base that looks live still adopts, but says so", async () => {
+    const a = await arrangeDivergence();
+    try {
+      makeLookLive(a.basePath);
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      expect(p.divergence?.resolution).toBe("adopt-hub");
+      expect(uuidsOf(a.basePath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "b-entry-4", "b-entry-5",
+      ]);
+      expect(p.warnings.join(" ")).toContain("live Claude Code session");
+    } finally {
+      a.cleanup();
     }
   });
 });

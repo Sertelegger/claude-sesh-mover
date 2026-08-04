@@ -39,6 +39,7 @@ import type {
   BrowseResult,
   ErrorResult,
   ConfigureResult,
+  OnDivergenceMode,
 } from "./types.js";
 
 const program = new Command();
@@ -693,6 +694,7 @@ program
   .option("--project-id <id>", "Link to an existing hub project id")
   .option("--force-append", "Append a pulled continuation even if the local session looks recently active")
   .option("--no-append", "Never append; import continuations as separate sessions")
+  .option("--on-divergence <mode>", "When a thread was extended on both machines: fragment | adopt-hub | skip")
   .option("--source-config-dir <path>", "Override Claude config dir")
   .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
@@ -700,6 +702,9 @@ program
       const configDir = resolveConfigDir(opts.sourceConfigDir);
       const projectPath = opts.projectPath ?? process.cwd();
       const config = loadEffectiveConfig(configDir, projectPath);
+      // Validated before the hub lookup: a bad mode is a bad invocation, and
+      // saying so should not depend on whether a hub happens to be configured.
+      const onDivergence = parseOnDivergence(opts.onDivergence ?? config.hub.onDivergence);
       const { resolveHubPath } = await import("./hub/init.js");
       const hubPath = resolveHubPath(config);
       if (!hubPath) {
@@ -719,6 +724,7 @@ program
         projectIdOverride: opts.projectId,
         forceAppend: !!opts.forceAppend,
         noAppend: opts.append === false || !config.hub.pullAppend,
+        onDivergence,
         claudeVersion: getClaudeVersion(),
         onProgress,
       }));
@@ -959,6 +965,16 @@ function parseScope(value: string, command: string): SessionScope {
   if (value === "current" || value === "all") return value;
   throw new Error(
     `Invalid --scope value for ${command}: "${value}". Valid: current, all.`
+  );
+}
+
+// Validates BOTH the flag and hub.onDivergence from config — a typo'd config
+// value must fail loudly here rather than silently resolving to a mode the
+// user didn't pick.
+function parseOnDivergence(value: string): OnDivergenceMode {
+  if (value === "fragment" || value === "adopt-hub" || value === "skip") return value;
+  throw new Error(
+    `Invalid --on-divergence value: "${value}". Valid: fragment, adopt-hub, skip.`
   );
 }
 

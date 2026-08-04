@@ -21,6 +21,7 @@ export function getDefaultConfig(): SeshMoverConfig {
       path: "",
       noWorkspace: false,
       pullAppend: true,
+      onDivergence: "fragment",
     },
   };
 }

@@ -142,8 +142,20 @@ export interface SeshMoverConfig {
         path: string;
         noWorkspace: boolean;
         pullAppend: boolean;
+        onDivergence: OnDivergenceMode;
     };
 }
+/**
+ * How `pull` resolves a thread that diverged (local and hub both extended the
+ * same anchor, so the chain guard refuses to splice):
+ * - `fragment` (default): keep both, import the hub's branch as its own
+ *   session. Nothing local is touched — the Slice-1 behavior.
+ * - `adopt-hub`: make the hub's branch canonical in the local session and
+ *   preserve the local branch as a second, complete session.
+ * - `skip`: change nothing at all and leave the bundle unrecorded, so the same
+ *   pull can be re-run with a different decision.
+ */
+export type OnDivergenceMode = "fragment" | "adopt-hub" | "skip";
 export interface ExportResult {
     success: true;
     command: "export";
@@ -350,7 +362,36 @@ export interface HubPullResult {
         baseSessionId: string;
         entriesAppended: number;
     }>;
+    divergence?: HubPullDivergence;
     warnings: string[];
+}
+export interface HubPullDivergence {
+    threadId: string;
+    /** The last entry both branches share; "" when the bundle carries none. */
+    anchorUuid: string;
+    /** The local session that diverged — the one the numbers below describe. */
+    localSessionId: string;
+    localHeadUuid: string;
+    /** 0 when the anchor isn't in the local base (nothing to measure from). */
+    localEntriesSinceAnchor: number;
+    localLastActiveAt: string;
+    hubHeadUuid: string;
+    hubEntriesSinceAnchor: number;
+    hubLastActiveAt: string;
+    /**
+     * False when the anchor is absent from the local session (compacted or
+     * unrelated history) — `adopt-hub` is then refused and falls back to
+     * `fragment`, because there is no point to cut the local branch at.
+     */
+    adoptAvailable: boolean;
+    /** What actually happened, which is not always what was asked for. */
+    resolution: OnDivergenceMode;
+    /**
+     * Set only when `resolution === "adopt-hub"`: the new session holding the
+     * local branch. It has NO thread mapping, so the next push publishes it as
+     * a thread of its own.
+     */
+    preservedSessionId?: string;
 }
 export interface HubPullListResult {
     success: true;

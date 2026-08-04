@@ -12,12 +12,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  adoptHubBranch,
   tryAppendContinuation,
   readDeltaChainInfo,
   identityRewriteContext,
   APPEND_LIVE_WINDOW_MS,
 } from "../src/hub/append.js";
 import { buildImportRewriteContext } from "../src/rewriter.js";
+import { detectPlatform } from "../src/platform.js";
 import type { VersionAdapter } from "../src/types.js";
 
 function tmp(prefix: string): string {
@@ -585,6 +587,272 @@ describe("tryAppendContinuation", () => {
       expect(lines).toHaveLength(4);
       expect(lines[2].uuid).toBe("d1");
       expect(lines.every((l) => l.sessionId === "base-sid")).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("adoptHubBranch", () => {
+  /**
+   * A forked base: b1 -> b2 is the common history, L1 -> L2 the local branch.
+   * The hub's branch (H1 -> H2) hangs off the same anchor, b2.
+   */
+  function makeForkedBase(dir: string, trailingNewline = true): string {
+    return makeBaseAt(
+      dir,
+      "base.jsonl",
+      [
+        entry("b1", null, "base-sid"),
+        entry("b2", "b1", "base-sid"),
+        entry("L1", "b2", "base-sid"),
+        entry("L2", "L1", "base-sid"),
+      ],
+      trailingNewline
+    );
+  }
+
+  function makeHubBranch(dir: string): string {
+    const p = join(dir, "delta.jsonl");
+    writeJsonl(p, [HEADER, entry("H1", "b2"), entry("H2", "H1")]);
+    return p;
+  }
+
+  async function anchorOffsetOf(path: string, uuid: string): Promise<number> {
+    const { findEntryOffsetByUuid } = await import("../src/jsonl.js");
+    const offset = await findEntryOffsetByUuid(path, uuid);
+    if (offset === null) throw new Error(`test setup: no ${uuid} in ${path}`);
+    return offset;
+  }
+
+  it("preserves the full local history, splices the hub branch onto the anchor", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+      expect(r.kind).toBe("adopted");
+      if (r.kind !== "adopted") return;
+      expect(r.newHeadUuid).toBe("H2");
+      expect(r.entriesAppended).toBe(2); // the synthetic header is stripped
+      expect(r.preservedSessionId).toBe("preserved-sid");
+
+      const baseLines = readFileSync(base, "utf-8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(baseLines.map((l) => l.uuid)).toEqual(["b1", "b2", "H1", "H2"]);
+      expect(baseLines.every((l) => l.sessionId === "base-sid")).toBe(true);
+      expect(readFileSync(base, "utf-8")).not.toContain("[sesh-mover continuation]");
+
+      const preservedLines = readFileSync(preservedPath, "utf-8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The FULL local history, not just the divergent tail — a session that
+      // starts mid-conversation is the fragment problem all over again.
+      expect(preservedLines.map((l) => l.uuid)).toEqual(["b1", "b2", "L1", "L2"]);
+      expect(preservedLines.every((l) => l.sessionId === "preserved-sid")).toBe(true);
+      // No synthetic marker entry is injected into the preserved transcript.
+      expect(readFileSync(preservedPath, "utf-8")).not.toContain("sesh-mover");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("restores the base byte-for-byte and writes no preserved file when the splice fails", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const before = readFileSync(base);
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+        __injectFailure: () => {
+          throw new Error("boom");
+        },
+      });
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("boom");
+
+      expect(readFileSync(base).equals(before)).toBe(true);
+      expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The guard findEntryOffsetByUuid's JSDoc demands. Its offset for a file
+  // whose final line has no trailing newline is 1 PAST EOF, and truncateSync
+  // past EOF does not error — it EXTENDS the file with a NUL byte, producing a
+  // corrupt JSONL line with no exception anywhere.
+  it("refuses an offset past EOF instead of NUL-extending the base", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir, false); // final line unterminated
+      const delta = makeHubBranch(dir);
+      const size = statSync(base).size;
+      const anchorOffset = await anchorOffsetOf(base, "L2"); // = size + 1
+      expect(anchorOffset).toBe(size + 1);
+      const preservedPath = join(dir, "preserved.jsonl");
+      const before = readFileSync(base);
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("line boundary");
+
+      const after = readFileSync(base);
+      expect(after.equals(before)).toBe(true);
+      expect(after.includes(0x00)).toBe(false); // no NUL extension
+      expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The other half of the same guard: findEntryOffsetByUuid undercounts CRLF
+  // files by one byte per line, so its offset lands ON the "\n" and truncating
+  // there would leave a bare "\r" that glues the anchor line to the first
+  // spliced entry.
+  it("refuses a CRLF offset that would truncate mid-terminator", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = join(dir, "base.jsonl");
+      writeFileSync(
+        base,
+        [entry("b1", null, "base-sid"), entry("b2", "b1", "base-sid"), entry("L1", "b2", "base-sid")]
+          .map((e) => JSON.stringify(e))
+          .join("\r\n") + "\r\n",
+        "utf-8"
+      );
+      ageOut(base);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const before = readFileSync(base);
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("line boundary");
+      expect(readFileSync(base).equals(before)).toBe(true);
+      expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a delta with unparseable lines before touching the base", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = join(dir, "delta.jsonl");
+      // Mid-stream, so the chain endpoints still read cleanly and the refusal
+      // has to come from the rewrite's parse-failure count.
+      writeJsonl(delta, [HEADER, entry("H1", "b2"), "{not json", entry("H2", "H1")]);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+      const before = readFileSync(base);
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx: identityRewriteContext(),
+      });
+      expect(r.kind).toBe("failed");
+      if (r.kind !== "failed") return;
+      expect(r.detail).toContain("unparseable");
+      expect(readFileSync(base).equals(before)).toBe(true);
+      expect(existsSync(preservedPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("applies the caller's rewrite context to the spliced branch, never to the preserved copy", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+
+      // A context that maps the delta's "/p" cwd onto a local path. The
+      // preserved copy is local bytes and must NOT be run through it.
+      const platform = detectPlatform();
+      const ctx = {
+        mappings: [{ from: "/p", to: "/local", description: "test" }],
+        sourcePlatform: platform,
+        targetPlatform: platform,
+        sourceUser: "u",
+        targetUser: "u",
+      };
+
+      const r = await adoptHubBranch({
+        basePath: base,
+        baseSessionId: "base-sid",
+        deltaPath: delta,
+        anchorOffset,
+        preservedSessionId: "preserved-sid",
+        preservedPath,
+        ctx,
+      });
+      expect(r.kind).toBe("adopted");
+
+      const baseLines = readFileSync(base, "utf-8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(baseLines[2].cwd).toBe("/local"); // spliced entries translated
+      expect(baseLines[0].cwd).toBe("/p"); // pre-anchor history untouched
+
+      const preservedLines = readFileSync(preservedPath, "utf-8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(preservedLines.every((l) => l.cwd === "/p")).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

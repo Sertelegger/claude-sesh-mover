@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, createReadStream, createWriteStream, mkdtempSync, openSync, readSync, rmSync, statSync, truncateSync, } from "node:fs";
+import { appendFileSync, closeSync, copyFileSync, createReadStream, createWriteStream, mkdtempSync, openSync, readSync, rmSync, statSync, truncateSync, } from "node:fs";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
@@ -191,7 +191,7 @@ export async function tryAppendContinuation(a) {
         rollbackBytes = fresh.size;
         // 4. append (a base whose final line lacks its newline would otherwise be
         //    glued to the delta's first entry)
-        if (rollbackBytes > 0 && !endsWithNewline(a.basePath, rollbackBytes)) {
+        if (rollbackBytes > 0 && !isLineBoundary(a.basePath, rollbackBytes)) {
             wroteBytes = true;
             appendFileSync(a.basePath, "\n", "utf-8");
         }
@@ -228,11 +228,131 @@ export async function tryAppendContinuation(a) {
         rmSync(work, { recursive: true, force: true });
     }
 }
-function endsWithNewline(path, size) {
+/**
+ * Divergence adoption: make the hub's branch canonical WITHOUT losing local
+ * work. Two branches hang off a common anchor; this cuts the local one off at
+ * that anchor, splices the hub's on instead, and keeps the local branch as a
+ * second, complete session (common history + local branch — a transcript that
+ * starts mid-conversation is the fragment problem this whole path exists to
+ * avoid).
+ *
+ * Order is the design:
+ * 1. the full base is copied to a temp backup BEFORE any mutation, so a
+ *    failure is a RESTORE rather than a reconstruction from two half-written
+ *    files;
+ * 2. every cheap refusal (no delta entries, an offset that isn't a line
+ *    boundary) and all the O(delta) preparation happen while the base is
+ *    still untouched, so the mutation window is a truncate plus one append;
+ * 3. the preserved session is materialised only AFTER the splice verifies —
+ *    on failure there is no orphan file, and (because the caller registers it
+ *    in `history.jsonl` only once this returns `adopted`) nothing to
+ *    un-register either.
+ *
+ * No entry is injected into either transcript; the "preserved" labelling is
+ * the caller's `history.jsonl` display name, not content.
+ *
+ * Anticipated failures come back as `failed` with the base restored. The one
+ * case that throws is a restore that itself failed — the only situation where
+ * the base may be left inconsistent, and the temp backup is then deliberately
+ * NOT deleted so the error can name a full copy of the user's session.
+ */
+export async function adoptHubBranch(input) {
+    const work = mkdtempSync(join(tmpdir(), "sesh-adopt-"));
+    const backup = join(work, "base-backup.jsonl");
+    let keepWork = false;
+    try {
+        copyFileSync(input.basePath, backup);
+        const info = await readDeltaChainInfo(input.deltaPath);
+        if (!info.lastEntryUuid) {
+            return { kind: "failed", detail: "continuation bundle has no entries" };
+        }
+        if (!isLineBoundary(input.basePath, input.anchorOffset)) {
+            return {
+                kind: "failed",
+                detail: `anchor offset ${input.anchorOffset} is not on a line boundary (past end of file, or a CRLF transcript) — refusing to truncate ${input.basePath}`,
+            };
+        }
+        // Preparation, all of it before the base is touched: strip the synthetic
+        // header, then version-adapt + path-translate + re-stamp the session id in
+        // one pass, exactly as tryAppendContinuation does.
+        const stripped = join(work, "stripped.jsonl");
+        const entriesAppended = await stripHeader(input.deltaPath, stripped, info.headerPresent);
+        const rewritten = join(work, "rewritten.jsonl");
+        const report = await rewriteJsonlStream(stripped, rewritten, input.ctx, {
+            adapters: input.adapters,
+            newSessionId: input.baseSessionId,
+        });
+        if (report.parseFailures > 0) {
+            return {
+                kind: "failed",
+                detail: `continuation contains ${report.parseFailures} unparseable JSONL line(s); refusing to adopt (the base was not modified)`,
+            };
+        }
+        // Splice: cut the local divergence off at the anchor, append the hub's.
+        truncateSync(input.basePath, input.anchorOffset);
+        await pipeline(createReadStream(rewritten), createWriteStream(input.basePath, { flags: "a" }));
+        input.__injectFailure?.();
+        const newHead = readLastEntryUuid(input.basePath);
+        if (newHead !== info.lastEntryUuid) {
+            throw new Error(`post-adopt head ${newHead ?? "(none)"} != expected ${info.lastEntryUuid}`);
+        }
+        // Only now materialise the preserved copy: the pre-mutation backup is the
+        // full local history, and identityRewriteContext leaves everything but the
+        // session id alone (these are this machine's own bytes — running them
+        // through the import context would translate paths that are already local).
+        await rewriteJsonlStream(backup, input.preservedPath, identityRewriteContext(), {
+            newSessionId: input.preservedSessionId,
+        });
+        return {
+            kind: "adopted",
+            entriesAppended,
+            newHeadUuid: newHead,
+            preservedSessionId: input.preservedSessionId,
+        };
+    }
+    catch (e) {
+        const cause = e.message;
+        try {
+            copyFileSync(backup, input.basePath); // byte-for-byte restore
+            rmSync(input.preservedPath, { force: true }); // nothing half-written survives
+        }
+        catch (restoreError) {
+            keepWork = true; // the backup is the user's only intact copy — keep it
+            throw new Error(`adopt failed (${cause}) AND restoring ${input.basePath} failed — a complete copy of the session as it was is at ${backup}: ${restoreError.message}`);
+        }
+        return { kind: "failed", detail: cause };
+    }
+    finally {
+        if (!keepWork)
+            rmSync(work, { recursive: true, force: true });
+    }
+}
+/**
+ * True when `offset` sits exactly on a line boundary — i.e. the byte
+ * immediately before it is `\n`. At `offset === size` that is "the file ends
+ * with a newline"; at any other offset it is the pre-truncate guard
+ * `findEntryOffsetByUuid` (jsonl.ts) demands, and it is the ONLY enforcement
+ * of that contract in the codebase:
+ *
+ * - For a file whose final line has no trailing newline the helper's offset is
+ *   1 PAST EOF, and `truncateSync` past EOF does not error — it EXTENDS the
+ *   file with a NUL byte, i.e. silently writes a corrupt JSONL line. Here the
+ *   read returns 0 bytes, so this returns false.
+ * - For a CRLF file the helper undercounts one byte per line, landing the
+ *   offset ON the `\n`; truncating there strips the terminator and glues the
+ *   anchor line to whatever is appended next. Here the byte is `\r`, so this
+ *   returns false.
+ *
+ * Clamping the offset to the file size (the obvious "fix") catches only the
+ * first case and silently accepts the second.
+ */
+function isLineBoundary(path, offset) {
+    if (offset <= 0)
+        return false;
     const fd = openSync(path, "r");
     try {
         const buf = Buffer.alloc(1);
-        const read = readSync(fd, buf, 0, 1, size - 1);
+        const read = readSync(fd, buf, 0, 1, offset - 1);
         return read === 1 && buf[0] === 0x0a;
     }
     finally {

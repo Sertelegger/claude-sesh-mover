@@ -19,6 +19,7 @@ export function getDefaultConfig() {
             path: "",
             noWorkspace: false,
             pullAppend: true,
+            onDivergence: "fragment",
         },
     };
 }

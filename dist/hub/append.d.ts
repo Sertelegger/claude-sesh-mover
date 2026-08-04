@@ -121,4 +121,76 @@ export type AppendOutcome = {
  * where the base may be left corrupt.
  */
 export declare function tryAppendContinuation(a: AppendAttempt): Promise<AppendOutcome>;
+export interface AdoptHubInput {
+    basePath: string;
+    /** Session id the adopted (hub) entries are rewritten to — the base's own. */
+    baseSessionId: string;
+    deltaPath: string;
+    /**
+     * Byte offset just past the common anchor entry, from
+     * `findEntryOffsetByUuid`. Verified to sit on a line boundary before
+     * anything is truncated (see `isLineBoundary`).
+     */
+    anchorOffset: number;
+    /** Caller-minted uuid for the copy of the local branch. */
+    preservedSessionId: string;
+    /** `<projectDir>/<preservedSessionId>.jsonl` — must not exist yet. */
+    preservedPath: string;
+    /**
+     * Source -> target rewrite context for the bundle the delta came out of.
+     * REQUIRED for exactly the reason `AppendAttempt.ctx` is: the delta is
+     * another machine's bytes. Build it with `buildImportRewriteContext`. The
+     * PRESERVED copy is local bytes and is deliberately NOT run through this —
+     * it only gets a new session id.
+     */
+    ctx: RewriteContext;
+    /** Version adapters for source -> target Claude Code versions. */
+    adapters?: VersionAdapter[];
+    /**
+     * Test seam: forced failure after the base has been rewritten but before
+     * head verification — the window in which restore has real bytes to undo.
+     * Never set in production code.
+     */
+    __injectFailure?: () => never;
+}
+export type AdoptOutcome = {
+    kind: "adopted";
+    entriesAppended: number;
+    newHeadUuid: string;
+    preservedSessionId: string;
+}
+/** Nothing was kept: the base is byte-for-byte what it was. */
+ | {
+    kind: "failed";
+    detail: string;
+};
+/**
+ * Divergence adoption: make the hub's branch canonical WITHOUT losing local
+ * work. Two branches hang off a common anchor; this cuts the local one off at
+ * that anchor, splices the hub's on instead, and keeps the local branch as a
+ * second, complete session (common history + local branch — a transcript that
+ * starts mid-conversation is the fragment problem this whole path exists to
+ * avoid).
+ *
+ * Order is the design:
+ * 1. the full base is copied to a temp backup BEFORE any mutation, so a
+ *    failure is a RESTORE rather than a reconstruction from two half-written
+ *    files;
+ * 2. every cheap refusal (no delta entries, an offset that isn't a line
+ *    boundary) and all the O(delta) preparation happen while the base is
+ *    still untouched, so the mutation window is a truncate plus one append;
+ * 3. the preserved session is materialised only AFTER the splice verifies —
+ *    on failure there is no orphan file, and (because the caller registers it
+ *    in `history.jsonl` only once this returns `adopted`) nothing to
+ *    un-register either.
+ *
+ * No entry is injected into either transcript; the "preserved" labelling is
+ * the caller's `history.jsonl` display name, not content.
+ *
+ * Anticipated failures come back as `failed` with the base restored. The one
+ * case that throws is a restore that itself failed — the only situation where
+ * the base may be left inconsistent, and the temp backup is then deliberately
+ * NOT deleted so the error can name a full copy of the user's session.
+ */
+export declare function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome>;
 //# sourceMappingURL=append.d.ts.map

@@ -1,5 +1,5 @@
 import { type HubBundleRecord } from "./layout.js";
-import type { ErrorResult, HubLockBusyResult, HubPullListResult, HubPullResult, HubUnlinkedResult, NotYetSyncedResult, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubLockBusyResult, HubPullListResult, HubPullResult, HubUnlinkedResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
 export interface HubPullOptions {
     configDir: string;
     projectPath: string;
@@ -14,6 +14,8 @@ export interface HubPullOptions {
     forceAppend?: boolean;
     /** Never splice: import every continuation as its own session (Slice-1 behavior). */
     noAppend?: boolean;
+    /** How to resolve a two-sided fork. Defaults to "fragment". */
+    onDivergence?: OnDivergenceMode;
     onProgress?: (ev: ProgressEvent) => void;
 }
 export interface ThreadBaseCandidate {

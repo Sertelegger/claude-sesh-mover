@@ -1,7 +1,10 @@
 import {
-  mkdtempSync, rmSync, mkdirSync, createWriteStream, existsSync, readdirSync, copyFileSync,
+  mkdtempSync, rmSync, mkdirSync, createReadStream, createWriteStream, existsSync, readdirSync,
+  appendFileSync, copyFileSync, statSync,
 } from "node:fs";
+import { createInterface } from "node:readline";
 import { pipeline } from "node:stream/promises";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend } from "./backend.js";
@@ -13,13 +16,17 @@ import { buildIndexFile, readMachineIndex, writeMachineIndex, readAllIndexes } f
 import { resolveThreads, type ResolvedThread } from "./threads.js";
 import { shapeThreads } from "./whereis.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
-import { readDeltaChainInfo, tryAppendContinuation } from "./append.js";
+import {
+  adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS,
+} from "./append.js";
 import { extractArchive } from "../archiver.js";
 import { importSession } from "../importer.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { computeIntegrityHashFromFile, readManifest } from "../manifest.js";
-import { countJsonlLines, readLastEntryUuid, readLastJsonlLine } from "../jsonl.js";
+import {
+  countJsonlLines, findEntryOffsetByUuid, readLastEntryUuid, readLastJsonlLine,
+} from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream, type RewriteContext } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
@@ -28,11 +35,14 @@ import type {
   ErrorResult,
   ExportManifest,
   HubLockBusyResult,
+  HubPullDivergence,
   HubPullListResult,
   HubPullResult,
   HubUnlinkedResult,
   NotYetSyncedResult,
+  OnDivergenceMode,
   ProgressEvent,
+  SessionManifest,
   SyncState,
 } from "../types.js";
 
@@ -50,6 +60,8 @@ export interface HubPullOptions {
   forceAppend?: boolean;
   /** Never splice: import every continuation as its own session (Slice-1 behavior). */
   noAppend?: boolean;
+  /** How to resolve a two-sided fork. Defaults to "fragment". */
+  onDivergence?: OnDivergenceMode;
   onProgress?: (ev: ProgressEvent) => void;
 }
 
@@ -204,6 +216,96 @@ async function copyLayerDirs(
       }
     }
   }
+}
+
+/**
+ * How many entries the local base holds beyond the common anchor — the "your
+ * side" number the divergence report shows the user.
+ *
+ * Reading from `start: offset` rather than counting bytes back up to it keeps
+ * this immune to the byte-arithmetic caveats on `findEntryOffsetByUuid`: an
+ * offset past EOF yields nothing (0), and a CRLF offset that lands on the
+ * terminator just produces one leading empty line, which is skipped.
+ */
+async function countEntriesAfterOffset(path: string, offset: number): Promise<number> {
+  const input = createReadStream(path, { encoding: "utf-8", start: offset });
+  const rl = createInterface({ input, crlfDelay: Infinity });
+  let count = 0;
+  try {
+    for await (const line of rl) if (line.trim()) count++;
+  } finally {
+    rl.close();
+    input.destroy();
+  }
+  return count;
+}
+
+/**
+ * The bookkeeping `importSession` would normally do, which the splice paths
+ * (plain append and divergence adoption alike) deliberately bypass: no new
+ * session was created, so there is nothing for the importer to record — but
+ * without these entries the very same bundle is "needed" again on the next
+ * pull (selectNeededBundles reads peers[...].received) and a push back to the
+ * hub would re-upload the whole session as a full bundle.
+ *
+ * Callers must run this BEFORE copying layer files: the base is already
+ * extended by then, so a layer-copy fault must not leave the splice
+ * unrecorded — the next pull would re-need the bundle, chain-mismatch against
+ * the now-longer base, and land the very same entries again as a fragment.
+ *
+ * Deliberately NOT written: state.lineage[baseSessionId]. The base already has
+ * lineage describing where the SESSION came from; overwriting it with this
+ * splice's provenance would destroy that and claim the whole transcript
+ * arrived as a continuation.
+ */
+function recordSplice(b: {
+  projectPath: string;
+  basePath: string;
+  baseSessionId: string;
+  peerId: string;
+  hubPeerId: string;
+  manifest: ExportManifest;
+  record: HubBundleRecord;
+  bundleSession: SessionManifest;
+  newHeadUuid: string;
+}): void {
+  const now = new Date().toISOString();
+  const messageCount = countJsonlLines(b.basePath);
+  const st = readSyncState(b.projectPath);
+  st.peers[b.peerId] ??= {
+    name: b.manifest.sourceMachineName ?? b.peerId,
+    lastSentAt: null, lastReceivedAt: null, sent: {}, received: {},
+  };
+  const peer = st.peers[b.peerId];
+  if (b.manifest.sourceMachineName) peer.name = b.manifest.sourceMachineName;
+  peer.lastReceivedAt = now;
+  peer.received[b.record.sessionIdInBundle] = {
+    localSessionId: b.baseSessionId,
+    type: "continuation",
+    importedAt: now,
+  };
+  // This machine is now level with that peer on this session.
+  peer.sent[b.baseSessionId] = {
+    headEntryUuid: b.newHeadUuid,
+    messageCount,
+    sentAsType: "continuation",
+    sentAsSessionId: b.record.sessionIdInBundle,
+  };
+  st.imported[b.bundleSession.integrityHash] = {
+    localSessionId: b.baseSessionId,
+    importedAt: now,
+    registered: true,
+  };
+  writeSyncState(st);
+  // ...and so is the hub, which is where this content came from. After an
+  // adoption the base matches the hub's branch exactly, so this is what stops
+  // the next push re-shipping content we just took FROM the hub.
+  recordSentToPeer(b.projectPath, { id: b.hubPeerId, name: "hub" }, b.baseSessionId, {
+    headEntryUuid: b.newHeadUuid,
+    messageCount,
+    sentAsType: "continuation",
+    sentAsSessionId: b.record.sessionIdInBundle,
+  });
 }
 
 // Last full bundle + everything after it, minus records already received AND
@@ -391,6 +493,11 @@ export async function hubPull(
     // the end and the preferred splice target for later bundles in the same
     // chain, since the mapping itself isn't written until the loop is done.
     let threadLandedSessionId: string | null = null;
+    // The last two-sided fork this pull ran into, and whether a bundle was
+    // deliberately left unapplied because of one. A chain is pulled in order,
+    // so a later bundle's divergence supersedes an earlier one's.
+    let lastDivergence: HubPullDivergence | undefined;
+    let skippedByDivergence = false;
 
     for (const [i, record] of needed.entries()) {
       const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
@@ -498,7 +605,8 @@ export async function hubPull(
           // Decided by the delta's own anchor, never by map order — see
           // selectThreadBase. Re-read state because importSession rewrites it
           // between iterations.
-          const anchorUuid = (await readDeltaChainInfo(deltaPath)).firstEntryParentUuid;
+          const deltaInfo = await readDeltaChainInfo(deltaPath);
+          const anchorUuid = deltaInfo.firstEntryParentUuid;
           const baseSessionId = selectThreadBase(
             threadBaseCandidates(
               readSyncState(effectiveProjectPath),
@@ -531,60 +639,10 @@ export async function hubPull(
             });
 
             if (outcome.kind === "appended") {
-              // Bookkeeping importSession would normally do. It has to happen
-              // here because the append path deliberately bypasses it: no new
-              // session was created, so there is nothing for the importer to
-              // record — but without these entries the very same bundle is
-              // "needed" again on the next pull (selectNeededBundles reads
-              // peers[...].received) and a push back to the hub would
-              // re-upload the whole session as a full bundle.
-              //
-              // It runs BEFORE the layer copy, not after: the base is already
-              // extended at this point, so a layer-copy fault must not leave
-              // the splice unrecorded — the next pull would re-need the
-              // bundle, chain-mismatch against the now-longer base, and land
-              // the very same entries a second time as a fragment.
-              //
-              // Deliberately NOT written: state.lineage[baseSessionId]. The
-              // base already has lineage describing where the SESSION came
-              // from; overwriting it with this splice's provenance would
-              // destroy that and claim the whole transcript arrived as a
-              // continuation.
-              const now = new Date().toISOString();
-              const messageCount = countJsonlLines(basePath);
-              const st = readSyncState(effectiveProjectPath);
-              const peerId = sourceCopy.machineId;
-              st.peers[peerId] ??= {
-                name: bundleManifest.sourceMachineName ?? peerId,
-                lastSentAt: null, lastReceivedAt: null, sent: {}, received: {},
-              };
-              const peer = st.peers[peerId];
-              if (bundleManifest.sourceMachineName) peer.name = bundleManifest.sourceMachineName;
-              peer.lastReceivedAt = now;
-              peer.received[record.sessionIdInBundle] = {
-                localSessionId: baseSessionId,
-                type: "continuation",
-                importedAt: now,
-              };
-              // This machine is now level with that peer on this session.
-              peer.sent[baseSessionId] = {
-                headEntryUuid: outcome.newHeadUuid,
-                messageCount,
-                sentAsType: "continuation",
-                sentAsSessionId: record.sessionIdInBundle,
-              };
-              st.imported[bundleSession.integrityHash] = {
-                localSessionId: baseSessionId,
-                importedAt: now,
-                registered: true,
-              };
-              writeSyncState(st);
-              // ...and so is the hub, which is where this content came from.
-              recordSentToPeer(effectiveProjectPath, { id: hubPeerId, name: "hub" }, baseSessionId, {
-                headEntryUuid: outcome.newHeadUuid,
-                messageCount,
-                sentAsType: "continuation",
-                sentAsSessionId: record.sessionIdInBundle,
+              recordSplice({
+                projectPath: effectiveProjectPath, basePath, baseSessionId,
+                peerId: sourceCopy.machineId, hubPeerId, manifest: bundleManifest,
+                record, bundleSession, newHeadUuid: outcome.newHeadUuid,
               });
 
               // Best effort by design: layers are auxiliary artifacts
@@ -612,9 +670,153 @@ export async function hubPull(
               continue; // bundle handled — no fragment import
             }
 
-            warnings.push(
-              `Continuation for thread ${target.threadId} could not be appended to the local session (${outcome.detail}) — imported as a separate session instead.`
-            );
+            // A chain mismatch is not just "couldn't splice": it means this
+            // thread was extended on BOTH machines from a common anchor, so
+            // neither branch continues the other. The fragment fallback is
+            // safe but leaves the user with two half-conversations and no way
+            // forward, so the mode decides — and whatever happens, the shape
+            // of the fork is reported so the skill layer can explain it.
+            if (outcome.reason === "chain-mismatch") {
+              const anchorOffset = anchorUuid
+                ? await findEntryOffsetByUuid(basePath, anchorUuid)
+                : null;
+              const baseMtimeMs = statSync(basePath).mtimeMs;
+              const mode = opts.onDivergence ?? "fragment";
+              const divergence: HubPullDivergence = {
+                threadId: target.threadId,
+                anchorUuid: anchorUuid ?? "",
+                localSessionId: baseSessionId,
+                localHeadUuid: readLastEntryUuid(basePath) ?? "",
+                localEntriesSinceAnchor:
+                  anchorOffset === null ? 0 : await countEntriesAfterOffset(basePath, anchorOffset),
+                localLastActiveAt: new Date(baseMtimeMs).toISOString(),
+                hubHeadUuid: deltaInfo.lastEntryUuid ?? "",
+                // The synthetic continuation header is bundle plumbing, not a
+                // message — counting it would overstate the hub's side by one.
+                hubEntriesSinceAnchor: Math.max(
+                  0,
+                  bundleSession.messageCount - (deltaInfo.headerPresent ? 1 : 0)
+                ),
+                hubLastActiveAt: record.pushedAt,
+                adoptAvailable: anchorOffset !== null,
+                resolution: mode,
+              };
+              lastDivergence = divergence;
+
+              if (mode === "skip") {
+                warnings.push(
+                  `Thread ${target.threadId} has diverged: your session ${baseSessionId} continues ${divergence.anchorUuid} with ${divergence.localEntriesSinceAnchor} entr${divergence.localEntriesSinceAnchor === 1 ? "y" : "ies"} the hub hasn't seen, and the hub's copy continues the same entry with ${divergence.hubEntriesSinceAnchor} of its own — skipped, nothing changed. Re-run with --on-divergence fragment or adopt-hub to decide.`
+                );
+                skippedByDivergence = true;
+                continue; // nothing recorded, so the decision can be revisited
+              }
+
+              if (mode === "adopt-hub" && divergence.adoptAvailable) {
+                const preservedSessionId = randomUUID();
+                const preservedPath = join(targetProjectDir, `${preservedSessionId}.jsonl`);
+                const adopt = await adoptHubBranch({
+                  basePath, baseSessionId, deltaPath,
+                  anchorOffset: anchorOffset!,
+                  preservedSessionId, preservedPath, ctx,
+                  adapters: getApplicableAdapters(
+                    bundleManifest.sourceClaudeVersion, opts.claudeVersion
+                  ),
+                });
+
+                if (adopt.kind === "adopted") {
+                  // Same ordering rule as the plain append: durable
+                  // bookkeeping first, then everything whose loss is a
+                  // nuisance rather than a correctness problem.
+                  recordSplice({
+                    projectPath: effectiveProjectPath, basePath, baseSessionId,
+                    peerId: sourceCopy.machineId, hubPeerId, manifest: bundleManifest,
+                    record, bundleSession, newHeadUuid: adopt.newHeadUuid,
+                  });
+                  // Register the preserved branch so it is resumable and
+                  // findable. The "preserved" marker lives HERE, in the
+                  // display name — never as an injected entry in the
+                  // transcript itself.
+                  try {
+                    appendFileSync(
+                      join(opts.configDir, "history.jsonl"),
+                      JSON.stringify({
+                        display: `${bundleSession.slug} (local divergence, preserved ${new Date().toISOString().slice(0, 10)})`,
+                        pastedContents: {},
+                        timestamp: Date.now(),
+                        project: effectiveProjectPath,
+                        sessionId: preservedSessionId,
+                      }) + "\n",
+                      "utf-8"
+                    );
+                  } catch (e) {
+                    warnings.push(
+                      `Your local branch was preserved as session ${preservedSessionId}, but registering it in history.jsonl failed (${(e as Error).message}) — the file is there and \`claude --resume ${preservedSessionId}\` still works; it just won't be listed.`
+                    );
+                  }
+                  // The adopted branch's layer files, onto the base — exactly
+                  // as for a plain append. The PRESERVED session deliberately
+                  // gets none: layer files are uuid-named under the base
+                  // session's directories and stay there, shared history and
+                  // local branch alike. Duplicating arbitrarily large blobs to
+                  // give a second session the same auxiliary detail is a poor
+                  // trade; the preserved transcript is complete without them.
+                  try {
+                    await copyLayerDirs(
+                      extractDir, record.sessionIdInBundle,
+                      targetProjectDir, baseSessionId, opts.configDir, ctx
+                    );
+                  } catch (e) {
+                    warnings.push(
+                      `The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${(e as Error).message}) — the transcript is complete; those side files are missing.`
+                    );
+                  }
+
+                  divergence.preservedSessionId = preservedSessionId;
+                  appended.push({
+                    threadId: target.threadId,
+                    baseSessionId,
+                    entriesAppended: adopt.entriesAppended,
+                  });
+                  warnings.push(
+                    `Adopted the hub branch for thread ${target.threadId} into session ${baseSessionId}; your local branch was preserved in full as session ${preservedSessionId}, which has no thread mapping and will therefore be published as its own thread on the next push.`
+                  );
+                  // Unlike a plain append, adoption never consults the
+                  // liveness guard: tryAppendContinuation checks the chain
+                  // FIRST, so a diverged base declines before the mtime is
+                  // ever looked at, and refusing here instead would block
+                  // adopt-hub in its most common case (the user's local branch
+                  // is fresh — that is why it diverged). The base is only ever
+                  // extended by a live writer, so the risk is a confused chain
+                  // rather than corruption. Say so instead of guessing.
+                  if (!opts.forceAppend && baseMtimeMs < opNowMs && Date.now() - baseMtimeMs < APPEND_LIVE_WINDOW_MS) {
+                    warnings.push(
+                      `Session ${baseSessionId} was modified ${Math.round((Date.now() - baseMtimeMs) / 1000)}s ago — if a live Claude Code session is still open on it, exit it: anything it writes from now on chains onto the adopted hub branch, not onto the local branch preserved as ${preservedSessionId}.`
+                    );
+                  }
+                  threadLandedSessionId = baseSessionId;
+                  continue; // bundle handled — no fragment import
+                }
+
+                warnings.push(
+                  `adopt-hub failed for thread ${target.threadId} and session ${baseSessionId} was restored unchanged (${adopt.detail}) — importing the hub's branch as a separate session instead.`
+                );
+                divergence.resolution = "fragment";
+              } else if (mode === "adopt-hub") {
+                warnings.push(
+                  `adopt-hub is unavailable for thread ${target.threadId}: the continuation's anchor ${divergence.anchorUuid} is not present in the local session ${baseSessionId} (unrelated or compacted history) — importing the hub's branch as a separate session instead.`
+                );
+                divergence.resolution = "fragment";
+              } else {
+                warnings.push(
+                  `Thread ${target.threadId} has diverged: session ${baseSessionId} and the hub's copy both continue ${divergence.anchorUuid} (${divergence.localEntriesSinceAnchor} local entr${divergence.localEntriesSinceAnchor === 1 ? "y" : "ies"} vs ${divergence.hubEntriesSinceAnchor} on the hub), so the hub's branch was imported as a separate session and nothing local was touched. Re-run with --on-divergence adopt-hub to make the hub's branch canonical and keep your branch as a second session, or --on-divergence skip to decide later.`
+                );
+              }
+              // fall through to the fragment import
+            } else {
+              warnings.push(
+                `Continuation for thread ${target.threadId} could not be appended to the local session (${outcome.detail}) — imported as a separate session instead.`
+              );
+            }
           }
         }
       }
@@ -677,9 +879,14 @@ export async function hubPull(
     if (localSessionId !== null) {
       setThreadId(stateAfter, hub.hubId, localSessionId, target.threadId);
       writeSyncState(stateAfter);
-    } else {
+    } else if (!skippedByDivergence) {
       // Never map a thread to a fabricated id (an empty string would poison
       // the index projection below and every future pull's dedup).
+      //
+      // Gated on the divergence skip, which lands here by design: nothing was
+      // applied, so there is nothing to map, and the skip warning has already
+      // said exactly that. "Its session could not be identified" would be a
+      // second, contradictory story about a deliberate no-op.
       warnings.push(
         "pulled content already exists locally but its session could not be identified — a future push from this machine will re-map the thread"
       );
@@ -687,28 +894,43 @@ export async function hubPull(
 
     // Rewrite our machine index over current local sessions — pulls never
     // create bundles, so newBundles is always empty here.
-    const sessionsNow = discoverSessions(opts.configDir, effectiveProjectPath).map((s) => ({
-      sessionId: s.sessionId,
-      slug: s.slug,
-      summary: s.slug,
-      headEntryUuid: readLastEntryUuid(s.jsonlPath) ?? "",
-      messageCount: s.messageCount,
-      lastActiveAt: s.lastActiveAt,
-    }));
-    const prior = await readMachineIndex(backend, local.projectId, machine.id);
-    await writeMachineIndex(
-      backend,
-      buildIndexFile({
-        projectId: local.projectId,
-        machineId: machine.id,
-        projectPath: effectiveProjectPath,
-        sessions: sessionsNow,
-        state: stateAfter,
-        priorIndex: prior,
-        newBundles: [],
-        now: new Date().toISOString(),
-      })
-    );
+    //
+    // Unless the run was a pure divergence skip, where "nothing changed" has
+    // to include the index. The projection reads the LOCAL session head, so
+    // rewriting it here would publish the local branch's head — which no
+    // bundle on the hub backs — and make this machine the thread's most
+    // recent copy. The re-run the skip warning promises would then be refused
+    // outright ("the latest copy of this thread is already local"), turning
+    // "decide later" into "decide never".
+    const appliedNothing =
+      importedSessions.length === 0 &&
+      skippedSessions.length === 0 &&
+      appended.length === 0 &&
+      workspaceUnpacked === null;
+    if (!(skippedByDivergence && appliedNothing)) {
+      const sessionsNow = discoverSessions(opts.configDir, effectiveProjectPath).map((s) => ({
+        sessionId: s.sessionId,
+        slug: s.slug,
+        summary: s.slug,
+        headEntryUuid: readLastEntryUuid(s.jsonlPath) ?? "",
+        messageCount: s.messageCount,
+        lastActiveAt: s.lastActiveAt,
+      }));
+      const prior = await readMachineIndex(backend, local.projectId, machine.id);
+      await writeMachineIndex(
+        backend,
+        buildIndexFile({
+          projectId: local.projectId,
+          machineId: machine.id,
+          projectPath: effectiveProjectPath,
+          sessions: sessionsNow,
+          state: stateAfter,
+          priorIndex: prior,
+          newBundles: [],
+          now: new Date().toISOString(),
+        })
+      );
+    }
 
     opts.onProgress?.({ phase: "hub-pull", percent: 100 });
     return {
@@ -721,6 +943,7 @@ export async function hubPull(
       localSessionId,
       workspaceUnpacked,
       appended: appended.length > 0 ? appended : undefined,
+      divergence: lastDivergence,
       warnings,
     };
   } finally {

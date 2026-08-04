@@ -226,6 +226,28 @@ describe("cli", () => {
     });
   });
 
+  describe("pull command", () => {
+    it("rejects invalid --on-divergence values before any hub lookup", () => {
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(`pull --latest --on-divergence bogus --source-config-dir "${configDir}"`);
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = { stdout: err.stdout ? err.stdout.toString() : "", status: err.status ?? 0 };
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.command).toBe("pull");
+      // Not the "no hub configured" error: the bad mode is reported on its own
+      // terms, whether or not a hub happens to be set up.
+      expect(result.error).toMatch(/on-divergence/i);
+      expect(result.error).toMatch(/adopt-hub/);
+    });
+
+  });
+
   describe("--progress", () => {
     it("emits NDJSON progress on stderr while stdout stays one JSON object", () => {
       const outputDir = join(tempDir, "cli-progress");

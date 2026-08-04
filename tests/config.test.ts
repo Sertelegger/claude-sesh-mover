@@ -120,12 +120,18 @@ describe("config", () => {
     it("defaults include the hub section so setConfigValue accepts hub.path", async () => {
       const { getDefaultConfig, setConfigValue } = await import("../src/config.js");
       const cfg = getDefaultConfig();
-      expect(cfg.hub).toEqual({ path: "", noWorkspace: false, pullAppend: true });
+      expect(cfg.hub).toEqual({
+        path: "", noWorkspace: false, pullAppend: true, onDivergence: "fragment",
+      });
       const updated = setConfigValue(cfg, "hub.path", "/mnt/share/hub");
       expect(updated.hub.path).toBe("/mnt/share/hub");
       // setConfigValue only accepts keys that already exist in the defaults,
-      // so this is also the guard that hub.pullAppend is settable at all.
+      // so this is also the guard that hub.pullAppend/hub.onDivergence are
+      // settable at all.
       expect(setConfigValue(cfg, "hub.pullAppend", false).hub.pullAppend).toBe(false);
+      expect(setConfigValue(cfg, "hub.onDivergence", "adopt-hub").hub.onDivergence).toBe(
+        "adopt-hub"
+      );
     });
   });
 
