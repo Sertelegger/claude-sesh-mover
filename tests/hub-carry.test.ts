@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  rmSync, symlinkSync, writeFileSync,
+  rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -1339,8 +1339,347 @@ describe("applyCarry", () => {
       expect(r.applied).toBe(true);
       expect(readFileSync(join(twin, "pkg", "app", "f.txt"), "utf-8")).toBe("v2\n");
       expect(readFileSync(join(twin, "pkg", "app", "fresh.txt"), "utf-8")).toBe("new\n");
+      // `filesChanged` is git's own count, from a `--numstat` that has to carry
+      // the SAME --directory as the apply. Without it the number reported to
+      // the user was 0 for every patch a subdirectory project applied.
+      if (!r.applied) return;
+      expect(r.filesChanged).toBe(1);
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
+
+  // --- The layout axis CROSSED with the hostile-payload axis ---
+  //
+  // Both axes were already covered, and neither crossed the other: the
+  // hostile-payload tests all ran at repo-root layout, and the subdirectory
+  // test ran a benign payload. The floor's `--numstat` source is exactly what
+  // falls through that gap — `git apply --numstat` resolves paths against the
+  // REPOSITORY ROOT and silently ignores everything outside the cwd, so at a
+  // subdirectory project it reported no entries at all and the check passed
+  // vacuously. Measured against the pre-fix build, all three payloads below
+  // were REFUSED at repo root and APPLIED at a subdirectory project.
+
+  /** A repo whose PROJECT is the subdirectory `pkg/app`, with a plugin dir in it. */
+  function subdirRepo(name: string, seedHubinclude: boolean): {
+    repo: string; project: string; head: string;
+  } {
+    const repo = gitRepo(name);
+    const project = join(repo, "pkg", "app");
+    mkdirSync(join(project, ".claude-sesh-mover"), { recursive: true });
+    if (seedHubinclude) {
+      writeFileSync(join(project, ".claude-sesh-mover", "hubinclude"), "docs/\n");
+    }
+    writeFileSync(join(project, "f.txt"), "v1\n");
+    git(repo, ["add", "-A", "-f"]);
+    git(repo, ["commit", "-q", "-m", "sub"]);
+    return { repo, project, head: git(repo, ["rev-parse", "HEAD"]).trim() };
+  }
+
+  it("refuses a BINARY patch naming plugin internals at SUBDIRECTORY layout too", async () => {
+    // The raw scan is blind to binary entries (no `---`/`+++` lines at all), so
+    // `--numstat` is the ONLY source that sees this one — and it saw nothing
+    // here until it carried the same --directory as the apply.
+    const { repo, project, head } = subdirRepo("apply-subdir-bin", false);
+    let dir: string | undefined;
+    try {
+      writeFileSync(
+        join(project, ".claude-sesh-mover", "hubinclude"),
+        Buffer.from([0, 1, 2, 3, 0, 255])
+      );
+      git(repo, ["add", "-A", "-f"]);
+      // `--relative` is what the capture side uses, so the paths in the patch
+      // are PROJECT-relative — the shape whose resolution --directory fixes.
+      const patch = git(project, [
+        "diff", "HEAD", "--binary", "--relative", "--src-prefix=a/", "--dst-prefix=b/",
+      ]);
+      expect(patch).toContain("GIT binary patch");
+      expect(patch).not.toContain("+++ b/");
+      git(repo, ["reset", "-q", "--hard", "HEAD"]);
+      git(repo, ["clean", "-qfdx"]);
+      const payload = handPayload(patch, { baseCommit: head, repoPrefix: "pkg/app/" });
+      dir = payload.dir;
+
+      const r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("unsafe-payload");
+      // git's own parse reports the path with the prefix applied, which is
+      // where it would really have landed.
+      expect(r.detail).toContain("pkg/app/.claude-sesh-mover/hubinclude");
+      expect(existsSync(join(project, ".claude-sesh-mover", "hubinclude"))).toBe(false);
+      // Refused whole means refused whole: the saved copy carries no command.
+      expect(readFileSync(join(r.savedTo!, "README.md"), "utf-8")).not.toContain("git apply");
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
+  it("refuses an EMPTY-FILE creation of plugin internals at SUBDIRECTORY layout", async () => {
+    // A creation with no hunk at all: nothing for the raw scan's `+++ b/` line
+    // to find beyond the header, and the file it creates is the project-scope
+    // config.json that decides where the hub is.
+    const { repo, project, head } = subdirRepo("apply-subdir-empty", true);
+    let dir: string | undefined;
+    try {
+      const payload = handPayload(
+        "diff --git a/.claude-sesh-mover/config.json b/.claude-sesh-mover/config.json\n" +
+          "new file mode 100644\nindex 0000000..e69de29\n",
+        { baseCommit: head, repoPrefix: "pkg/app/" }
+      );
+      dir = payload.dir;
+
+      const r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("unsafe-payload");
+      expect(existsSync(join(project, ".claude-sesh-mover", "config.json"))).toBe(false);
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
+  it("refuses a MODE CHANGE on plugin internals at SUBDIRECTORY layout", async () => {
+    if (process.platform === "win32") return; // no POSIX mode bits to observe
+    const { repo, project, head } = subdirRepo("apply-subdir-mode", true);
+    let dir: string | undefined;
+    try {
+      const target = join(project, ".claude-sesh-mover", "hubinclude");
+      const before = statSync(target).mode & 0o777;
+      const payload = handPayload(
+        "diff --git a/.claude-sesh-mover/hubinclude b/.claude-sesh-mover/hubinclude\n" +
+          "old mode 100644\nnew mode 100755\n",
+        { baseCommit: head, repoPrefix: "pkg/app/" }
+      );
+      dir = payload.dir;
+
+      const r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("unsafe-payload");
+      // `core.fileMode=false` does not stop a mode change reaching the
+      // filesystem (measured) — only refusing the patch does.
+      expect(statSync(target).mode & 0o777).toBe(before);
+      expect(readFileSync(target, "utf-8")).toBe("docs/\n");
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
+  it("hands out an apply command that WORKS at SUBDIRECTORY layout", async () => {
+    if (process.platform === "win32") return; // runs the README's POSIX line verbatim
+    // The saved payload is the sole remedy on every declining path — the
+    // re-run is foreclosed — so a command that exits 0 and writes nothing is
+    // worse than no command. This runs the exact line the README hands over.
+    const repo = gitRepo("apply-subdir-readme");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let twin: string | undefined;
+    try {
+      mkdirSync(join(repo, "pkg", "app"), { recursive: true });
+      writeFileSync(join(repo, "pkg", "app", "f.txt"), "v1\n");
+      git(repo, ["add", "-A"]);
+      git(repo, ["commit", "-q", "-m", "sub"]);
+      writeFileSync(join(repo, "pkg", "app", "f.txt"), "v2\n");
+      payload = await capturePayload(join(repo, "pkg", "app"));
+      twin = cleanTwin(repo);
+      const project = join(twin, "pkg", "app");
+
+      // The routine path: a plain pull, no --apply-carry.
+      const r = await applyCarry({
+        carryDir: payload.dir, targetPath: project, meta: payload.meta, saveOnly: true,
+      });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("not-requested");
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      // The RECEIVER's prefix, read here, not the sender's `meta.repoPrefix`.
+      expect(readme).toContain('--directory="pkg/app/"');
+
+      const command = readme.match(/```bash\n(git [^\n]*)\n```/)?.[1];
+      expect(command).toBeTruthy();
+      const run = spawnSync("sh", ["-c", command!], { cwd: project, encoding: "utf-8" });
+      expect(run.status).toBe(0);
+      expect(readFileSync(join(project, "f.txt"), "utf-8")).toBe("v2\n");
+    } finally {
+      cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
+
+  it("refuses an unsafe payload the numstat floor sees even when only SAVING it", async () => {
+    // The save is the routine branch and its README recommends applying the
+    // patch by hand. Recommending one that --apply-carry would refuse as a
+    // security matter is the advice this guard exists to withhold, so the
+    // check runs ahead of the save rather than after it.
+    const { repo, project, head } = subdirRepo("apply-saveonly-unsafe", false);
+    let dir: string | undefined;
+    try {
+      const payload = handPayload(
+        "diff --git a/.claude-sesh-mover/config.json b/.claude-sesh-mover/config.json\n" +
+          "new file mode 100644\nindex 0000000..e69de29\n",
+        { baseCommit: head, repoPrefix: "pkg/app/" }
+      );
+      dir = payload.dir;
+
+      const r = await applyCarry({
+        carryDir: dir, targetPath: project, meta: payload.meta, saveOnly: true,
+      });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("unsafe-payload");
+      expect(existsSync(join(project, ".claude-sesh-mover", "config.json"))).toBe(false);
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      expect(readme).toContain("refused, not merely deferred");
+      expect(readme).not.toContain("git apply");
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
+  it("does not turn apply.whitespace=error into a false security refusal", async () => {
+    // `git apply --numstat` honours apply.whitespace=error and exits 128 on a
+    // patch that adds trailing whitespace (measured). An unhardened --numstat
+    // therefore routed an innocent payload into `unsafe-payload` — the SECURITY
+    // reason, with the security README text and no apply command — purely
+    // because of the receiver's own config.
+    const repo = gitRepo("apply-wserror");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let twin: string | undefined;
+    try {
+      writeFileSync(join(repo, "tracked.txt"), "v1\ntrailing   \n");
+      payload = await capturePayload(repo);
+      twin = cleanTwin(repo);
+      git(twin, ["config", "apply.whitespace", "error"]);
+
+      const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+      expect(r.applied).toBe(true);
+      if (!r.applied) return;
+      expect(r.filesChanged).toBe(1);
+      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\ntrailing   \n");
+    } finally {
+      cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
+
+  it("says how to find the prefix when this machine could not be asked for it", async () => {
+    if (process.platform === "win32") return; // PATH override + shell stub
+    // With no runnable git there is no honest prefix to print — and
+    // `meta.repoPrefix` is the SENDER's layout, not this machine's — so the
+    // note names the one command that answers it instead of guessing.
+    const repo = gitRepo("apply-noprefix");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let twin: string | undefined;
+    try {
+      writeFileSync(join(repo, "tracked.txt"), "v2\n");
+      payload = await capturePayload(repo);
+      twin = cleanTwin(repo);
+      const emptyDir = mkdtempSync(join(tmpdir(), "sesh-nopath2-"));
+      const restore = overridePath(emptyDir);
+      try {
+        const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+        expect(r.applied).toBe(false);
+        if (r.applied) return;
+        expect(r.reason).toBe("no-git");
+        expect(readFileSync(join(r.savedTo!, "README.md"), "utf-8"))
+          .toContain("git rev-parse --show-prefix");
+      } finally {
+        restore.restore();
+        rmSync(emptyDir, { recursive: true, force: true });
+      }
+    } finally {
+      cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
+
+  it("does not let retention delete the payload it just saved, nor a foreign carry-*", async () => {
+    // Retention is by NAME and chronological only because the stamps are ISO
+    // timestamps: a pinned stamp, a clock stepped back or a different timezone
+    // all produce a fresh save that sorts oldest. Pruning it would leave
+    // `savedTo` naming a directory that no longer exists while the result says
+    // the payload was saved. And `.claude-sesh-mover/` is also where a
+    // project-scope `sesh-mover export` lands, so a name match alone reached
+    // the user's own directories.
+    const repo = gitRepo("apply-retention");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let twin: string | undefined;
+    try {
+      writeFileSync(join(repo, "tracked.txt"), "v2\n");
+      payload = await capturePayload(repo);
+      twin = cleanTwin(repo);
+      writeFileSync(join(twin, "tracked.txt"), "MY OWN WORK\n"); // force a decline
+
+      // A user export that merely happens to be called `carry-…`, named so
+      // that it sorts INSIDE the prune window — a name-only rule deletes it.
+      const foreign = join(twin, ".claude-sesh-mover", "carry-2024-notes");
+      mkdirSync(foreign, { recursive: true });
+      writeFileSync(join(foreign, "manifest.json"), "{}\n");
+
+      // Five saves that all sort AFTER the sixth, which is the one just made.
+      for (let i = 0; i < 5; i++) {
+        await applyCarry({
+          carryDir: payload.dir, targetPath: twin, meta: payload.meta,
+          __stamp: `2026-09-0${i + 1}T00-00-00-000Z`,
+        });
+      }
+      const last = await applyCarry({
+        carryDir: payload.dir, targetPath: twin, meta: payload.meta,
+        __stamp: "2026-01-01T00-00-00-000Z", // oldest by name, newest in fact
+      });
+      expect(last.applied).toBe(false);
+      if (last.applied) return;
+
+      expect(last.savedTo).toBeTruthy();
+      expect(existsSync(last.savedTo!)).toBe(true);
+      expect(existsSync(join(last.savedTo!, "changes.patch"))).toBe(true);
+      expect(existsSync(join(foreign, "manifest.json"))).toBe(true);
+      // Still bounded: the budget is kept by dropping OUR oldest instead.
+      expect(savedDirs(twin).filter((n) => n !== "carry-2024-notes").length)
+        .toBeLessThanOrEqual(5);
+      expect(savedDirs(twin)).not.toContain("carry-2026-09-01T00-00-00-000Z");
+    } finally {
+      cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
+
+  it("leaves no half-copied saved directory behind when the copy faults", async () => {
+    if (process.platform === "win32") return; // relies on POSIX mode bits
+    if (process.getuid?.() === 0) return; // root reads a 000-mode file anyway
+    // A partly copied directory is indistinguishable from a complete one from
+    // the outside — same name, same README — so leaving one behind after
+    // falling through to the next root plants a plausible-looking decoy of the
+    // peer's working tree that is missing files nobody will ever notice.
+    const repo = gitRepo("apply-partialsave");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let twin: string | undefined;
+    let home: string | undefined;
+    try {
+      writeFileSync(join(repo, "tracked.txt"), "v2\n");
+      payload = await capturePayload(repo);
+      // Two untracked payload files; the SECOND one (sorted) cannot be read.
+      mkdirSync(join(payload.dir, "untracked"), { recursive: true });
+      writeFileSync(join(payload.dir, "untracked", "aaa.txt"), "readable\n");
+      const unreadable = join(payload.dir, "untracked", "zzz.txt");
+      writeFileSync(unreadable, "secret\n");
+      chmodSync(unreadable, 0o000);
+      twin = cleanTwin(repo);
+      writeFileSync(join(twin, "tracked.txt"), "MY OWN WORK\n"); // force a decline
+      home = mkdtempSync(join(tmpdir(), "sesh-home3-"));
+      const restore = overrideHome(home);
+      try {
+        const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+        expect(r.applied).toBe(false);
+        if (r.applied) return;
+        // Every root failed the same way, so there is genuinely no saved copy —
+        // and the result says so rather than pointing at a truncated one.
+        expect(r.savedTo).toBeNull();
+      } finally {
+        restore.restore();
+      }
+      expect(savedDirs(twin)).toEqual([]);
+      expect(readdirSync(join(home, ".claude-sesh-mover"), { withFileTypes: true })
+        .filter((e) => e.name.startsWith("carry-"))).toEqual([]);
+      chmodSync(unreadable, 0o600);
+    } finally {
+      cleanup(repo, payload?.dir ?? "", twin ?? "", home ?? "");
     }
   });
 

@@ -792,6 +792,44 @@ const APPLY_FLAGS = ["--whitespace=nowarn"];
 const APPLY_CONFIG = ["-c", "apply.ignoreWhitespace=no"];
 
 /**
+ * Every `git apply` this module runs, built in ONE place — because the four of
+ * them (`--numstat` for the floor check, `--numstat` for `filesChanged`,
+ * `--check`, and the apply itself) are the same command with the same
+ * path-resolution and the same configuration surface, and they are only correct
+ * while they agree. Two defects came from letting them drift:
+ *
+ * - **`--directory` on some but not all.** Inside a repository `git apply`
+ *   resolves patch paths against the REPOSITORY ROOT and silently ignores
+ *   anything that lands outside the current directory (exit 0, no stderr,
+ *   nothing written — measured). Applied to `--numstat` that means a
+ *   subdirectory project reports NO entries at all, so a floor check reading
+ *   its output passes vacuously: measured, a `GIT binary patch` creating
+ *   `.claude-sesh-mover/hubinclude` was refused at a repo-root project and
+ *   APPLIED at a subdirectory one, as were an empty-file creation of
+ *   `.claude-sesh-mover/config.json` and an `old mode`/`new mode` chmod. The
+ *   same omission zeroed `filesChanged` on every subdirectory project.
+ * - **`APPLY_CONFIG`/`APPLY_FLAGS` on some but not all.** `git apply --numstat`
+ *   honours `apply.whitespace=error` and exits 128 on a patch that adds
+ *   trailing whitespace (measured), so an unhardened `--numstat` turned an
+ *   innocent payload on a receiver with that config into a SECURITY refusal
+ *   (`unsafe-payload`, "could not be parsed") — with the security README text
+ *   and no apply command.
+ *
+ * `mode` is what distinguishes them (`["--numstat", "-z"]`, `["--check"]`, or
+ * nothing at all); everything else is shared by construction.
+ */
+function applyInvocation(applyPrefix: string, mode: string[], patchPath: string): string[] {
+  return [
+    ...APPLY_CONFIG,
+    "apply",
+    ...APPLY_FLAGS,
+    ...(applyPrefix ? [`--directory=${applyPrefix}`] : []),
+    ...mode,
+    patchPath,
+  ];
+}
+
+/**
  * Cap on a patch this module will INSPECT. Over it the payload is declined
  * rather than applied unchecked: the floor and symlink guards below both read
  * the whole patch, and a guard that silently gives up on large input is not a
@@ -1049,16 +1087,53 @@ function copyPayloadTree(src: string, dest: string): void {
 }
 
 /**
+ * First line of the `.gitignore` every saved payload carries — and the marker
+ * that makes a `carry-*` directory OURS to delete. `.claude-sesh-mover/` is also
+ * where `export --scope project` puts a bundle the user named, so a name match
+ * alone would let retention delete a user's own `carry-…` export.
+ */
+const SAVED_CARRY_MARKER = "# sesh-mover: a peer's uncommitted work, saved for you to apply by hand.";
+
+/** The self-ignoring `.gitignore` that both marks and protects a saved payload. */
+const SAVED_CARRY_GITIGNORE =
+  `${SAVED_CARRY_MARKER}\n# Self-ignoring so it can never be committed by accident.\n*\n`;
+
+/** Is this directory one WE wrote — as opposed to a same-named export? */
+function isSavedCarryDir(dir: string): boolean {
+  try {
+    return readFileSync(join(dir, ".gitignore"), "utf-8").startsWith(SAVED_CARRY_MARKER);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Drop all but the newest `SAVED_CARRY_RETENTION` saved payloads. Best effort:
  * a failure here must never turn a successful save into a failed one.
+ *
+ * Two things it is not allowed to do, both of which it did before:
+ *
+ * - **Delete the payload this run just wrote.** Retention is by NAME, and a
+ *   name is only chronological because the stamps are ISO timestamps — a pinned
+ *   `__stamp`, a clock stepped backwards or a machine in a different timezone
+ *   all produce a fresh directory that sorts oldest, and pruning it would leave
+ *   `savedTo` naming nothing at all while the result claims the payload was
+ *   saved. `keepName` is excluded from the candidates outright (it still counts
+ *   against the budget, so the total stays bounded).
+ * - **Delete something that is not ours.** `.claude-sesh-mover/` is also where a
+ *   project-scope `sesh-mover export` lands, so a user export named `carry-…`
+ *   matched the name filter. Ownership is now proven by the marker inside the
+ *   directory, not by its name.
  */
-function pruneSavedCarries(pluginDir: string): void {
+function pruneSavedCarries(pluginDir: string, keepName: string): void {
   try {
-    const dirs = readdirSync(pluginDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && /^carry-/.test(e.name))
+    const ours = readdirSync(pluginDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.startsWith("carry-"))
       .map((e) => e.name)
+      .filter((name) => name === keepName || isSavedCarryDir(join(pluginDir, name)))
       .sort();
-    for (const name of dirs.slice(0, Math.max(0, dirs.length - SAVED_CARRY_RETENTION))) {
+    const excess = Math.max(0, ours.length - SAVED_CARRY_RETENTION);
+    for (const name of ours.filter((n) => n !== keepName).slice(0, excess)) {
       rmSync(join(pluginDir, name), { recursive: true, force: true });
     }
   } catch {
@@ -1090,6 +1165,7 @@ function saveCarryPayload(opts: {
   detail: string;
   recommendApply: boolean;
   applyPrefix: string;
+  prefixKnown: boolean;
   stamp: string;
 }): string | null {
   const stamp = opts.stamp;
@@ -1107,23 +1183,28 @@ function saveCarryPayload(opts: {
       if (!dest.ok) continue;
     }
     for (let attempt = 0; attempt < 20; attempt++) {
-      const dir = join(root, attempt === 0 ? `carry-${stamp}` : `carry-${stamp}-${attempt + 1}`);
+      const name = attempt === 0 ? `carry-${stamp}` : `carry-${stamp}-${attempt + 1}`;
+      const dir = join(root, name);
       if (existsSync(dir)) continue;
       try {
         mkdirSync(dir, { recursive: true });
-        writeFileSync(
-          join(dir, ".gitignore"),
-          "# sesh-mover: a peer's uncommitted work, saved for you to apply by hand.\n" +
-            "# Self-ignoring so it can never be committed by accident.\n*\n",
-          "utf-8"
-        );
+        writeFileSync(join(dir, ".gitignore"), SAVED_CARRY_GITIGNORE, "utf-8");
         copyPayloadTree(opts.carryDir, dir);
         writeFileSync(join(dir, "README.md"), renderSavedReadme({ ...opts, dir }), "utf-8");
-        pruneSavedCarries(root);
+        pruneSavedCarries(root, name);
         return dir;
       } catch {
         // A collision with a directory created between the check and the
-        // mkdir, or an unwritable root. Try the next name, then the next root.
+        // mkdir, an unwritable root, or a fault part-way through the copy.
+        // Remove whatever landed before trying the next name and then the next
+        // root: a half-copied directory looks exactly like a complete one from
+        // the outside, and the next root's save would leave it behind as a
+        // silent, plausible-looking decoy of the peer's working tree.
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          /* nothing more this function can do; the next root still gets a try */
+        }
         continue;
       }
     }
@@ -1131,13 +1212,27 @@ function saveCarryPayload(opts: {
   return null;
 }
 
-/** The manual-steps note that ships beside every saved payload. */
+/**
+ * The manual-steps note that ships beside every saved payload.
+ *
+ * The command in here is the SOLE remedy on every declining path — a pull
+ * records its bundles as received before it returns, so the re-run is
+ * foreclosed — which makes `--directory` load-bearing rather than cosmetic. Get
+ * it wrong on a subdirectory project and the command handed to the user exits
+ * 0, writes nothing and says nothing (measured), while the result tells them
+ * their payload is safely saved. `applyPrefix` is therefore read from THIS
+ * machine before any decline can return, and when it could not be read at all
+ * (no project directory here, no runnable `git`) the note says so rather than
+ * guessing — `meta.repoPrefix` is the SENDER's layout and the same project can
+ * be a monorepo package there and a plain clone here.
+ */
 function renderSavedReadme(opts: {
   dir: string;
   meta: CarryMeta;
   detail: string;
   recommendApply: boolean;
   applyPrefix: string;
+  prefixKnown: boolean;
 }): string {
   const { meta } = opts;
   const patch = join(opts.dir, "changes.patch");
@@ -1174,6 +1269,19 @@ function renderSavedReadme(opts: {
     "",
     "Both settings matter: `apply.whitespace=fix` silently strips whitespace the patch adds, and `apply.ignoreWhitespace=change` will apply a patch whose context does not match and rewrite your indentation to it.",
     "",
+  );
+  if (!opts.prefixKnown) {
+    lines.push(
+      "This machine could not be asked where the project sits inside its repository, so the command above has no `--directory`. **If this project directory is inside a git repository but is not its root, add one** — from the project directory, `git rev-parse --show-prefix` prints exactly what it needs (for example `--directory=\"pkg/app/\"`). Without it `git apply` resolves the patch's paths against the repository root, ignores everything outside your current directory, and exits 0 having written nothing.",
+      "",
+    );
+  } else if (opts.applyPrefix) {
+    lines.push(
+      `\`--directory\` is not optional here: this project is the subdirectory \`${opts.applyPrefix}\` of its repository, and \`git apply\` resolves patch paths against the repository ROOT. Without it the command exits 0 and writes nothing at all.`,
+      "",
+    );
+  }
+  lines.push(
     "The untracked files are under `untracked/`. Copying them OVERWRITES same-named files — sesh-mover's own apply never does that — so check first:",
     "",
     "```bash",
@@ -1238,16 +1346,20 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
     scan.symlink !== null ||
     scan.paths.some((p) => isNeverIncludable(p));
 
-  const decline = (
-    reason: CarryApplyDeclineReason,
-    detail: string,
-    applyPrefix = ""
-  ): CarryNotApplied => ({
+  // `applyPrefix` is deliberately mutable and read at CALL time by `decline`:
+  // it is what the saved README's apply command needs, and that README is the
+  // only remedy every declining path has. A prefix threaded as an argument was
+  // simply absent from every decline that returns before it is measured — which
+  // included the routine `not-requested` one.
+  let applyPrefix = "";
+  let prefixKnown = false;
+
+  const decline = (reason: CarryApplyDeclineReason, detail: string): CarryNotApplied => ({
     applied: false,
     reason,
     detail,
     savedTo: saveCarryPayload({
-      carryDir, targetPath, meta, detail, stamp, applyPrefix,
+      carryDir, targetPath, meta, detail, stamp, applyPrefix, prefixKnown,
       recommendApply: !scanUnsafe && reason !== "unsafe-payload",
     }),
   });
@@ -1261,6 +1373,80 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
           : `the patch writes paths that never travel (${scan.paths.filter((p) => isNeverIncludable(p)).slice(0, 3).join(", ")})`;
     return decline("unsafe-payload", detail);
   }
+
+  // Where this project sits inside its repository, measured BEFORE any decline
+  // can return. Two things need it and both are load-bearing:
+  //
+  // 1. Every `git apply` below. `git apply` resolves patch paths against the
+  //    REPOSITORY ROOT and silently ignores anything outside the current
+  //    directory — exit 0, no stderr, nothing written, and `--check` and
+  //    `--numstat` are just as quiet (all measured). A `--relative` patch
+  //    applied at a project that is a repo SUBDIRECTORY is a silent no-op
+  //    without this, and a `--numstat` floor check reading no entries at all
+  //    passes vacuously.
+  // 2. The saved README's apply command, on every decline.
+  //
+  // Read from THIS machine, never from `meta.repoPrefix`: the same project can
+  // be a monorepo package on one machine and a plain clone on the other, and
+  // what has to be translated is where the patch lands HERE.
+  //
+  // Spawning with a cwd that does not exist fails with the SAME `ENOENT` a
+  // missing git binary does (verified), so the directory is checked first.
+  const targetExists = existsSync(targetPath);
+  let gitDir = "";
+  if (targetExists) {
+    const where = git(targetPath, ["rev-parse", "--absolute-git-dir", "--show-prefix"], 64 * 1024);
+    if (where.ok) {
+      const [dir = "", prefix = ""] = where.stdout.toString("utf-8").split("\n").map((l) => l.trim());
+      gitDir = dir;
+      applyPrefix = prefix;
+      prefixKnown = true;
+    } else if (where.code !== "ENOENT") {
+      // A real `git` answered "not a repository". The empty prefix is then the
+      // RIGHT answer, not a missing one: outside a repository `git apply`
+      // resolves paths against the cwd (measured).
+      prefixKnown = true;
+    }
+  }
+
+  // git's own parse of the patch, which the raw scan above cannot replace: it
+  // is the only source that covers binary entries. A failure to enumerate is a
+  // refusal — an un-inspected patch is not a safe patch.
+  //
+  // It runs BEFORE the `saveOnly` return on purpose. Saving is the routine
+  // path, its README recommends applying the patch by hand, and recommending a
+  // payload that `--apply-carry` would refuse as `unsafe-payload` is exactly
+  // the advice this guard exists to withhold.
+  if (patchBytes > 0 && targetExists) {
+    const numstat = git(
+      targetPath,
+      applyInvocation(applyPrefix, ["--numstat", "-z"], patchPath),
+      LS_FILES_MAX_BUFFER
+    );
+    if (numstat.ok) {
+      const unsafe = numstat.stdout
+        .toString("utf-8")
+        .split("\0")
+        .filter((r) => r.length > 0)
+        .map((row) => row.split("\t").slice(2).join("\t"))
+        .filter((p) => p.length > 0 && isNeverIncludable(p));
+      if (unsafe.length > 0) {
+        return decline(
+          "unsafe-payload",
+          `the patch writes paths that never travel (${unsafe.slice(0, 3).join(", ")})`
+        );
+      }
+    } else if (numstat.code !== "ENOENT") {
+      // `git` ran and refused to parse the patch. ENOENT means there is no git
+      // on this machine at all, which is diagnosed as `no-git` below — the raw
+      // scan above is this module's whole answer there, and it has already run.
+      return decline(
+        "unsafe-payload",
+        `the patch could not be parsed (${numstat.stderr || String(numstat.code ?? "")})`
+      );
+    }
+  }
+
   if (opts.saveOnly) {
     return decline(
       "not-requested",
@@ -1268,11 +1454,10 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
     );
   }
 
-  // Before any `git`: spawning with a cwd that does not exist fails with the
-  // SAME `ENOENT` a missing git binary does (verified), so without this a pull
-  // into a project directory that is not here yet would report "git could not
-  // be run" — a diagnosis pointing at the wrong machine entirely.
-  if (!existsSync(targetPath)) {
+  if (!targetExists) {
+    // Without this a pull into a project directory that is not here yet would
+    // report "git could not be run" — a diagnosis pointing at the wrong
+    // machine entirely.
     return decline("not-git", "the project directory does not exist on this machine");
   }
   const head = git(targetPath, ["rev-parse", "--verify", "HEAD"], 4096);
@@ -1285,57 +1470,11 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
         );
   }
   const headSha = head.stdout.toString("utf-8").trim();
-  const where = git(targetPath, ["rev-parse", "--absolute-git-dir", "--show-prefix"], 64 * 1024);
-  const [gitDir = "", repoPrefix = ""] = where.ok
-    ? where.stdout.toString("utf-8").split("\n").map((l) => l.trim())
-    : [];
-
-  // `git apply` resolves patch paths against the REPOSITORY ROOT and silently
-  // ignores anything outside the current directory — exit 0, no stderr, nothing
-  // written, and `--check` is just as quiet (all measured). A `--relative`
-  // patch applied at a project that is a repo SUBDIRECTORY is therefore a
-  // silent no-op without this. The prefix is read from THIS machine, not from
-  // `meta.repoPrefix`: the same project can be a monorepo package on one
-  // machine and a plain clone on the other, and what has to be translated is
-  // where the patch lands HERE.
-  const applyPrefix = repoPrefix;
-
-  // git's own parse of the patch, which the raw scan above cannot replace: it
-  // is the only source that covers binary entries. A failure to enumerate is a
-  // refusal — an un-inspected patch is not a safe patch.
-  if (patchBytes > 0) {
-    const numstat = git(
-      targetPath,
-      ["apply", "--numstat", "-z", patchPath],
-      LS_FILES_MAX_BUFFER
-    );
-    if (!numstat.ok) {
-      return decline(
-        "unsafe-payload",
-        `the patch could not be parsed (${numstat.stderr || String(numstat.code ?? "")})`,
-        applyPrefix
-      );
-    }
-    const unsafe = numstat.stdout
-      .toString("utf-8")
-      .split("\0")
-      .filter((r) => r.length > 0)
-      .map((row) => row.split("\t").slice(2).join("\t"))
-      .filter((p) => p.length > 0 && isNeverIncludable(p));
-    if (unsafe.length > 0) {
-      return decline(
-        "unsafe-payload",
-        `the patch writes paths that never travel (${unsafe.slice(0, 3).join(", ")})`,
-        applyPrefix
-      );
-    }
-  }
 
   if (headSha !== meta.baseCommit) {
     return decline(
       "wrong-base",
-      `this machine is at commit ${headSha.slice(0, 8)}, the changes were captured at ${meta.baseCommit.slice(0, 8)} on branch ${meta.branch}`,
-      applyPrefix
+      `this machine is at commit ${headSha.slice(0, 8)}, the changes were captured at ${meta.baseCommit.slice(0, 8)} on branch ${meta.branch}`
     );
   }
   const inProgress = gitDir ? detectInProgress(gitDir) : null;
@@ -1346,8 +1485,7 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
     // to run against a dirty tree, for reasons the user never asked for.
     return decline(
       "in-progress",
-      `this machine is in the middle of a ${inProgress} — finish or abort it first`,
-      applyPrefix
+      `this machine is in the middle of a ${inProgress} — finish or abort it first`
     );
   }
   // `-- .` scopes the question to the project directory: a monorepo package
@@ -1357,33 +1495,30 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
   if (!status.ok) {
     return decline(
       "dirty-tree",
-      `this machine's working tree could not be verified as clean (${status.stderr || String(status.code ?? "")})`,
-      applyPrefix
+      `this machine's working tree could not be verified as clean (${status.stderr || String(status.code ?? "")})`
     );
   }
   if (status.stdout.toString("utf-8").trim().length > 0) {
     return decline(
       "dirty-tree",
-      "this machine has uncommitted changes of its own, which the carried patch would be mixed into irreversibly",
-      applyPrefix
+      "this machine has uncommitted changes of its own, which the carried patch would be mixed into irreversibly"
     );
   }
 
   let filesChanged = 0;
   if (patchBytes > 0) {
-    const args = [
-      ...APPLY_CONFIG, "apply", ...APPLY_FLAGS,
-      ...(applyPrefix ? [`--directory=${applyPrefix}`] : []),
-    ];
-    const check = git(targetPath, [...args, "--check", patchPath], 1024 * 1024);
+    const check = git(
+      targetPath,
+      applyInvocation(applyPrefix, ["--check"], patchPath),
+      1024 * 1024
+    );
     if (!check.ok) {
       return decline(
         "apply-failed",
-        `the carried patch does not apply here (${check.stderr || String(check.code ?? "")})`,
-        applyPrefix
+        `the carried patch does not apply here (${check.stderr || String(check.code ?? "")})`
       );
     }
-    const applied = git(targetPath, [...args, patchPath], 1024 * 1024);
+    const applied = git(targetPath, applyInvocation(applyPrefix, [], patchPath), 1024 * 1024);
     if (!applied.ok) {
       // `--check` just passed, so this is an IO fault rather than a mismatch.
       // `git apply` is all-or-nothing on the mismatch class (measured: a
@@ -1392,11 +1527,10 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
       // look rather than promising nothing happened.
       return decline(
         "apply-failed",
-        `git apply failed after its dry run passed (${applied.stderr || String(applied.code ?? "")}) — check \`git status\` before re-trying`,
-        applyPrefix
+        `git apply failed after its dry run passed (${applied.stderr || String(applied.code ?? "")}) — check \`git status\` before re-trying`
       );
     }
-    filesChanged = patchFileCount(targetPath, patchPath);
+    filesChanged = patchFileCount(targetPath, applyPrefix, patchPath);
   }
 
   const collisions: string[] = [];
@@ -1456,9 +1590,17 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
  * porcelain surface to harden, it cannot see files the patch CREATED (they are
  * untracked), and it would count unrelated dirt if the tree check were ever
  * loosened. A rename counts once, which is what `--numstat` reports.
+ *
+ * Built through `applyInvocation` like the other three, and `applyPrefix` is
+ * not optional here either: without it a subdirectory project reported `0`
+ * verbatim to the user for every patch it had just successfully applied.
  */
-function patchFileCount(cwd: string, patchPath: string): number {
-  const numstat = git(cwd, ["apply", "--numstat", "-z", patchPath], LS_FILES_MAX_BUFFER);
+function patchFileCount(cwd: string, applyPrefix: string, patchPath: string): number {
+  const numstat = git(
+    cwd,
+    applyInvocation(applyPrefix, ["--numstat", "-z"], patchPath),
+    LS_FILES_MAX_BUFFER
+  );
   if (!numstat.ok) return 0;
   return numstat.stdout.toString("utf-8").split("\0").filter((r) => r.length > 0).length;
 }
