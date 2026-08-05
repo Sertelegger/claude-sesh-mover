@@ -455,7 +455,10 @@ program
                 const result = {
                     success: true,
                     command: "configure",
-                    config: readConfig(configDir),
+                    // Effective, like the other --set branches: machine.name lives in
+                    // machine-id.json rather than config.json, so this scope's file has
+                    // nothing to say about it either way.
+                    config: loadEffectiveConfig(resolveConfigDir(), process.cwd()),
                     scope: opts.scope,
                     message: `Set machine.name = ${identity.name}`,
                 };

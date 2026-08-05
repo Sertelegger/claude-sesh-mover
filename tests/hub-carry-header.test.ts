@@ -1,13 +1,14 @@
 import { describe, it, expect } from "vitest";
 import { execFileSync } from "node:child_process";
 import {
-  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __scanPatchBytesForTests as scanPatchBytes } from "../src/hub/carry.js";
 import { isNeverIncludable } from "../src/hub/workspace.js";
 import { readTextLf } from "./helpers/eol.js";
+import { copyTreeSync } from "./helpers/copy-tree.js";
 
 /**
  * # The carry patch header scan, cross-checked against real `git apply`
@@ -747,7 +748,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
       for (const s of sample) {
         const twin = mkdtempSync(join(tmpdir(), "sesh-hdrtwin-"));
         try {
-          cpSync(seed, twin, { recursive: true });
+          copyTreeSync(seed, twin); // see copy-tree.ts: cpSync flaked on a git repo under macOS CI
           const patchFile = slot.file;
           writeFileSync(patchFile, s.patch, "latin1");
           // The cheap oracle first…

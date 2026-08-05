@@ -85,8 +85,15 @@ Two items change behavior for existing hub users with no action on their part.
 - New result fields — `pull`: `appended`, `divergence`, `workspaceMerge`,
   `workspaceRefused`, `workspaceDeclaredMissing`, `carryAvailable`, `carryApplied`,
   `unfetchableBundles`; `push`: `carry`, `ignoredNotCarried`; `whereis`:
-  `unfetchableBundles` per thread. Every one of them is a typed field precisely so the
-  slash commands branch on results rather than on warning wording.
+  `unfetchableBundles` per thread; `hub status`: `lastAutoPush`. Every one of them is a
+  typed field precisely so the slash commands branch on results rather than on warning
+  wording.
+- **`hub status` now reports the last automatic push** for the project you are in
+  (`lastAutoPush`: when, whether it succeeded, and its warnings). The session-end push runs
+  detached with its stdout closed, and Claude Code does not show a clean-exit hook's
+  stderr, so everything it computes for a human was thrown away — including the disclosure
+  naming gitignored-but-*tracked* files whose contents its patch carried off the machine,
+  and the error from a push that has been failing every session against an unmounted share.
 - Library: `hub/append`, `hub/merge`, `hub/carry` and `hub/hooks` are re-exported from the
   package barrel (`src/index.ts`).
 
@@ -111,6 +118,36 @@ Two items change behavior for existing hub users with no action on their part.
   `schemaVersion: 2`.
 
 ### Fixed
+- **`configure --set <key> --scope project` unconfigured the hub for that project**
+  (pre-existing, and this is the release that tells you to run it). A scope-targeted write
+  serialized the *whole* config — every default included — so the project file then beat
+  the user file on keys only the user scope had ever set, `hub.path: ""` among them:
+  `hub status` answered `hubPath: null` and `push` answered "No hub configured". A scope's
+  file now holds only what that scope sets, and `--reset` clears one scope instead of
+  pinning defaults over the other. `hub init --scope project` had the same defect.
+- **A project *with* a git remote could have its whole working tree uploaded.** Which
+  payload a push builds is decided by asking git for the project's remotes, and three
+  different answers collapsed into "there are none" — the condition for the workspace
+  snapshot, which deliberately does not read `.gitignore`. A remote sesh-mover could not
+  canonicalize (`git@gitserver:team/repo.git` — an ordinary self-hosted server, whose host
+  carries no dot) and *any* failure to run `git` at all (missing binary, timeout,
+  unreadable repository) both landed there, with `warnings: []`. Since the session-end
+  auto-push is on by default and unattended, that meant `.env`, `secrets/`, and everything
+  else `.gitignore` covers could reach the hub with nothing said. A project with an
+  unrecognized remote now takes the git-diff carry (the payload those rules *do* filter),
+  and a project whose git cannot be asked gets **neither** payload plus a warning saying so.
+- `pull --latest` (and "the latest copy of this thread is already local") returned before
+  the split-history disclosure ran, so a machine holding half of a thread whose bundles
+  span two others was told "all threads are current on this machine" — the most reassuring
+  answer available, on the copy that was least complete. Both branches now report
+  `unfetchableBundles`.
+- The header at the top of a pulled continuation said the earlier messages lived in a named
+  session "on this machine". That id is the *sending* machine's, and the importer mints a
+  fresh one for everything it writes, so on the machine actually reading the header it named
+  nothing. It now names the machine those messages are on.
+- `--force-workspace` was described as merging into the target directory in four places,
+  including one suggestion emitted only when no merge was possible. It overwrites files of
+  the same name; the 3-way merge is a different path that the flag deliberately skips.
 - `whereis`/`pull` picked the "latest copy" of a thread by index-file iteration order when
   `lastActiveAt`, `messageCount` and head uuid all tied — which is exactly what a
   successful append produces. The tiebreak is now total and deterministic (final key:

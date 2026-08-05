@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome, overridePath } from "./helpers/env.js";
+import { copyTreeSync } from "./helpers/copy-tree.js";
 import { readBytesLf, readTextLf } from "./helpers/eol.js";
 import { applyCarry, captureCarry, CARRY_MAX_BYTES, type CarryMeta } from "../src/hub/carry.js";
 
@@ -50,7 +51,9 @@ function writeHubRules(repo: string, file: "hubinclude" | "hubignore", body: str
 /** A clean clone-ish copy of `repo` at the same HEAD, for `git apply` round-trips. */
 function cleanTwin(repo: string): string {
   const twin = mkdtempSync(join(tmpdir(), "sesh-twin-"));
-  cpSync(repo, twin, { recursive: true });
+  // copyTreeSync, not cpSync: see its doc — cpSync of a git repo threw a
+  // destination-side ENOENT on macOS CI from inside its C++ walk.
+  copyTreeSync(repo, twin);
   git(twin, ["reset", "-q", "--hard", "HEAD"]);
   git(twin, ["clean", "-qfdx"]);
   return twin;
