@@ -12,8 +12,11 @@ import { hubPush } from "../src/hub/push.js";
 import { hubPull, selectNeededBundles, selectThreadBase, type HubPullOptions } from "../src/hub/pull.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
-import { readAllIndexes } from "../src/hub/index-file.js";
+import { readAllIndexes, writeMachineIndex } from "../src/hub/index-file.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
+import { machinePath } from "../src/hub/layout.js";
+import { loadOrCreateMachineId } from "../src/machine.js";
+import { idx, entry, bundle } from "./helpers/hub-fixtures.js";
 import { createArchive, extractArchive } from "../src/archiver.js";
 import { importSession } from "../src/importer.js";
 import { readSyncState, writeSyncState, getThreadId } from "../src/sync-state.js";
@@ -3343,6 +3346,228 @@ describe("hub pull — workspace 3-way merge", () => {
       for (const d of [homeA, homeB, hub, base, projectB]) {
         rmSync(d, { recursive: true, force: true });
       }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 12b: the disclosure for a thread whose bundles are split across two
+// OTHER machines. Hub state is written by hand here (rather than driven
+// through three real pushes) for one reason: which machine a pull resolves to
+// is decided by lastActiveAt/messageCount/head/machineId, and machine ids are
+// random uuids — a scenario that has to assert a specific SOURCE and a
+// specific unreachable machine must state both, not roll for them.
+// ---------------------------------------------------------------------------
+describe("hub pull: a thread split across two other machines", () => {
+  const MACHINE_A = "machine-alpha";
+  const MACHINE_B = "machine-beta";
+  const THREAD = "thread-split";
+  const PROJECT_ID = "proj-split";
+
+  interface SplitFixture {
+    home: string; hub: string; base: string; project: string; configDir: string;
+    backend: ReturnType<typeof createFsBackend>;
+    restore: { restore: () => void };
+  }
+
+  async function setupSplit(prefix: string, opts: { withB: boolean }): Promise<SplitFixture> {
+    const home = mkdtempSync(join(tmpdir(), `${prefix}-home-`));
+    const hub = mkdtempSync(join(tmpdir(), `${prefix}-hub-`));
+    const base = mkdtempSync(join(tmpdir(), `${prefix}-fix-`));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const project = createRealProject(base, configDir, "proj");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      writeLocalProjectId(project, {
+        projectId: PROJECT_ID, name: "proj",
+        createdAt: "2026-07-01T00:00:00Z", createdByMachine: MACHINE_A,
+      });
+
+      const backend = createFsBackend(hub);
+      for (const [id, name] of [[MACHINE_A, "alpha-laptop"], [MACHINE_B, "beta-desktop"]]) {
+        await backend.writeAtomic(
+          machinePath(id),
+          JSON.stringify({ id, name, platform: "linux", lastSeenAt: "2026-07-21T00:00:00Z" }) + "\n"
+        );
+      }
+      // A is the newest copy, so a pull resolves to A and fetches A's list.
+      await writeMachineIndex(backend, {
+        ...idx(MACHINE_A, {
+          [THREAD]: entry({
+            localSessionId: "sA-local", lastActiveAt: "2026-07-21T12:00:00Z", headEntryUuid: "head-a1",
+            bundles: [bundle({ bundleId: "a1", type: "full", sessionIdInBundle: "sA", headEntryUuid: "head-a1" })],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      if (opts.withB) {
+        // B pushed its own continuation of the same thread. Nothing in A's
+        // index mentions it — a machine only ever lists what IT pushed.
+        await writeMachineIndex(backend, {
+          ...idx(MACHINE_B, {
+            [THREAD]: entry({
+              localSessionId: "sB-local", lastActiveAt: "2026-07-21T09:00:00Z", headEntryUuid: "head-b1",
+              bundles: [bundle({ bundleId: "b1", sessionIdInBundle: "sB", headEntryUuid: "head-b1" })],
+            }),
+          }),
+          projectId: PROJECT_ID,
+        });
+      }
+
+      // This machine already holds A's half: the fixture session IS the local
+      // copy, and the peer bookkeeping says where it came from. That makes
+      // A's bundle "already received", which is what drives the pull into the
+      // "already up to date with the source machine" answer.
+      const st = readSyncState(project);
+      st.peers[MACHINE_A] = {
+        name: "alpha-laptop", lastSentAt: null, lastReceivedAt: "2026-07-21T12:30:00Z",
+        sent: {
+          [FIXTURE_SESSION_ID]: {
+            headEntryUuid: "head-a1", messageCount: 3, sentAsType: "full", sentAsSessionId: "sA",
+          },
+        },
+        received: {
+          sA: { localSessionId: FIXTURE_SESSION_ID, type: "full", importedAt: "2026-07-21T12:30:00Z" },
+        },
+      };
+      writeSyncState(st);
+
+      return { home, hub, base, project, configDir, backend, restore };
+    } catch (e) {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+      throw e;
+    }
+  }
+
+  function cleanupSplit(f: SplitFixture): void {
+    f.restore.restore();
+    for (const d of [f.home, f.hub, f.base]) rmSync(d, { recursive: true, force: true });
+  }
+
+  it('"already up to date" says WHICH machine holds the part it cannot fetch', async () => {
+    const f = await setupSplit("sesh-pull-split", { withB: true });
+    try {
+      const pull = await hubPull({
+        configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
+        threadId: THREAD, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      const err = "error" in pull ? pull.error : "";
+      const sug = "suggestion" in pull ? (pull.suggestion ?? "") : "";
+      // Still truthful about the source machine...
+      expect(err).toContain("Already up to date with the source machine");
+      // ...and no longer silent about the half of the thread that is not here.
+      expect(err).toContain("could not be pulled whole");
+      expect(err).toContain("beta-desktop");
+      expect(err).toContain("alpha-laptop"); // the machine it did resolve to
+      expect(err).toContain("split across machines");
+      // No invented remedy: this branch offers no flag and no re-run.
+      expect(`${err} ${sug}`).not.toMatch(/--[a-z]/);
+      expect(sug).toContain("nothing to re-run");
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  it("says nothing extra when only one other machine has ever pushed the thread", async () => {
+    // The false-positive control for the branch above: the SAME fixture with
+    // B's index absent must produce the original two-machine answer, verbatim.
+    const f = await setupSplit("sesh-pull-nosplit", { withB: false });
+    try {
+      const pull = await hubPull({
+        configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
+        threadId: THREAD, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      expect("error" in pull && pull.error).toBe("Already up to date with the source machine.");
+      expect("suggestion" in pull && pull.suggestion).toBe("Run whereis to confirm.");
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  it("says nothing when the other machine's bundle already arrived here", async () => {
+    // Three machines, but nothing is missing: this machine pulled B's bundle
+    // earlier. A disclosure here would fire on an ordinary synced project.
+    const f = await setupSplit("sesh-pull-split-synced", { withB: true });
+    try {
+      const st = readSyncState(f.project);
+      st.peers[MACHINE_B] = {
+        name: "beta-desktop", lastSentAt: null, lastReceivedAt: "2026-07-21T13:00:00Z",
+        sent: {
+          [FIXTURE_SESSION_ID]: {
+            headEntryUuid: "head-b1", messageCount: 5, sentAsType: "continuation", sentAsSessionId: "sB",
+          },
+        },
+        received: {
+          sB: { localSessionId: FIXTURE_SESSION_ID, type: "continuation", importedAt: "2026-07-21T13:00:00Z" },
+        },
+      };
+      writeSyncState(st);
+
+      const pull = await hubPull({
+        configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
+        threadId: THREAD, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      expect("error" in pull && pull.error).toBe("Already up to date with the source machine.");
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  it("whereis reports the same split, on a thread it also calls current", async () => {
+    const f = await setupSplit("sesh-pull-split-whereis", { withB: true });
+    try {
+      // This machine's own index publishes A's head — the shape that makes
+      // `current` true while half the conversation is on a machine no pull
+      // reads. The field is what stops that being reassuring.
+      const me = loadOrCreateMachineId();
+      await writeMachineIndex(f.backend, {
+        ...idx(me.id, {
+          [THREAD]: entry({
+            localSessionId: FIXTURE_SESSION_ID, lastActiveAt: "2026-07-21T11:00:00Z",
+            headEntryUuid: "head-a1", bundles: [],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+
+      const w = await hubWhereis({ configDir: f.configDir, projectPath: f.project, hubPath: f.hub });
+      expect(w.linked).toBe(true);
+      const t = w.threads.find((x) => x.threadId === THREAD)!;
+      expect(t.localCopy?.current).toBe(true);
+      expect(t.pullNeeded).toBe(false);
+      expect(t.unfetchableBundles).toEqual([
+        { machineId: MACHINE_B, machineName: "beta-desktop", bundleIds: ["b1"] },
+      ]);
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  it("whereis is silent on the ordinary two-machine project", async () => {
+    const f = await setupSplit("sesh-pull-nosplit-whereis", { withB: false });
+    try {
+      const me = loadOrCreateMachineId();
+      await writeMachineIndex(f.backend, {
+        ...idx(me.id, {
+          [THREAD]: entry({
+            localSessionId: FIXTURE_SESSION_ID, lastActiveAt: "2026-07-21T11:00:00Z",
+            headEntryUuid: "head-a1", bundles: [],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      const w = await hubWhereis({ configDir: f.configDir, projectPath: f.project, hubPath: f.hub });
+      expect(w.threads.every((t) => t.unfetchableBundles === undefined)).toBe(true);
+    } finally {
+      cleanupSplit(f);
     }
   });
 });

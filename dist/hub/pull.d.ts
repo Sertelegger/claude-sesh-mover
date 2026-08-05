@@ -1,5 +1,5 @@
 import { type HubBundleRecord } from "./layout.js";
-import type { ErrorResult, HubLockBusyResult, HubPullListResult, HubPullResult, HubUnlinkedResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubLockBusyResult, HubPullListResult, HubPullResult, HubUnlinkedResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent, UnfetchableBundleGroup } from "../types.js";
 export interface HubPullOptions {
     configDir: string;
     projectPath: string;
@@ -61,6 +61,20 @@ export interface ThreadBaseCandidate {
  *      directory iteration order.
  */
 export declare function selectThreadBase(candidates: ThreadBaseCandidate[], anchorUuid: string | null, preferred: string | null): string | null;
+/**
+ * The half of a thread this pull cannot reach, in words.
+ *
+ * Deliberately names NO remedy: there is no `--from-machine`, `--thread` and
+ * `--target-path` resolve to the same single source, and `hub reindex` only
+ * rebuilds this machine's index from its own bundles. Saying plainly that a
+ * thread split across machines cannot be assembled yet is honest; inventing a
+ * flag would put this in the milestone's own foreclosure class — a warning
+ * whose stated remedy silently does nothing.
+ *
+ * Machine names are capped at three so a hub with many machines still
+ * produces one readable sentence; the full set is in the typed field.
+ */
+export declare function describeUnfetchable(threadId: string, groups: UnfetchableBundleGroup[], sourceLabel: string): string;
 export declare function selectNeededBundles(bundles: HubBundleRecord[], received: Record<string, {
     localSessionId: string;
 }> | undefined, localSessionFileExists: (localSessionId: string) => boolean): HubBundleRecord[];

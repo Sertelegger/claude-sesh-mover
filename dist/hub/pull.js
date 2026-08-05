@@ -10,8 +10,8 @@ import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, linkToHubProject } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex, readAllIndexes } from "./index-file.js";
-import { resolveThreads } from "./threads.js";
-import { shapeThreads } from "./whereis.js";
+import { resolveThreads, findUnfetchableBundles } from "./threads.js";
+import { createMachineNameLookup, shapeThreads } from "./whereis.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
 import { mergeWorkspaceTrees } from "./merge.js";
 import { applyCarry } from "./carry.js";
@@ -25,7 +25,7 @@ import { countJsonlLines, findEntryOffsetByUuid, readLastConversationEntry, read
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
-import { readSyncState, writeSyncState, setThreadId, setLastWorkspace, recordSentToPeer, knownWorkspaceGenerations, } from "../sync-state.js";
+import { readSyncState, peekSyncState, writeSyncState, setThreadId, setLastWorkspace, recordSentToPeer, knownWorkspaceGenerations, } from "../sync-state.js";
 /**
  * Pick which of a thread's local sessions a continuation should splice onto.
  *
@@ -533,6 +533,32 @@ function describeCarryApply(result, meta, bundleFile) {
     }
     return out;
 }
+/**
+ * The half of a thread this pull cannot reach, in words.
+ *
+ * Deliberately names NO remedy: there is no `--from-machine`, `--thread` and
+ * `--target-path` resolve to the same single source, and `hub reindex` only
+ * rebuilds this machine's index from its own bundles. Saying plainly that a
+ * thread split across machines cannot be assembled yet is honest; inventing a
+ * flag would put this in the milestone's own foreclosure class — a warning
+ * whose stated remedy silently does nothing.
+ *
+ * Machine names are capped at three so a hub with many machines still
+ * produces one readable sentence; the full set is in the typed field.
+ */
+export function describeUnfetchable(threadId, groups, sourceLabel) {
+    const NAMED = 3;
+    const one = (g) => `${g.machineName ?? g.machineId} (${g.bundleIds.length} bundle${g.bundleIds.length === 1 ? "" : "s"})`;
+    const rest = groups.length - NAMED;
+    const list = groups.slice(0, NAMED).map(one).join(", ") +
+        (rest > 0 ? ` and ${rest} more machine${rest === 1 ? "" : "s"}` : "");
+    const hold = groups.length === 1 ? "holds bundles" : "hold bundles";
+    return (`Thread ${threadId} could not be pulled whole: ${list} ${hold} for it that ${sourceLabel} does not list, ` +
+        `and a pull only ever fetches the bundle list of the one machine it resolves to (${sourceLabel}). ` +
+        `The entries in those bundles are not on this machine, and no flag or re-run fetches them — ` +
+        `sesh-mover cannot yet assemble a thread whose history is split across machines. ` +
+        `Nothing is lost: every bundle is still on the hub.`);
+}
 // Last full bundle + everything after it, minus records already received AND
 // still present locally (mirrors the importer's own dedup verification: a
 // registry/peer record can outlive the file it points at, e.g. after a
@@ -619,7 +645,13 @@ export async function hubPull(opts) {
         warnings.push(...indexWarnings);
         const resolved = resolveThreads(indexes);
         if (!opts.threadId && !opts.latest) {
-            const threads = await shapeThreads(backend, resolved, machine.id);
+            // Same project path the real pull below keys its sync-state off, so the
+            // pick list's `unfetchableBundles` says exactly what pulling that thread
+            // would report. peekSyncState, not readSyncState: this branch returns
+            // without applying anything, and it is the only place in pull that reads
+            // sync-state without going on to write it — a corrupt file must not be
+            // renamed aside by a run that does nothing else.
+            const threads = await shapeThreads(backend, resolved, machine.id, peekSyncState(opts.targetPath ?? opts.projectPath));
             return { success: true, command: "pull", pickRequired: true, threads, warnings };
         }
         const isCurrent = (t) => {
@@ -665,7 +697,42 @@ export async function hubPull(opts) {
         const state = readSyncState(effectiveProjectPath);
         const received = state.peers[sourceCopy.machineId]?.received;
         const needed = selectNeededBundles(sourceCopy.bundles, received, (localSessionId) => existsSync(join(targetProjectDir, `${localSessionId}.jsonl`)));
+        // DISCLOSURE ONLY — see findUnfetchableBundles. It reads no timestamp, it
+        // merges nothing into the source's bundle list, and nothing below it
+        // changes what this pull fetches, applies, records, orders or resolves to.
+        // A pull that gets half a cross-machine thread still gets exactly the same
+        // half it got before; it just no longer does so in silence.
+        const unfetchableSets = findUnfetchableBundles({
+            copies: target.copies,
+            sourceMachineId: sourceCopy.machineId,
+            localMachineId: machine.id,
+            state,
+        });
+        let unfetchableBundles;
+        let unfetchableText;
+        if (unfetchableSets.length > 0) {
+            const machineName = createMachineNameLookup(backend);
+            unfetchableBundles = await Promise.all(unfetchableSets.map(async (u) => ({
+                machineId: u.machineId,
+                machineName: await machineName(u.machineId),
+                bundleIds: u.bundleIds,
+            })));
+            const sourceLabel = (await machineName(sourceCopy.machineId)) ?? sourceCopy.machineId;
+            unfetchableText = describeUnfetchable(target.threadId, unfetchableBundles, sourceLabel);
+            warnings.push(unfetchableText);
+        }
         if (needed.length === 0) {
+            if (unfetchableText) {
+                // The nag loop this defect produces: whereis says the thread needs
+                // pulling, the SessionStart notice repeats it, and every pull used to
+                // answer "already up to date" — true of the source machine, false of
+                // the thread. Say which.
+                return {
+                    success: false, command: "pull",
+                    error: `Already up to date with the source machine, but this thread is not whole here. ${unfetchableText}`,
+                    suggestion: "There is nothing to re-run: no flag pulls a thread whose bundles are split across machines. Run whereis — the same threads report it as unfetchableBundles.",
+                };
+            }
             return {
                 success: false, command: "pull",
                 error: "Already up to date with the source machine.",
@@ -1324,6 +1391,7 @@ export async function hubPull(opts) {
             carryApplied,
             appended: appended.length > 0 ? appended : undefined,
             divergence: lastDivergence,
+            unfetchableBundles,
             warnings,
         };
     }

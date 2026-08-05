@@ -1,13 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { overrideHome } from "./helpers/env.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
 import { indexPath, machinePath, projectJsonPath, type HubMachineJson, type HubProjectJson } from "../src/hub/layout.js";
 import { writeMachineIndex } from "../src/hub/index-file.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
+import { syncStatePath } from "../src/sync-state.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { idx, entry } from "./helpers/hub-fixtures.js";
 
@@ -194,6 +195,43 @@ describe("hub whereis", () => {
       expect(t.latest.machineId).toBe("../evil");
       expect(t.latest.machineName).toBeNull();
       expect(t.copies.find((c) => c.machineId === "../evil")!.machineName).toBeNull();
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, projectDir]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  // whereis is documented as a read-only view, and Task 12b gave it a reason
+  // to read this machine's sync-state (peer bookkeeping is what tells a
+  // genuinely missing half of a thread from one already held). readSyncState
+  // renames a corrupt file aside — a write — so this path must use the
+  // read-only reader. The SessionStart hook runs it too.
+  it("does not touch a corrupt sync-state file", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-whereis-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-whereis-hub-"));
+    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-proj-"));
+    const restore = overrideHome(home);
+    try {
+      const me = loadOrCreateMachineId();
+      writeLocalProjectId(projectDir, {
+        projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
+      });
+      const backend = createFsBackend(hub);
+      await writeMachineFile(backend, me.id, "my-laptop");
+      await writeMachineIndex(backend, {
+        ...idx(me.id, { t1: entry({ localSessionId: "sLocal" }) }),
+        projectId: PROJECT_ID,
+      });
+
+      const statePath = syncStatePath(projectDir);
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, "{not json", "utf-8");
+
+      const result = await hubWhereis({ configDir: home, projectPath: projectDir, hubPath: hub });
+      expect(result.linked).toBe(true);
+      expect(existsSync(statePath)).toBe(true);
+      expect(readFileSync(statePath, "utf-8")).toBe("{not json");
+      expect(readdirSync(dirname(statePath))).toHaveLength(1); // nothing renamed aside either
     } finally {
       restore.restore();
       for (const d of [home, hub, projectDir]) rmSync(d, { recursive: true, force: true });

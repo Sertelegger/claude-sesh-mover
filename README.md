@@ -117,6 +117,12 @@ On the other machine a carry is **never** applied on its own. `pull` reports it 
 
 Anything that stops the automatic path — a different commit, your own uncommitted work, no `--apply-carry` at all — parks the entire payload in `.claude-sesh-mover/carry-<timestamp>/` with a `README.md` explaining what happened, and the exact commands to finish by hand. Two cases withhold those commands on purpose and say so instead: a payload the floor refused, and a patch this machine's `git` could not parse. That is deliberate: a pull records its bundles as received, so re-running it never offers the same carry again, and the saved copy is the only remedy that actually works. Those directories are self-ignoring (they carry a `.gitignore` of `*`, so a peer's uncommitted work can never be committed here by accident) and only the most recent few are kept.
 
+### Three machines: a thread is pulled from one machine, not from the hub as a whole
+
+A pull resolves a thread to the machine holding its latest copy and fetches **that machine's** bundle list. Each machine's hub index lists only the bundles *it* pushed, so with two machines every bundle is either on the one being pulled from or already here. With three it may not be: a conversation started on A, continued on B and pulled back to A leaves half its bundles listed by A and half by B, and a pull on C reads one of those lists.
+
+sesh-mover cannot assemble that yet, so it says so instead of pretending otherwise: `pull` and `whereis` report the machines holding the part that could not be fetched (`unfetchableBundles`, plus a warning on `pull`), including on the "already up to date with the source machine" answer and on a thread `whereis` would otherwise call current. Nothing is lost — every bundle stays on the hub — but there is no flag that fetches them today. Cross-machine chain assembly is tracked in [ROADMAP.md](./ROADMAP.md).
+
 ### Same-machine lock
 
 Push and pull take an advisory lock per project while they run, so two hub operations for the *same project on the same machine* can't race each other and corrupt the hub's index. This is **not** a distributed lock — two different machines can (and normally do) push or pull concurrently; the hub's append-only bundle/index design is what keeps that safe, not the lock. If a command reports `reason: "lock-busy"`, wait a few seconds and retry once.

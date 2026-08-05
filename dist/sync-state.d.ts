@@ -1,6 +1,19 @@
 import type { SyncState, SyncStateSessionSent, WorkspaceGenerationRef } from "./types.js";
 export declare function syncStatePath(projectPath: string): string;
 export declare function readSyncState(projectPath: string): SyncState;
+/**
+ * Read-only twin of `readSyncState`: same file, same parse, but it NEVER
+ * writes — a corrupt file is left exactly where it is and reads as the default
+ * state.
+ *
+ * For commands that are read-only by contract. `whereis` is the caller this
+ * exists for: it needs this machine's peer bookkeeping to tell a genuinely
+ * missing half of a thread from one it already holds, and `readSyncState`
+ * renames a corrupt file aside as a side effect — a write, in a command
+ * documented as never changing anything, on a path the SessionStart hook also
+ * runs.
+ */
+export declare function peekSyncState(projectPath: string): SyncState;
 export declare function writeSyncState(state: SyncState): void;
 export declare function recordSentFromBundle(projectPath: string, peer: {
     id: string;

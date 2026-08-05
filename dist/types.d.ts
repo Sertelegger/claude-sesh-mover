@@ -354,6 +354,24 @@ export interface HubPushResult {
      */
     carry?: CarryMeta;
 }
+/**
+ * One machine's bundles for a thread that a pull resolving to some OTHER
+ * machine cannot fetch — the reported shape of `findUnfetchableBundles`
+ * (hub/threads.ts), with the hub's display name for the machine attached.
+ *
+ * Its presence means part of a thread's history is on a machine this pull did
+ * not read the bundle list of, and no flag reaches it: a pull fetches exactly
+ * one machine's list, and each machine's index lists only its own pushes.
+ * Callers must report that plainly and must NOT offer a flag or a re-run —
+ * there is none, and a warning whose stated remedy silently does nothing is
+ * this milestone's own defect class.
+ */
+export interface UnfetchableBundleGroup {
+    machineId: string;
+    /** null when the hub has no readable `machines/<id>.json` record. */
+    machineName: string | null;
+    bundleIds: string[];
+}
 export interface WhereisThread {
     threadId: string;
     slug: string;
@@ -378,6 +396,17 @@ export interface WhereisThread {
         current: boolean;
     } | null;
     pullNeeded: boolean;
+    /**
+     * Set when at least one machine other than this one and the latest copy's
+     * lists bundles for this thread that a pull cannot fetch. Absent on every
+     * ordinary thread.
+     *
+     * Read it BEFORE `localCopy.current` and `pullNeeded`: when it is present,
+     * both of those describe only the half of the thread this machine can see.
+     * `current: true` alongside it means "level with the copy a pull would
+     * resolve to", NOT "holds the whole conversation".
+     */
+    unfetchableBundles?: UnfetchableBundleGroup[];
 }
 export interface WhereisResult {
     success: true;
@@ -478,6 +507,19 @@ export interface HubPullResult {
         entriesAppended: number;
     }>;
     divergence?: HubPullDivergence;
+    /**
+     * Bundles for this thread that this pull could not fetch because they are
+     * listed only by a machine other than the one it resolved to. Absent on
+     * every ordinary pull — see `UnfetchableBundleGroup` and, for the reasoning,
+     * `findUnfetchableBundles` in hub/threads.ts.
+     *
+     * A field rather than warning prose because the skill layer has to branch on
+     * it: everything else this result reports (`importedSessions`, `appended`,
+     * an empty `warnings`) describes a pull that succeeded, and it did — it just
+     * did not deliver the whole thread. Warning text is not an interface (see
+     * `commands/pull.md`).
+     */
+    unfetchableBundles?: UnfetchableBundleGroup[];
     warnings: string[];
 }
 export interface HubPullDivergence {

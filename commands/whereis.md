@@ -20,7 +20,7 @@ You are running the sesh-mover whereis command. This is a read-only view — it 
    - **Thread** — `slug`
    - **Machines** — the distinct machine names across `copies` (fall back to machine id if `machineName` is null)
    - **Latest** — `latest.machineName` (or id) and `latest.lastActiveAt`
-   - **Current here?** — "yes" if `localCopy` is non-null and `localCopy.current` is true; "stale" if `localCopy` is non-null but `current` is false; "no local copy" if `localCopy` is null
+   - **Current here?** — "yes" if `localCopy` is non-null and `localCopy.current` is true; "stale" if `localCopy` is non-null but `current` is false; "no local copy" if `localCopy` is null — **unless `unfetchableBundles` is present on that thread** (see step 5b), in which case render it as "partial" instead: `current` there means "level with the copy a pull would resolve to", not "holds the whole conversation"
 
    Example:
    ```
@@ -29,7 +29,9 @@ You are running the sesh-mover whereis command. This is a read-only view — it 
    design-review        laptop             laptop @ 2026-07-19T09:11:00Z  yes
    ```
 
-5. For any thread with `pullNeeded: true`, mention that `/sesh-mover:pull` (with that thread's slug/id) would bring it up to date on this machine.
+5. For any thread with `pullNeeded: true`, mention that `/sesh-mover:pull` (with that thread's slug/id) would bring it up to date on this machine — except where step 5b applies, which limits what "up to date" can mean.
+
+5b. For any thread with a non-empty `unfetchableBundles` (a result field — branch on it, not on wording): its history is split across machines. A pull fetches the bundle list of exactly **one** machine and each machine's index lists only the bundles *it* pushed, so the machines named in that field hold parts of this conversation that no pull can bring here. Name them (`machineName`, falling back to `machineId`) and say that pulling this thread — whether it was already pulled or not — cannot deliver it whole, that nothing is lost because every bundle is still on the hub, and that assembling a split thread is a later release. **Offer no flag and no re-run; there is none.** Say this even when the thread reads as "current" or `pullNeeded: false` — that is exactly the case where the rest of the row is reassuring and wrong.
 
 6. Report any `warnings` from the result (e.g. a machine whose index file couldn't be read).
 

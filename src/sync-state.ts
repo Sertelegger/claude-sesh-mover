@@ -31,15 +31,10 @@ function defaultState(projectPath: string): SyncState {
   };
 }
 
-export function readSyncState(projectPath: string): SyncState {
-  const p = syncStatePath(projectPath);
-  if (!existsSync(p)) return defaultState(projectPath);
-  let raw: string;
-  try {
-    raw = readFileSync(p, "utf-8");
-  } catch {
-    return defaultState(projectPath);
-  }
+// `null` means "not usable as sync state" — the caller decides what that
+// costs. Extracted so the read-only reader below can share EXACTLY this
+// parse without also inheriting the rename-aside that follows a failure.
+function parseSyncState(raw: string): SyncState | null {
   try {
     const parsed = JSON.parse(raw) as SyncState;
     if (
@@ -49,7 +44,7 @@ export function readSyncState(projectPath: string): SyncState {
       parsed.lineage === null ||
       typeof parsed.lineage !== "object"
     ) {
-      throw new Error("schema mismatch");
+      return null;
     }
     parsed.imported = parsed.imported ?? {};
     for (const entry of Object.values(parsed.imported)) {
@@ -57,12 +52,48 @@ export function readSyncState(projectPath: string): SyncState {
     }
     return parsed;
   } catch {
-    const aside = `${p}.corrupt.${Date.now()}`;
-    try {
-      renameSync(p, aside);
-    } catch {
-      /* best effort */
-    }
+    return null;
+  }
+}
+
+export function readSyncState(projectPath: string): SyncState {
+  const p = syncStatePath(projectPath);
+  if (!existsSync(p)) return defaultState(projectPath);
+  let raw: string;
+  try {
+    raw = readFileSync(p, "utf-8");
+  } catch {
+    return defaultState(projectPath);
+  }
+  const parsed = parseSyncState(raw);
+  if (parsed) return parsed;
+  const aside = `${p}.corrupt.${Date.now()}`;
+  try {
+    renameSync(p, aside);
+  } catch {
+    /* best effort */
+  }
+  return defaultState(projectPath);
+}
+
+/**
+ * Read-only twin of `readSyncState`: same file, same parse, but it NEVER
+ * writes — a corrupt file is left exactly where it is and reads as the default
+ * state.
+ *
+ * For commands that are read-only by contract. `whereis` is the caller this
+ * exists for: it needs this machine's peer bookkeeping to tell a genuinely
+ * missing half of a thread from one it already holds, and `readSyncState`
+ * renames a corrupt file aside as a side effect — a write, in a command
+ * documented as never changing anything, on a path the SessionStart hook also
+ * runs.
+ */
+export function peekSyncState(projectPath: string): SyncState {
+  const p = syncStatePath(projectPath);
+  if (!existsSync(p)) return defaultState(projectPath);
+  try {
+    return parseSyncState(readFileSync(p, "utf-8")) ?? defaultState(projectPath);
+  } catch {
     return defaultState(projectPath);
   }
 }

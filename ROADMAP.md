@@ -36,9 +36,13 @@ tooling on either machine and already satisfies the sync/network-share requireme
 - **Slice 2 — automation.** An optional `SessionEnd` hook that auto-pushes so the hub
   index stays current without a manual `/sesh-mover:push`; carrying a git-diff summary
   alongside a push so `whereis`/`pull` can show what changed, not just when.
-- **Slice 3 — encryption at rest + compaction.** Age/gpg encryption of bundles in the hub
-  (closing the plaintext-at-rest gap called out in Slice 1's security notes); compaction
-  of superseded bundles so a long-lived hub directory doesn't grow unbounded.
+- **Slice 3 — cross-machine chain assembly + encryption at rest + compaction.** Assembling
+  a thread whose bundles are split across several machines' indexes by walking the
+  `fromEntryUuid`/`headEntryUuid` links, so a third machine can pull it whole (today a pull
+  reads one machine's bundle list and discloses what it could not fetch — see "Three
+  machines" in the README); age/gpg encryption of bundles in the hub (closing the
+  plaintext-at-rest gap called out in Slice 1's security notes); compaction of superseded
+  bundles so a long-lived hub directory doesn't grow unbounded.
 - **Slice 4 — web service + UI.** A hosted alternative to the filesystem backend (own
   design pass — auth, multi-user access control, and a browsable UI are all out of scope
   for the dumb-storage model above and need dedicated design work).

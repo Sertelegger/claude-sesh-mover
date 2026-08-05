@@ -980,4 +980,139 @@ describe("hub keystone: multi-machine round trip", () => {
       for (const d of [hub, homeA, homeB, baseA, cloneRoot]) rmSync(d, { recursive: true, force: true });
     }
   });
+
+  // Task 12b, and the artifact Critical 3 never had: a thread whose history
+  // spans TWO machines cannot be pulled whole by a THIRD, because each index
+  // lists only the bundles its own machine pushed and a pull fetches exactly
+  // one machine's list. This test asserts the DISCLOSURE — that the pull says
+  // which machine holds the part it could not fetch — and, in the same
+  // fixture, that the ordinary two-machine round trip stays completely silent.
+  // It does not assert the truncation as a desired outcome; assembling such a
+  // chain is a later slice.
+  it("three machines: the half a pull cannot fetch is disclosed, and the two-machine flow stays silent", async () => {
+    const f = await setupThroughAppendPush("sesh-keystone-split");
+    const homeC = mkdtempSync(join(tmpdir(), "sesh-keystone-split-homeC-"));
+    const projectC = mkdtempSync(join(tmpdir(), "sesh-keystone-split-projC-"));
+    try {
+      // Phase 4 (A): the ordinary round trip — A pulls B's continuation back
+      // into its own session. FALSE-POSITIVE CONTROL: with only two machines
+      // on the hub, neither the pull nor whereis may say a word about split
+      // history, because there is none.
+      f.restore.restore();
+      const restoreA = overrideHome(f.homeA);
+      try {
+        const localA = f.pushA.pushedSessions[0].sessionId;
+        ageOutOfLiveWindow(sessionFilePath(f.configDirA, f.projectA, localA));
+        const pullA = await hubPull({
+          configDir: f.configDirA, projectPath: f.projectA, hubPath: f.hub,
+          latest: true, claudeVersion: CLAUDE_VERSION,
+        });
+        expect(pullA.success).toBe(true);
+        if (!pullA.success) return;
+        expect((pullA as HubPullResult).appended ?? []).toHaveLength(1); // the splice really happened
+        expect((pullA as HubPullResult).unfetchableBundles).toBeUndefined();
+
+        const whereisA = await hubWhereis({
+          configDir: f.configDirA, projectPath: f.projectA, hubPath: f.hub,
+        });
+        expect(whereisA.threads).toHaveLength(1);
+        expect(whereisA.threads[0].unfetchableBundles).toBeUndefined();
+      } finally {
+        restoreA.restore();
+      }
+
+      const restoreB = overrideHome(f.homeB);
+      try {
+        const whereisB = await hubWhereis({
+          configDir: f.configDirB, projectPath: f.projectB, hubPath: f.hub,
+        });
+        expect(whereisB.threads).toHaveLength(1);
+        expect(whereisB.threads[0].unfetchableBundles).toBeUndefined();
+      } finally {
+        restoreB.restore();
+      }
+
+      // Phase 5 (C): a third machine joins and pulls the same thread. The two
+      // bundles that make up this conversation sit in two different machines'
+      // index files; this pull reads one of them.
+      const restoreC = overrideHome(homeC);
+      try {
+        const configDirC = join(homeC, ".claude");
+        const initC = await hubInit({ hubPath: f.hub, configScope: "user", cwd: homeC });
+        expect(initC.success).toBe(true);
+        setMachineName("keystone-machine-c");
+        writeLocalProjectId(projectC, {
+          projectId: f.pushA.projectId, name: "proj",
+          createdAt: new Date().toISOString(), createdByMachine: f.machineIdA,
+        });
+
+        const pullC = await hubPull({
+          configDir: configDirC, projectPath: projectC, hubPath: f.hub,
+          latest: true, claudeVersion: CLAUDE_VERSION,
+        });
+        expect(pullC.success).toBe(true);
+        if (!pullC.success) return;
+        const pC = pullC as HubPullResult;
+
+        // Which machine this pull resolves to is a deterministic function of
+        // the two copies (threads.ts), but it is not this test's subject — the
+        // disclosure has to be right EITHER way, so the expectation is derived
+        // from the result rather than assumed.
+        const backend = createFsBackend(f.hub);
+        const { indexes } = await readAllIndexes(backend, f.pushA.projectId);
+        const bundlesOf = (machineId: string) =>
+          Object.values(indexes.find((i) => i.machineId === machineId)?.threads ?? {})
+            .flatMap((t) => t.bundles);
+        const otherId = pC.sourceMachineId === f.machineIdA ? f.machineIdB : f.machineIdA;
+        const otherName = otherId === f.machineIdB ? f.machineNameB : "keystone-machine-a";
+        const unfetched = bundlesOf(otherId);
+        expect(unfetched.length).toBeGreaterThan(0);
+
+        // The typed field: which machine, and exactly which bundles.
+        expect(pC.unfetchableBundles).toEqual([
+          {
+            machineId: otherId,
+            machineName: otherName,
+            bundleIds: unfetched.map((b) => b.bundleId),
+          },
+        ]);
+
+        // The warning: what is missing, who has it, and NO remedy — there is
+        // no --from-machine, --thread resolves to the same source, and hub
+        // reindex only rebuilds this machine's index from its own bundles.
+        const disclosure = pC.warnings.find((w) => w.includes("could not be pulled whole"));
+        expect(disclosure).toBeDefined();
+        expect(disclosure!).toContain(otherName);
+        expect(disclosure!).toContain("split across machines");
+        expect(disclosure!).toContain("still on the hub");
+        expect(disclosure!).not.toMatch(/--[a-z]/); // no flag is named, because none exists
+        expect(disclosure!).toContain("no flag or re-run fetches them"); // it forecloses instead
+
+        // ...and it is not decorative: the entries in the bundle it names are
+        // genuinely absent from every transcript this pull produced.
+        const projectDirC = join(configDirC, "projects", encodeProjectPath(projectC));
+        const uuidsOnC = new Set(
+          jsonlFiles(projectDirC).flatMap((n) =>
+            readEntries(join(projectDirC, n)).map((e) => e.uuid as string)
+          )
+        );
+        for (const b of unfetched) expect(uuidsOnC.has(b.headEntryUuid)).toBe(false);
+
+        // whereis on C repeats the same signal, per thread — this is the view
+        // that otherwise reports the thread as "current" on a machine holding
+        // half of it.
+        const whereisC = await hubWhereis({
+          configDir: configDirC, projectPath: projectC, hubPath: f.hub,
+        });
+        const tC = whereisC.threads.find((t) => t.threadId === pC.threadId);
+        expect(tC?.unfetchableBundles).toEqual(pC.unfetchableBundles);
+      } finally {
+        restoreC.restore();
+      }
+    } finally {
+      rmSync(homeC, { recursive: true, force: true });
+      rmSync(projectC, { recursive: true, force: true });
+      cleanup(f);
+    }
+  });
 });

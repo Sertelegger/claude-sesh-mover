@@ -127,6 +127,36 @@ describe("sync-state", () => {
     expect(renamed).toBe(true);
   });
 
+  it("peekSyncState reads the same state but never writes, whatever the file holds", async () => {
+    const { peekSyncState, readSyncState, writeSyncState, syncStatePath } = await import(
+      "../src/sync-state.js"
+    );
+    const project = "/Users/sascha/Projects/foo";
+    const p = syncStatePath(project);
+
+    // A real file reads identically through both readers.
+    const state = readSyncState(project);
+    state.peers["m1"] = {
+      name: "m1", lastSentAt: null, lastReceivedAt: null, sent: {},
+      received: { s1: { localSessionId: "local-1", type: "full", importedAt: "t" } },
+    };
+    writeSyncState(state);
+    expect(peekSyncState(project)).toEqual(readSyncState(project));
+
+    // A corrupt one degrades to the default state and is LEFT ALONE — the
+    // whole reason this reader exists. `whereis` is documented as read-only
+    // and the SessionStart hook runs the same path; readSyncState renames a
+    // corrupt file aside, which is a write.
+    writeFileSync(p, "{not json", "utf-8");
+    const before = readFileSync(p, "utf-8");
+    expect(peekSyncState(project).peers).toEqual({});
+    expect(existsSync(p)).toBe(true);
+    expect(readFileSync(p, "utf-8")).toBe(before);
+    // Negative control: the writing reader does move it.
+    readSyncState(project);
+    expect(existsSync(p)).toBe(false);
+  });
+
   it("recordSentFromBundle records head uuids from the bundle snapshot, not the live file", async () => {
     const { recordSentFromBundle, readSyncState } = await import("../src/sync-state.js");
     const { writeManifest } = await import("../src/manifest.js");
