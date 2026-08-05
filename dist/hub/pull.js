@@ -753,6 +753,13 @@ export async function hubPull(opts) {
         let workspaceUnpacked = null;
         let workspaceMerge;
         let workspaceRefused;
+        // Set when a manifest declares a workspace payload the bundle does not
+        // contain (see the guard below). A FIELD, not just the warning, because it
+        // is field-indistinguishable from the routine no-ancestor skip otherwise —
+        // same null workspaceUnpacked, same absent workspaceMerge — and the two
+        // want opposite advice (that skip's remedies cannot deliver a payload that
+        // was never in the bundle).
+        let workspaceDeclaredMissing;
         // Which bundle in this chain carries the workspace generation to apply:
         // the NEWEST one that has a payload, not needed[0].
         //
@@ -903,6 +910,7 @@ export async function hubPull(opts) {
             // exists to close. No sesh-mover produces that, but the sentence below
             // claims to cover a hand-made bundle, so the check has to mean it.
             if (workspaceDeclared && !isReadableDir(incomingDir)) {
+                workspaceDeclaredMissing = true;
                 warnings.push("The bundle's manifest declares a workspace payload but the bundle does not contain one, so there was nothing to apply and this project's files were left untouched. It was written by an older sesh-mover whose snapshot carried no files, damaged in transit, or not produced by sesh-mover at all.");
             }
             else if (workspaceDeclared) {
@@ -1387,6 +1395,7 @@ export async function hubPull(opts) {
             workspaceUnpacked,
             workspaceMerge,
             workspaceRefused,
+            workspaceDeclaredMissing,
             carryAvailable,
             carryApplied,
             appended: appended.length > 0 ? appended : undefined,

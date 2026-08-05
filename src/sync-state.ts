@@ -159,6 +159,16 @@ export function recordSentFromBundle(
 // whole session as "full" instead of recognizing later edits as a
 // continuation (hub/push.ts's incremental diff only consults
 // state.peers[hubPeerId]?.sent).
+//
+// INVARIANT — hub mediation: this credits a peer's "already has it" ledger for
+// content that arrived FROM that peer. Its only caller is hub pull, where the
+// content demonstrably just came from the hub, so the credit is always true by
+// construction.
+//
+// Any future transfer path that moves sessions BETWEEN machines without going
+// through the hub must NOT credit the hub ledger here. Doing so would make the
+// next push ship only a delta, leaving a continuation chain on the hub with no
+// base bundle to anchor it — an unreconstructable thread for any third machine.
 export function recordSentToPeer(
   projectPath: string,
   peer: { id: string; name?: string },

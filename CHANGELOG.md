@@ -2,6 +2,161 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.6.0] — 2026-08-04
+
+The Hub, Slice 2: the hub keeps itself current, and a pulled continuation lands *in* the
+session it continues instead of beside it.
+
+### Read this before upgrading
+
+Two items change behavior for existing hub users with no action on their part.
+
+- **A linked project starts pushing by itself.** This release registers a `SessionEnd`
+  hook, and **linking a project to a hub project is the consent gate** — so a project you
+  linked under 0.5.x is auto-pushed at the end of your next Claude Code session, with
+  nothing further to enable. For a project **with a git remote** that push also carries
+  your *uncommitted* work (a `git diff HEAD` patch plus untracked, non-gitignored files),
+  because `hub.carryDiff` defaults to on: the payload is your working tree, not just
+  transcripts. The hook takes no flags, so config is the only opt-out —
+  `sesh-mover configure --set hub.autoPush=false`, `… hub.carryDiff=false`,
+  `… hub.noWorkspace=true`, `… hub.startupNotice=false` (add `--scope project` to limit any
+  of them to one project). Nothing happens at all for a project that was never linked, or
+  on a machine with no hub configured.
+- **Workspace bundles already on your hub can be unpullable, and this release fixes
+  them** — every sesh-mover that has ever written one (0.5.0, 0.5.1) could produce this.
+  When a workspace snapshot happened to contain no files (an empty
+  project directory, a `hubignore` broad enough to drop the whole tree, or a project whose
+  only content was the `project.json` that linking had just planted), `push` still wrote a
+  manifest declaring a workspace payload the bundle did not contain. Pulling such a bundle
+  **crashed, terminally**: the crash happened inside the bundle loop *before* the session
+  import, so no session arrived, nothing was recorded as received, every retry failed
+  identically, and no flag skipped the workspace step — the thread was permanently
+  unpullable. 0.6.0 stops producing that bundle **and** degrades to a warning when it meets
+  one already sitting on a hub, so a thread stranded by an older version becomes pullable
+  again by upgrading the machine that pulls.
+
+### Added
+- **Hub automation** (`hooks/hooks.json`, two internal CLI endpoints). `SessionEnd` →
+  auto-push, run detached so it never delays session exit; `SessionStart` (on `startup`
+  and `resume`) → a one-line notice when another machine holds newer work for this project,
+  bounded at 10s so an unreachable hub can't stall a session opening. Both default on, both
+  inert until a hub is configured *and* the project is linked. Opt out with
+  `hub.autoPush` / `hub.startupNotice`.
+- **Append-to-base on pull.** A continuation for a session this machine already has is
+  spliced onto the end of that transcript (`appended`), so a two-machine round trip leaves
+  one resumable session instead of a chain of fragments. Guards: the entry chain must line
+  up, the local file must not have been written in the last 5 minutes, and the bundle must
+  pass its integrity hash. `--force-append` overrides the liveness guard only;
+  `--no-append` / `hub.pullAppend=false` disables the path.
+- **Divergence resolution** (`--on-divergence fragment|adopt-hub|skip`, `hub.onDivergence`)
+  for the case where both machines continued a thread from the same point: keep both,
+  adopt the hub's branch while preserving your own **in full** as a new registered session,
+  or apply and record nothing so the choice can be made later. `/sesh-mover:pull` always
+  asks before applying anything.
+- **3-way workspace merge** for projects with no git remote. An incoming snapshot is merged
+  against a generation both trees are known to have held (matched by bundle id, never by a
+  timestamp) rather than skipped or overwritten: unmergeable files keep the local copy with
+  the incoming one parked as `<name>.theirs-<ts>`, conflicts get real conflict markers, and
+  the merge never deletes. Reported as `workspaceMerge`.
+- **Carried uncommitted work for git projects.** `push` bundles a `git diff HEAD` patch
+  (binary-safe) plus untracked, non-gitignored files; `pull` never applies it on its own —
+  `--apply-carry` plus a clean tree at the exact base commit, no merge/rebase in progress,
+  and `git apply --check` clean. Any decline parks the whole payload in
+  `.claude-sesh-mover/carry-<ts>/` with a README of the manual steps. `--no-carry` /
+  `hub.carryDiff=false` turns it off.
+- **`.claude-sesh-mover/hubinclude`** — the opposite of `hubignore`. Paths listed there are
+  carried even when `hubignore`, the built-in excludes, or `.gitignore` would drop them,
+  for **both** payload builders (workspace snapshot and git carry). Meant to be committed,
+  so one line fixes every clone. `.git` and `.claude-sesh-mover` can never be re-included.
+  Until the file exists, `push` reports a capped sample of the gitignored paths it left
+  behind (`ignoredNotCarried`) and `/sesh-mover:push` offers to create it from them.
+- New flags: `--force-append`, `--no-append`, `--on-divergence <mode>`, `--apply-carry`
+  (pull); `--no-carry` (push).
+- New config keys: `hub.autoPush`, `hub.startupNotice`, `hub.pullAppend`,
+  `hub.onDivergence`, `hub.carryDiff`.
+- New result fields — `pull`: `appended`, `divergence`, `workspaceMerge`,
+  `workspaceRefused`, `workspaceDeclaredMissing`, `carryAvailable`, `carryApplied`,
+  `unfetchableBundles`; `push`: `carry`, `ignoredNotCarried`; `whereis`:
+  `unfetchableBundles` per thread. Every one of them is a typed field precisely so the
+  slash commands branch on results rather than on warning wording.
+- Library: `hub/append`, `hub/merge`, `hub/carry` and `hub/hooks` are re-exported from the
+  package barrel (`src/index.ts`).
+
+### Changed
+- A pulled continuation now **appends** to the local session it continues when the chain
+  matches; the separate "continuation session" fragment is the documented fallback, not the
+  norm. Sessions that were appended are reported in `appended` and are **not** in
+  `importedSessions`.
+- A workspace payload applied to a non-empty directory now **merges** when a shared
+  generation is known, instead of being skipped. `--force-workspace` keeps exactly one
+  meaning — "overwrite, don't combine" — and now overrides the merge too.
+- Session head/metadata derivation no longer reads the literal first or last line of a
+  transcript. Claude Code brackets a transcript with uuid-less bookkeeping entries; on real
+  transcripts ~31% of line boundaries have one. In 0.5.x that made `whereis`'s
+  "which machine has the latest copy" tiebreak compare missing values, and project-path
+  recovery fall back to the lossy encoded directory name. Left unfixed it would also have
+  defeated this release's headline feature — a wrong head reads as a chain mismatch, which
+  0.6.0 classifies as divergence, so `pull` would have reported forks that had not happened
+  and offered `--on-divergence adopt-hub`, the one destructive answer, as the remedy.
+- Sync-state's `hub` block gains `workspaceGenerations` (bounded history of the snapshot
+  generations this tree passed through) alongside `lastWorkspace`. Additive; still
+  `schemaVersion: 2`.
+
+### Fixed
+- `whereis`/`pull` picked the "latest copy" of a thread by index-file iteration order when
+  `lastActiveAt`, `messageCount` and head uuid all tied — which is exactly what a
+  successful append produces. The tiebreak is now total and deterministic (final key:
+  machine id).
+- Workspace snapshots skipped `.git` case-sensitively, so on a case-insensitive filesystem
+  (macOS, Windows) a directory named `.GIT` was copied into the bundle and uploaded to the
+  hub — a git store, in plaintext, in every push of that project.
+- Unpacking a workspace payload (`--force-workspace`) refused nothing: a bundle carrying
+  `workspace/.claude-sesh-mover/…` could plant the project-scope `config.json` that decides
+  where this machine's hub is, or the `hubinclude` that decides what its next push uploads.
+  Both names are now refused on every apply path (`workspaceRefused`).
+- Unpacking a workspace payload wrote **through** a symlink in the target tree, landing a
+  file outside the project entirely. Both apply paths now share one destination classifier.
+- `push` no longer records a workspace generation for a snapshot it did not send
+  (over-budget or skipped) — a recorded-but-unapplied generation makes the next merge read
+  the whole tree as deleted.
+
+### Known limitation
+- **A thread whose history spans two machines cannot be pulled whole by a third**
+  ([#35](https://github.com/Sertelegger/claude-sesh-mover/issues/35)). A pull fetches the
+  bundle list of exactly one machine, and each machine's index lists only the bundles it
+  pushed. **v0.6.0 ships a disclosure, not a fix:** `pull` and `whereis` now report the
+  machines holding the part that could not be fetched (`unfetchableBundles`, plus a warning
+  on `pull`), and there is **no flag that fetches them** — `--from-machine` does not exist,
+  `--thread`/`--target-path` resolve to the same source, and `hub reindex` only rebuilds
+  this machine's index from its own bundles. Nothing is lost (every bundle stays on the
+  hub) and two machines are unaffected; on a third, the conversation arrives in halves and
+  the session-start notice will keep flagging that thread as behind. Chain assembly is the
+  next slice.
+
+### Security / consent
+- **Linking a project is the consent gate for the automation.** Both hooks default on and
+  both are inert until a hub is configured *and* the project is linked. See "Read this
+  before upgrading" for the opt-out keys.
+- **The carry's safety rules cover the untracked half only — say it that way.** Among
+  *untracked* files, a gitignored one is never carried unless `hubinclude` names it, and
+  symlinks, `.git`, `.claude-sesh-mover`, `hubignore` matches and the built-in excludes are
+  all dropped. **None of that filters the patch:** `git diff HEAD` describes every *tracked*
+  file that changed, so a file that is gitignored *and* tracked (committed once, gitignored
+  later, never `git rm --cached`; or `git add -f`) travels in full. `push` names that set
+  back in `carry.trackedIgnored` and in a warning — the remedy there is `git rm --cached`
+  or `--no-carry`, never a `hubinclude`/`hubignore` line.
+- `.git` and `.claude-sesh-mover` are refused on every apply path — workspace unpack,
+  workspace merge, and the carry patch (a bundle must never be able to plant the
+  `config.json` that says where your hub is, or the `hubinclude` that decides what your
+  next push uploads). A carry payload naming either, or creating a symlink, is refused
+  whole rather than partly applied.
+- The hub directory's threat model is unchanged and still **"a folder only machines you own
+  can write"**: sessions remain plaintext at rest, applying a payload writes ordinary
+  project files ([#36](https://github.com/Sertelegger/claude-sesh-mover/issues/36)), and
+  the merge ancestor is verified on our side but self-reported by the peer
+  ([#37](https://github.com/Sertelegger/claude-sesh-mover/issues/37)). Both are gates on
+  any future hosted backend.
+
 ## [0.5.1] — 2026-07-28
 
 ### Fixed

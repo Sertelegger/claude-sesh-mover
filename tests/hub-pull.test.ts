@@ -812,6 +812,10 @@ describe("hub pull", () => {
       expect(p.importedSessions).toHaveLength(1);
       expect(p.warnings.join(" ")).toContain("--force-workspace");
       expect(p.warnings.join(" ")).toContain("--target-path"); // names the fresh-dir recovery too
+      // The other branch that leaves both workspace fields empty is "the
+      // manifest declared a payload the bundle does not hold" — this is not it,
+      // and only the typed field tells the two apart.
+      expect(p.workspaceDeclaredMissing).toBeUndefined();
       // The bundle's workspace payload (README.md from projA) was NOT written.
       expect(existsSync(join(projectB, "README.md"))).toBe(false);
       expect(readFileSync(join(projectB, "local-work.txt"), "utf-8")).toBe("mine\n");
@@ -3336,6 +3340,11 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(p.importedSessions).toHaveLength(1);
       expect(p.workspaceUnpacked).toBeNull();
       expect(p.warnings.join(" ")).toMatch(/does not contain/i);
+      // The typed discriminator: field-identical to the routine no-ancestor
+      // skip otherwise (null workspaceUnpacked, absent workspaceMerge), and
+      // that skip's remedies cannot deliver a payload the bundle never held.
+      expect(p.workspaceDeclaredMissing).toBe(true);
+      expect(p.workspaceMerge).toBeUndefined();
       // Nothing was applied, so nothing may be recorded as applied: a
       // generation this tree never held would make the next merge read the
       // whole payload as "deleted here" (the Task 8 rule).

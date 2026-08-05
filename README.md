@@ -18,7 +18,7 @@ Claude Code sessions are JSONL files keyed to an absolute path on the machine th
 | `/sesh-mover:pull` | Bring a project's thread down from the hub onto this machine. |
 | `/sesh-mover:whereis` | Read-only: which machines have which sessions for this project, and which is latest. |
 
-Where this is heading beyond Slice 1 — hub automation, encryption at rest, a web service — and later other agentic CLIs, is tracked in [ROADMAP.md](./ROADMAP.md). Release history: [CHANGELOG.md](./CHANGELOG.md).
+The hub also runs itself once a project is linked: a session-end auto-push and a session-start "newer work elsewhere" notice — see [Automation](#automation) for what they do and how to turn them off. Where this is heading beyond that — assembling a thread whose history is split across three machines, encryption at rest, a web service — and later other agentic CLIs, is tracked in [ROADMAP.md](./ROADMAP.md). Release history: [CHANGELOG.md](./CHANGELOG.md).
 
 ## Install
 
@@ -77,6 +77,22 @@ Incremental sync (above) moves sessions one peer-to-peer round-trip at a time �
 
 `whereis` is read-only — it never links a project or pulls anything, so it's safe to run just to look.
 
+### Automation
+
+Once a project is linked to a hub project, sesh-mover keeps it current without being asked. Two Claude Code lifecycle hooks do it:
+
+- **Session end → push.** When a Claude Code session ends in a linked project, the same push you would have run manually runs by itself: this project's sessions, plus a workspace snapshot (no git remote) or a `git diff HEAD` patch and untracked files (git remote). It runs detached, so it never delays session exit — and that cuts both ways: a failure is written to stderr, which Claude Code doesn't show at a clean exit, so a chronically failing auto-push (an unmounted share, say) is invisible until you run `/sesh-mover:push` or `/sesh-mover:whereis` by hand. Detached also means nothing bounds it: a push wedged on an unreachable network path leaves a `node` process running until the path answers.
+- **Session start → notice.** When a session starts or resumes in a linked project, sesh-mover checks the hub and, if another machine holds newer work for this project, injects one line naming the thread, the machine, and how long ago — then gets out of the way. It's bounded at 10 seconds so an unreachable hub can't stall session start, and it says nothing at all when this machine already has the latest of everything.
+
+**Linking a project is the consent gate.** Both are on by default and both are inert until a hub is configured *and* the project is linked — so nothing happens for anyone who never uses the hub. The flip side: if you linked a project under an earlier version, the automatic push starts at your next session end, with no further action. Turn either off per machine (or add `--scope project` for one project):
+
+```bash
+sesh-mover configure --set hub.autoPush=false
+sesh-mover configure --set hub.startupNotice=false
+```
+
+The automatic push takes no flags, so `--no-workspace` / `--no-carry` can't be given to it — `hub.noWorkspace=true` and `hub.carryDiff=false` are how you opt out of those payloads everywhere, manual pushes included.
+
 ### Storage
 
 The hub backend is filesystem-only in this slice: point `hub init --path` at anything that behaves like a directory both machines can read and write —
@@ -93,13 +109,34 @@ Synced folders have two gotchas the hub can't paper over:
 
 **The hub directory is a trust boundary, not a vault.** Sessions are stored there in plaintext at rest — anyone with read access to the hub folder can read every session ever pushed to it, until a future encryption-at-rest slice ships (tracked in [ROADMAP.md](./ROADMAP.md)). Every pulled bundle still goes through the same tar-entry and manifest-id validation as a manual import — see [Security notes](#security-notes) below; the hub doesn't relax any of that, it just adds a shared drop point on top.
 
+**Point it at a directory only your own machines can write.** Pulling is not a read-only operation: a bundle can carry project files (a workspace snapshot, or another machine's uncommitted work), and applying them writes into your working tree. Two names are refused unconditionally on every path — `.git` and `.claude-sesh-mover`, in any casing or dot spelling, so a bundle can never plant the files that decide where your hub is or what your next push uploads — and a carry needs `--apply-carry` plus a clean tree at the exact base commit before it touches anything. Beyond those, an applied payload can write ordinary project files, which on a *shared or hostile* hub would be enough to reach code execution the next time you build or run something ([#36](https://github.com/Sertelegger/claude-sesh-mover/issues/36)). Relatedly, the merge's "only merge against a generation both trees held" rule is verified on your side and taken on trust from the sender's ([#37](https://github.com/Sertelegger/claude-sesh-mover/issues/37)). Both are fine for a folder shared between machines you own, which is what this slice is for; both are gates on any future multi-user backend.
+
 ### Workspace snapshots
 
-For projects with no git remotes (including remote-less git repositories), `push`/`pull` also carry a **workspace snapshot** — a copy of the project's files, not just its Claude Code sessions — because there's no git remote to reconstruct the project from otherwise. Skip it with `--no-workspace` on push. To exclude specific paths from the snapshot (large build artifacts, secrets, anything you don't want copied into the hub), add a `.claude-sesh-mover/hubignore` file (one pattern per line, `#` comments allowed; matched against path segments, with `*` wildcards — not full `.gitignore` semantics; `dir/` and `dir` mean the same thing). `hubignore` also works in the other direction: when a pull merges an incoming payload, a path it names is not applied and your local file there is left alone (reported in the merge's `skipped` list). `--force-workspace` does not honor that — it takes the hub's copy wholesale. `pull` refuses to overwrite a non-empty target directory with a workspace snapshot unless you pass `--force-workspace`.
+For projects with no git remotes (including remote-less git repositories), `push`/`pull` also carry a **workspace snapshot** — a copy of the project's files, not just its Claude Code sessions — because there's no git remote to reconstruct the project from otherwise. Skip it with `--no-workspace` on push. To exclude specific paths from the snapshot (large build artifacts, secrets, anything you don't want copied into the hub), add a `.claude-sesh-mover/hubignore` file (one pattern per line, `#` comments allowed; matched against path segments, with `*` wildcards — not full `.gitignore` semantics; `dir/` and `dir` mean the same thing). `hubignore` also works in the other direction: when a pull merges an incoming payload, a path it names is not applied and your local file there is left alone (reported in the merge's `skipped` list). `--force-workspace` does not honor that — it takes the hub's copy wholesale.
+
+A snapshot (and the git carry below) rides a bundle, and a bundle is only written when a **session** has something new in it: with no new messages, `push` reports `upToDate` before writing anything at all. So editing project files without talking to Claude Code publishes nothing — the files travel with the next push that has conversation in it.
 
 A snapshot is a plain file copy: it does **not** read `.gitignore`. Four things keep a file out of it: `hubignore`, the built-in excludes (`.git`, `.claude-sesh-mover`, `node_modules`, `.venv`, `__pycache__`, `.DS_Store`), symlinks (never followed, never copied — reported as `symlinksSkipped`), and a 50 MB budget, over which the whole snapshot is declined with a warning rather than partially copied. A remote-less git repository takes this path, so a gitignored `.env` sitting in one **is** copied into the bundle unless `hubignore` names it — that is the opposite of the git-carry rule below, and the difference is which payload builder ran, not which files you have.
 
 The opposite lever is `.claude-sesh-mover/hubinclude`, in the same directory and with the same wildcards — but note one deliberate difference, spelled out below: a trailing slash is decoration in `hubignore` and meaningful in `hubinclude`. Paths listed there are carried **even if** `hubignore`, the built-in excludes or `.gitignore` would drop them (`.gitignore` only ever applies to the git carry below, where it decides which *untracked* files travel). It is meant to be **committed**, so one line fixes a project on every clone and every machine — this repo's own gitignored `docs/superpowers/` specs are the motivating case. A pattern with a `/` **anywhere in it** — trailing one included — is rooted at the project: `docs/` is `docs` at the top level and everything under it, never a `docs` nested somewhere else; `docs/superpowers/` carries that subtree, `docs/*.md` those files. Only a pattern with no separator at all matches that name at any depth (`*.keepme`). This is the difference from `hubignore`, where patterns are matched per path segment and a trailing slash is stripped: `docs/` there excludes a `docs` at **any** depth, while `docs/` here names back only the top-level one. Two names can never be re-included, by any pattern or spelling: `.git` and `.claude-sesh-mover`. Treat the file as security-relevant — `.gitignore` is also where `.env` lives, so list only what you mean to upload. It applies to **both** payload builders: the workspace snapshot for a project with no remotes, and the git carry below for a project with one. A push that re-includes gitignored files names them back to you in `carry.reIncluded` and in its warnings.
+
+### Applying a workspace snapshot: 3-way merge, never a silent overwrite
+
+A pull applies an incoming snapshot one of three ways, and the result says which:
+
+- **Merge** — when this machine and the payload share a *generation* (a snapshot both trees are known to have passed through, matched by bundle id). Every file is decided against that common ancestor: unchanged here → take theirs, unchanged there → keep yours, changed on both → a real 3-way merge via `git merge-file`. Reported as `workspaceMerge`.
+- **Unpack** — into an empty project directory, or when you pass `--force-workspace`, which means "give me the hub's copy wholesale" and overwrites files of the same name. Reported as `workspaceUnpacked` alone.
+- **Skip** — a directory that already has content with no shared generation to merge from. Nothing is written, and the sessions still import normally. The warning names `--target-path <fresh-dir>` (unpacks elsewhere, destroys nothing) and `--force-workspace` (overwrites) — but treat those as applying to the *next* payload rather than as a retry of this one: the pull has already recorded its bundles, so an immediate re-run can answer "already up to date" before it reaches the files. Nothing is lost either way; the payload stays in the bundle on the hub. Once one payload has been applied here, both trees share a generation and later ones merge, so this is a first-contact case rather than a recurring one.
+
+What the merge will and won't do:
+
+- **Conflict markers are normal.** A file both sides changed in the same place comes back with markers in it — `<<<<<<< local`, `||||||| ancestor`, `>>>>>>> incoming` — and is listed in `conflicted`. Resolve them the way you would a git conflict.
+- **Nothing is merged blindly.** A file both sides changed that can't be merged — a binary, one `git merge-file` fails on, or any of them if there's no usable `git merge-file` on this machine — keeps your copy, with the incoming one parked beside it as `<name>.theirs-<timestamp>` (`sidecars`). Delete those once you've reconciled — otherwise the next push carries them back to the hub.
+- **Some paths get nothing written near them at all.** If a symlink or a directory occupies the destination (or one of its parent segments), the file is reported in `skipped` and no sidecar is left either — parking one beside a `docs -> ~/notes` symlink would escape the project exactly as the original write would. The incoming copy is still in the bundle on the hub. Files your own `hubignore` excludes land here too (`locally-excluded`), which is a rule on this machine rather than a fault.
+- **The merge never deletes.** A file the other machine deleted is kept here and reported (`upstreamDeleted`) — delete it yourself if you agree. Symmetrically, a file *you* deleted that nobody changed upstream stays deleted (`localDeleted`), while one you deleted that *was* changed upstream comes back (`restored`), because that edit exists nowhere else. `localDeleted` is a report, not a verdict: a path an earlier merge couldn't write to lands in the same list, so it doesn't prove you deleted anything.
+- **Falling back is safe by construction.** Without a common ancestor, sesh-mover refuses to guess one — no timestamp is consulted anywhere in that decision, because the hub stamps nothing and every clock in it belongs to the machine that pushed. An older-than-necessary base fails toward "keep local, show a conflict"; a wrong newer one would fail toward silently overwriting your work, so it is never chosen.
+- Two paths can never be applied, whatever a bundle says: `.git` and `.claude-sesh-mover` at any depth, in any casing (`workspaceRefused`).
 
 ### Uncommitted work (git projects)
 
@@ -121,15 +158,29 @@ Anything that stops the automatic path — a different commit, your own uncommit
 
 A pull resolves a thread to the machine holding its latest copy and fetches **that machine's** bundle list. Each machine's hub index lists only the bundles *it* pushed, so with two machines every bundle is either on the one being pulled from or already here. With three it may not be: a conversation started on A, continued on B and pulled back to A leaves half its bundles listed by A and half by B, and a pull on C reads one of those lists.
 
-sesh-mover cannot assemble that yet, so it says so instead of pretending otherwise: `pull` and `whereis` report the machines holding the part that could not be fetched (`unfetchableBundles`, plus a warning on `pull`), including on the "already up to date with the source machine" answer and on a thread `whereis` would otherwise call current. Nothing is lost — every bundle stays on the hub — but there is no flag that fetches them today. Cross-machine chain assembly is tracked in [ROADMAP.md](./ROADMAP.md).
+**This release ships a disclosure, not a fix.** sesh-mover cannot assemble such a thread yet, so it tells you when it happens instead of pretending otherwise: `pull` and `whereis` report the machines holding the part that could not be fetched (`unfetchableBundles`, plus a warning on `pull`), including on the "already up to date with the source machine" answer and on a thread `whereis` would otherwise call current. **There is no flag that fetches them** — no `--from-machine` exists, `--thread`/`--target-path` resolve to the same single source, and `hub reindex` only rebuilds *this* machine's index from *its own* bundles. Nothing is lost (every bundle stays on the hub) and two machines are unaffected, but on a third the conversation arrives in halves and one side-effect is visible: the session-start notice keeps flagging such a thread as behind, because it always will be. Tracked as [#35](https://github.com/Sertelegger/claude-sesh-mover/issues/35); chain assembly is the next slice ([ROADMAP.md](./ROADMAP.md)).
 
 ### Same-machine lock
 
 Push and pull take an advisory lock per project while they run, so two hub operations for the *same project on the same machine* can't race each other and corrupt the hub's index. This is **not** a distributed lock — two different machines can (and normally do) push or pull concurrently; the hub's append-only bundle/index design is what keeps that safe, not the lock. If a command reports `reason: "lock-busy"`, wait a few seconds and retry once.
 
-### Pulled continuations are new sessions
+### What a pulled continuation lands as
 
-Be clear-eyed about what `pull` actually gives you: a pulled session is always a **separate, new session** on this machine, registered fresh for `claude --resume`. If it continues work from elsewhere, its first entry is a synthetic continuation header pointing at where the earlier messages actually live — the full original conversation is never silently merged into it. This matches the honesty requirement the incremental-sync continuations above already follow; the hub doesn't change the underlying mechanic, it just adds a directory-based way to discover and fetch the bundles.
+When a pulled bundle continues a session **this machine already has**, `pull` appends the new entries to the end of that local transcript, so the thread stays one resumable session (`appended`, naming the `baseSessionId` to resume). That is the ordinary case for a two-machine round trip: work on A, continue on B, pull back to A, and A's original session simply has B's messages at the end of it.
+
+Three things make it fall back to importing a **separate** session instead, and the pull says which:
+
+- the local session was written in the last five minutes, so a live Claude Code session may still be appending to it — `--force-append` overrides this one, once you've closed that session (an earlier pull's own write counts as recent, so two pulls a few minutes apart can fragment);
+- no local session's entry chain lines up with the continuation — nothing to append to, and `--force-append` will not help, because the chain guard is never skipped;
+- the bundle's content doesn't match its manifest hash, so it is never welded into a transcript you own.
+
+`--no-append` (or `hub.pullAppend=false`) turns the whole path off. Either way the content arrives — the difference is one session or two. A separate session is registered fresh for `claude --resume`, and its first entry is a synthetic continuation header pointing at where the earlier messages actually live: the full original conversation is never silently merged into it.
+
+**Divergence — both machines continued from the same point.** Then neither branch continues the other and there is no safe automatic answer, so `pull` reports a `divergence` object with both sides' entry counts and last-active times, and you choose:
+
+- **keep both** (`--on-divergence fragment`, the CLI default) — your session is untouched and the hub's branch is imported alongside it. Nothing is lost; the conversation stays in two transcripts.
+- **adopt the hub's branch** (`--on-divergence adopt-hub`) — your session becomes the shared history plus the hub's branch, and your own branch is preserved **in full** as a new registered session. Three things worth knowing before you pick: the preserved session has no thread mapping, so your next push publishes it as its own thread; adoption truncates the session it rewrites, so it is refused outright while that transcript looks live; and the preserved copy is the transcript only — side files (subagent transcripts, tool-result blobs, file-history backups) stay attached to the session that was adopted.
+- **decide later** (`--on-divergence skip`) — nothing is applied and nothing is recorded, so the same pull can be re-run with either answer. `/sesh-mover:pull` always passes this first, then asks.
 
 ## Security notes
 

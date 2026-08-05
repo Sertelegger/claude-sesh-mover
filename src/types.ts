@@ -547,6 +547,21 @@ export interface HubPullResult {
    */
   workspaceRefused?: string[];
   /**
+   * `true` when a bundle's manifest declared a workspace payload the bundle
+   * does not actually contain, so there was nothing to apply and the project
+   * directory was left untouched. Absent otherwise.
+   *
+   * A field rather than warning prose for the usual reason (warning text is not
+   * an interface — see `commands/pull.md`), and here it is the ONLY signal:
+   * `workspaceUnpacked` is `null` and `workspaceMerge` is absent in this case
+   * exactly as they are for the routine "no shared generation, so the payload
+   * was skipped" branch, whose remedies (`--force-workspace`,
+   * `--target-path <fresh-dir>`) can do nothing for a payload that is not in
+   * the bundle. It is the workspace counterpart of `carryAvailable` present
+   * with `carryApplied` absent.
+   */
+  workspaceDeclaredMissing?: boolean;
+  /**
    * The uncommitted work this pull's bundle chain carried (design §6.2), as the
    * SENDING machine described it. Present whenever a bundle declared a carry,
    * whether or not it was applied — `carryApplied` says what happened to it.
