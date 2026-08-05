@@ -328,6 +328,11 @@ export interface ApplyCarryOptions {
  * perfectly healthy `git`, because `--numstat` prints only a rename's
  * destination and the scan did not read the source line.
  *
+ * **The nine do not share one termination rule**, and assuming they did was a
+ * hole of its own: only `---`/`+++` are read with `TERM_TAB`, and even they drop
+ * it when a traditional patch line carries a trailing timestamp. See
+ * `HeaderLineKind`.
+ *
  * A body line cannot be mistaken for a header: every one carries a leading
  * ` `, `+`, `-`, `@` or `\`, and no base85 line inside a `GIT binary patch`
  * block can contain a space (it is not in the alphabet), so none of the header

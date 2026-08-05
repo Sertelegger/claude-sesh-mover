@@ -2352,6 +2352,41 @@ describe("applyCarry", () => {
       'diff --git a/.claude-sesh-mover/config.json\r\t"b/.claude-sesh-mover/config.json"\n' +
         "new file mode 100644\nindex 0000000..e69de29\n",
     ],
+    // --- Round 5: TAB does NOT end a name for seven of the nine keywords.
+    // Only `---`/`+++` are read with TERM_TAB, and even they drop it when a
+    // traditional line carries a trailing timestamp; the six rename/copy
+    // keywords are read with `terminate = 0`. A scan that truncated every
+    // keyword at the first TAB produced the candidate list `["b"]` for each of
+    // these, all measured applying against bare `git apply` (exit 0, the file
+    // lands or the receiver's own file is deleted).
+    [
+      "TAB inside a traditional +++ name, with a timestamp",
+      "--- /dev/null\n+++ b\tQ/.claude-sesh-mover/config.json" +
+        "\t2024-01-02 00:00:00.000000000 +0000\n@@ -0,0 +1 @@\n+{}\n",
+    ],
+    [
+      "TAB inside a traditional --- name, with a timestamp (a DELETE)",
+      "--- b\tQ/.claude-sesh-mover/hubinclude\t2024-01-02 00:00:00.000000000 +0000\n" +
+        "+++ /dev/null\n@@ -1 +0,0 @@\n-docs/\n",
+    ],
+    [
+      "TAB inside a `copy to` name",
+      "diff --git a/decoy.txt b/stolen.txt\nsimilarity index 100%\n" +
+        "copy from decoy.txt\ncopy to X\tsub/.claude-sesh-mover/config.json\n",
+    ],
+    [
+      "TAB inside a `rename new` name (git's legacy spelling)",
+      "diff --git a/decoy.txt b/moved.txt\nsimilarity index 100%\n" +
+        "rename old decoy.txt\nrename new X\tsub/.claude-sesh-mover/config.json\n",
+    ],
+    // A SPACE-separated timestamp is stripped too, and only the LAST component
+    // can be hidden behind one — so this is the one shape where the unstripped
+    // reading of the line is not enough.
+    [
+      "SPACE-separated timestamp hiding the forbidden LEAF",
+      "--- /dev/null\n+++ b/sub/.claude-sesh-mover 2024-01-02 00:00:00.000000000 +0000\n" +
+        "@@ -0,0 +1 @@\n+pwned\n",
+    ],
   ];
 
   it("refuses `diff --git` spellings git accepts, at BOTH layouts, with no runnable git", async () => {

@@ -1021,6 +1021,52 @@ function unquoteGitPath(raw: string): string | null {
 }
 
 /**
+ * Which of git's two name-termination rules reads this keyword's line.
+ *
+ * **`"name"` — `---` and `+++` only.** Those two lines are read by two
+ * different git functions depending on where they sit, and BOTH readings have
+ * to be offered because the byte scan is line-based and does not know which:
+ * inside a `diff --git` block `gitdiff_verify_name` calls `find_name(…,
+ * TERM_TAB)`, so a TAB ends the name; standing alone (a traditional patch)
+ * `find_name_traditional` applies TERM_TAB **only when it finds no trailing
+ * timestamp**, and passes `terminate = 0` when it does — the name then runs to
+ * the end of the line minus the timestamp, TABs and all.
+ *
+ * **`"rename-copy"` — the other six.** `gitdiff_renamesrc`/`renamedst`/
+ * `copysrc`/`copydst` all call `find_name(…, 0)`. A TAB never terminates there
+ * and no timestamp is ever stripped: the name is the whole rest of the line.
+ *
+ * Every clause above was MEASURED against `git apply --numstat -z --summary`
+ * (git 2.50.1), not read off a comment — the claim that TAB terminates
+ * everywhere was itself the hole this distinction closes. `git apply` writes
+ * these paths for real: `+++ b<TAB>Q/.claude-sesh-mover/config.json<TAB><ts>`
+ * created the project-root `.claude-sesh-mover/config.json`, `copy to X<TAB>sub/
+ * .claude-sesh-mover/evil` applied, and `+++ b/sub/.claude-sesh-mover <ts>`
+ * (space-separated timestamp, forbidden segment LAST) created that file — all
+ * three invisible to a scan that truncated at the first TAB. The exhaustive
+ * statement of the rule, and the thing that keeps it true, is the `tab-inside`
+ * / `ts-*` axis in `tests/hub-carry-header.test.ts`.
+ */
+type HeaderLineKind = "name" | "rename-copy";
+
+/**
+ * A trailing GNU-diff timestamp on a traditional `---`/`+++` line, matched
+ * permissively rather than ported from `diff_timestamp_len`.
+ *
+ * Only the LAST path component can be affected by one — a timestamp is appended
+ * to the name — so this matters exactly when the forbidden segment is the leaf,
+ * and the unstripped reading (always offered too) covers every other position.
+ * Permissive is the safe side: an extra candidate can only ever cause a refusal.
+ * Every form git was measured to strip (`\t2024-01-02 00:00:00.000000000 +0000`,
+ * the same space-separated, second- and fraction-less variants, and a bare
+ * `\t12345`) is a run of digits, `-`, `+`, `:`, `.` and blanks, so requiring
+ * that shape is wide enough; requiring the run to hold no LETTERS is what keeps
+ * `docs/.claude-sesh-mover notes.md` — a real tracked name in the harness's
+ * negative corpus — from being trimmed back to a forbidden segment.
+ */
+const TRAILING_TIMESTAMP = /[ \t][-+0-9:.][-+0-9:.\t ]*$/;
+
+/**
  * Every path one single-name header line (`---`, `+++`, `rename from/to`,
  * `rename old/new`, `copy from/to`) can be read as — the decoded form AND the
  * literal one, because git itself tries both in that order (`find_name` calls
@@ -1028,22 +1074,38 @@ function unquoteGitPath(raw: string): string | null {
  * fails). Collecting both is what keeps a malformed escape from hiding a path:
  * whichever reading git ends up using, the floor has seen it.
  *
+ * `kind` selects the termination rules (see `HeaderLineKind`); where git's
+ * reading depends on context the union of the possible readings is offered,
+ * since a candidate git will not use can only ever add a refusal.
+ *
  * Each reading is also offered with an `a/`/`b/` prefix stripped, since that is
  * the component git removes at `-p1`. The unstripped form is kept as well and
  * costs nothing: `isNeverIncludable` judges EVERY segment, so a leading
- * component can only ever add one.
+ * component can only ever add one — which is also why the scan does not try to
+ * model `-p1` stripping a component spelled anything else. Stripping only ever
+ * REMOVES a segment, so the unstripped reading already covers whatever git's
+ * stripped one names.
  */
-function headerPathCandidates(rest: string): string[] {
-  // Traditional diffs put a tab-separated timestamp after the name and git's
-  // own parser stops at the tab too (`name_terminate`, TERM_TAB).
-  const token = rest.split("\t")[0]!.trim();
+function headerPathCandidates(rest: string, kind: HeaderLineKind): string[] {
+  const readings = [rest, rest.trim()];
+  if (kind === "name") {
+    const tabbed = rest.split("\t")[0]!;
+    readings.push(tabbed, tabbed.trim());
+    const dated = rest.replace(TRAILING_TIMESTAMP, "");
+    if (dated !== rest) readings.push(dated, dated.trim());
+  }
   const out: string[] = [];
-  for (const reading of [token, unquoteGitPath(token)]) {
-    // `/dev/null` is git's "no such side" marker, not a path the floor judges.
-    if (reading === null || reading.length === 0 || reading === "/dev/null") continue;
-    out.push(reading);
-    const stripped = reading.replace(/^[ab]\//, "");
-    if (stripped !== reading && stripped.length > 0) out.push(stripped);
+  const seen = new Set<string>();
+  for (const reading of readings) {
+    if (seen.has(reading)) continue;
+    seen.add(reading);
+    for (const form of [reading, unquoteGitPath(reading)]) {
+      // `/dev/null` is git's "no such side" marker, not a path the floor judges.
+      if (form === null || form.length === 0 || form === "/dev/null") continue;
+      out.push(form);
+      const stripped = form.replace(/^[ab]\//, "");
+      if (stripped !== form && stripped.length > 0) out.push(stripped);
+    }
   }
   return out;
 }
@@ -1248,6 +1310,11 @@ function diffGitHeaderPaths(rest: string, budget: { left: number }): string[] | 
  * perfectly healthy `git`, because `--numstat` prints only a rename's
  * destination and the scan did not read the source line.
  *
+ * **The nine do not share one termination rule**, and assuming they did was a
+ * hole of its own: only `---`/`+++` are read with `TERM_TAB`, and even they drop
+ * it when a traditional patch line carries a trailing timestamp. See
+ * `HeaderLineKind`.
+ *
  * A body line cannot be mistaken for a header: every one carries a leading
  * ` `, `+`, `-`, `@` or `\`, and no base85 line inside a `GIT binary patch`
  * block can contain a space (it is not in the alphabet), so none of the header
@@ -1296,15 +1363,15 @@ function scanPatchBytes(patchPath: string): { paths: string[]; symlink: string |
       continue;
     }
     let found: string[] = [];
-    if (line.startsWith("--- ") || line.startsWith("+++ ")) found = headerPathCandidates(line.slice(4));
-    else if (line.startsWith("rename from ")) found = headerPathCandidates(line.slice(12));
-    else if (line.startsWith("rename to ")) found = headerPathCandidates(line.slice(10));
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) found = headerPathCandidates(line.slice(4), "name");
+    else if (line.startsWith("rename from ")) found = headerPathCandidates(line.slice(12), "rename-copy");
+    else if (line.startsWith("rename to ")) found = headerPathCandidates(line.slice(10), "rename-copy");
     // Git's legacy spelling of the same two lines, still in its keyword table
     // and still accepted (measured end to end).
-    else if (line.startsWith("rename old ")) found = headerPathCandidates(line.slice(11));
-    else if (line.startsWith("rename new ")) found = headerPathCandidates(line.slice(11));
-    else if (line.startsWith("copy from ")) found = headerPathCandidates(line.slice(10));
-    else if (line.startsWith("copy to ")) found = headerPathCandidates(line.slice(8));
+    else if (line.startsWith("rename old ")) found = headerPathCandidates(line.slice(11), "rename-copy");
+    else if (line.startsWith("rename new ")) found = headerPathCandidates(line.slice(11), "rename-copy");
+    else if (line.startsWith("copy from ")) found = headerPathCandidates(line.slice(10), "rename-copy");
+    else if (line.startsWith("copy to ")) found = headerPathCandidates(line.slice(8), "rename-copy");
     else if (line.startsWith("diff --git ")) {
       const header = diffGitHeaderPaths(line.slice(11), headerBudget);
       // Unparseable within the budget: the floor cannot answer for this entry,

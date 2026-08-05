@@ -738,6 +738,22 @@ function unquoteGitPath(raw) {
     return null; // no closing quote — git's unquote fails and the literal wins
 }
 /**
+ * A trailing GNU-diff timestamp on a traditional `---`/`+++` line, matched
+ * permissively rather than ported from `diff_timestamp_len`.
+ *
+ * Only the LAST path component can be affected by one — a timestamp is appended
+ * to the name — so this matters exactly when the forbidden segment is the leaf,
+ * and the unstripped reading (always offered too) covers every other position.
+ * Permissive is the safe side: an extra candidate can only ever cause a refusal.
+ * Every form git was measured to strip (`\t2024-01-02 00:00:00.000000000 +0000`,
+ * the same space-separated, second- and fraction-less variants, and a bare
+ * `\t12345`) is a run of digits, `-`, `+`, `:`, `.` and blanks, so requiring
+ * that shape is wide enough; requiring the run to hold no LETTERS is what keeps
+ * `docs/.claude-sesh-mover notes.md` — a real tracked name in the harness's
+ * negative corpus — from being trimmed back to a forbidden segment.
+ */
+const TRAILING_TIMESTAMP = /[ \t][-+0-9:.][-+0-9:.\t ]*$/;
+/**
  * Every path one single-name header line (`---`, `+++`, `rename from/to`,
  * `rename old/new`, `copy from/to`) can be read as — the decoded form AND the
  * literal one, because git itself tries both in that order (`find_name` calls
@@ -745,24 +761,42 @@ function unquoteGitPath(raw) {
  * fails). Collecting both is what keeps a malformed escape from hiding a path:
  * whichever reading git ends up using, the floor has seen it.
  *
+ * `kind` selects the termination rules (see `HeaderLineKind`); where git's
+ * reading depends on context the union of the possible readings is offered,
+ * since a candidate git will not use can only ever add a refusal.
+ *
  * Each reading is also offered with an `a/`/`b/` prefix stripped, since that is
  * the component git removes at `-p1`. The unstripped form is kept as well and
  * costs nothing: `isNeverIncludable` judges EVERY segment, so a leading
- * component can only ever add one.
+ * component can only ever add one — which is also why the scan does not try to
+ * model `-p1` stripping a component spelled anything else. Stripping only ever
+ * REMOVES a segment, so the unstripped reading already covers whatever git's
+ * stripped one names.
  */
-function headerPathCandidates(rest) {
-    // Traditional diffs put a tab-separated timestamp after the name and git's
-    // own parser stops at the tab too (`name_terminate`, TERM_TAB).
-    const token = rest.split("\t")[0].trim();
+function headerPathCandidates(rest, kind) {
+    const readings = [rest, rest.trim()];
+    if (kind === "name") {
+        const tabbed = rest.split("\t")[0];
+        readings.push(tabbed, tabbed.trim());
+        const dated = rest.replace(TRAILING_TIMESTAMP, "");
+        if (dated !== rest)
+            readings.push(dated, dated.trim());
+    }
     const out = [];
-    for (const reading of [token, unquoteGitPath(token)]) {
-        // `/dev/null` is git's "no such side" marker, not a path the floor judges.
-        if (reading === null || reading.length === 0 || reading === "/dev/null")
+    const seen = new Set();
+    for (const reading of readings) {
+        if (seen.has(reading))
             continue;
-        out.push(reading);
-        const stripped = reading.replace(/^[ab]\//, "");
-        if (stripped !== reading && stripped.length > 0)
-            out.push(stripped);
+        seen.add(reading);
+        for (const form of [reading, unquoteGitPath(reading)]) {
+            // `/dev/null` is git's "no such side" marker, not a path the floor judges.
+            if (form === null || form.length === 0 || form === "/dev/null")
+                continue;
+            out.push(form);
+            const stripped = form.replace(/^[ab]\//, "");
+            if (stripped !== form && stripped.length > 0)
+                out.push(stripped);
+        }
     }
     return out;
 }
@@ -970,6 +1004,11 @@ function diffGitHeaderPaths(rest, budget) {
  * perfectly healthy `git`, because `--numstat` prints only a rename's
  * destination and the scan did not read the source line.
  *
+ * **The nine do not share one termination rule**, and assuming they did was a
+ * hole of its own: only `---`/`+++` are read with `TERM_TAB`, and even they drop
+ * it when a traditional patch line carries a trailing timestamp. See
+ * `HeaderLineKind`.
+ *
  * A body line cannot be mistaken for a header: every one carries a leading
  * ` `, `+`, `-`, `@` or `\`, and no base85 line inside a `GIT binary patch`
  * block can contain a space (it is not in the alphabet), so none of the header
@@ -1020,21 +1059,21 @@ function scanPatchBytes(patchPath) {
         }
         let found = [];
         if (line.startsWith("--- ") || line.startsWith("+++ "))
-            found = headerPathCandidates(line.slice(4));
+            found = headerPathCandidates(line.slice(4), "name");
         else if (line.startsWith("rename from "))
-            found = headerPathCandidates(line.slice(12));
+            found = headerPathCandidates(line.slice(12), "rename-copy");
         else if (line.startsWith("rename to "))
-            found = headerPathCandidates(line.slice(10));
+            found = headerPathCandidates(line.slice(10), "rename-copy");
         // Git's legacy spelling of the same two lines, still in its keyword table
         // and still accepted (measured end to end).
         else if (line.startsWith("rename old "))
-            found = headerPathCandidates(line.slice(11));
+            found = headerPathCandidates(line.slice(11), "rename-copy");
         else if (line.startsWith("rename new "))
-            found = headerPathCandidates(line.slice(11));
+            found = headerPathCandidates(line.slice(11), "rename-copy");
         else if (line.startsWith("copy from "))
-            found = headerPathCandidates(line.slice(10));
+            found = headerPathCandidates(line.slice(10), "rename-copy");
         else if (line.startsWith("copy to "))
-            found = headerPathCandidates(line.slice(8));
+            found = headerPathCandidates(line.slice(8), "rename-copy");
         else if (line.startsWith("diff --git ")) {
             const header = diffGitHeaderPaths(line.slice(11), headerBudget);
             // Unparseable within the budget: the floor cannot answer for this entry,

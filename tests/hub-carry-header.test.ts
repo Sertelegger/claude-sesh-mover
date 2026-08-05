@@ -45,8 +45,14 @@ import { isNeverIncludable } from "../src/hub/workspace.js";
  *    the scan still sees the spelling and refuses. Counted as an over-refusal,
  *    which is the safe direction, and excluded from the false-refusal rule.
  *
- * Runtime is dominated by one `git apply` per DISTINCT generated spelling: 634
- * cases, 600 spawns, **1.9 s in isolation and 40 s under full-suite load**
+ * Rule 3 is the only branch that asserts nothing, so it is where a weakened
+ * ORACLE would silently drain the corpus — measured: an oracle that stops
+ * reading `--summary` moves 60 floor resolutions into it. `FLOOR_RESOLVED` is
+ * therefore pinned exactly and rule 3 bounded, and a `--summary` line that
+ * cannot be read back to exactly one source is a FAILURE rather than a guess.
+ *
+ * Runtime is dominated by one `git apply` per DISTINCT generated spelling: 834
+ * cases, 800 spawns, **2.8 s in isolation and 43 s under full-suite load**
  * (37 files in parallel, where every spawn costs ~60 ms instead of ~3 ms). It
  * is not on the suite's critical path — `hub-carry.test.ts` is longer — but it
  * is far past vitest's 20 s default, hence the explicit per-test timeout.
@@ -56,12 +62,30 @@ import { isNeverIncludable } from "../src/hub/workspace.js";
  * counters (how many spellings git accepted, how many it resolved onto the
  * floor, how many were expected differences) — that is where the numbers in
  * the task report come from.
+ *
+ * The axes are still ENUMERATED, and every one of them was added after a
+ * reviewer found the family it would have caught. The two that generalise
+ * furthest are worth naming, because they are what a new axis should look like:
+ * `SEPARATORS` and `TERMINATION_SPELLINGS` are not lists of exploits, they are
+ * the two byte-classification decisions git's parser makes (what separates two
+ * names, what ends one) swept over their whole plausible domain.
  */
 
 /** The receiver-side file every hostile spelling is aiming at. */
 const FLOOR = ".claude-sesh-mover/hubinclude";
-/** Its innocent twin: same shape, nothing the floor forbids. */
+/**
+ * The same floor, reached at the LEAF instead of a middle component.
+ *
+ * A trailing timestamp is appended to the last component, so it is the only
+ * position where git stripping one can uncover a forbidden segment that the
+ * un-stripped reading of the line does not already show. Measured applying for
+ * real: `+++ b/sub/.claude-sesh-mover <timestamp>` creates that file.
+ */
+const FLOOR_TAIL = "sub/.claude-sesh-mover";
+/** Their innocent twin: same shape, nothing the floor forbids. */
 const SAFE = "docs/notes.txt";
+/** `\t2024-01-02 …` — the trailing timestamp GNU diff writes after a name. */
+const TIMESTAMP = "2024-01-02 00:00:00.000000000 +0000";
 
 /**
  * The real `git` executable, resolved ONCE.
@@ -95,6 +119,23 @@ function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr
     const err = e as { stdout?: string; stderr?: string };
     return { ok: false, stdout: err.stdout ?? "", stderr: (err.stderr ?? "").trim().split("\n")[0]! };
   }
+}
+
+/**
+ * A scratch file to write generated patches into, in a directory of its own.
+ *
+ * A fixed name under `$TMPDIR` (what this file used) races: two runs of the
+ * suite on one machine — a watch-mode run beside a full one is the ordinary
+ * case — would read each other's bytes and answer for the wrong patch. Not
+ * inside the oracle repo either, where an untracked file would show up in the
+ * negative test's own `git diff`.
+ */
+function patchSlot(name: string): { file: string; dispose: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), `sesh-${name}-patch-`));
+  return {
+    file: join(dir, "patch.diff"),
+    dispose: () => rmSync(dir, { recursive: true, force: true }),
+  };
 }
 
 /** A throwaway repo holding both paths, committed. NEVER the checkout. */
@@ -144,6 +185,34 @@ const SPELLINGS: Spelling[] = [
   // of any kind would end the path early here.
   { id: "escaped-dq", of: (p) => `"${p}\\""` },
 ];
+
+/**
+ * Spellings that exercise git's NAME TERMINATION rather than its quoting — the
+ * axis a `diff --git` line has no branch for (a TAB there is a separator, and
+ * the separator sweep already crosses every one of them), so these are added to
+ * the single-name keywords only.
+ *
+ * They exist because the nine path-bearing keywords do NOT share one rule:
+ * `---`/`+++` are read with `TERM_TAB`, and drop even that when a traditional
+ * line carries a trailing timestamp; the six rename/copy keywords are read with
+ * `terminate = 0`, where a TAB is an ordinary byte of the name. A scan that
+ * truncated every keyword at the first TAB — what this one did — saw `["b"]` for
+ * a line git resolves onto the floor and applies.
+ */
+const TERMINATION_SPELLINGS: Spelling[] = [
+  // A TAB mid-name, with a further component after it: the six rename/copy
+  // keywords keep the whole thing, and so does a timestamped `---`/`+++`.
+  { id: "tab-inside", of: (p) => `X\t${p}` },
+  { id: "tab-inside-sub", of: (p) => `X\tsub/${p}` },
+  { id: "tab-inside+ts", of: (p) => `X\tsub/${p}\t${TIMESTAMP}` },
+  // Timestamps on an otherwise plain name. The TAB form is terminated by
+  // TERM_TAB anyway; the SPACE form is not, and git strips it all the same.
+  { id: "ts-tab", of: (p) => `${p}\t${TIMESTAMP}` },
+  { id: "ts-space", of: (p) => `${p} ${TIMESTAMP}` },
+];
+
+/** Every spelling a single-name header line is generated with. */
+const NAME_LINE_SPELLINGS = [...SPELLINGS, ...TERMINATION_SPELLINGS];
 
 /** The subset used for the separator sweep — quoting symmetry × trailing bytes. */
 const SYMMETRY_SPELLINGS = SPELLINGS.filter((s) => ["plain", "quoted", "quoted+X"].includes(s.id));
@@ -293,9 +362,9 @@ const KEYWORDS: Array<{
 
 function keywordCases(): Case[] {
   const out: Case[] = [];
-  for (const [path, intent] of [[FLOOR, "floor"], [SAFE, "safe"]] as const) {
+  for (const [path, intent] of [[FLOOR, "floor"], [FLOOR_TAIL, "floor"], [SAFE, "safe"]] as const) {
     for (const keyword of KEYWORDS) {
-      for (const spelling of SPELLINGS) {
+      for (const spelling of NAME_LINE_SPELLINGS) {
         out.push({
           id: `keyword/${keyword.id}/${spelling.id}/${intent}`,
           keyword: keyword.id,
@@ -317,17 +386,53 @@ interface Oracle {
   paths: string[];
   /** Only the `--numstat` records — used to assert the documented blindness. */
   numstatPaths: string[];
+  /** Summary bodies this file could not read back to exactly one source. */
+  ambiguous: string[];
 }
 
 /**
- * ` rename docs/{notes.txt => other.txt} (100%)` — `--summary` compacts a
- * shared prefix/suffix, so the two paths have to be reassembled.
+ * ` rename docs/{a.txt => b.txt} (100%)` → the rename's SOURCE, `docs/a.txt`.
+ *
+ * `git apply --summary` is `show_rename_copy` in apply.c, **not** `git diff
+ * --summary`'s `pprint_rename` — measured, and the difference matters: it
+ * compacts only a common PREFIX (never a suffix) and it never C-quotes, so
+ * every byte of both paths is present raw. What it does not do is escape `{`,
+ * `}` or ` => `, which makes the line ambiguous on its face: a rename of
+ * `d/.claude-sesh-mover/{f.txt` to `d/out.txt` prints
+ * ` rename d/{.claude-sesh-mover/{f.txt => out.txt} (100%)`, and reading that
+ * with a `(.*)\{(.*) => (.*)\}(.*)` regex yields `d/{.claude-sesh-mover/f.txt`
+ * — whose first segment is `{.claude-sesh-mover`, so a genuine floor resolution
+ * scores as an ordinary one and the case drains into rule 3 unnoticed.
+ *
+ * It is not ambiguous once the DESTINATION is known, and `--numstat` reports
+ * that exactly. Both shapes are then anchored:
+ *
+ * - plain: `body === <src> " => " <dest>`;
+ * - compacted: `body === <pfx> "{" <srcRest> " => " <dstRest> "}"`, where
+ *   `<pfx>` ends in `/` and `<pfx><dstRest> === <dest>` — so every `/` in the
+ *   destination is one candidate split and at most one of them can fit.
+ *
+ * A body that yields no reading, or more than one, is reported as AMBIGUOUS
+ * rather than guessed at: the caller fails the suite on it, because a silently
+ * mis-expanded source is exactly the failure this replaces.
  */
-function expandRenameSummary(body: string): string[] {
-  const brace = /^(.*)\{(.*) => (.*)\}(.*)$/.exec(body);
-  if (brace) return [brace[1]! + brace[2]! + brace[4]!, brace[1]! + brace[3]! + brace[4]!];
-  const halves = body.split(" => ");
-  return halves.length === 2 ? halves : [body];
+function renameSummarySource(body: string, dests: readonly string[]): string[] {
+  const found = new Set<string>();
+  for (const dest of dests) {
+    const plain = ` => ${dest}`;
+    if (body.length > plain.length && body.endsWith(plain)) {
+      found.add(body.slice(0, body.length - plain.length));
+    }
+    for (let i = 0; i < dest.length; i++) {
+      if (dest[i] !== "/") continue;
+      const open = `${dest.slice(0, i + 1)}{`;
+      const close = ` => ${dest.slice(i + 1)}}`;
+      if (body.length < open.length + close.length) continue;
+      if (!body.startsWith(open) || !body.endsWith(close)) continue;
+      found.add(dest.slice(0, i + 1) + body.slice(open.length, body.length - close.length));
+    }
+  }
+  return [...found];
 }
 
 /**
@@ -338,18 +443,25 @@ function expandRenameSummary(body: string): string[] {
  */
 function oracle(repo: string, patchFile: string): Oracle {
   const r = git(repo, ["-c", "core.quotePath=false", "apply", "--numstat", "-z", "--summary", patchFile]);
-  if (!r.ok) return { accepted: false, paths: [], numstatPaths: [] };
+  if (!r.ok) return { accepted: false, paths: [], numstatPaths: [], ambiguous: [] };
   const records = r.stdout.split("\0");
   const summary = records.pop() ?? "";
   const numstatPaths = records
     .filter((rec) => rec.length > 0)
+    // A numstat record is `<added>\t<deleted>\t<path>`, and the path may itself
+    // hold TABs (`rename to X<TAB>sub/…` is a name git accepts), so the tail is
+    // rejoined rather than taken as one field.
     .map((rec) => rec.split("\t").slice(2).join("\t"));
   const paths = [...numstatPaths];
+  const ambiguous: string[] = [];
   for (const line of summary.split("\n")) {
     const m = /^ (?:rename|copy) (.*) \(\d+%\)$/.exec(line);
-    if (m) paths.push(...expandRenameSummary(m[1]!));
+    if (!m) continue;
+    const sources = renameSummarySource(m[1]!, numstatPaths);
+    if (sources.length === 1) paths.push(sources[0]!);
+    else ambiguous.push(`${line} [readings=${JSON.stringify(sources)} dests=${JSON.stringify(numstatPaths)}]`);
   }
-  return { accepted: true, paths, numstatPaths };
+  return { accepted: true, paths, numstatPaths, ambiguous };
 }
 
 /** Exactly what `applyCarry` computes as `scanUnsafe`, for one patch file. */
@@ -364,13 +476,26 @@ function scanRefuses(patchFile: string): { refuses: boolean; paths: string[] } {
 
 const CASES = [...diffGitCases(), ...keywordCases()];
 
+/**
+ * Measured coverage, pinned so the corpus cannot quietly drain.
+ *
+ * `FLOOR_RESOLVED` is how many generated cases git resolves onto the floor —
+ * the only cases that constrain the scan at all. `OVER_REFUSED_BY_STRIP` bounds
+ * rule 3, the one branch that asserts nothing. Both were read out of a real run
+ * (`SESH_HEADER_STATS=<file> npx vitest run tests/hub-carry-header.test.ts`,
+ * git 2.50.1).
+ */
+const FLOOR_RESOLVED = 247;
+const OVER_REFUSED_BY_STRIP = 82;
+
 describe("carry patch header scan — differential against real `git apply`", () => {
   it(
     "flags every generated spelling git resolves onto the floor, and no innocent one",
     { timeout: 180_000 },
     () => {
       const repo = oracleRepo("hdrdiff");
-      const patchFile = join(repo, "..", "hdrdiff.patch");
+      const slot = patchSlot("hdrdiff");
+      const patchFile = slot.file;
       try {
         /** git resolves a forbidden path, the scan does not flag it. THE bug class. */
         const holes: string[] = [];
@@ -378,6 +503,8 @@ describe("carry patch header scan — differential against real `git apply`", ()
         const falseRefusals: string[] = [];
         /** `--numstat` saw a forbidden path on a line documented as blind to it. */
         const blindnessBroken: string[] = [];
+        /** A `--summary` line the oracle could not read back to one source. */
+        const oracleAmbiguous: string[] = [];
         const stats = {
           total: 0, accepted: 0, gitRejected: 0, floorResolved: 0, overRefusedByStrip: 0,
           gitCalls: 0,
@@ -408,6 +535,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
             continue;
           }
           stats.accepted++;
+          if (o.ambiguous.length > 0) oracleAmbiguous.push(`${detail}\n    ambiguous=${JSON.stringify(o.ambiguous)}`);
           const gitFloor = o.paths.filter((p) => isNeverIncludable(p));
           if (gitFloor.length > 0) {
             stats.floorResolved++;
@@ -434,28 +562,38 @@ describe("carry patch header scan — differential against real `git apply`", ()
         expect(holes).toEqual([]);
         expect(falseRefusals).toEqual([]);
         expect(blindnessBroken).toEqual([]);
+        // An unreadable `--summary` line silently costs a floor resolution, so
+        // it is a failure of the harness, not something to work around.
+        expect(oracleAmbiguous).toEqual([]);
 
         // The corpus has to stay meaningful: a generator that silently stopped
         // producing appliable floor spellings would satisfy everything above.
+        // Rule 3 is the one branch with no assertion inside it, so it is the one
+        // a weakened oracle would drain into — `floorResolved` is therefore
+        // pinned EXACTLY and rule 3 bounded, rather than both left loose. A
+        // failure here means the corpus, the oracle or git's parser moved; the
+        // answer is to find out which and re-measure, not to widen the numbers.
         expect(stats.total).toBe(CASES.length);
-        expect(stats.floorResolved).toBeGreaterThan(100);
+        expect(stats.floorResolved, "floor resolutions (pinned; see comment)").toBe(FLOOR_RESOLVED);
+        expect(stats.overRefusedByStrip, "rule-3 sink (bounded; see comment)")
+          .toBeLessThanOrEqual(OVER_REFUSED_BY_STRIP);
         expect(stats.gitRejected).toBeGreaterThan(0); // the VT/FF and bad-escape axes
         expect([...floorKeywords].sort()).toEqual(
           ["diff --git", ...KEYWORDS.map((k) => k.id)].sort()
         );
       } finally {
         rmSync(repo, { recursive: true, force: true });
-        rmSync(join(repo, "..", "hdrdiff.patch"), { force: true });
+        slot.dispose();
       }
     }
   );
 
   it("the cheap oracle agrees with what a real `git apply` does to the floor file", () => {
     // `--numstat`/`--summary` are a PARSE, not an apply, so the harness above
-    // rests on them meaning what they say. These four spellings — one per way
-    // the oracle learns a path — are applied for real by a bare `git apply`
-    // with none of this module's guards, and the receiver's own
-    // `.claude-sesh-mover/hubinclude` is inspected afterwards.
+    // rests on them meaning what they say. These spellings — at least one per
+    // way the oracle learns a path, and one per termination rule — are applied
+    // for real by a bare `git apply` with none of this module's guards, and the
+    // receiver's own `.claude-sesh-mover` tree is inspected afterwards.
     const sample: Array<{ id: string; patch: string; check(dir: string): boolean }> = [
       {
         id: "rename from, quoted with a trailing byte (--summary source)",
@@ -481,14 +619,38 @@ describe("carry patch header scan — differential against real `git apply`", ()
         patch: `diff --git a/${FLOOR}\r"b/${FLOOR}"\nold mode 100644\nnew mode 100755\n`,
         check: (d) => (statSync(join(d, FLOOR)).mode & 0o111) !== 0,
       },
+      // The four below are the TAB-termination family: a scan that truncated
+      // every keyword's name at the first TAB saw `["b"]` or `["X"]` for each.
+      {
+        id: "copy to, TAB inside the name (rename/copy read with terminate = 0)",
+        patch: `diff --git a/decoy.txt b/stolen.txt\nsimilarity index 100%\n` +
+          `copy from decoy.txt\ncopy to X\tsub/${FLOOR}\n`,
+        check: (d) => readFileSync(join(d, "X\tsub", ".claude-sesh-mover", "hubinclude"), "utf-8") === "v1\n",
+      },
+      {
+        id: "--- traditional, TAB inside the name + timestamp (terminate = 0)",
+        patch: `--- b\tQ/${FLOOR}\t${TIMESTAMP}\n+++ /dev/null\n@@ -1 +0,0 @@\n-v1\n`,
+        check: (d) => !existsSync(join(d, FLOOR)),
+      },
+      {
+        id: "+++ traditional, TAB inside the name + timestamp (terminate = 0)",
+        patch: `--- /dev/null\n+++ b\tQ/.claude-sesh-mover/config.json\t${TIMESTAMP}\n@@ -0,0 +1 @@\n+{}\n`,
+        check: (d) => readFileSync(join(d, ".claude-sesh-mover", "config.json"), "utf-8") === "{}\n",
+      },
+      {
+        id: "+++ traditional, SPACE-separated timestamp, forbidden segment LAST",
+        patch: `--- /dev/null\n+++ b/${FLOOR_TAIL} ${TIMESTAMP}\n@@ -0,0 +1 @@\n+pwned\n`,
+        check: (d) => existsSync(join(d, "sub", ".claude-sesh-mover")),
+      },
     ];
     const seed = oracleRepo("hdrreal");
+    const slot = patchSlot("hdrreal");
     try {
       for (const s of sample) {
         const twin = mkdtempSync(join(tmpdir(), "sesh-hdrtwin-"));
         try {
           cpSync(seed, twin, { recursive: true });
-          const patchFile = join(twin, "..", "real.patch");
+          const patchFile = slot.file;
           writeFileSync(patchFile, s.patch, "latin1");
           // The cheap oracle first…
           const o = oracle(twin, patchFile);
@@ -508,6 +670,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
       }
     } finally {
       rmSync(seed, { recursive: true, force: true });
+      slot.dispose();
     }
   });
 
@@ -518,6 +681,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
     // survive. A single flag here is a peer's ordinary edit reported to the
     // user as a security refusal naming them.
     const repo = oracleRepo("hdrnegative");
+    const slot = patchSlot("hdrnegative");
     try {
       const names = [
         "docs/notes.txt",
@@ -530,6 +694,10 @@ describe("carry patch header scan — differential against real `git apply`", ()
         "docs/back\\slash.txt",
         "docs/dollar$sign.txt",
         "docs/.claude-sesh-mover notes.md",
+        // Digits after the space: the shape the trailing-timestamp strip must
+        // NOT trim back to a forbidden segment (it refuses to strip a run
+        // holding letters, and `2024.md` holds two).
+        "docs/.claude-sesh-mover 2024.md",
         "docs/.claude-sesh-moverX/notes.md",
         "docs/not.claude-sesh-mover/notes.md",
         "docs/a b/c d/e f.txt",
@@ -554,7 +722,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
       for (const name of names) writeFileSync(join(repo, name), "v2\n");
       git(repo, ["mv", movable, "docs/renamed \"quoted\".txt"]);
 
-      const patchFile = join(repo, "..", "negative.patch");
+      const patchFile = slot.file;
       const diff = git(repo, ["diff", "HEAD", "--src-prefix=a/", "--dst-prefix=b/"]);
       expect(diff.ok).toBe(true);
       writeFileSync(patchFile, diff.stdout, "utf-8");
@@ -564,9 +732,71 @@ describe("carry patch header scan — differential against real `git apply`", ()
 
       const scan = scanRefuses(patchFile);
       expect(scan.refuses).toBe(false);
-      rmSync(patchFile, { force: true });
     } finally {
       rmSync(repo, { recursive: true, force: true });
+      slot.dispose();
+    }
+  });
+
+  it("reads a rename's SOURCE back out of every shape `git apply --summary` prints", () => {
+    // The oracle above learns a rename/copy source from `--summary` alone, so a
+    // mis-read there does not fail — it quietly scores a floor resolution as an
+    // ordinary one and the case drains into rule 3. These are real renames, made
+    // with `git mv` and rendered by git itself, chosen so that every branch of
+    // `show_rename_copy` and every character that makes its output ambiguous is
+    // present: the `{…}` prefix compaction, a name holding ` => `, names holding
+    // `{` and `}`, a name git C-quotes in `git diff` but NOT in `--summary`, and
+    // — the one that matters — a floor path whose spelling makes the naive
+    // `(.*)\{(.*) => (.*)\}(.*)` reading come out as `{.claude-sesh-mover`,
+    // i.e. innocent.
+    const renames: Array<[from: string, to: string]> = [
+      ["docs/deep/a.txt", "docs/deep/b.txt"],
+      ["docs/one/name.txt", "docs/two/name.txt"],
+      ["one/shared/name.txt", "two/shared/name.txt"],
+      ["alpha.txt", "beta.txt"],
+      ["docs/café.txt", "docs/naïve.txt"],
+      ["docs/a => b.txt", "docs/c.txt"],
+      ["docs/{brace.txt", "docs/out.txt"],
+      ["docs/}close.txt", "docs/out2.txt"],
+      ["d/.claude-sesh-mover/{f.txt", "d/out.txt"],
+    ];
+    const repo = oracleRepo("hdrsummary");
+    const slot = patchSlot("hdrsummary");
+    try {
+      renames.forEach(([from], i) => {
+        mkdirSync(join(repo, from, ".."), { recursive: true });
+        // Distinct content per file: identical bodies let git pair the renames
+        // any way it likes, and then the expected source is not what we asked.
+        writeFileSync(join(repo, from), Array.from({ length: 30 }, (_, n) => `file ${i} line ${n}\n`).join(""));
+      });
+      git(repo, ["add", "-A", "-f"]);
+      git(repo, ["commit", "-q", "-m", "renamable"]);
+      for (const [from, to] of renames) {
+        mkdirSync(join(repo, to, ".."), { recursive: true });
+        const mv = git(repo, ["mv", "-f", from, to]);
+        expect(mv.ok, `git mv ${from}: ${mv.stderr}`).toBe(true);
+      }
+      const diff = git(repo, ["diff", "HEAD", "-M", "--src-prefix=a/", "--dst-prefix=b/"]);
+      expect(diff.ok).toBe(true);
+      writeFileSync(slot.file, diff.stdout, "utf-8");
+
+      const o = oracle(repo, slot.file);
+      expect(o.accepted).toBe(true);
+      expect(o.ambiguous, "every summary line resolves to exactly one source").toEqual([]);
+      // Every source, byte for byte — including the compacted and the
+      // brace-bearing ones. `toContain` per entry so a failure names the path.
+      for (const [from] of renames) expect(o.paths, from).toContain(from);
+      // …and the floor one is scored as a floor resolution, which is the whole
+      // point: the naive expansion returned `d/{.claude-sesh-mover/f.txt` here,
+      // whose first segment is not forbidden.
+      expect(o.paths.filter((p) => isNeverIncludable(p)))
+        .toEqual(["d/.claude-sesh-mover/{f.txt"]);
+      // The corpus really did exercise the compaction rather than nine plain
+      // `<src> => <dst>` lines.
+      expect(diff.stdout).toContain("rename from ");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      slot.dispose();
     }
   });
 });
