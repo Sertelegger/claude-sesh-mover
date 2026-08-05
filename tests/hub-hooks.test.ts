@@ -489,6 +489,82 @@ describe("hub hook-session-end (CLI)", () => {
     expect(second).toContain("sessions"); // non-vacuous: a real bundle was written
   });
 
+  it("records what it could not tell anyone, and hub status reports it", async () => {
+    // The auto-push computes real disclosures and has nowhere to put them:
+    // stdout is closed to it and a clean session exit never shows its stderr.
+    // The one that matters most is `carry.trackedIgnored` — a gitignored file
+    // that git TRACKS, whose contents ride the patch off this machine.
+    const { execFileSync } = await import("node:child_process");
+    const g = (args: string[]): void => {
+      execFileSync("git", args, { cwd: project, stdio: "ignore" });
+    };
+    g(["init", "-q"]);
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "Test"]);
+    g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+    writeFileSync(join(project, ".env"), "DB_PASSWORD=old\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]); // .env committed...
+    writeFileSync(join(project, ".gitignore"), ".env\n");
+    g(["add", ".gitignore"]);
+    g(["commit", "-q", "-m", "ignore env"]); // ...then gitignored, never untracked
+    writeFileSync(join(project, ".env"), "DB_PASSWORD=hunter2_NEW\n");
+
+    const restore = overrideHome(home);
+    try {
+      const { hubInit } = await import("../src/hub/init.js");
+      await hubInit({ hubPath: hubDir, configScope: "user", cwd: home });
+      const { loadOrCreateMachineId } = await import("../src/machine.js");
+      const { createFsBackend } = await import("../src/hub/backend.js");
+      const { createHubProject } = await import("../src/hub/identity.js");
+      await createHubProject(createFsBackend(hubDir), project, loadOrCreateMachineId().id);
+    } finally {
+      restore.restore();
+    }
+
+    // The REAL path, on both sides: sync-state is keyed by the encoded project
+    // path, and a child process's own cwd is always resolved (on macOS /var is
+    // a symlink to /private/var), so a hook told "/var/..." and a `hub status`
+    // standing in the same directory would otherwise key two different files.
+    const { realpathSync } = await import("node:fs");
+    const projectReal = realpathSync(project);
+    if (projectReal !== project) {
+      cpSync(
+        join(configDir, "projects", encodeProjectPath(project)),
+        join(configDir, "projects", encodeProjectPath(projectReal)),
+        { recursive: true }
+      );
+    }
+
+    const r = runHook(JSON.stringify({ cwd: projectReal, session_id: sessionId }));
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(""); // still silent, as the hook contract requires
+    expect(r.stderr).toBe("");
+
+    const { peekSyncState } = await import("../src/sync-state.js");
+    const restore2 = overrideHome(home);
+    let recorded;
+    try {
+      recorded = peekSyncState(projectReal).hub?.lastAutoPush;
+    } finally {
+      restore2.restore();
+    }
+    expect(recorded).toBeDefined();
+    expect(recorded!.ok).toBe(true);
+    expect(recorded!.notes.join(" ")).toMatch(/TRACKS/);
+    expect(recorded!.notes.join(" ")).toContain(".env");
+
+    // ...and the user can actually find it.
+    const status = JSON.parse(
+      runCli(["hub", "status"], {
+        env: { ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
+        cwd: projectReal,
+      }).stdout
+    );
+    expect(status.lastAutoPush.notes.join(" ")).toMatch(/TRACKS/);
+    expect(status.warnings.join(" ")).toMatch(/could not show you/);
+  });
+
   it("stays completely silent when another hub operation holds the project lock", async () => {
     writeSeshMoverConfig(home, { path: hubDir });
     linkProject(project);

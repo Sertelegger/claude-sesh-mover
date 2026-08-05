@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { HUB_JSON, bundleDir, bundleFileName } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
-import { resolveProjectIdentity, createHubProject, linkToHubProject, localGitRemotes, readLocalProjectId, } from "./identity.js";
+import { resolveProjectIdentity, createHubProject, linkToHubProject, scanGitRemotes, readLocalProjectId, } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
 import { snapshotWorkspace, hubincludePath, isNeverIncludable } from "./workspace.js";
@@ -172,13 +172,27 @@ export async function hubPush(opts) {
         // ignored-path discovery aid below, and neither runs on the up-to-date
         // early return above — so a quiet auto-push with no workspace still spawns
         // nothing, and a manual push of a git project spawns it once, not twice.
-        let gitRemotesCache = null;
-        const gitRemotes = () => (gitRemotesCache ??= localGitRemotes(opts.projectPath));
+        let gitScanCache = null;
+        const gitScan = () => (gitScanCache ??= scanGitRemotes(opts.projectPath));
+        // Neither payload is built when git could not be asked about this project's
+        // remotes (see `GitRemoteScan`). The workspace snapshot copies the whole
+        // project directory WITHOUT reading .gitignore, so taking that path on a
+        // repository whose remotes are merely unknown uploads secrets a git project
+        // never intended to publish — and this push may be the unattended SessionEnd
+        // one. The carry needs a working `git` by definition. Say so instead, in the
+        // shape the declined-carry warning already uses: no remedy is named that
+        // this invocation has already foreclosed.
+        if (gitScan().kind === "unknown" &&
+            (!opts.noWorkspace || !opts.noCarry) &&
+            existsSync(opts.projectPath)) {
+            const scan = gitScan();
+            warnings.push(`No project files or uncommitted work were included in this push: ${scan.detail}, so whether this project has a git remote could not be established. A full copy of the working tree is only safe for a project that genuinely has none — it does not read .gitignore — and the git-diff carry needs a working \`git\` of its own. The sessions pushed normally; once git can answer here, the files travel with the next push that has new session content.`);
+        }
         // Workspace payload — projects with no git remotes (including
         // remote-less git repositories), since there's no remote to reconstruct
         // the working tree from otherwise.
         let hasWorkspace = false;
-        if (!opts.noWorkspace && gitRemotes().length === 0 && existsSync(opts.projectPath)) {
+        if (!opts.noWorkspace && gitScan().kind === "none" && existsSync(opts.projectPath)) {
             const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));
             if (ws.symlinksSkipped > 0)
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
@@ -223,8 +237,14 @@ export async function hubPush(opts) {
         // its only reader was `snapshotWorkspace`, which runs exactly when there
         // are NO remotes, so the discovery aid below offered a file that could not
         // do anything for the project being offered it.
+        //
+        // Gated on `rawCount > 0`, not on the normalized list: a self-hosted
+        // `git@gitserver:team/repo.git` is a perfectly real remote that
+        // `normalizeGitRemote` declines to canonicalize (no dot in the host), and
+        // such a project must get the carry — the payload the .gitignore rules
+        // apply to — rather than a whole-tree snapshot.
         let carryMeta;
-        if (!opts.noCarry && gitRemotes().length > 0 && existsSync(opts.projectPath)) {
+        if (!opts.noCarry && gitScan().kind === "remotes" && existsSync(opts.projectPath)) {
             const diagnostics = [];
             // Contained deliberately, unlike the workspace snapshot above: this
             // branch runs `git` against a real user repository whose state is
@@ -256,7 +276,7 @@ export async function hubPush(opts) {
                     // uncommitted contents and no carry rule filters the patch.
                     const shown = cap.meta.trackedIgnored.join(", ");
                     const more = cap.meta.trackedIgnoredCount - cap.meta.trackedIgnored.length;
-                    warnings.push(`The patch carries changes to ${cap.meta.trackedIgnoredCount} gitignored file(s) that git TRACKS, so .gitignore did not keep them off the hub: ${shown}${more > 0 ? `, and ${more} more` : ""}. Untrack them (git rm --cached) or push with --no-carry to stop that.`);
+                    warnings.push(`The patch carries changes to ${cap.meta.trackedIgnoredCount} gitignored file(s) that git TRACKS, so .gitignore did not keep them off the hub: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now and nothing takes them off it; untrack them (git rm --cached) or push with --no-carry to keep the next push from carrying them again.`);
                 }
                 if (cap.meta.inProgress) {
                     warnings.push(`Uncommitted changes were captured during an in-progress ${cap.meta.inProgress}: the patch records the working tree as it stands, conflict markers included, and the ${cap.meta.inProgress} itself does not travel.`);
@@ -343,7 +363,7 @@ export async function hubPush(opts) {
         // mechanism and further nagging is noise. Existence, not pattern count, is
         // the test: a file holding only comments still means "I know about this".
         let ignoredNotCarried;
-        if (!opts.quiet && gitRemotes().length > 0 && !existsSync(hubincludePath(opts.projectPath))) {
+        if (!opts.quiet && gitScan().kind === "remotes" && !existsSync(hubincludePath(opts.projectPath))) {
             const ignored = listTopLevelIgnored(opts.projectPath);
             if (ignored.length > 0)
                 ignoredNotCarried = ignored;

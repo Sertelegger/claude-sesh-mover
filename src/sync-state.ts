@@ -279,6 +279,42 @@ export function setLastWorkspace(
 }
 
 /**
+ * Cap on the notes carried in `hub.lastAutoPush`. This is a breadcrumb, not a
+ * log: enough to recognize a recurring disclosure or a persistent failure, and
+ * bounded because the file is rewritten on every hub operation.
+ */
+export const MAX_AUTO_PUSH_NOTES = 5;
+
+/** Per-note character cap, for the same reason (a carry warning names files). */
+const MAX_AUTO_PUSH_NOTE_CHARS = 500;
+
+/**
+ * Record what the last SessionEnd auto-push produced for a human to read —
+ * which is otherwise thrown away, since that hook's stdout is closed and its
+ * stderr is only visible in Claude Code's debug output. See the field's doc in
+ * `types.ts`.
+ *
+ * No-op without a hub block: the breadcrumb is hub bookkeeping, and a project
+ * that has never pushed has nothing to say. That also keeps this from being the
+ * thing that bumps a file to schemaVersion 2 (the auto-push mints thread ids
+ * before it gets here, so a real push has always created the block already).
+ */
+export function setLastAutoPush(
+  state: SyncState,
+  entry: { ok: boolean; notes: string[]; at?: string }
+): void {
+  if (!state.hub) return;
+  state.hub.lastAutoPush = {
+    at: entry.at ?? new Date().toISOString(),
+    ok: entry.ok,
+    notes: entry.notes
+      .slice(0, MAX_AUTO_PUSH_NOTES)
+      .map((n) => (n.length > MAX_AUTO_PUSH_NOTE_CHARS ? `${n.slice(0, MAX_AUTO_PUSH_NOTE_CHARS)}…` : n)),
+    noteCount: entry.notes.length,
+  };
+}
+
+/**
  * Every workspace generation this machine's tree has passed through, most
  * recent first.
  *

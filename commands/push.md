@@ -12,6 +12,7 @@ You are running the sesh-mover push command. Follow these steps:
    - If `hubPath` is `null`, tell the user no hub is configured yet and point them at `/sesh-mover:hub-init`. Stop.
    - If `reachable` is false, surface the `warnings` (e.g. the synced folder isn't mounted) and stop.
    - Note `project.linked` / `project.projectId` — informational only; the actual link/create decision happens in step 3 if push reports it's unlinked.
+   - If `lastAutoPush` is present, that is the record of the last **automatic** (session-end) push for this project, which has no other output at all. Mention it when `ok` is `false` (the automatic pushes have been failing and nothing would have said so) or when `notes` is non-empty (those are warnings the user was never shown — the gitignored-but-tracked disclosure is one of them). Don't repeat it once the manual push below reports the same thing.
 
 2. Ask the user which sessions to push. Default to "All sessions in this project" (omit `--session-id`). Only ask for specific sessions if the user requests narrower scope — if so, detect session IDs the same way `export` does (see "Detecting the Current Session" in the skill doc) and let them multi-select via AskUserQuestion, passing each as `--session-id <id>`.
 
@@ -22,6 +23,8 @@ You are running the sesh-mover push command. Follow these steps:
    For non-git projects, push bundles a workspace snapshot (the project's files) alongside the sessions by default — offer `--no-workspace` when the user doesn't want project files uploaded to the hub (large or sensitive working directory), and carry it into any re-run in step 4.
 
    For git projects (a remote is configured) push instead carries the **uncommitted** work: a `git diff HEAD` patch plus untracked, non-gitignored files. Offer `--no-carry` when the user doesn't want work-in-progress on the hub, and carry it into any re-run. Among *untracked* files, a gitignored one is never carried unless `.claude-sesh-mover/hubinclude` names it (see step 4). That rule does **not** extend to tracked files: the patch describes every tracked file that changed, so a gitignored-but-tracked file's changes do travel — never tell the user `.gitignore` protects them from the carry without that qualification.
+
+   Which of the two a project gets is decided by asking `git` for its remotes, and there is a third answer: if `git` can't be asked (not on `PATH`, or a repository it refuses to read), push includes **neither** payload and says so in a warning. That is deliberate — a workspace snapshot copies the whole directory without reading `.gitignore`, which is only safe for a project that genuinely has no remote — so relay it as a local setup problem to fix (the sessions still pushed), never as the project having no uncommitted work.
 
 4. Parse the result and branch on its shape:
    - `reason: "unlinked"` (this project isn't linked to any hub project yet): present `linkCandidates` (name + gitRemotes) as a pick-list via AskUserQuestion, with an extra "Create a new hub project for this directory" option. Then re-run the step 3 invocation with `--project-id <picked-id>` appended (if the user picked a candidate) or `--create-project` appended (if they chose to create new). Do this once automatically as part of the flow — don't ask the user to re-invoke the command themselves.

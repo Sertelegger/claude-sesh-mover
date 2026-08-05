@@ -48,10 +48,11 @@ export interface HookGate {
 /**
  * Which automation flag under `hub` in config gates this hook.
  *
- * `startupNotice` is part of this union before it exists in the config
- * defaults (it ships with the SessionStart endpoint): an absent key reads as
- * `undefined`, which is not `false`, so it is treated as enabled — matching
- * the default-on consent model either way.
+ * Both keys are in the config defaults (`getDefaultConfig`), which is what
+ * makes them settable at all — `configure --set` rejects a dot-path the
+ * defaults don't contain. The read below is indexed rather than dotted anyway,
+ * so a key MISSING from an older on-disk config reads as `undefined`, which is
+ * not `false` and therefore enabled: the default-on consent model either way.
  */
 export type HookGateKey = "autoPush" | "startupNotice";
 

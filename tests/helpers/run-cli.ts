@@ -24,6 +24,12 @@ export interface RunCliOptions {
   env?: Record<string, string | undefined>;
   /** Written to the child's stdin (array form only). */
   input?: string;
+  /**
+   * Working directory for the child. Needed for anything project-scoped:
+   * `--scope project` resolves to `<cwd>/.claude-sesh-mover`, and the effective
+   * config is always read from the cwd's project layer.
+   */
+  cwd?: string;
 }
 
 export interface RunCliResult {
@@ -44,10 +50,12 @@ export function runCli(
   opts: RunCliOptions = {}
 ): string | RunCliResult {
   const env = { ...process.env, ...opts.env };
+  const cwd = opts.cwd === undefined ? {} : { cwd: opts.cwd };
   if (Array.isArray(args)) {
     const result = spawnSync("node", [cliPath(), ...args], {
       encoding: "utf-8",
       env,
+      ...cwd,
       // Only pass `input` when the caller supplied one: spawnSync treats an
       // explicit `undefined` the same as omitted, but being explicit here
       // keeps the no-stdin case identical to every pre-existing call site.
@@ -55,5 +63,5 @@ export function runCli(
     });
     return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", status: result.status };
   }
-  return execSync(`node "${cliPath()}" ${args}`, { encoding: "utf-8", env });
+  return execSync(`node "${cliPath()}" ${args}`, { encoding: "utf-8", env, ...cwd });
 }

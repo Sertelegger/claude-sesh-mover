@@ -18,10 +18,15 @@ Two items change behavior for existing hub users with no action on their part.
   your *uncommitted* work (a `git diff HEAD` patch plus untracked, non-gitignored files),
   because `hub.carryDiff` defaults to on: the payload is your working tree, not just
   transcripts. The hook takes no flags, so config is the only opt-out —
-  `sesh-mover configure --set hub.autoPush=false`, `… hub.carryDiff=false`,
-  `… hub.noWorkspace=true`, `… hub.startupNotice=false` (add `--scope project` to limit any
-  of them to one project). Nothing happens at all for a project that was never linked, or
-  on a machine with no hub configured.
+  `sesh-mover configure --set hub.autoPush=false` (no automatic push at all),
+  `… hub.carryDiff=false` (no uncommitted work from git projects),
+  `… hub.noWorkspace=true` (no workspace snapshot from projects *without* a git remote —
+  it does not affect the carry), `… hub.startupNotice=false` (add `--scope project` to
+  limit any of them to one project). Nothing happens at all for a project that was never
+  linked, or on a machine with no hub configured. The automatic push is also **silent by
+  construction** — its output goes to a stderr a clean session exit never shows — so the
+  warnings a manual push prints, the `carry.trackedIgnored` disclosure included, are
+  recorded in sync-state and reported by `hub status` (`lastAutoPush`) instead.
 - **Workspace bundles already on your hub can be unpullable, and this release fixes
   them** — every sesh-mover that has ever written one (0.5.0, 0.5.1) could produce this.
   When a workspace snapshot happened to contain no files (an empty
@@ -31,9 +36,12 @@ Two items change behavior for existing hub users with no action on their part.
   **crashed, terminally**: the crash happened inside the bundle loop *before* the session
   import, so no session arrived, nothing was recorded as received, every retry failed
   identically, and no flag skipped the workspace step — the thread was permanently
-  unpullable. 0.6.0 stops producing that bundle **and** degrades to a warning when it meets
-  one already sitting on a hub, so a thread stranded by an older version becomes pullable
-  again by upgrading the machine that pulls.
+  unpullable. 0.6.0 fixes both ends: a snapshot that carries no files now creates the
+  (empty) `workspace/` directory it declares, so the payload matches the manifest — the
+  manifest still declares `fileCount: 0`, which is a legitimate snapshot — **and** a pull
+  that meets a bundle declaring a payload it does not contain degrades to a warning instead
+  of crashing, so a thread stranded by an older version becomes pullable again by upgrading
+  the machine that pulls.
 
 ### Added
 - **Hub automation** (`hooks/hooks.json`, two internal CLI endpoints). `SessionEnd` →

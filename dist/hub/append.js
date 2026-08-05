@@ -169,7 +169,13 @@ export async function tryAppendContinuation(a) {
         return {
             kind: "declined",
             reason: "recently-active",
-            detail: `base session was modified ${Math.round(ageMs / 1000)}s ago (possible live session); use --force-append to override`,
+            // States the fact, never a remedy. This module cannot know what its
+            // caller does with a decline, and the caller that has one — hub/pull.ts —
+            // falls through to a fragment import that RECORDS the bundle, so naming
+            // `--force-append` here produced a warning telling the user to re-run
+            // with a flag that can no longer reach this bundle. Advice belongs where
+            // the consequence is known.
+            detail: `base session was modified ${Math.round(ageMs / 1000)}s ago (possible live session)`,
         };
     }
     // Rollback length and "did we touch the file at all" bookkeeping. The length

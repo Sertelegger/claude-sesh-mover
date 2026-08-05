@@ -34,7 +34,13 @@ const MAX_HUBINCLUDE_PATTERNS = 500;
 export class WorkspaceTargetNotEmptyError extends Error {
     targetPath;
     constructor(targetPath) {
-        super(`workspace target ${targetPath} exists and is not empty — pass force to merge into it`);
+        // "overwrite", never "merge": `force` here means unpack the payload over
+        // whatever is there, replacing files of the same name. The 3-way merge is a
+        // different code path entirely (`mergeWorkspaceTrees`), reached only when a
+        // generation common to both trees is known, and `--force-workspace`
+        // deliberately SKIPS it. Calling this a merge is how a user ends up
+        // consenting to an overwrite.
+        super(`workspace target ${targetPath} exists and is not empty — pass force to unpack over it, overwriting files of the same name`);
         this.targetPath = targetPath;
     }
 }
@@ -634,7 +640,7 @@ export async function snapshotWorkspace(projectPath, destDir, opts) {
     // top-level directory, so the snapshot silently carried nothing. Say so
     // whenever there WAS something to carry.
     if (fileCount === 0 && listDirSafely(projectPath).some((n) => n !== ".claude-sesh-mover")) {
-        warnings.push("The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by .claude-sesh-mover/hubignore, so this push carries no project files. Check hubignore for an over-broad pattern (`*` and `*/` match everything at a level), or push with --no-workspace if that is what you meant.");
+        warnings.push("The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by .claude-sesh-mover/hubignore, so this push carries no project files. Check hubignore for an over-broad pattern (`*` and `*/` match everything at a level), or pass --no-workspace on future pushes if that is what you meant.");
     }
     return { fileCount, byteSize, symlinksSkipped, skipped: false, warnings };
 }

@@ -389,6 +389,18 @@ export interface HubStatusResult {
   machineRegistered: boolean;
   machinesKnown: number;
   project: { linked: boolean; projectId: string | null };
+  /**
+   * What the last SessionEnd auto-push for THIS project reported — the only
+   * place its output survives, since that hook's stdout is closed and its
+   * stderr is invisible at a clean exit. Absent when no auto-push has run here
+   * (or when this project's sync-state predates the field).
+   *
+   * `notes` are that push's own warnings verbatim (capped), which is where the
+   * carry disclosures live: gitignored-but-TRACKED files whose contents rode
+   * the patch off this machine, and `hubinclude` paths that were re-included.
+   * On a failed push it is the error instead.
+   */
+  lastAutoPush?: { at: string; ok: boolean; notes: string[]; noteCount: number };
   warnings: string[];
 }
 
@@ -835,5 +847,27 @@ export interface SyncState {
      * with what the incoming chain declares it descends from.
      */
     workspaceGenerations?: WorkspaceGenerationRef[];
+    /**
+     * What the last SessionEnd auto-push had to say for itself.
+     *
+     * The auto-push runs detached with its stdout closed and its stderr shown
+     * only in Claude Code's debug output, so everything it computes for a human
+     * is discarded — including the disclosures that exist precisely to be read:
+     * `carry.trackedIgnored` (gitignored-but-TRACKED files whose contents left
+     * the machine in the patch) and the re-included `hubinclude` paths. It is
+     * also where a chronically failing push (an unmounted share) would
+     * otherwise be invisible. This is the durable breadcrumb for both, surfaced
+     * by `hub status`.
+     *
+     * Written only by the auto-push endpoint, and only best-effort: it is a
+     * record OF a push, never an input TO one, so nothing reads it back.
+     */
+    lastAutoPush?: {
+      at: string;
+      ok: boolean;
+      /** Capped at `MAX_AUTO_PUSH_NOTES`; `noteCount` is how many there were. */
+      notes: string[];
+      noteCount: number;
+    };
   };
 }

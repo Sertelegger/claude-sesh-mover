@@ -1460,7 +1460,14 @@ describe("hub pull — continuation append", () => {
       expect(after).toHaveLength(before.length + 1);
       expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
       expect(p.warnings.join(" ")).toContain("live session");
-      expect(p.warnings.join(" ")).toContain("--force-append");
+      // Deliberately changed (whole-branch review, Important 4): this
+      // assertion used to require the warning to name `--force-append`, which
+      // is the foreclosure class itself. The fragment import below records the
+      // bundle, so no later run with that flag can ever reach it — the advice
+      // was impossible, and the test was pinning it in place.
+      expect(p.warnings.join(" ")).not.toContain("--force-append");
+      expect(p.warnings.join(" ")).toContain("Nothing local was touched");
+      expect(p.warnings.join(" ")).toContain("close the Claude Code session");
     } finally {
       a.cleanup();
     }
@@ -3530,6 +3537,102 @@ describe("hub pull: a thread split across two other machines", () => {
       expect(pull.success).toBe(false);
       if (pull.success) return;
       expect("error" in pull && pull.error).toBe("Already up to date with the source machine.");
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  // The disclosure has to survive the branches that return BEFORE any bundle
+  // is selected. `--latest` skips a thread this machine is "current" with, and
+  // head equality is exactly what a fragment of a split thread produces — so
+  // the machine holding the least of a conversation got the most reassuring
+  // answer of all: "all threads are current".
+  it("--latest discloses a split thread instead of saying everything is current", async () => {
+    const f = await setupSplit("sesh-pull-split-latest", { withB: true });
+    try {
+      // This machine publishes A's head, so isCurrent() is true for the only
+      // thread and --latest finds no candidate.
+      const me = loadOrCreateMachineId();
+      await writeMachineIndex(f.backend, {
+        ...idx(me.id, {
+          [THREAD]: entry({
+            localSessionId: FIXTURE_SESSION_ID, lastActiveAt: "2026-07-21T11:00:00Z",
+            headEntryUuid: "head-a1", bundles: [],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+
+      const pull = await hubPull({
+        configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      const err = "error" in pull ? pull.error : "";
+      const sug = "suggestion" in pull ? (pull.suggestion ?? "") : "";
+      expect(err).toContain("not every thread is whole here");
+      expect(err).toContain("beta-desktop");
+      expect(err).toContain("split across machines");
+      expect(sug).toContain("nothing to re-run");
+      expect(`${err} ${sug}`).not.toMatch(/--[a-z]/); // no invented remedy
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  it("--latest keeps its plain answer when nothing is missing (control)", async () => {
+    const f = await setupSplit("sesh-pull-nosplit-latest", { withB: false });
+    try {
+      const me = loadOrCreateMachineId();
+      await writeMachineIndex(f.backend, {
+        ...idx(me.id, {
+          [THREAD]: entry({
+            localSessionId: FIXTURE_SESSION_ID, lastActiveAt: "2026-07-21T11:00:00Z",
+            headEntryUuid: "head-a1", bundles: [],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      const pull = await hubPull({
+        configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      expect("error" in pull && pull.error).toBe(
+        "Nothing to pull: all threads are current on this machine."
+      );
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  it('"the latest copy is already local" discloses it too', async () => {
+    const f = await setupSplit("sesh-pull-split-local", { withB: true });
+    try {
+      // Newest copy of all: this machine. --thread then resolves to us and
+      // returns before sync-state was ever read (Task 12b's recorded residual).
+      const me = loadOrCreateMachineId();
+      await writeMachineIndex(f.backend, {
+        ...idx(me.id, {
+          [THREAD]: entry({
+            localSessionId: FIXTURE_SESSION_ID, lastActiveAt: "2026-07-22T09:00:00Z",
+            headEntryUuid: "head-local", bundles: [],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      const pull = await hubPull({
+        configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
+        threadId: THREAD, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      const err = "error" in pull ? pull.error : "";
+      expect(err).toContain("already local");
+      expect(err).toContain("not whole here");
+      expect(err).toContain("beta-desktop");
     } finally {
       cleanupSplit(f);
     }

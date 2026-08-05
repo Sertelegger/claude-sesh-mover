@@ -813,6 +813,53 @@ export async function hubPull(
       return !!localEntry && localEntry.headEntryUuid === t.latest.headEntryUuid;
     };
 
+    // Everything below (dedup/sync-state, workspace unpack, session import,
+    // and this machine's own index projection) is keyed off the EFFECTIVE
+    // project path: --target-path when given, else opts.projectPath. Declared
+    // here rather than after thread selection so the two "there is nothing to
+    // pull" early returns can read sync-state too — see `discloseUnfetchable`.
+    const effectiveProjectPath = opts.targetPath ?? opts.projectPath;
+
+    /**
+     * The #35 disclosure for a branch that returns BEFORE fetching anything.
+     *
+     * "Nothing to pull" and "the latest copy is already local" are the two
+     * answers a machine holding half a cross-machine thread gets most often —
+     * head equality is exactly what a fragment produces (see the head-equality
+     * trap in the ledger), so `isCurrent` is TRUE for the thread that is most
+     * incomplete. Saying "all threads are current" there is the nag loop this
+     * disclosure exists to break, one step earlier than the `needed.length ===
+     * 0` branch that already handles it.
+     *
+     * peekSyncState, not readSyncState: these branches apply nothing, and a
+     * corrupt state file must not be renamed aside by a run that does nothing
+     * else (same rule as the pick-list branch above).
+     */
+    const discloseUnfetchable = async (candidates: ResolvedThread[]): Promise<string | null> => {
+      const peeked = peekSyncState(effectiveProjectPath);
+      const machineName = createMachineNameLookup(backend);
+      const lines: string[] = [];
+      for (const t of candidates) {
+        const sets = findUnfetchableBundles({
+          copies: t.copies,
+          sourceMachineId: t.latest.machineId,
+          localMachineId: machine.id,
+          state: peeked,
+        });
+        if (sets.length === 0) continue;
+        const groups = await Promise.all(
+          sets.map(async (u) => ({
+            machineId: u.machineId,
+            machineName: await machineName(u.machineId),
+            bundleIds: u.bundleIds,
+          }))
+        );
+        const sourceLabel = (await machineName(t.latest.machineId)) ?? t.latest.machineId;
+        lines.push(describeUnfetchable(t.threadId, groups, sourceLabel));
+      }
+      return lines.length > 0 ? lines.join(" ") : null;
+    };
+
     let target: ResolvedThread | undefined;
     if (opts.threadId) {
       target = resolved.find((t) => t.threadId === opts.threadId);
@@ -828,27 +875,33 @@ export async function hubPull(
       // take the first thread that is NOT already current on this machine.
       target = resolved.find((t) => !isCurrent(t));
       if (!target) {
+        const split = await discloseUnfetchable(resolved);
         return {
           success: false, command: "pull",
-          error: "Nothing to pull: all threads are current on this machine.",
-          suggestion: "Run whereis to double-check thread status.",
+          error: split
+            ? `Nothing to pull: every thread is current with the machine it resolves to, but not every thread is whole here. ${split}`
+            : "Nothing to pull: all threads are current on this machine.",
+          suggestion: split
+            ? "There is nothing to re-run: no flag pulls a thread whose bundles are split across machines. Run whereis — the same threads report it as unfetchableBundles."
+            : "Run whereis to double-check thread status.",
         };
       }
     }
 
     const sourceCopy = target.latest;
     if (sourceCopy.machineId === machine.id) {
+      const split = await discloseUnfetchable([target]);
       return {
         success: false, command: "pull",
-        error: "The latest copy of this thread is already local.",
-        suggestion: "Run whereis to confirm — there is nothing to pull.",
+        error: split
+          ? `The latest copy of this thread is already local, but the thread is not whole here. ${split}`
+          : "The latest copy of this thread is already local.",
+        suggestion: split
+          ? "There is nothing to re-run: no flag pulls a thread whose bundles are split across machines. Run whereis — the same thread reports it as unfetchableBundles."
+          : "Run whereis to confirm — there is nothing to pull.",
       };
     }
 
-    // Everything below (dedup/sync-state, workspace unpack, session import,
-    // and this machine's own index projection) is keyed off the EFFECTIVE
-    // project path: --target-path when given, else opts.projectPath.
-    const effectiveProjectPath = opts.targetPath ?? opts.projectPath;
     const targetProjectDir = join(opts.configDir, "projects", encodeProjectPath(effectiveProjectPath));
     const state = readSyncState(effectiveProjectPath);
     const received = state.peers[sourceCopy.machineId]?.received;
@@ -1136,8 +1189,18 @@ export async function hubPull(
           writeSyncState(stateWs);
           warnings.push(...describeWorkspaceMerge(report));
         } else if (hasRealContent && !opts.forceWorkspace && !opts.targetPath) {
+          // The two flags are named for the NEXT payload, never as a re-run of
+          // this pull: this bundle is recorded as received by the end of it, so
+          // an immediate repeat answers "already up to date" without reaching
+          // the files. The last sentence is the part that used to be missing —
+          // this branch records NO generation (recording one this tree never
+          // received is how the next merge reads the whole payload as "deleted
+          // here"), so nothing about it self-heals. Every payload from that
+          // machine skips exactly like this until one is applied, and every
+          // workspace bundle written before 0.6.0 declares no ancestor at all,
+          // which is precisely how a first 0.6.0 pull lands here.
           warnings.push(
-            "Bundle carries a workspace payload but the project directory already has content and no workspace generation is shared between this machine and the payload, so there is no common point to merge from — pass --force-workspace to unpack it here, OVERWRITING any file of the same name, or re-pull with --target-path <fresh-dir> to unpack it elsewhere. Once this machine and the other one share one generation, later payloads merge 3-way instead."
+            "Bundle carries a workspace payload but the project directory already has content and no workspace generation is shared between this machine and the payload, so there is no common point to merge from and NOTHING was written. The sessions imported normally, and the payload is still in the bundle on the hub. This pull cannot be re-run to get it — its bundles are recorded now — and it will not resolve itself: no generation is recorded for a payload that was not applied, so the next payload from that machine skips for the same reason. Breaking out of that takes a deliberate choice on a LATER pull: --target-path <fresh-dir> unpacks that payload somewhere else and destroys nothing, or --force-workspace unpacks it over this directory, OVERWRITING any file of the same name. Whichever you use, that machine and this one then share a generation and later payloads merge 3-way."
           );
         } else {
           try {
@@ -1187,7 +1250,15 @@ export async function hubPull(
               return {
                 success: false, command: "pull",
                 error: e.message,
-                suggestion: "Pass --force-workspace to merge into the existing (non-empty) target directory.",
+                // Not "merge": this branch is only reached when
+                // chooseMergeAncestor found NO generation common to both trees,
+                // so a merge is impossible here by construction — and
+                // --force-workspace would skip the merge even if one were
+                // available. Recommending a merge at the exact point the code
+                // has ruled one out is how a user consents to an overwrite
+                // thinking their local files will be combined.
+                suggestion:
+                  "Nothing was written. To use this destination anyway, re-run with --force-workspace: it unpacks the hub's copy over the existing (non-empty) directory, OVERWRITING any file of the same name — it does not combine the two. To keep that directory untouched, point --target-path at an empty one instead.",
               };
             }
             throw e;
@@ -1472,8 +1543,14 @@ export async function hubPull(
                 );
                 divergence.resolution = "fragment";
               } else if (divergence.adoptAvailable) {
+                // No re-run is offered, because none exists: the fragment
+                // import below records this bundle, after which
+                // `--on-divergence adopt-hub` reports "already up to date" and
+                // never reaches the fork. `skip` is named only as the mode to
+                // run the NEXT divergence under — it applies and records
+                // nothing, which is what keeps the choice open.
                 warnings.push(
-                  `Thread ${target.threadId} has diverged: ${forkSummary}, so the hub's branch was imported as a separate session and nothing local was touched. Re-run with --on-divergence adopt-hub to make the hub's branch canonical and keep your branch as a second session, or --on-divergence skip to decide later.`
+                  `Thread ${target.threadId} has diverged: ${forkSummary}, so the hub's branch was imported as a separate session and nothing local was touched. Both branches are now local sessions and this bundle is recorded as received, so that decision stands for it — adopt-hub cannot be applied to it afterwards. To be asked instead of having fragment chosen for you, pull with --on-divergence skip (what /sesh-mover:pull always passes) or set hub.onDivergence=skip.`
                 );
               } else {
                 warnings.push(
@@ -1482,8 +1559,21 @@ export async function hubPull(
               }
               // fall through to the fragment import
             } else {
+              // Deliberately names no flag. The fragment import below RECORDS
+              // this bundle, so `--force-append` — the flag that would have
+              // spliced it — cannot reach it on any later run: the re-run
+              // answers "already up to date". What IS still true is the
+              // preventive advice, so that is what this says. (The decline is
+              // left as a fragment rather than converted to a skip, unlike the
+              // adopt-hub refusal: a plain append is the default path, and the
+              // invariant that content always arrives — at worst as a second
+              // session — is worth more here than the chance to retry.)
+              const preventive =
+                outcome.reason === "recently-active"
+                  ? " Nothing local was touched. This bundle is now recorded, so no re-run applies it to the existing session; to have future continuations of this thread spliced in, close the Claude Code session writing to that transcript before pulling."
+                  : "";
               warnings.push(
-                `Continuation for thread ${target.threadId} could not be appended to the local session (${outcome.detail}) — imported as a separate session instead.`
+                `Continuation for thread ${target.threadId} could not be appended to the local session (${outcome.detail}) — imported as a separate session instead.${preventive}`
               );
             }
           }

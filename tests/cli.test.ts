@@ -51,6 +51,18 @@ describe("cli", () => {
     args: string | string[],
     envOverrides?: Record<string, string>
   ): string | RunCliResult {
+    // This wrapper's second parameter is a flat ENV RECORD, not the shared
+    // helper's options object. Handing it `{ env: …, cwd: … }` silently sets
+    // two environment variables named "env" and "cwd" instead — the child then
+    // runs against the DEVELOPER'S REAL HOME, and a `hub init --scope user` in
+    // a test rewrites their actual config. That happened; this is the guard.
+    for (const [k, v] of Object.entries(envOverrides ?? {})) {
+      if (typeof v !== "string") {
+        throw new TypeError(
+          `runCli env override "${k}" must be a string — this wrapper takes a flat env record, not RunCliOptions. Use the imported sharedRunCli for cwd/input.`
+        );
+      }
+    }
     const env = { CLAUDE_CONFIG_DIR: configDir, ...envOverrides };
     return Array.isArray(args)
       ? sharedRunCli(args, { env })
@@ -653,10 +665,21 @@ describe("cli", () => {
 
   describe("configure command", () => {
     it("shows current config", () => {
-      const output = runCli("configure --show --json");
-      const result = JSON.parse(output);
-      expect(result.success).toBe(true);
-      expect(result.config.export.storage).toBe("user");
+      // Isolated HOME on purpose: `--show` reports the EFFECTIVE config, so
+      // without one this asserts on whatever the developer running the suite
+      // happens to have configured (it read the real ~/.claude-sesh-mover).
+      const home = mkdtempSync(join(tmpdir(), "sesh-cfg-show-home-"));
+      try {
+        const output = sharedRunCli(["configure", "--show", "--json"], {
+          env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(home) },
+          cwd: home,
+        }).stdout;
+        const result = JSON.parse(output);
+        expect(result.success).toBe(true);
+        expect(result.config.export.storage).toBe("user");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     });
 
     it("sets machine.name via --set", () => {
@@ -686,6 +709,73 @@ describe("cli", () => {
         expect(shown.config.hub.startupNotice).toBe(false);
       } finally {
         homeOverride.restore();
+      }
+    });
+
+    // The whole-branch review's Critical 1, end to end through the real CLI:
+    // 0.6.0's release notes tell users to add `--scope project` to any of the
+    // hub opt-outs, and doing so used to write a defaults snapshot — `hub.path:
+    // ""` included — into the project file, which then beat the user-scope hub
+    // path. `hub status` answered `hubPath: null` and `push` answered "No hub
+    // configured" for that project, forever.
+    it("a project-scope --set does not unconfigure the user-scope hub", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cfg-scope-home-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cfg-scope-proj-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cfg-scope-hub-"));
+      try {
+        // sharedRunCli, not the local wrapper: this needs a cwd (that IS the
+        // project scope) as well as an isolated HOME.
+        const env = { env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(home) }, cwd: project };
+        const init = JSON.parse(
+          sharedRunCli(["hub", "init", "--scope", "user", "--path", hubDir], env).stdout
+        );
+        expect(init.success).toBe(true);
+
+        const set = JSON.parse(
+          sharedRunCli(
+            ["configure", "--set", "hub.autoPush=false", "--scope", "project", "--json"],
+            env
+          ).stdout
+        );
+        expect(set.success).toBe(true);
+        // The result reports what APPLIES now, so the regression is visible in
+        // the very output of the command that caused it.
+        expect(set.config.hub.autoPush).toBe(false);
+        expect(set.config.hub.path).toBe(hubDir);
+
+        // The file itself holds only what this scope sets.
+        const written = JSON.parse(
+          readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8")
+        );
+        expect(written).toEqual({ hub: { autoPush: false } });
+
+        // And the hub is still configured for this project.
+        const status = JSON.parse(sharedRunCli(["hub", "status"], env).stdout);
+        expect(status.hubPath).toBe(hubDir);
+        expect(status.reachable).toBe(true);
+      } finally {
+        for (const d of [home, project, hubDir]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    it("--reset clears one scope's settings instead of pinning defaults over the other", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cfg-reset-home-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cfg-reset-proj-"));
+      try {
+        const env = { env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(home) }, cwd: project };
+        sharedRunCli(["configure", "--set", "export.storage=project", "--scope", "user"], env);
+        sharedRunCli(["configure", "--set", "hub.autoPush=false", "--scope", "project"], env);
+        const reset = JSON.parse(
+          sharedRunCli(["configure", "--reset", "--scope", "project", "--json"], env).stdout
+        );
+        expect(reset.success).toBe(true);
+        expect(reset.config.hub.autoPush).toBe(true); // the project override is gone
+        expect(reset.config.export.storage).toBe("project"); // the user's setting survives
+        expect(
+          JSON.parse(readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8"))
+        ).toEqual({});
+      } finally {
+        for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
       }
     });
 

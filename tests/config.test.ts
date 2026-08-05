@@ -170,4 +170,67 @@ describe("config", () => {
       expect(effective.export.storage).toBe("project");
     });
   });
+
+  // The WRITE side of the same defect computeEffectiveConfig exists for. A
+  // scope-targeted write that serializes a whole defaults-backfilled config
+  // turns every default into an explicit setting at that scope, and the project
+  // layer then beats the user layer on keys the user only ever set once.
+  describe("scope-targeted overrides", () => {
+    it("setConfigOverride keeps the object sparse", async () => {
+      const { setConfigOverride } = await import("../src/config.js");
+      expect(setConfigOverride({}, "hub.autoPush", false)).toEqual({ hub: { autoPush: false } });
+      // Second key in the same section, and an existing one is not disturbed.
+      const two = setConfigOverride(
+        setConfigOverride({}, "hub.autoPush", false),
+        "export.storage",
+        "project"
+      );
+      expect(two).toEqual({ hub: { autoPush: false }, export: { storage: "project" } });
+      // Critically: no `hub.path` key at all. An empty-string path written here
+      // is what unconfigured the hub for the project.
+      expect(JSON.stringify(two)).not.toContain("path");
+    });
+
+    it("setConfigOverride validates against the defaults, like setConfigValue", async () => {
+      const { setConfigOverride } = await import("../src/config.js");
+      expect(() => setConfigOverride({}, "hub.notAKey", 1)).toThrow(/Invalid config path/);
+      expect(() => setConfigOverride({}, "nope.thing", 1)).toThrow(/Invalid config path/);
+      expect(() => setConfigOverride({}, "__proto__.polluted", 1)).toThrow(/Invalid config path/);
+      // and the prototype was not touched by the attempt
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    });
+
+    it("a project-scope override leaves the user scope's OTHER keys effective", async () => {
+      const { computeEffectiveConfig, readConfigOverrides, writeConfigOverrides, setConfigOverride } =
+        await import("../src/config.js");
+      const userDir = join(tempDir, "u3");
+      const projectDir = join(tempDir, "p3");
+      writeConfigOverrides(
+        userDir,
+        setConfigOverride(readConfigOverrides(userDir), "hub.path", "/mnt/share/hub")
+      );
+      // What `configure --set hub.autoPush=false --scope project` now writes.
+      writeConfigOverrides(
+        projectDir,
+        setConfigOverride(readConfigOverrides(projectDir), "hub.autoPush", false)
+      );
+
+      const effective = computeEffectiveConfig(userDir, projectDir);
+      expect(effective.hub.autoPush).toBe(false); // the project's own setting wins
+      expect(effective.hub.path).toBe("/mnt/share/hub"); // and the hub is still configured
+      expect(effective.export.storage).toBe("user"); // untouched keys fall through to defaults
+    });
+
+    it("the old defaults-backfilled write is what broke it (negative control)", async () => {
+      const { computeEffectiveConfig, readConfig, writeConfig, setConfigValue } = await import(
+        "../src/config.js"
+      );
+      const userDir = join(tempDir, "u4");
+      const projectDir = join(tempDir, "p4");
+      writeConfig(userDir, setConfigValue(readConfig(userDir), "hub.path", "/mnt/share/hub"));
+      // Exactly what cli.ts used to do for --scope project.
+      writeConfig(projectDir, setConfigValue(readConfig(projectDir), "hub.autoPush", false));
+      expect(computeEffectiveConfig(userDir, projectDir).hub.path).toBe("");
+    });
+  });
 });

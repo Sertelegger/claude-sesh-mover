@@ -7,10 +7,10 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync }
 import { execFileSync } from "node:child_process";
 import { resolveConfigDir } from "./platform.js";
 import {
-  getDefaultConfig,
   readConfig,
-  writeConfig,
-  setConfigValue,
+  readConfigOverrides,
+  writeConfigOverrides,
+  setConfigOverride,
   computeEffectiveConfig,
 } from "./config.js";
 import { exportSession, exportAllSessions } from "./exporter.js";
@@ -18,7 +18,13 @@ import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
 import { readManifest, assertSafeManifestIds } from "./manifest.js";
 import { loadOrCreateMachineId } from "./machine.js";
-import { readSyncState, recordSentFromBundle } from "./sync-state.js";
+import {
+  readSyncState,
+  recordSentFromBundle,
+  setLastAutoPush,
+  writeSyncState,
+} from "./sync-state.js";
+import { acquireProjectLock } from "./hub/lock.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import {
   createArchive,
@@ -490,13 +496,19 @@ program
           : join(homedir(), ".claude-sesh-mover");
 
       if (opts.reset) {
-        writeConfig(configDir, getDefaultConfig());
+        // Clear this scope's overrides rather than writing a snapshot of every
+        // default: a defaults-filled file is indistinguishable from one whose
+        // author meant those values, so `--reset --scope project` used to pin
+        // every default over the user scope (`hub.path: ""` included). The
+        // reported config is the EFFECTIVE one, which for a project-scope reset
+        // is the user's settings — that is what now applies here.
+        writeConfigOverrides(configDir, {});
         const result: ConfigureResult = {
           success: true,
           command: "configure",
-          config: getDefaultConfig(),
+          config: loadEffectiveConfig(resolveConfigDir(), process.cwd()),
           scope: opts.scope as StorageScope,
-          message: "Config reset to defaults",
+          message: `Cleared all ${opts.scope}-scope settings; the effective config below is what applies now.`,
         };
         output(result);
         return;
@@ -533,7 +545,12 @@ program
           output(result);
           return;
         }
-        let config = readConfig(configDir);
+        // Read/write this scope's OVERRIDES, never a defaults-backfilled
+        // config: writing the latter into the project scope pins every default
+        // over the user scope, which silently unconfigured the hub for that
+        // project (`hub.path: ""` beats a user-scope hub.path). Same defect
+        // class as the read side that computeEffectiveConfig exists to fix.
+        let overrides = readConfigOverrides(configDir);
         // Parse value
         let parsedValue: unknown = value;
         if (value === "true") parsedValue = true;
@@ -550,12 +567,16 @@ program
           }
         }
 
-        config = setConfigValue(config, key, parsedValue);
-        writeConfig(configDir, config);
+        overrides = setConfigOverride(overrides, key, parsedValue);
+        writeConfigOverrides(configDir, overrides);
         const result: ConfigureResult = {
           success: true,
           command: "configure",
-          config,
+          // The EFFECTIVE config after the write, not this scope's file: with
+          // only the overrides on disk, that file no longer describes what
+          // applies, and what applies is the useful answer (it also shows a
+          // user-scope --set that a project-scope file still overrides).
+          config: loadEffectiveConfig(resolveConfigDir(), process.cwd()),
           scope: opts.scope as StorageScope,
           message: `Set ${key} = ${value}`,
         };
@@ -692,8 +713,17 @@ hub
       // lock-busy is an expected outcome, not a failure: another sesh-mover
       // hub operation for this project is already running, so this push is
       // redundant by definition. Everything else is worth a stderr line.
-      if (!result.success && !("reason" in result && result.reason === "lock-busy")) {
+      const lockBusy = "reason" in result && result.reason === "lock-busy";
+      if (!result.success && !lockBusy) {
         writeHookDiagnostic(`sesh-mover auto-push: ${JSON.stringify(result)}\n`);
+      }
+      // ...and a durable copy, because that stderr line is invisible at a clean
+      // exit. This push computes real disclosures — which gitignored-but-TRACKED
+      // files its patch carried off the machine, which hubinclude paths it
+      // re-included — and then discards every one of them. `hub status` reads
+      // this back. Never for lock-busy: that push did nothing.
+      if (!lockBusy) {
+        recordAutoPushOutcome(projectPath, result);
       }
     } catch (e) {
       writeHookDiagnostic(`sesh-mover auto-push failed: ${(e as Error).message}\n`);
@@ -826,7 +856,10 @@ program
   .option("--latest", "Pull whichever thread most needs updating on this machine")
   .option("--project-path <path>", "Override project path (default: cwd)")
   .option("--target-path <path>", "Workspace unpack destination when the project directory doesn't exist locally yet")
-  .option("--force-workspace", "Merge workspace files into a non-empty target directory")
+  .option(
+    "--force-workspace",
+    "Unpack the hub's workspace copy over a non-empty target directory, overwriting files of the same name (never a merge)"
+  )
   .option("--apply-carry", "Apply carried uncommitted changes (requires the same base commit and a clean tree)")
   .option("--project-id <id>", "Link to an existing hub project id")
   .option("--force-append", "Append a pulled continuation even if the local session looks recently active")
@@ -1246,6 +1279,50 @@ function writeHookDiagnostic(message: string): void {
     process.stderr.write(message);
   } catch {
     /* stderr is gone — stay silent rather than fail the hook */
+  }
+}
+
+/**
+ * Leave a durable trace of an auto-push in this project's sync-state.
+ *
+ * The SessionEnd push is the only push nobody reads: stdout is closed to it,
+ * and Claude Code shows a clean-exit hook's stderr only in debug output. Two
+ * things it computes are worth more than that — the carry disclosures (which
+ * gitignored-but-TRACKED files the patch took off the machine, which
+ * `hubinclude` paths were re-included) and the fact that it failed at all, which
+ * an unmounted share otherwise hides indefinitely. `hub status` reads this back.
+ *
+ * Best effort in every direction, because a breadcrumb must never cost a push:
+ * it takes the same project lock the push itself uses (sync-state is a
+ * read-modify-write of a file `pull` also rewrites, and the push released the
+ * lock before returning), and it gives up silently on a busy lock or any error.
+ */
+function recordAutoPushOutcome(projectPath: string, result: { success: boolean }): void {
+  try {
+    const r = result as unknown as Record<string, unknown>;
+    const notes: string[] = [];
+    if (result.success) {
+      const warnings = Array.isArray(r.warnings) ? (r.warnings as unknown[]) : [];
+      notes.push(...warnings.filter((w): w is string => typeof w === "string"));
+    } else {
+      const error = typeof r.error === "string" ? r.error : JSON.stringify(result);
+      const suggestion = typeof r.suggestion === "string" ? ` ${r.suggestion}` : "";
+      notes.push(`${error}${suggestion}`);
+    }
+    // Nothing to say and nothing already on record is the overwhelmingly common
+    // case (a clean push of a project with no disclosures). Still recorded, so
+    // "the last auto-push was fine" is distinguishable from "no auto-push has
+    // ever run here" — both are answers a user asks `hub status` for.
+    const lock = acquireProjectLock(projectPath);
+    try {
+      const state = readSyncState(projectPath);
+      setLastAutoPush(state, { ok: result.success, notes });
+      writeSyncState(state);
+    } finally {
+      lock.release();
+    }
+  } catch {
+    /* lock busy, unreadable state, read-only home — the push already happened */
   }
 }
 

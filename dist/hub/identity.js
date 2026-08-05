@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { projectJsonPath, assertSafeHubId } from "./layout.js";
@@ -52,9 +52,31 @@ export function normalizeGitRemote(url) {
         return null;
     return `${host.toLowerCase()}/${path.toLowerCase()}`;
 }
-export function localGitRemotes(projectPath) {
+/**
+ * Is there a git repository at or above `projectPath`?
+ *
+ * A filesystem fact, deliberately — it is the one thing still knowable when
+ * `git` itself cannot be run, which is exactly the case that must not be read
+ * as "no remotes". Walks up because git's own discovery does: a monorepo
+ * package has no `.git` of its own but is inside a repository, and its remotes
+ * belong to it. `.git` may be a directory or a file (worktrees, submodules).
+ */
+function hasGitRepoMarker(projectPath) {
+    let dir = resolve(projectPath);
+    // Bounded by construction: dirname() reaches a fixed point at the root.
+    for (;;) {
+        if (existsSync(join(dir, ".git")))
+            return true;
+        const parent = dirname(dir);
+        if (parent === dir)
+            return false;
+        dir = parent;
+    }
+}
+export function scanGitRemotes(projectPath) {
+    let out;
     try {
-        const out = execFileSync("git", ["remote", "-v"], {
+        out = execFileSync("git", ["remote", "-v"], {
             cwd: projectPath, encoding: "utf-8", timeout: 5000,
             // Not the inherited environment (see `gitChildEnv`): this answer is what
             // decides whether push takes the git-carry path or the workspace-snapshot
@@ -63,20 +85,51 @@ export function localGitRemotes(projectPath) {
             env: gitChildEnv(),
             stdio: ["ignore", "pipe", "ignore"], // suppress git's stderr (e.g. "not a git repository")
         });
-        const urls = new Set();
-        for (const line of out.split("\n")) {
-            const m = /^\S+\s+(\S+)\s+\(fetch\)$/.exec(line.trim());
-            if (m) {
-                const norm = normalizeGitRemote(m[1]);
-                if (norm)
-                    urls.add(norm);
-            }
+    }
+    catch (e) {
+        // Every failure lands here: a missing binary (ENOENT from the spawn), a
+        // timeout (SIGTERM), and every non-zero exit — "not a repository" (128) and
+        // "detected dubious ownership" (also 128) among them. git's own exit codes
+        // cannot tell those apart with stderr suppressed, and stderr text is
+        // localized, so the discriminator is the filesystem: no `.git` anywhere
+        // above us means there is no repository to have remotes.
+        if (!hasGitRepoMarker(projectPath))
+            return { kind: "none" };
+        const err = e;
+        return {
+            kind: "unknown",
+            reason: err.code === "ENOENT" ? "git-missing" : "git-failed",
+            detail: err.code === "ENOENT"
+                ? "`git` was not found on PATH"
+                : err.signal
+                    ? `\`git remote -v\` timed out (${err.signal})`
+                    : "`git remote -v` failed in this repository",
+        };
+    }
+    let rawCount = 0;
+    const urls = new Set();
+    for (const line of out.split("\n")) {
+        const m = /^\S+\s+(\S+)\s+\(fetch\)$/.exec(line.trim());
+        if (m) {
+            rawCount++;
+            const norm = normalizeGitRemote(m[1]);
+            if (norm)
+                urls.add(norm);
         }
-        return [...urls];
     }
-    catch {
-        return []; // non-git dir, git missing, or timeout — all mean "no remotes"
-    }
+    return rawCount === 0 ? { kind: "none" } : { kind: "remotes", normalized: [...urls], rawCount };
+}
+/**
+ * The project's remotes in matcher form, for hub-project identity only.
+ *
+ * Deliberately still collapses "no remotes", "remotes I could not normalize"
+ * and "could not ask git" into `[]`: an empty matcher list means "do not link
+ * by remote", which is the right answer in all three. Anything deciding what
+ * LEAVES the machine must use `scanGitRemotes` instead — see its doc.
+ */
+export function localGitRemotes(projectPath) {
+    const scan = scanGitRemotes(projectPath);
+    return scan.kind === "remotes" ? scan.normalized : [];
 }
 export async function listHubProjects(backend) {
     const files = await backend.list("projects");

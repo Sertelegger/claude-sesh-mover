@@ -57,6 +57,12 @@ describe("continuation", () => {
     expect(lines[0].message.content).toContain("`orig-session`");
     expect(lines[0].message.content).toContain("`peer-name`");
     expect(lines[0].message.content).toContain("`local-prev`");
+    // ...but never as a session on the machine READING it. This header is
+    // built by the sender and read by the receiver, and the id is the
+    // sender's; the importer mints a fresh uuid for everything it writes, so
+    // "on this machine" was false wherever anyone could see it.
+    expect(lines[0].message.content).not.toMatch(/`local-prev`[^.]*on this machine/);
+    expect(lines[0].message.content).toContain("`peer-name`");
     expect(lines[0].sessionId).toBe("new-session");
     expect(lines[1].uuid).toBe("entry-3");
   });

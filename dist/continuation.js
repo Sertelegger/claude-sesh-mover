@@ -31,8 +31,14 @@ function boundaryUuid(line) {
 }
 // Shared by string and stream builders so header text can never drift.
 function buildContinuationHeader(input, previousCount, newCount) {
+    // "on this machine" is the one thing this header must NEVER say about that
+    // id, and it used to say it twice over. The header is written on the SENDING
+    // machine and read only on the RECEIVING one, and the id here is
+    // `peerSent[...].sentAsSessionId` — the sender's id for the earlier slice.
+    // The importer mints a fresh randomUUID for every session it writes, so on
+    // the machine actually reading this line that id names nothing at all.
     const priorLocation = input.previousLocalSessionId
-        ? `live in session \`${input.previousLocalSessionId}\` on this machine`
+        ? `live in session \`${input.previousLocalSessionId}\` on \`${input.sourceMachineName}\` — that is the id there, and a copy of them synced to this machine has a different one`
         : "are not present on this machine; see the originating machine for context";
     const content = `[sesh-mover continuation]\n` +
         `This session continues session \`${input.sourceSessionId}\` from machine \`${input.sourceMachineName}\` (\`${input.sourceMachineId}\`). ` +

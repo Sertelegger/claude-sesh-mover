@@ -5,7 +5,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { overrideHome } from "./helpers/env.js";
+import { overrideHome, overridePath } from "./helpers/env.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
@@ -445,6 +445,117 @@ describe("hub push — git-diff carry", () => {
       cleanup();
     }
   });
+
+  // The whole-branch review's Critical 2. Which payload a push builds is decided
+  // by asking git for this project's remotes, and "I could not ask" used to be
+  // indistinguishable from "there are none" — the answer that uploads the entire
+  // working tree, .gitignore not consulted, from an unattended hook.
+  describe("payload routing when git's answer is not a plain yes/no", () => {
+    it("a remote sesh-mover cannot canonicalize takes the CARRY path, not a whole-tree snapshot", async () => {
+      const { result, extractDir, cleanup } = await pushAndExtract((p) => {
+        // An ordinary self-hosted server: no dot in the host, so
+        // normalizeGitRemote returns null and the project used to reclassify
+        // as remote-less.
+        gitCommit(p, ["remote", "set-url", "origin", "git@gitserver:team/repo.git"]);
+        writeFileSync(join(p, ".gitignore"), ".env\n");
+        writeFileSync(join(p, ".env"), "DB_PASSWORD=hunter2\n");
+        writeFileSync(join(p, "README.md"), "edited, uncommitted\n");
+      });
+      try {
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.hasWorkspace).toBe(false);
+        expect(existsSync(join(extractDir, "workspace"))).toBe(false);
+        expect("carry" in result && result.carry).toBeTruthy();
+        // The secret .gitignore is there to protect never leaves the machine.
+        expect(existsSync(join(extractDir, "carry", "untracked", ".env"))).toBe(false);
+        expect(readFileSync(join(extractDir, "carry", "changes.patch"), "utf-8")).not.toContain(
+          "hunter2"
+        );
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("git that cannot be run inside a repository builds NEITHER payload and says so", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+      const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+      const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+      const restore = overrideHome(home);
+      const emptyBin = mkdtempSync(join(tmpdir(), "sesh-push-nobin-"));
+      try {
+        const { configDir } = createFixtureTree(base);
+        const projectPath = makeCommittedGitProject(base, configDir);
+        writeFileSync(join(projectPath, ".gitignore"), ".env\n");
+        writeFileSync(join(projectPath, ".env"), "DB_PASSWORD=hunter2\n");
+        await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+        // The SessionEnd hook's actual hazard: a detached process with a PATH
+        // that has no git on it, in a project that very much has a remote.
+        const path = overridePath(emptyBin);
+        let result;
+        try {
+          result = await hubPush({
+            configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+          });
+        } finally {
+          path.restore();
+        }
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.hasWorkspace).toBe(false);
+        expect("carry" in result && result.carry).toBeFalsy();
+        expect(result.warnings.join(" ")).toMatch(/could not be established/);
+
+        // ...and the bundle proves it: sessions only.
+        const backend = createFsBackend(hub);
+        const { indexes } = await readAllIndexes(backend, result.projectId);
+        const bundleFile = Object.values(indexes[0].threads)[0].bundles[0].file;
+        const archiveTmp = join(base, "bundle.tar.gz");
+        writeFileSync(archiveTmp, await backend.read(bundleFile));
+        const extractDir = join(base, "extracted-nogit");
+        mkdirSync(extractDir, { recursive: true });
+        await extractArchive(archiveTmp, extractDir);
+        expect(existsSync(join(extractDir, "workspace"))).toBe(false);
+        expect(existsSync(join(extractDir, "carry"))).toBe(false);
+        expect(existsSync(join(extractDir, "sessions"))).toBe(true);
+      } finally {
+        restore.restore();
+        for (const d of [home, hub, base, emptyBin]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    it("a genuinely git-less project still gets its workspace snapshot with no git on PATH", async () => {
+      // The false-positive control for the refusal above: the case the snapshot
+      // exists for must not become collateral damage.
+      const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+      const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+      const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+      const restore = overrideHome(home);
+      const emptyBin = mkdtempSync(join(tmpdir(), "sesh-push-nobin2-"));
+      try {
+        const { configDir } = createFixtureTree(base);
+        const projectPath = createRealProject(base, configDir);
+        await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+        const path = overridePath(emptyBin);
+        let result;
+        try {
+          result = await hubPush({
+            configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+          });
+        } finally {
+          path.restore();
+        }
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.hasWorkspace).toBe(true);
+        expect(result.warnings.join(" ")).not.toMatch(/could not be established/);
+      } finally {
+        restore.restore();
+        for (const d of [home, hub, base, emptyBin]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 describe("hub push — ignoredNotCarried discovery aid", () => {
@@ -585,6 +696,7 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
     }
   });
+
 
   it("is absent for a project with no git remote (its files travel as a workspace snapshot)", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
