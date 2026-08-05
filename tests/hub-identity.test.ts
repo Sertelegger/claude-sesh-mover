@@ -92,6 +92,27 @@ describe("scanGitRemotes", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it("counts a remote whose URL contains spaces", () => {
+    // `git remote -v` puts the url between a tab and " (fetch)", and a
+    // local-path remote may well have a space in it. A url pattern of `\S+`
+    // matched nothing here and the project read as remote-less — the same
+    // reclassification, by a different route.
+    const dir = tmp("sesh-scan-spacey-");
+    const remote = join(tmp("sesh-scan-My Backup-"), "repo.git");
+    try {
+      execFileSync("git", ["init", "-q", "--bare", remote]);
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "origin", remote], { cwd: dir });
+      const scan = scanGitRemotes(dir);
+      expect(scan.kind).toBe("remotes");
+      if (scan.kind !== "remotes") return;
+      expect(scan.rawCount).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(remote, { recursive: true, force: true });
+    }
+  });
+
   it('git that cannot be run inside a repository is "unknown", not "none"', () => {
     // The dangerous one: the SessionEnd hook runs detached with whatever PATH
     // it inherits, and a missing `git` used to read as "no remotes".

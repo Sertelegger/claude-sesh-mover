@@ -137,12 +137,19 @@ export function scanGitRemotes(projectPath: string): GitRemoteScan {
   let rawCount = 0;
   const urls = new Set<string>();
   for (const line of out.split("\n")) {
-    const m = /^\S+\s+(\S+)\s+\(fetch\)$/.exec(line.trim());
-    if (m) {
-      rawCount++;
-      const norm = normalizeGitRemote(m[1]);
-      if (norm) urls.add(norm);
-    }
+    // `git remote -v` prints `<name>\t<url> (fetch)`. Parsed by peeling the
+    // ends off rather than with `(\S+)` for the url, because a url may contain
+    // SPACES — a local-path remote such as `/Volumes/My Backup/repo.git` is the
+    // ordinary case. An unmatched line used to leave rawCount at 0, which is
+    // the same defect this function exists to fix: a project with a remote
+    // reading as one without, and taking the whole-tree snapshot path.
+    const trimmed = line.trim();
+    if (!trimmed.endsWith("(fetch)")) continue;
+    const url = trimmed.slice(0, -"(fetch)".length).trim().replace(/^\S+\s+/, "").trim();
+    if (!url) continue;
+    rawCount++;
+    const norm = normalizeGitRemote(url);
+    if (norm) urls.add(norm);
   }
   return rawCount === 0 ? { kind: "none" } : { kind: "remotes", normalized: [...urls], rawCount };
 }
