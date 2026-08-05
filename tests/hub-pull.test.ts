@@ -6,6 +6,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome, overridePath } from "./helpers/env.js";
+import { readTextLf } from "./helpers/eol.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
@@ -292,7 +293,11 @@ describe("hub pull", () => {
         expect(p.carryApplied.untrackedCopied).toBe(1);
         expect(p.carryApplied.refused).toEqual([]);
       }
-      expect(readFileSync(join(projectB, "README.md"), "utf-8")).toBe("uncommitted\n");
+      // README.md is TRACKED and `git apply` wrote it, so the receiving
+      // checkout's EOL convention decides its line endings (see helpers/eol.ts);
+      // scratch.txt is UNTRACKED and the carry code copied its bytes, so that
+      // one stays byte-exact and would catch a text-mode transform in the copy.
+      expect(readTextLf(join(projectB, "README.md"))).toBe("uncommitted\n");
       expect(readFileSync(join(projectB, "scratch.txt"), "utf-8")).toBe("wip\n");
       // Applied, therefore not also parked: no saved copy is written when the
       // payload reached the tree.

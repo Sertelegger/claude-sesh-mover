@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { APPEND_LIVE_WINDOW_MS } from "../src/hub/append.js";
 import { overrideHome, homeEnv, type HomeOverrideHandle } from "./helpers/env.js";
+import { readTextLf } from "./helpers/eol.js";
 import { runCli } from "./helpers/run-cli.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
@@ -72,22 +73,6 @@ function sessionFilePath(configDir: string, projectPath: string, sessionId: stri
 function ageOutOfLiveWindow(path: string): void {
   const old = new Date(Date.now() - APPEND_LIVE_WINDOW_MS - 60_000);
   utimesSync(path, old, old);
-}
-
-/**
- * File content with CRLF folded to LF.
- *
- * Only used for files that travel through `git` (clone checkout, `git apply`).
- * Git for Windows ships `core.autocrlf=true`, so a committed LF file is checked
- * out as CRLF there and a patch git applies is converted the same way — the
- * bytes on disk are then legitimately different from the ones the sending
- * machine held, on Windows only. What these tests assert is that the other
- * machine's work arrived, not what line ending the receiving repo is configured
- * to use, so the comparison is normalized rather than the repo being pinned
- * (pinning would test a git configuration nobody in the field has).
- */
-function readTextLf(path: string): string {
-  return readFileSync(path, "utf-8").replace(/\r\n/g, "\n");
 }
 
 function readEntries(path: string): Array<Record<string, unknown>> {

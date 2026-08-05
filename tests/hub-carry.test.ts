@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome, overridePath } from "./helpers/env.js";
+import { readBytesLf, readTextLf } from "./helpers/eol.js";
 import { applyCarry, captureCarry, CARRY_MAX_BYTES, type CarryMeta } from "../src/hub/carry.js";
 
 /** A throwaway repo with one commit and a remote. NEVER run git against the checkout. */
@@ -299,7 +300,7 @@ describe("captureCarry — patch fidelity", () => {
       expect(check.status).toBe(0);
       expect(spawnSync("git", ["apply", "c.patch"], { cwd: twin }).status).toBe(0);
       expect(readFileSync(join(twin, "bin.dat")).equals(newBin)).toBe(true);
-      expect(readFileSync(join(twin, "latin.txt")).equals(newLatin)).toBe(true);
+      expect(readBytesLf(join(twin, "latin.txt")).equals(newLatin)).toBe(true);
     } finally {
       cleanup(repo, dest, twin);
     }
@@ -354,13 +355,106 @@ describe("captureCarry — patch fidelity", () => {
       expect(check.stderr.trim()).toBe("");
       expect(check.status).toBe(0);
       expect(spawnSync("git", ["apply", "c.patch"], { cwd: twin }).status).toBe(0);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe(after);
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe(after);
     } finally {
       if (savedExternal === undefined) delete process.env.GIT_EXTERNAL_DIFF;
       else process.env.GIT_EXTERNAL_DIFF = savedExternal;
       if (savedDiffOpts === undefined) delete process.env.GIT_DIFF_OPTS;
       else process.env.GIT_DIFF_OPTS = savedDiffOpts;
       cleanup(repo, dest, twin);
+    }
+  });
+
+  it("carries the same bytes between a CRLF checkout and an LF one, both ways", async () => {
+    // `core.autocrlf` is the one configuration `carry.ts` deliberately does NOT
+    // pin ("Not pinned, and why"), on the grounds that it is the receiving
+    // checkout's own convention and git honours it on apply exactly as on
+    // checkout. That was measured on a Unix box, where the setting is off by
+    // default and therefore never actually exercised — and it stayed unproven
+    // until Windows CI, whose git ships `core.autocrlf=true` in its SYSTEM
+    // config, turned twelve assertions red at once.
+    //
+    // So the claim is made executable here, on EVERY platform, by setting the
+    // config in the fixture instead of inheriting it. Three properties, each one
+    // a way the pipeline could have been corrupting content in the field
+    // without a single Unix test noticing:
+    //
+    // 1. CAPTURE is EOL-independent. `git diff HEAD` renders in INDEX form, so
+    //    a CRLF worktree and an LF one produce byte-identical patches — nothing
+    //    platform-specific ever reaches the hub.
+    // 2. APPLY honours the receiver, losslessly. An LF patch lands as CRLF in a
+    //    CRLF checkout, with trailing whitespace and every other byte intact.
+    // 3. There is NO CHURN. The receiver's own re-capture of the applied work is
+    //    byte-identical to the sender's patch, so a mixed-platform pair cannot
+    //    ping-pong whole-file diffs at each other.
+    const lf = gitRepo("carry-eol-lf");
+    const crlf = gitRepo("carry-eol-crlf");
+    const lfDest = tempDest();
+    const crlfDest = tempDest();
+    let lfTwin = "";
+    let crlfTwin = "";
+    try {
+      // BOTH ends are pinned, unlike every other fixture in this file. The two
+      // conventions are the subject here rather than the environment, so
+      // inheriting either one would make the test read its own runner's default
+      // back to itself — and on Windows the "LF" half would not be LF at all.
+      git(lf, ["config", "core.autocrlf", "false"]);
+      git(lf, ["config", "core.eol", "lf"]);
+      git(crlf, ["config", "core.autocrlf", "true"]);
+      // Materialise the CRLF worktree the way Git for Windows does: the blob is
+      // LF, and re-checking it out with the setting on writes CRLF.
+      rmSync(join(crlf, "tracked.txt"));
+      git(crlf, ["checkout", "-q", "--", "tracked.txt"]);
+      expect(readFileSync(join(crlf, "tracked.txt"), "utf-8")).toBe("v1\r\n");
+      expect(readFileSync(join(lf, "tracked.txt"), "utf-8")).toBe("v1\n");
+
+      // The same logical edit, each in its checkout's own convention — trailing
+      // whitespace included, because that is the byte `apply.whitespace=fix`
+      // eats and the one an EOL rewrite would take with it.
+      writeFileSync(join(lf, "tracked.txt"), "v2\ntrailing   \n");
+      writeFileSync(join(crlf, "tracked.txt"), "v2\r\ntrailing   \r\n");
+
+      const lfCap = await captureCarry(lf, lfDest);
+      const crlfCap = await captureCarry(crlf, crlfDest);
+      expect(lfCap.captured).toBe(true);
+      expect(crlfCap.captured).toBe(true);
+      if (!lfCap.captured || !crlfCap.captured) return;
+
+      // 1. Byte-identical patches from the two checkouts.
+      const lfPatch = readFileSync(join(lfDest, "changes.patch"));
+      const crlfPatch = readFileSync(join(crlfDest, "changes.patch"));
+      expect(crlfPatch.equals(lfPatch)).toBe(true);
+      expect(lfPatch.includes(Buffer.from("\r\n"))).toBe(false);
+
+      // 2. Each patch applied into the OTHER family's checkout.
+      lfTwin = cleanTwin(lf);
+      crlfTwin = cleanTwin(crlf);
+      const intoCrlf = await applyCarry({
+        carryDir: lfDest, targetPath: crlfTwin, meta: crlfCap.meta,
+      });
+      const intoLf = await applyCarry({
+        carryDir: crlfDest, targetPath: lfTwin, meta: lfCap.meta,
+      });
+      expect(intoCrlf.applied).toBe(true);
+      expect(intoLf.applied).toBe(true);
+      // The receiving convention decides the line ending…
+      expect(readFileSync(join(crlfTwin, "tracked.txt"), "utf-8")).toBe("v2\r\ntrailing   \r\n");
+      expect(readFileSync(join(lfTwin, "tracked.txt"), "utf-8")).toBe("v2\ntrailing   \n");
+      // …and nothing else. Same content, trailing run of spaces intact.
+      expect(readTextLf(join(crlfTwin, "tracked.txt"))).toBe("v2\ntrailing   \n");
+
+      // 3. No churn: the receiver's own re-capture is the sender's patch.
+      const echoDest = tempDest();
+      try {
+        const echo = await captureCarry(crlfTwin, echoDest);
+        expect(echo.captured).toBe(true);
+        if (!echo.captured) return;
+        expect(readFileSync(join(echoDest, "changes.patch")).equals(lfPatch)).toBe(true);
+      } finally {
+        cleanup(echoDest);
+      }
+    } finally {
+      cleanup(lf, crlf, lfDest, crlfDest, lfTwin, crlfTwin);
     }
   });
 
@@ -929,12 +1023,12 @@ describe("applyCarry", () => {
       writeFileSync(join(repo, "new.txt"), "brand new\n");
       payload = await capturePayload(repo);
       twin = cleanTwin(repo);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\n");
 
       const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
       expect(r.applied).toBe(true);
       if (!r.applied) return;
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v2\n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v2\n");
       expect(readFileSync(join(twin, "new.txt"), "utf-8")).toBe("brand new\n");
       expect(r.filesChanged).toBe(1);
       expect(r.untrackedCopied).toBe(1);
@@ -987,7 +1081,7 @@ describe("applyCarry", () => {
       if (r.applied) return;
       expect(r.reason).toBe("wrong-base");
       expect(r.detail).toContain(payload.meta.baseCommit.slice(0, 8));
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\n");
       expect(existsSync(join(r.savedTo!, "changes.patch"))).toBe(true);
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
@@ -1181,7 +1275,7 @@ describe("applyCarry", () => {
       // Both files are still where they were: the second spelling is git's own
       // C-quoted form, which reads as a segment starting with `"` unless it is
       // decoded first.
-      expect(readFileSync(join(twin, ".claude-sesh-mover", "hubinclude"), "utf-8")).toBe("docs/\n");
+      expect(readTextLf(join(twin, ".claude-sesh-mover", "hubinclude"))).toBe("docs/\n");
       expect(existsSync(join(twin, ".claude-sesh-mover", "café"))).toBe(true);
       expect(existsSync(join(twin, "moved.txt"))).toBe(false);
     } finally {
@@ -1268,7 +1362,7 @@ describe("applyCarry", () => {
 
       const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
       expect(r.applied).toBe(true);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v2\n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v2\n");
       expect(readFileSync(join(twin, "scratch-of-mine.txt"), "utf-8")).toBe("mine\n");
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
@@ -1337,7 +1431,7 @@ describe("applyCarry", () => {
         carryDir: payload.dir, targetPath: join(twin, "pkg", "app"), meta: payload.meta,
       });
       expect(r.applied).toBe(true);
-      expect(readFileSync(join(twin, "pkg", "app", "f.txt"), "utf-8")).toBe("v2\n");
+      expect(readTextLf(join(twin, "pkg", "app", "f.txt"))).toBe("v2\n");
       expect(readFileSync(join(twin, "pkg", "app", "fresh.txt"), "utf-8")).toBe("new\n");
       // `filesChanged` is git's own count, from a `--numstat` that has to carry
       // the SAME --directory as the apply. Without it the number reported to
@@ -1499,7 +1593,7 @@ describe("applyCarry", () => {
       expect(command).toBeTruthy();
       const run = spawnSync("sh", ["-c", command!], { cwd: project, encoding: "utf-8" });
       expect(run.status).toBe(0);
-      expect(readFileSync(join(project, "f.txt"), "utf-8")).toBe("v2\n");
+      expect(readTextLf(join(project, "f.txt"))).toBe("v2\n");
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
     }
@@ -1541,6 +1635,9 @@ describe("applyCarry", () => {
     // therefore routed an innocent payload into `unsafe-payload` — the SECURITY
     // reason, with the security README text and no apply command — purely
     // because of the receiver's own config.
+    //
+    // As above, `readTextLf` folds the EOL and nothing else: the trailing run of
+    // spaces is still compared byte for byte.
     const repo = gitRepo("apply-wserror");
     let payload: { dir: string; meta: CarryMeta } | undefined;
     let twin: string | undefined;
@@ -1554,7 +1651,7 @@ describe("applyCarry", () => {
       expect(r.applied).toBe(true);
       if (!r.applied) return;
       expect(r.filesChanged).toBe(1);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\ntrailing   \n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\ntrailing   \n");
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
     }
@@ -1687,6 +1784,12 @@ describe("applyCarry", () => {
     // Measured: with apply.whitespace=fix, `git apply` strips the trailing
     // whitespace it is being asked to add and exits 0 — the patch applies
     // cleanly and the peer's file ends up with bytes neither machine has.
+    //
+    // `readTextLf` folds the EOL and NOTHING else, so the trailing run of
+    // spaces — the entire subject of this test — is still compared byte for
+    // byte. Measured under `core.autocrlf=true`: the file lands as
+    // `v1\r\ntrailing   \r\n`, i.e. the pin holds and only the receiving
+    // checkout's line ending differs.
     const repo = gitRepo("apply-ws");
     let payload: { dir: string; meta: CarryMeta } | undefined;
     let twin: string | undefined;
@@ -1698,7 +1801,7 @@ describe("applyCarry", () => {
 
       const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
       expect(r.applied).toBe(true);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\ntrailing   \n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\ntrailing   \n");
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
     }
@@ -1728,7 +1831,7 @@ describe("applyCarry", () => {
       expect(r.applied).toBe(false);
       if (r.applied) return;
       expect(r.reason).toBe("apply-failed");
-      expect(readFileSync(join(twin, "a.py"), "utf-8")).toBe("def f():\n\tx = 1\n\treturn x\n");
+      expect(readTextLf(join(twin, "a.py"))).toBe("def f():\n\tx = 1\n\treturn x\n");
       rmSync(payload.dir, { recursive: true, force: true });
     } finally {
       cleanup(repo, twin ?? "");
@@ -1872,7 +1975,7 @@ describe("applyCarry", () => {
         restore.restore();
         rmSync(emptyDir, { recursive: true, force: true });
       }
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\n");
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
     }
@@ -1901,7 +2004,7 @@ describe("applyCarry", () => {
         carryDir: payload.dir, targetPath: twin, meta: payload.meta,
       });
       expect(second.applied).toBe(true);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v2\n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v2\n");
 
       // Retention is bounded, so a routine flow cannot fill the project with
       // superseded copies of the same peer's working tree.
@@ -2207,7 +2310,7 @@ describe("applyCarry", () => {
       const run = spawnSync("sh", ["-c", command!], { cwd: project, encoding: "utf-8" });
       expect(run.stderr).toBe("");
       expect(run.status).toBe(0);
-      expect(readFileSync(join(project, "f.txt"), "utf-8")).toBe("v2\n");
+      expect(readTextLf(join(project, "f.txt"))).toBe("v2\n");
       // Nothing the path spelled was executed, anywhere the shell could have
       // run it from.
       expect(existsSync(join(project, "pwned"))).toBe(false);
@@ -2582,7 +2685,7 @@ describe("applyCarry", () => {
       twin = cleanTwin(repo);
       const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
       expect(r.applied).toBe(true);
-      expect(readFileSync(join(twin, name), "utf-8")).toBe("v2\n");
+      expect(readTextLf(join(twin, name))).toBe("v2\n");
     } finally {
       cleanup(repo, twin ?? "", payload?.dir ?? "");
     }
@@ -2599,7 +2702,14 @@ describe("applyCarry", () => {
     const repo = gitRepo("apply-deep");
     let dir: string | undefined;
     try {
-      const deep = join(repo, ...Array.from({ length: 70 }, (_, i) => `d${i}`));
+      // One character per level, on purpose. `d0/d1/…/d69` is 270 characters of
+      // path on its own, and past Win32's 260-character MAX_PATH `git add`
+      // cannot enter the directory at all (`core.longpaths` is off by default in
+      // Git for Windows): it skips the tree silently, the commit below then
+      // fails with "nothing to commit", and the test dies in its own fixture
+      // rather than in the code it is about. Depth is the whole subject here and
+      // the names carry no meaning, so 70 nested `d`s say the same thing in 140.
+      const deep = join(repo, ...Array.from({ length: 70 }, () => "d"));
       mkdirSync(deep, { recursive: true });
       writeFileSync(join(deep, "f.txt"), "v1\n");
       git(repo, ["add", "-A"]);

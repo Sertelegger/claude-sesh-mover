@@ -18,6 +18,7 @@ import * as tar from "tar";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { overrideHome, homeEnv, prependPath, tmpEnv } from "./helpers/env.js";
+import { readTextLf } from "./helpers/eol.js";
 import { runCli as sharedRunCli, type RunCliResult } from "./helpers/run-cli.js";
 
 const isWindows = platform() === "win32";
@@ -295,7 +296,9 @@ describe("cli", () => {
         );
         expect(pulled.success).toBe(true);
         expect(pulled.carryApplied.applied).toBe(true);
-        expect(readFileSync(join(clone, "tracked.txt"), "utf-8")).toBe("v2 uncommitted\n");
+        // Tracked, and `git apply` wrote it — so the clone's own EOL convention
+        // decides its line endings on Windows. See helpers/eol.ts.
+        expect(readTextLf(join(clone, "tracked.txt"))).toBe("v2 uncommitted\n");
       } finally {
         for (const d of [homeA, homeB, hubDir, cloneRoot]) {
           rmSync(d, { recursive: true, force: true });

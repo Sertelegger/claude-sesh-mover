@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __scanPatchBytesForTests as scanPatchBytes } from "../src/hub/carry.js";
 import { isNeverIncludable } from "../src/hub/workspace.js";
+import { readTextLf } from "./helpers/eol.js";
 
 /**
  * # The carry patch header scan, cross-checked against real `git apply`
@@ -86,6 +87,81 @@ const FLOOR_TAIL = "sub/.claude-sesh-mover";
 const SAFE = "docs/notes.txt";
 /** `\t2024-01-02 …` — the trailing timestamp GNU diff writes after a name. */
 const TIMESTAMP = "2024-01-02 00:00:00.000000000 +0000";
+
+/**
+ * Corpus names Win32 cannot hold — with git's OWN rendering of each, so the
+ * scan still meets the bytes on that platform.
+ *
+ * `< > : " / \ | ? *` and every byte below 0x20 are reserved in a Win32
+ * filename, and five of the negative test's exotic names use one. Four of them
+ * simply cannot be created (`ENOENT`/`EINVAL`); `back\slash.txt` is worse,
+ * because it does not fail — Win32 reads the backslash as a separator and
+ * silently creates `docs/back/slash.txt`, a name that is not the one under test
+ * and whose rendering git does not quote at all. Both outcomes lose coverage the
+ * negative test exists to have.
+ *
+ * The shapes are real and were each added after a reviewer found the hole it
+ * covers, so they are SUBSTITUTED rather than dropped: the scan reads patch
+ * bytes and has no idea whether a file exists, so on Windows these are appended
+ * to the corpus as synthetic header blocks. `header`/`body` are the exact bytes
+ * git prints — measured, then pinned by the drift guard in the test itself,
+ * which asserts on every other platform that git's real rendering of the very
+ * same name still contains them. A synthetic that stopped matching git would
+ * therefore fail the POSIX run rather than quietly test a spelling git no longer
+ * produces.
+ */
+const WIN32_RESERVED_NAMES: Array<{ name: string; why: string; header: string; body: string }> = [
+  {
+    name: "docs/=> arrow.txt",
+    why: "`>` is reserved",
+    // Unquoted (all bytes are printable ASCII), and the traditional lines carry
+    // git's trailing TAB because the name holds a space.
+    header: "diff --git a/docs/=> arrow.txt b/docs/=> arrow.txt",
+    body: "--- a/docs/=> arrow.txt\t\n+++ b/docs/=> arrow.txt\t",
+  },
+  {
+    name: "docs/pipe|bar.txt",
+    why: "`|` is reserved",
+    header: "diff --git a/docs/pipe|bar.txt b/docs/pipe|bar.txt",
+    body: "--- a/docs/pipe|bar.txt\n+++ b/docs/pipe|bar.txt",
+  },
+  {
+    name: "docs/back\\slash.txt",
+    why: "`\\` is the Win32 path separator, so this name becomes docs/back/slash.txt",
+    header: "diff --git \"a/docs/back\\\\slash.txt\" \"b/docs/back\\\\slash.txt\"",
+    body: "--- \"a/docs/back\\\\slash.txt\"\n+++ \"b/docs/back\\\\slash.txt\"",
+  },
+  {
+    name: "docs/quote\"inside.txt",
+    why: "`\"` is reserved",
+    header: "diff --git \"a/docs/quote\\\"inside.txt\" \"b/docs/quote\\\"inside.txt\"",
+    body: "--- \"a/docs/quote\\\"inside.txt\"\n+++ \"b/docs/quote\\\"inside.txt\"",
+  },
+  {
+    name: "docs/tab\there.txt",
+    why: "every byte below 0x20 is reserved",
+    header: "diff --git \"a/docs/tab\\there.txt\" \"b/docs/tab\\there.txt\"",
+    body: "--- \"a/docs/tab\\there.txt\"\n+++ \"b/docs/tab\\there.txt\"",
+  },
+];
+
+/**
+ * The negative test's RENAME, whose destination Win32 cannot hold either.
+ *
+ * `docs/renamed "quoted".txt` is there for one shape: a `rename to` line git
+ * C-quotes *and* whose body holds an escaped `"`, which is where a decoder that
+ * ended the name at the first quote of any kind would stop early. Windows gets a
+ * legal destination for the real `git mv` — still non-ASCII, so `rename to` is
+ * still quoted — plus this block appended synthetically for the escaped-quote
+ * spelling. Same drift guard as above.
+ */
+const WIN32_RESERVED_RENAME = {
+  posixTo: "docs/renamed \"quoted\".txt",
+  win32To: "docs/renamed café.txt",
+  header: "diff --git \"a/docs/moved  caf\\303\\251.txt\" \"b/docs/renamed \\\"quoted\\\".txt\"",
+  body: "rename from \"docs/moved  caf\\303\\251.txt\"\n" +
+    "rename to \"docs/renamed \\\"quoted\\\".txt\"",
+};
 
 /**
  * The real `git` executable, resolved ONCE.
@@ -594,30 +670,47 @@ describe("carry patch header scan — differential against real `git apply`", ()
     // way the oracle learns a path, and one per termination rule — are applied
     // for real by a bare `git apply` with none of this module's guards, and the
     // receiver's own `.claude-sesh-mover` tree is inspected afterwards.
-    const sample: Array<{ id: string; patch: string; check(dir: string): boolean }> = [
+    //
+    // Two of the eight state an OUTCOME Win32 cannot represent — an executable
+    // bit, and a filename holding a TAB. `noApplyOnWin32` names the reason and
+    // drops only the apply-and-inspect half there; the two halves that decide
+    // whether the scan is sound (git's own `--numstat`/`--summary` reading of
+    // the bytes, and the scan's) are pure parses and still run on every
+    // platform. The count of dropped halves is asserted, so this cannot quietly
+    // grow into "Windows checks nothing".
+    interface Sample {
+      id: string;
+      patch: string;
+      check(dir: string): boolean;
+      /** Why the apply-and-inspect half cannot run on Windows. */
+      noApplyOnWin32?: string;
+    }
+    const sample: Sample[] = [
       {
         id: "rename from, quoted with a trailing byte (--summary source)",
         patch: `diff --git a/decoy.txt b/moved.txt\nsimilarity index 100%\n` +
           `rename from "${FLOOR}"X\nrename to moved.txt\n`,
-        check: (d) => !existsSync(join(d, FLOOR)) && readFileSync(join(d, "moved.txt"), "utf-8") === "v1\n",
+        check: (d) => !existsSync(join(d, FLOOR)) && readTextLf(join(d, "moved.txt")) === "v1\n",
       },
       {
         id: "rename from, octal-escaped with a trailing byte (--summary source)",
         patch: `diff --git a/decoy.txt b/moved.txt\nsimilarity index 100%\n` +
           `rename from "${octalHead(FLOOR)}"X\nrename to moved.txt\n`,
-        check: (d) => !existsSync(join(d, FLOOR)) && readFileSync(join(d, "moved.txt"), "utf-8") === "v1\n",
+        check: (d) => !existsSync(join(d, FLOOR)) && readTextLf(join(d, "moved.txt")) === "v1\n",
       },
       {
         id: "copy from, quoted with a trailing byte (--summary source)",
         patch: `diff --git a/decoy.txt b/stolen.txt\nsimilarity index 100%\n` +
           `copy from "${FLOOR}"X\ncopy to stolen.txt\n`,
         check: (d) => existsSync(join(d, FLOOR)) &&
-          readFileSync(join(d, "stolen.txt"), "utf-8") === "v1\n",
+          readTextLf(join(d, "stolen.txt")) === "v1\n",
       },
       {
         id: "diff --git, CR separator + asymmetric quoting (--numstat destination)",
         patch: `diff --git a/${FLOOR}\r"b/${FLOOR}"\nold mode 100644\nnew mode 100755\n`,
         check: (d) => (statSync(join(d, FLOOR)).mode & 0o111) !== 0,
+        noApplyOnWin32: "no filesystem executable bit exists there, so a mode-only " +
+          "change has no observable outcome to inspect",
       },
       // The four below are the TAB-termination family: a scan that truncated
       // every keyword's name at the first TAB saw `["b"]` or `["X"]` for each.
@@ -625,17 +718,21 @@ describe("carry patch header scan — differential against real `git apply`", ()
         id: "copy to, TAB inside the name (rename/copy read with terminate = 0)",
         patch: `diff --git a/decoy.txt b/stolen.txt\nsimilarity index 100%\n` +
           `copy from decoy.txt\ncopy to X\tsub/${FLOOR}\n`,
-        check: (d) => readFileSync(join(d, "X\tsub", ".claude-sesh-mover", "hubinclude"), "utf-8") === "v1\n",
+        check: (d) => readTextLf(join(d, "X\tsub", ".claude-sesh-mover", "hubinclude")) === "v1\n",
+        noApplyOnWin32: "TAB is a reserved character in a Win32 filename, so the " +
+          "directory this case creates cannot exist there",
       },
       {
         id: "--- traditional, TAB inside the name + timestamp (terminate = 0)",
         patch: `--- b\tQ/${FLOOR}\t${TIMESTAMP}\n+++ /dev/null\n@@ -1 +0,0 @@\n-v1\n`,
+        // The TAB is in the `-p1`-stripped component, so nothing named with one
+        // is ever created: this half runs everywhere.
         check: (d) => !existsSync(join(d, FLOOR)),
       },
       {
         id: "+++ traditional, TAB inside the name + timestamp (terminate = 0)",
         patch: `--- /dev/null\n+++ b\tQ/.claude-sesh-mover/config.json\t${TIMESTAMP}\n@@ -0,0 +1 @@\n+{}\n`,
-        check: (d) => readFileSync(join(d, ".claude-sesh-mover", "config.json"), "utf-8") === "{}\n",
+        check: (d) => readTextLf(join(d, ".claude-sesh-mover", "config.json")) === "{}\n",
       },
       {
         id: "+++ traditional, SPACE-separated timestamp, forbidden segment LAST",
@@ -645,6 +742,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
     ];
     const seed = oracleRepo("hdrreal");
     const slot = patchSlot("hdrreal");
+    let applyHalvesSkipped = 0;
     try {
       for (const s of sample) {
         const twin = mkdtempSync(join(tmpdir(), "sesh-hdrtwin-"));
@@ -657,9 +755,13 @@ describe("carry patch header scan — differential against real `git apply`", ()
           expect(o.accepted, s.id).toBe(true);
           expect(o.paths.some((p) => isNeverIncludable(p)), s.id).toBe(true);
           // …then the real thing, with no guards in the way.
-          const applied = git(twin, ["apply", patchFile]);
-          expect(applied.ok, `${s.id}: ${applied.stderr}`).toBe(true);
-          expect(s.check(twin), s.id).toBe(true);
+          if (process.platform === "win32" && s.noApplyOnWin32 !== undefined) {
+            applyHalvesSkipped++;
+          } else {
+            const applied = git(twin, ["apply", patchFile]);
+            expect(applied.ok, `${s.id}: ${applied.stderr}`).toBe(true);
+            expect(s.check(twin), s.id).toBe(true);
+          }
           // And the scan — the only line of defence for the two `--summary`
           // shapes on a receiver whose git works perfectly.
           expect(scanRefuses(patchFile).refuses, s.id).toBe(true);
@@ -668,6 +770,8 @@ describe("carry patch header scan — differential against real `git apply`", ()
           rmSync(twin, { recursive: true, force: true });
         }
       }
+      expect(applyHalvesSkipped, "apply halves dropped for Win32 (see noApplyOnWin32)")
+        .toBe(process.platform === "win32" ? 2 : 0);
     } finally {
       rmSync(seed, { recursive: true, force: true });
       slot.dispose();
@@ -687,11 +791,8 @@ describe("carry patch header scan — differential against real `git apply`", ()
         "docs/notes.txt",
         "docs/my notes.txt",
         "docs/two  spaces.txt",
-        "docs/tab\there.txt",
         "docs/café.txt",
         "docs/naïve — dash.txt",
-        "docs/quote\"inside.txt",
-        "docs/back\\slash.txt",
         "docs/dollar$sign.txt",
         "docs/.claude-sesh-mover notes.md",
         // Digits after the space: the shape the trailing-timestamp strip must
@@ -701,13 +802,14 @@ describe("carry patch header scan — differential against real `git apply`", ()
         "docs/.claude-sesh-moverX/notes.md",
         "docs/not.claude-sesh-mover/notes.md",
         "docs/a b/c d/e f.txt",
-        "docs/=> arrow.txt",
         "docs/percent%20.txt",
         "docs/新しい.txt",
         "docs/trailing .txt",
         "docs/#hash.txt",
         "docs/semi;colon.txt",
-        "docs/pipe|bar.txt",
+        // Created for real everywhere they CAN be; fed to the scan as synthetic
+        // header blocks below on the one platform where they cannot.
+        ...(process.platform === "win32" ? [] : WIN32_RESERVED_NAMES.map((n) => n.name)),
       ];
       for (const name of names) {
         mkdirSync(join(repo, name, ".."), { recursive: true });
@@ -720,12 +822,33 @@ describe("carry patch header scan — differential against real `git apply`", ()
       git(repo, ["add", "-A"]);
       git(repo, ["commit", "-q", "-m", "exotic"]);
       for (const name of names) writeFileSync(join(repo, name), "v2\n");
-      git(repo, ["mv", movable, "docs/renamed \"quoted\".txt"]);
+      const renameTo = process.platform === "win32"
+        ? WIN32_RESERVED_RENAME.win32To
+        : WIN32_RESERVED_RENAME.posixTo;
+      const mv = git(repo, ["mv", movable, renameTo]);
+      expect(mv.ok, `git mv ${renameTo}: ${mv.stderr}`).toBe(true);
 
       const patchFile = slot.file;
-      const diff = git(repo, ["diff", "HEAD", "--src-prefix=a/", "--dst-prefix=b/"]);
+      const diff = git(repo, ["diff", "HEAD", "-M", "--src-prefix=a/", "--dst-prefix=b/"]);
       expect(diff.ok).toBe(true);
-      writeFileSync(patchFile, diff.stdout, "utf-8");
+      // The names Win32 cannot hold are scanned as SYNTHETIC header blocks
+      // instead of skipped — the scan reads bytes, and these are the exact bytes
+      // git prints. On every other platform the same names are in the corpus for
+      // real, and the drift guard below proves git still spells them this way,
+      // so the substitute cannot drift away from what it substitutes for.
+      const synthetic = WIN32_RESERVED_NAMES
+        .map((n) => `${n.header}\nindex 1111111..2222222 100644\n${n.body}\n@@ -1 +1 @@\n-v1\n+v2\n`)
+        .join("") +
+        `${WIN32_RESERVED_RENAME.header}\nsimilarity index 100%\n${WIN32_RESERVED_RENAME.body}\n`;
+      if (process.platform === "win32") {
+        writeFileSync(patchFile, diff.stdout + synthetic, "utf-8");
+      } else {
+        for (const n of [...WIN32_RESERVED_NAMES, { name: "the rename", ...WIN32_RESERVED_RENAME }]) {
+          expect(diff.stdout, `${n.name}: git's own rendering`).toContain(`${n.header}\n`);
+          expect(diff.stdout, `${n.name}: git's own rendering`).toContain(`${n.body}\n`);
+        }
+        writeFileSync(patchFile, diff.stdout, "utf-8");
+      }
       // The corpus really did reach the scan's hard shapes.
       expect(diff.stdout).toContain('diff --git "a/docs/caf');
       expect(diff.stdout).toContain("rename from ");
@@ -749,13 +872,31 @@ describe("carry patch header scan — differential against real `git apply`", ()
     // — the one that matters — a floor path whose spelling makes the naive
     // `(.*)\{(.*) => (.*)\}(.*)` reading come out as `{.claude-sesh-mover`,
     // i.e. innocent.
+    //
+    // `docs/a => b.txt` is the one Win32 cannot hold (`>` is reserved), and it
+    // is also the case with the most to say: its summary line reads ` rename
+    // docs/{a => b.txt => c.txt} (100%)`, where the ` => ` separator appears
+    // twice and only the destination tells the two apart. Skipping it there
+    // would silently drop the ambiguity this test is named for, so on Windows
+    // the rename is not MADE — it is fed to the oracle as the exact patch text
+    // git produces for it. `git apply --numstat --summary` is a parse: measured,
+    // it reads that patch identically in a repo where neither path exists. The
+    // POSIX run makes the same rename for real and asserts git still prints
+    // these bytes, so the substitute cannot drift.
+    const ARROW_RENAME = {
+      from: "docs/a => b.txt",
+      to: "docs/c.txt",
+      patch: "diff --git a/docs/a => b.txt b/docs/c.txt\nsimilarity index 100%\n" +
+        "rename from docs/a => b.txt\nrename to docs/c.txt\n",
+    };
+    const win32 = process.platform === "win32";
     const renames: Array<[from: string, to: string]> = [
       ["docs/deep/a.txt", "docs/deep/b.txt"],
       ["docs/one/name.txt", "docs/two/name.txt"],
       ["one/shared/name.txt", "two/shared/name.txt"],
       ["alpha.txt", "beta.txt"],
       ["docs/café.txt", "docs/naïve.txt"],
-      ["docs/a => b.txt", "docs/c.txt"],
+      ...(win32 ? [] : [[ARROW_RENAME.from, ARROW_RENAME.to] as [string, string]]),
       ["docs/{brace.txt", "docs/out.txt"],
       ["docs/}close.txt", "docs/out2.txt"],
       ["d/.claude-sesh-mover/{f.txt", "d/out.txt"],
@@ -778,14 +919,18 @@ describe("carry patch header scan — differential against real `git apply`", ()
       }
       const diff = git(repo, ["diff", "HEAD", "-M", "--src-prefix=a/", "--dst-prefix=b/"]);
       expect(diff.ok).toBe(true);
-      writeFileSync(slot.file, diff.stdout, "utf-8");
+      // The drift guard: where the rename could be made for real, git's own
+      // rendering of it is the synthetic patch, byte for byte.
+      if (!win32) expect(diff.stdout).toContain(ARROW_RENAME.patch);
+      writeFileSync(slot.file, win32 ? diff.stdout + ARROW_RENAME.patch : diff.stdout, "utf-8");
 
       const o = oracle(repo, slot.file);
       expect(o.accepted).toBe(true);
       expect(o.ambiguous, "every summary line resolves to exactly one source").toEqual([]);
-      // Every source, byte for byte — including the compacted and the
-      // brace-bearing ones. `toContain` per entry so a failure names the path.
-      for (const [from] of renames) expect(o.paths, from).toContain(from);
+      // Every source, byte for byte — including the compacted, the
+      // brace-bearing, and the ` => `-bearing one. `toContain` per entry so a
+      // failure names the path.
+      for (const [from] of [...renames, [ARROW_RENAME.from]]) expect(o.paths, from).toContain(from);
       // …and the floor one is scored as a floor resolution, which is the whole
       // point: the naive expansion returned `d/{.claude-sesh-mover/f.txt` here,
       // whose first segment is not forbidden.
