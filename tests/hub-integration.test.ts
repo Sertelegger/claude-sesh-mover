@@ -1,12 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
   mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync, cpSync,
-  utimesSync,
+  utimesSync, existsSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { APPEND_LIVE_WINDOW_MS } from "../src/hub/append.js";
-import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
+import { overrideHome, homeEnv, type HomeOverrideHandle } from "./helpers/env.js";
+import { runCli } from "./helpers/run-cli.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
@@ -14,9 +16,9 @@ import { hubPull } from "../src/hub/pull.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes } from "../src/hub/index-file.js";
-import { indexPath } from "../src/hub/layout.js";
+import { bundleDir, indexPath } from "../src/hub/layout.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
-import { loadOrCreateMachineId } from "../src/machine.js";
+import { setMachineName } from "../src/machine.js";
 import { encodeProjectPath } from "../src/platform.js";
 import type { HubPullResult, HubPushResult, NotYetSyncedResult } from "../src/types.js";
 
@@ -72,6 +74,30 @@ function ageOutOfLiveWindow(path: string): void {
   utimesSync(path, old, old);
 }
 
+/**
+ * File content with CRLF folded to LF.
+ *
+ * Only used for files that travel through `git` (clone checkout, `git apply`).
+ * Git for Windows ships `core.autocrlf=true`, so a committed LF file is checked
+ * out as CRLF there and a patch git applies is converted the same way — the
+ * bytes on disk are then legitimately different from the ones the sending
+ * machine held, on Windows only. What these tests assert is that the other
+ * machine's work arrived, not what line ending the receiving repo is configured
+ * to use, so the comparison is normalized rather than the repo being pinned
+ * (pinning would test a git configuration nobody in the field has).
+ */
+function readTextLf(path: string): string {
+  return readFileSync(path, "utf-8").replace(/\r\n/g, "\n");
+}
+
+function readEntries(path: string): Array<Record<string, unknown>> {
+  return readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+function jsonlFiles(dir: string): string[] {
+  return readdirSync(dir).filter((n) => n.endsWith(".jsonl")).sort();
+}
+
 function lastUuid(path: string): string {
   const lines = readFileSync(path, "utf-8").trim().split("\n");
   return (JSON.parse(lines[lines.length - 1]) as { uuid: string }).uuid;
@@ -110,6 +136,7 @@ interface ThreeMachineFixture {
   pushB: HubPushResult;
   machineIdA: string;
   machineIdB: string;
+  machineNameB: string;
   restore: HomeOverrideHandle;
   // Snapshots taken immediately after phase 1 (before B's later push adds its
   // own index/bundles to the hub) — assertions about "just after A's first
@@ -141,7 +168,11 @@ async function setupThroughAppendPush(prefix: string): Promise<ThreeMachineFixtu
     const projectA = createRealProject(baseA, configDirA, "proj");
     const initA = await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
     if (!initA.success) throw new Error(`hubInit(A) failed: ${JSON.stringify(initA)}`);
-    const machineIdA = loadOrCreateMachineId().id;
+    // Distinct, stated machine NAMES: both temp homes run on one host, so the
+    // hostname default would give A and B the same name and any assertion about
+    // "which machine is this notice about" would pass vacuously. The push below
+    // re-registers the machine on the hub, so the rename lands there.
+    const machineIdA = setMachineName("keystone-machine-a").id;
 
     const pushA = await hubPush({
       configDir: configDirA, projectPath: projectA, hubPath: hub,
@@ -161,7 +192,8 @@ async function setupThroughAppendPush(prefix: string): Promise<ThreeMachineFixtu
     const configDirB = join(homeB, ".claude");
     const initB = await hubInit({ hubPath: hub, configScope: "user", cwd: homeB });
     if (!initB.success) throw new Error(`hubInit(B) failed: ${JSON.stringify(initB)}`);
-    const machineIdB = loadOrCreateMachineId().id;
+    const machineNameB = "keystone-machine-b";
+    const machineIdB = setMachineName(machineNameB).id;
 
     writeLocalProjectId(projectB, {
       projectId: pushA.projectId, name: "proj",
@@ -189,7 +221,7 @@ async function setupThroughAppendPush(prefix: string): Promise<ThreeMachineFixtu
 
     return {
       hub, homeA, homeB, baseA, projectB, configDirA, projectA, configDirB,
-      pushA, pullB1, pushB, machineIdA, machineIdB, restore,
+      pushA, pullB1, pushB, machineIdA, machineIdB, machineNameB, restore,
       indexCountAfterPush1, bundleCountAfterPush1,
     };
   } catch (e) {
@@ -205,7 +237,19 @@ function cleanup(f: ThreeMachineFixture): void {
 }
 
 describe("hub keystone: multi-machine round trip", () => {
-  it("A pushes, B pulls and continues, A pulls back to one unified thread, then idempotent", async () => {
+  // THE milestone assertion (design §10, "keystone extension"): the round trip
+  // closes back into the ORIGINAL session file, not into a second one.
+  //
+  // This test used to assert the opposite — `importedSessions` of length 1,
+  // i.e. a fragment — and it passed for a reason that was nothing to do with
+  // intent: A's base carried the mtime of the fixture's own `cpSync`, a few
+  // hundred milliseconds before the pull's clock read, so append.ts's liveness
+  // guard called it a live session and declined. The fixture's setup cost was
+  // deciding the product behaviour under test. Task 12 flipped it deliberately:
+  // the age of A's base is now STATED (`ageOutOfLiveWindow` — the user left
+  // this session and is pulling it back), and with the guard answering the
+  // question it was written to answer, the continuation splices.
+  it("A pushes, B pulls and continues, A pulls the continuation back INTO its own session, then idempotent", async () => {
     const f = await setupThroughAppendPush("sesh-keystone");
     try {
       // Phase 1 assertions: exactly one full bundle landed on the hub.
@@ -235,6 +279,16 @@ describe("hub keystone: multi-machine round trip", () => {
       f.restore.restore();
       const restoreA = overrideHome(f.homeA);
       try {
+        const localA = f.pushA.pushedSessions[0].sessionId;
+        const pathA = sessionFilePath(f.configDirA, f.projectA, localA);
+        const projectDirA = join(f.configDirA, "projects", encodeProjectPath(f.projectA));
+        const filesBeforePull = jsonlFiles(projectDirA);
+        const entriesBeforePull = readEntries(pathA).length;
+        // A's session is one the user left on this machine and is now pulling
+        // back into — not one being written this instant. Say so, rather than
+        // racing the pull's clock (see `ageOutOfLiveWindow`).
+        ageOutOfLiveWindow(pathA);
+
         const pullA = await hubPull({
           configDir: f.configDirA, projectPath: f.projectA, hubPath: f.hub,
           latest: true, claudeVersion: CLAUDE_VERSION,
@@ -242,8 +296,27 @@ describe("hub keystone: multi-machine round trip", () => {
         expect(pullA.success).toBe(true);
         if (!pullA.success) return;
         const pA = pullA as HubPullResult;
-        expect(pA.importedSessions).toHaveLength(1);
         expect(pA.threadId).toBe(f.pullB1.threadId);
+
+        // Appended, not imported: no new session file, and A's own file grew by
+        // exactly the two entries B wrote.
+        expect(pA.importedSessions).toHaveLength(0);
+        expect(pA.appended ?? []).toHaveLength(1);
+        expect(pA.appended![0]).toMatchObject({
+          threadId: f.pullB1.threadId, baseSessionId: localA, entriesAppended: 2,
+        });
+        expect(pA.localSessionId).toBe(localA);
+        expect(jsonlFiles(projectDirA)).toEqual(filesBeforePull);
+
+        const after = readEntries(pathA);
+        expect(after).toHaveLength(entriesBeforePull + 2);
+        expect(lastUuid(pathA)).toBe("b-append-2"); // B's last uuid is now A's head
+        expect(after.map((e) => e.uuid)).toContain("b-append-1");
+        // One transcript, one identity: everything spliced in belongs to A's
+        // session now, so `claude --resume <localA>` replays the whole thing.
+        expect(after.every((e) => e.sessionId === localA)).toBe(true);
+        // And it is one unbroken chain — B's first entry hangs off A's old head.
+        expect(after[entriesBeforePull].parentUuid).toBe(after[entriesBeforePull - 1].uuid);
 
         // The milestone's core promise: A now sees ONE thread for this
         // project, current locally, whose copies span BOTH machines.
@@ -258,18 +331,17 @@ describe("hub keystone: multi-machine round trip", () => {
         );
 
         // Phase 5 (A): pulling again is a no-op — nothing left to pull, and
-        // no new session file appears (dedup idempotency).
-        const projectDirA = join(f.configDirA, "projects", encodeProjectPath(f.projectA));
-        const filesBefore = readdirSync(projectDirA).filter((n) => n.endsWith(".jsonl"));
-
+        // no new session file appears (dedup idempotency). The splice published
+        // B's head as A's own, so this is the "all threads are current" branch
+        // rather than the per-source "already up to date" one.
         const pullA2 = await hubPull({
           configDir: f.configDirA, projectPath: f.projectA, hubPath: f.hub,
           latest: true, claudeVersion: CLAUDE_VERSION,
         });
         expect(pullA2.success).toBe(false);
+        if (!pullA2.success) expect("error" in pullA2 && pullA2.error).toMatch(/nothing to pull/i);
 
-        const filesAfter = readdirSync(projectDirA).filter((n) => n.endsWith(".jsonl"));
-        expect(filesAfter).toEqual(filesBefore);
+        expect(jsonlFiles(projectDirA)).toEqual(filesBeforePull);
       } finally {
         restoreA.restore();
       }
@@ -456,6 +528,452 @@ describe("hub keystone: multi-machine round trip", () => {
       }
     } finally {
       cleanup(f);
+    }
+  });
+
+  // The other half of the headline promise: a machine that was never part of
+  // the conversation gets ONE session, not 1 + N fragments. Nothing here ages
+  // anything out of the liveness window on purpose — C writes the base itself,
+  // in this same pull, and the self-write exemption (one `opNowMs` for the
+  // whole operation) is precisely what has to hold for the continuation to land
+  // in the file the full bundle just created.
+  it("a fresh machine pulling a full+continuation chain lands ONE session, in order, header-free", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-keystone-chain-hub-"));
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-keystone-chain-homeA-"));
+    const homeC = mkdtempSync(join(tmpdir(), "sesh-keystone-chain-homeC-"));
+    const baseA = mkdtempSync(join(tmpdir(), "sesh-keystone-chain-fixA-"));
+    const projectC = mkdtempSync(join(tmpdir(), "sesh-keystone-chain-projC-"));
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(baseA);
+      const projectA = createRealProject(baseA, configDirA, "proj");
+      const initA = await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      expect(initA.success).toBe(true);
+      const machineIdA = setMachineName("keystone-chain-a").id;
+
+      const push1 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, noWorkspace: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push1.success).toBe(true);
+      if (!push1.success) return;
+      expect(push1.pushedSessions[0].type).toBe("full");
+
+      const localA = push1.pushedSessions[0].sessionId;
+      const pathA = sessionFilePath(configDirA, projectA, localA);
+      const historyUuids = readEntries(pathA).map((e) => e.uuid);
+      appendContinuationEntries(pathA, localA, projectA);
+      const push2 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        noWorkspace: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push2.success).toBe(true);
+      if (!push2.success) return;
+      expect(push2.pushedSessions[0].type).toBe("continuation");
+
+      restore.restore();
+      const restoreC = overrideHome(homeC);
+      try {
+        const configDirC = join(homeC, ".claude");
+        const initC = await hubInit({ hubPath: hub, configScope: "user", cwd: homeC });
+        expect(initC.success).toBe(true);
+        setMachineName("keystone-chain-c");
+        writeLocalProjectId(projectC, {
+          projectId: push1.projectId, name: "proj",
+          createdAt: new Date().toISOString(), createdByMachine: machineIdA,
+        });
+
+        const pullC = await hubPull({
+          configDir: configDirC, projectPath: projectC, hubPath: hub,
+          latest: true, claudeVersion: CLAUDE_VERSION,
+        });
+        expect(pullC.success).toBe(true);
+        if (!pullC.success) return;
+        const pC = pullC as HubPullResult;
+        expect(pC.importedSessions).toHaveLength(1);
+        expect(pC.appended ?? []).toHaveLength(1);
+
+        const projectDirC = join(configDirC, "projects", encodeProjectPath(projectC));
+        const files = jsonlFiles(projectDirC);
+        expect(files).toHaveLength(1);
+        const landed = join(projectDirC, files[0]);
+        const entries = readEntries(landed);
+        expect(entries.map((e) => e.uuid)).toEqual([...historyUuids, "b-append-1", "b-append-2"]);
+        expect(entries.every((e) => e.sessionId === pC.localSessionId)).toBe(true);
+        // One transcript means no seam: the synthetic header exists to explain
+        // a fragment, so its presence anywhere here would mean the chain was
+        // NOT reassembled.
+        expect(readFileSync(landed, "utf-8")).not.toContain("[sesh-mover continuation]");
+      } finally {
+        restoreC.restore();
+      }
+    } finally {
+      restore.restore();
+      for (const d of [hub, homeA, homeC, baseA, projectC]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("divergence: adopt-hub makes the hub's branch canonical and keeps A's fork as a second complete session", async () => {
+    const f = await setupThroughAppendPush("sesh-keystone-fork");
+    try {
+      f.restore.restore();
+      const restoreA = overrideHome(f.homeA);
+      try {
+        const localA = f.pushA.pushedSessions[0].sessionId;
+        const pathA = sessionFilePath(f.configDirA, f.projectA, localA);
+        const projectDirA = join(f.configDirA, "projects", encodeProjectPath(f.projectA));
+        // A genuine two-sided fork: A carried on from the SAME entry B
+        // continued from, so neither branch contains the other.
+        const anchor = lastUuid(pathA);
+        const commonHistory = readEntries(pathA).map((e) => e.uuid);
+        appendFileSync(
+          pathA,
+          [
+            {
+              uuid: "a-fork-1", parentUuid: anchor, timestamp: "2026-07-21T03:00:00Z",
+              sessionId: localA, cwd: f.projectA, version: CLAUDE_VERSION, type: "user",
+              message: { role: "user", content: "meanwhile, back on machine A" },
+            },
+            {
+              uuid: "a-fork-2", parentUuid: "a-fork-1", timestamp: "2026-07-21T03:00:05Z",
+              sessionId: localA, cwd: f.projectA, version: CLAUDE_VERSION, type: "user",
+              message: { role: "user", content: "and a second local thought" },
+            },
+          ].map((e) => JSON.stringify(e)).join("\n") + "\n"
+        );
+        // Adoption truncates a transcript the user owns, so pull refuses it
+        // outright on a base that looks live. State that this session was left
+        // behind rather than leaning on a clock coincidence.
+        ageOutOfLiveWindow(pathA);
+
+        const pullA = await hubPull({
+          configDir: f.configDirA, projectPath: f.projectA, hubPath: f.hub,
+          latest: true, onDivergence: "adopt-hub", claudeVersion: CLAUDE_VERSION,
+        });
+        expect(pullA.success).toBe(true);
+        if (!pullA.success) return;
+        const pA = pullA as HubPullResult;
+
+        expect(pA.divergence?.resolution).toBe("adopt-hub");
+        expect(pA.divergence?.adoptAvailable).toBe(true);
+        const preservedId = pA.divergence?.preservedSessionId;
+        expect(typeof preservedId).toBe("string");
+        expect(pA.appended ?? []).toHaveLength(1);
+        expect(pA.appended![0].baseSessionId).toBe(localA);
+
+        // The base IS the hub's branch now: common history, then B's entries,
+        // and A's fork cut away from it.
+        expect(readEntries(pathA).map((e) => e.uuid)).toEqual([
+          ...commonHistory, "b-append-1", "b-append-2",
+        ]);
+
+        // ...and A's own branch survives in full, under its own session id, so
+        // `claude --resume <preserved>` replays everything A ever had.
+        const preservedPath = join(projectDirA, `${preservedId}.jsonl`);
+        const preserved = readEntries(preservedPath);
+        expect(preserved.map((e) => e.uuid)).toEqual([...commonHistory, "a-fork-1", "a-fork-2"]);
+        expect(preserved.every((e) => e.sessionId === preservedId)).toBe(true);
+        expect(jsonlFiles(projectDirA)).toHaveLength(2);
+
+        // Registered where Claude Code lists sessions, and named as what it is.
+        const history = readFileSync(join(f.configDirA, "history.jsonl"), "utf-8");
+        const row = history.trim().split("\n").map((l) => JSON.parse(l) as { display: string; sessionId: string })
+          .find((h) => h.sessionId === preservedId);
+        expect(row).toBeDefined();
+        expect(row!.display).toContain("local divergence");
+      } finally {
+        restoreA.restore();
+      }
+    } finally {
+      cleanup(f);
+    }
+  });
+
+  it("the SessionEnd hook endpoint pushes this project to the hub, silently", async () => {
+    // CLI level on purpose: this is the path Claude Code actually takes, and it
+    // is the only one that proves the endpoint's stdout/exit contract together
+    // with a real push. No Claude Code involved — just the payload it sends.
+    const f = await setupThroughAppendPush("sesh-keystone-hookend");
+    try {
+      f.restore.restore();
+      const restoreA = overrideHome(f.homeA);
+      try {
+        const localA = f.pushA.pushedSessions[0].sessionId;
+        const pathA = sessionFilePath(f.configDirA, f.projectA, localA);
+        // Give the hook something to push: the session grew since A's own push.
+        appendContinuationEntries(pathA, localA, f.projectA);
+
+        const backend = createFsBackend(f.hub);
+        const before = await backend.list(bundleDir(f.pushA.projectId, f.machineIdA));
+
+        const r = runCli(["hub", "hook-session-end"], {
+          env: { ...homeEnv(f.homeA), CLAUDE_CONFIG_DIR: f.configDirA },
+          input: JSON.stringify({ cwd: f.projectA, session_id: localA, reason: "clear" }),
+        });
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toBe("");
+        expect(r.status).toBe(0);
+
+        const after = await backend.list(bundleDir(f.pushA.projectId, f.machineIdA));
+        expect(after).toHaveLength(before.length + 1);
+        // And it is a real continuation of the same thread, not a second copy:
+        // the auto-push rides the same incremental bookkeeping a manual push
+        // does, which is what keeps the hub cheap enough to hook at all.
+        const { indexes } = await readAllIndexes(backend, f.pushA.projectId);
+        const mine = indexes.find((i) => i.machineId === f.machineIdA)!;
+        const thread = mine.threads[f.pullB1.threadId];
+        expect(thread).toBeDefined();
+        expect(thread.bundles.map((b) => b.type)).toEqual(["full", "continuation"]);
+      } finally {
+        restoreA.restore();
+      }
+    } finally {
+      cleanup(f);
+    }
+  });
+
+  it("the SessionStart hook endpoint announces the other machine's newer work", async () => {
+    const f = await setupThroughAppendPush("sesh-keystone-hookstart");
+    try {
+      // A has not pulled B's continuation, so B genuinely holds newer work.
+      // Every field in the notice below comes out of the REAL two-machine hub
+      // state this fixture built — index, machine registry and thread slug —
+      // rather than a hand-written index file.
+      const r = runCli(["hub", "hook-session-start"], {
+        env: { ...homeEnv(f.homeA), CLAUDE_CONFIG_DIR: f.configDirA },
+        input: JSON.stringify({ cwd: f.projectA, session_id: "whatever", source: "startup" }),
+      });
+      expect(r.status).toBe(0);
+      const parsed = JSON.parse(r.stdout) as {
+        hookSpecificOutput: { hookEventName: string; additionalContext: string };
+      };
+      expect(parsed.hookSpecificOutput.hookEventName).toBe("SessionStart");
+      const context = parsed.hookSpecificOutput.additionalContext;
+      expect(context).toContain(f.machineNameB);
+      expect(context).toContain("test-session"); // the thread's slug
+      expect(context).toContain("/sesh-mover:pull");
+      expect(context).not.toContain("undefined");
+    } finally {
+      cleanup(f);
+    }
+  });
+
+  // --- Composition seams: both halves of a pull in one operation -------------
+  //
+  // Slice 2 put three payload kinds on one bundle chain. Sessions and the
+  // workspace merge ride the SAME pull (the merge is applied inside the bundle
+  // loop, the splice right after it, against the same project); sessions and a
+  // carry ride the same pull too, with the carry applied after the whole chain.
+  // Each half is covered on its own in hub-pull/hub-merge/hub-carry; what is
+  // only visible here is that neither half disturbs the other.
+
+  it("one pull merges the workspace 3-way AND splices the continuation", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-keystone-ws-hub-"));
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-keystone-ws-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-keystone-ws-homeB-"));
+    const baseA = mkdtempSync(join(tmpdir(), "sesh-keystone-ws-fixA-"));
+    const projectB = mkdtempSync(join(tmpdir(), "sesh-keystone-ws-projB-"));
+    const lines = (over: Record<number, string> = {}): string =>
+      Array.from({ length: 10 }, (_, i) => over[i + 1] ?? `line ${i + 1}`).join("\n") + "\n";
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(baseA);
+      const projectA = createRealProject(baseA, configDirA, "proj");
+      writeFileSync(join(projectA, "shared.txt"), lines());
+      const initA = await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      expect(initA.success).toBe(true);
+      const machineIdA = setMachineName("keystone-ws-a").id;
+
+      // No `noWorkspace` here — a git-less project is exactly the case the
+      // workspace payload exists for.
+      const push1 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push1.success).toBe(true);
+      if (!push1.success) return;
+      expect(push1.hasWorkspace).toBe(true);
+      const localA = push1.pushedSessions[0].sessionId;
+      const pathA = sessionFilePath(configDirA, projectA, localA);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      const initB = await hubInit({ hubPath: hub, configScope: "user", cwd: homeB });
+      expect(initB.success).toBe(true);
+      setMachineName("keystone-ws-b");
+      writeLocalProjectId(projectB, {
+        projectId: push1.projectId, name: "proj",
+        createdAt: new Date().toISOString(), createdByMachine: machineIdA,
+      });
+
+      // B bootstraps: the tree lands and the generation is recorded, which is
+      // what makes the LATER merge legal (a generation common to both trees).
+      const pullB = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pullB.success).toBe(true);
+      if (!pullB.success) return;
+      const pB = pullB as HubPullResult;
+      expect(pB.workspaceUnpacked?.fileCount).toBeGreaterThan(0);
+      expect(readFileSync(join(projectB, "shared.txt"), "utf-8")).toBe(lines());
+
+      // B works: one file edited, two messages added.
+      writeFileSync(join(projectB, "shared.txt"), lines({ 2: "B-EDIT" }));
+      const localB = pB.localSessionId!;
+      appendContinuationEntries(sessionFilePath(configDirB, projectB, localB), localB, projectB);
+      const pushB = await hubPush({
+        configDir: configDirB, projectPath: projectB, hubPath: hub, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pushB.success).toBe(true);
+      if (!pushB.success) return;
+      expect(pushB.hasWorkspace).toBe(true);
+      expect(pushB.pushedSessions[0].type).toBe("continuation");
+
+      // A meanwhile edited a DIFFERENT line of the same file, and left the
+      // session behind.
+      restore.restore();
+      restore = overrideHome(homeA);
+      writeFileSync(join(projectA, "shared.txt"), lines({ 8: "A-EDIT" }));
+      ageOutOfLiveWindow(pathA);
+
+      const pullA = await hubPull({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        latest: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pullA.success).toBe(true);
+      if (!pullA.success) return;
+      const pA = pullA as HubPullResult;
+
+      // Half one: the workspace merged, keeping both edits, no conflict.
+      expect(pA.workspaceMerge?.merged).toContain("shared.txt");
+      expect(pA.workspaceMerge?.conflicted ?? []).toHaveLength(0);
+      expect(readFileSync(join(projectA, "shared.txt"), "utf-8")).toBe(
+        lines({ 2: "B-EDIT", 8: "A-EDIT" })
+      );
+
+      // Half two: the session spliced into A's own transcript, in the same pull.
+      expect(pA.appended ?? []).toHaveLength(1);
+      expect(pA.appended![0]).toMatchObject({ baseSessionId: localA, entriesAppended: 2 });
+      expect(pA.importedSessions).toHaveLength(0);
+      expect(jsonlFiles(join(configDirA, "projects", encodeProjectPath(projectA)))).toHaveLength(1);
+      expect(lastUuid(pathA)).toBe("b-append-2");
+    } finally {
+      restore.restore();
+      for (const d of [hub, homeA, homeB, baseA, projectB]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("one pull applies the carried patch AND splices the continuation", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-keystone-carry-hub-"));
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-keystone-carry-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-keystone-carry-homeB-"));
+    const baseA = mkdtempSync(join(tmpdir(), "sesh-keystone-carry-fixA-"));
+    const cloneRoot = mkdtempSync(join(tmpdir(), "sesh-keystone-carry-clone-"));
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(baseA);
+      const projectA = createRealProject(baseA, configDirA, "proj");
+      const git = (args: string[], cwd = projectA): void => {
+        execFileSync("git", args, { cwd, stdio: "ignore" });
+      };
+      git(["init", "-q"]);
+      git(["config", "user.email", "t@example.com"]);
+      git(["config", "user.name", "Test"]);
+      git(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+      git(["add", "-A"]);
+      git(["commit", "-q", "-m", "init"]);
+      // The realistic receiving shape for a project with a remote: same commit,
+      // clean tree. Cloned BEFORE A dirties its tree.
+      const projectB = join(cloneRoot, "projB");
+      execFileSync("git", ["clone", "-q", projectA, projectB], { stdio: "ignore" });
+      writeFileSync(join(projectA, "README.md"), "work in progress\n");
+      writeFileSync(join(projectA, "scratch.txt"), "wip\n");
+
+      const initA = await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      expect(initA.success).toBe(true);
+      const machineIdA = setMachineName("keystone-carry-a").id;
+      const push1 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push1.success).toBe(true);
+      if (!push1.success) return;
+      expect("carry" in push1 && push1.carry).toBeTruthy();
+      const localA = push1.pushedSessions[0].sessionId;
+      const pathA = sessionFilePath(configDirA, projectA, localA);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      const initB = await hubInit({ hubPath: hub, configScope: "user", cwd: homeB });
+      expect(initB.success).toBe(true);
+      setMachineName("keystone-carry-b");
+      writeLocalProjectId(projectB, {
+        projectId: push1.projectId, name: "proj",
+        createdAt: new Date().toISOString(), createdByMachine: machineIdA,
+      });
+
+      // First pull WITHOUT --apply-carry: the session lands, the payload is
+      // only reported and saved, and B's working tree stays clean — which is
+      // what lets the second pull's carry apply.
+      const pullB1 = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pullB1.success).toBe(true);
+      if (!pullB1.success) return;
+      const p1 = pullB1 as HubPullResult;
+      expect(p1.importedSessions).toHaveLength(1);
+      expect(p1.carryApplied?.applied).toBe(false);
+      expect(readTextLf(join(projectB, "README.md"))).toBe("hello\n");
+      const localB = p1.localSessionId!;
+      const pathB = sessionFilePath(configDirB, projectB, localB);
+
+      // A carries on working: two more messages, and one more uncommitted edit.
+      restore.restore();
+      restore = overrideHome(homeA);
+      appendContinuationEntries(pathA, localA, projectA);
+      writeFileSync(join(projectA, "README.md"), "work in progress, take two\n");
+      const push2 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push2.success).toBe(true);
+      if (!push2.success) return;
+      expect(push2.pushedSessions[0].type).toBe("continuation");
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      ageOutOfLiveWindow(pathB);
+      const pullB2 = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, applyCarry: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pullB2.success).toBe(true);
+      if (!pullB2.success) return;
+      const p2 = pullB2 as HubPullResult;
+
+      // Half one: A's uncommitted work is in B's tree.
+      expect(p2.carryApplied?.applied).toBe(true);
+      expect(readTextLf(join(projectB, "README.md"))).toBe("work in progress, take two\n");
+      expect(readTextLf(join(projectB, "scratch.txt"))).toBe("wip\n");
+
+      // Half two: the transcript is one session, extended in place.
+      expect(p2.appended ?? []).toHaveLength(1);
+      expect(p2.appended![0]).toMatchObject({ baseSessionId: localB, entriesAppended: 2 });
+      expect(p2.importedSessions).toHaveLength(0);
+      expect(jsonlFiles(join(configDirB, "projects", encodeProjectPath(projectB)))).toHaveLength(1);
+      expect(lastUuid(pathB)).toBe("b-append-2");
+      // The applied payload is not also parked, so nothing invites the user to
+      // apply it a second time.
+      expect(existsSync(join(projectB, ".claude-sesh-mover"))).toBe(true);
+      expect(
+        readdirSync(join(projectB, ".claude-sesh-mover")).filter((n) => n.startsWith("carry-"))
+      ).toHaveLength(1); // the FIRST pull's save, and only that one
+    } finally {
+      restore.restore();
+      for (const d of [hub, homeA, homeB, baseA, cloneRoot]) rmSync(d, { recursive: true, force: true });
     }
   });
 });

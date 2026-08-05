@@ -9,7 +9,18 @@ function newer(a, b) {
         return a.lastActiveAt > b.lastActiveAt ? a : b;
     if (a.messageCount !== b.messageCount)
         return a.messageCount > b.messageCount ? a : b;
-    return a.headEntryUuid <= b.headEntryUuid ? a : b;
+    if (a.headEntryUuid !== b.headEntryUuid)
+        return a.headEntryUuid < b.headEntryUuid ? a : b;
+    // Total tie. Without this last key the answer was the reduce ACCUMULATOR,
+    // i.e. whichever index file the hub directory listed first — exactly the
+    // insertion-order dependence the comment above forbids, and it is reachable
+    // from the ordinary round trip (A pushes, B continues, A pulls the
+    // continuation back and splices it: both copies then carry the same
+    // lastActiveAt, messageCount and head). The two copies list DIFFERENT
+    // bundles, so this decides what a third machine's pull actually fetches.
+    // machineId is arbitrary as a preference and that is fine — it is stable,
+    // which is the property being bought here.
+    return a.machineId <= b.machineId ? a : b;
 }
 export function resolveThreads(indexes) {
     const byThread = new Map();

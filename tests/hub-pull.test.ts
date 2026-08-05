@@ -3217,4 +3217,126 @@ describe("hub pull — workspace 3-way merge", () => {
       w.cleanup();
     }
   });
+
+  it("a project whose workspace snapshot carries no files still pulls, sessions and all", async () => {
+    // The empty-project shape (`mkdir scratch && cd scratch && claude`), and
+    // the same thing an over-broad hubignore produces. push declares
+    // `manifest.workspace` for it — fileCount 0 is a legitimate snapshot, not a
+    // skipped one — so the puller runs its apply step, and before
+    // snapshotWorkspace created the payload directory unconditionally there was
+    // no `workspace/` in the bundle to apply: ENOENT out of hubPull, no
+    // sessions imported, nothing recorded, so every retry crashed the same way.
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-ws0-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-ws0-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-ws0-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-ws0-fix-"));
+    const projectA = mkdtempSync(join(tmpdir(), "sesh-ws0-projA-"));
+    const projectB = mkdtempSync(join(tmpdir(), "sesh-ws0-projB-"));
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      // Deliberately NOT createRealProject: that plants a README.md, and an
+      // empty project directory is the whole point here.
+      cpSync(
+        join(configDirA, "projects", FIXTURE_ENCODED),
+        join(configDirA, "projects", encodeProjectPath(projectA)),
+        { recursive: true }
+      );
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const push = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(push.success).toBe(true);
+      if (!push.success) return;
+      // The precondition this test rests on: a payload IS declared.
+      expect(push.hasWorkspace).toBe(true);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      writeLocalProjectId(projectB, {
+        projectId: push.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.importedSessions).toHaveLength(1);
+      expect(p.workspaceUnpacked).toEqual({ path: projectB, fileCount: 0 });
+      // An applied generation, even an empty one, is what lets the NEXT payload
+      // merge instead of hitting the no-ancestor skip.
+      expect(readSyncState(projectB).hub?.lastWorkspace).toBeTruthy();
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base, projectA, projectB]) {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("a bundle that declares a workspace payload it does not contain warns instead of failing the pull", async () => {
+    // Defence in depth for the bundles already on hubs: every sesh-mover before
+    // this guard wrote exactly this bundle whenever a snapshot carried no
+    // files, and a hand-made or truncated one can say it too. The transcripts
+    // are the point of a pull — the working tree is the optional half — so a
+    // payload that isn't there must degrade to a warning, never take the
+    // sessions down with it.
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-wsx-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-wsx-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-wsx-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-wsx-fix-"));
+    const projectB = mkdtempSync(join(tmpdir(), "sesh-wsx-projB-"));
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-wsx");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const push = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(push.success).toBe(true);
+      if (!push.success || !push.bundleId) return;
+      expect(push.hasWorkspace).toBe(true);
+      // Strip the payload the manifest keeps declaring.
+      await mutateBundleTree(hub, push.projectId, push.bundleId, (dir) => {
+        rmSync(join(dir, "workspace"), { recursive: true, force: true });
+      });
+
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      writeLocalProjectId(projectB, {
+        projectId: push.projectId, name: "projA-wsx",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.importedSessions).toHaveLength(1);
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.warnings.join(" ")).toMatch(/does not contain/i);
+      // Nothing was applied, so nothing may be recorded as applied: a
+      // generation this tree never held would make the next merge read the
+      // whole payload as "deleted here" (the Task 8 rule).
+      expect(readSyncState(projectB).hub?.lastWorkspace).toBeUndefined();
+      expect(readdirSync(projectB).sort()).toEqual([".claude-sesh-mover"]);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base, projectB]) {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+  });
 });

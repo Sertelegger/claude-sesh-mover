@@ -690,6 +690,15 @@ export async function snapshotWorkspace(
     return { fileCount: 0, byteSize: measured, symlinksSkipped: 0, skipped: true, warnings };
   }
 
+  // Created up front, not lazily per file: a payload this function returns
+  // WITHOUT `skipped` is one the caller declares in the manifest, and a
+  // declared payload that isn't in the bundle is a crash on every machine that
+  // pulls it (`unpackWorkspace`/`mergeWorkspaceTrees` both start by reading
+  // this directory). An empty tree is a legitimate outcome — an empty project,
+  // or a hubignore broad enough to drop everything — so the empty DIRECTORY is
+  // what has to travel. It survives the tar round trip (verified).
+  mkdirSync(destDir, { recursive: true });
+
   forEachCarriedFile(
     projectPath,
     rules,

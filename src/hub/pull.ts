@@ -949,10 +949,27 @@ export async function hubPull(
       // --target-path), and that metadata alone must neither trigger the
       // routine-skip branch nor trip unpackWorkspace's own emptiness check —
       // hence force is also set when the dir holds nothing but our metadata.
-      if (i === workspaceBundleIndex && bundleManifest.workspace) {
+      const incomingDir = join(extractDir, "workspace");
+      const workspaceDeclared = i === workspaceBundleIndex && !!bundleManifest.workspace;
+
+      // First, a payload the manifest declares and the bundle does not contain.
+      // Both application paths below start by READING that directory, so an
+      // absent one threw ENOENT straight out of hubPull: no sessions imported,
+      // nothing recorded, and therefore the identical crash on every retry —
+      // the optional half taking down the transcripts that are the point of the
+      // operation. Every sesh-mover before the accompanying snapshotWorkspace
+      // fix wrote exactly this bundle whenever a snapshot carried no files (an
+      // empty project, or a hubignore broad enough to drop the whole tree), so
+      // those bundles are on hubs now; a hand-made or truncated one says the
+      // same thing. Deliberately the same shape as the carry's own "declares it
+      // but does not contain it" guard further down.
+      if (workspaceDeclared && !existsSync(incomingDir)) {
+        warnings.push(
+          "The bundle's manifest declares a workspace payload but the bundle does not contain one, so there was nothing to apply and this project's files were left untouched. It was written by an older sesh-mover whose snapshot carried no files, damaged in transit, or not produced by sesh-mover at all."
+        );
+      } else if (workspaceDeclared) {
         const entries = existsSync(effectiveProjectPath) ? readdirSync(effectiveProjectPath) : [];
         const hasRealContent = entries.some((n) => n !== ".claude-sesh-mover");
-        const incomingDir = join(extractDir, "workspace");
 
         // Ancestor lookup is keyed off the EFFECTIVE project path, like every
         // other piece of local bookkeeping here — a pull into a fresh

@@ -49,6 +49,38 @@ describe("workspace snapshot", () => {
     } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
   });
 
+  it("creates the payload directory even when it carries nothing, so a declared payload is never absent", async () => {
+    // Every other snapshot test here hands `snapshotWorkspace` a dest that
+    // mkdtempSync already created, which is why this went unnoticed: the real
+    // caller (hub/push.ts) passes `<staging>/workspace`, a path that does NOT
+    // exist yet, and the copy pass only ever mkdirs the PARENT of a file it is
+    // about to write. Carry zero files and the directory was never created —
+    // while push still wrote `manifest.workspace` and declared `hasWorkspace`,
+    // so the bundle claimed a payload it did not contain and every puller of it
+    // crashed with ENOENT inside the apply step (measured, and see
+    // hub-pull.test.ts's end-to-end pair for this).
+    //
+    // Reachable without any exotic input: an empty project directory (the
+    // `mkdir scratch && cd scratch && claude` shape), or a hubignore broad
+    // enough to drop the whole tree.
+    const src = tmp("sesh-ws-empty-src-");
+    const staging = tmp("sesh-ws-empty-stage-");
+    const target = tmp("sesh-ws-empty-target-");
+    try {
+      const dest = join(staging, "workspace");
+      const r = await snapshotWorkspace(src, dest);
+      expect(r.fileCount).toBe(0);
+      expect(r.skipped).toBe(false);
+      expect(existsSync(dest)).toBe(true);
+      // And it survives the trip a real payload makes: applying an empty
+      // payload is a no-op, not a throw.
+      const u = await unpackWorkspace(dest, target, { force: true });
+      expect(u.fileCount).toBe(0);
+    } finally {
+      for (const d of [src, staging, target]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(isWindows)("symlinks are skipped, never followed", async () => {
     // Windows: symlinkSync needs elevation; the skip logic is platform-independent.
     const src = tmp("sesh-ws-src-");

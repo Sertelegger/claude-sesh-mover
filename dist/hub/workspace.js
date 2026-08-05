@@ -614,6 +614,14 @@ export async function snapshotWorkspace(projectPath, destDir, opts) {
         warnings.push(`The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so this push carries no project files (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with .claude-sesh-mover/hubignore — and check .claude-sesh-mover/hubinclude for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`);
         return { fileCount: 0, byteSize: measured, symlinksSkipped: 0, skipped: true, warnings };
     }
+    // Created up front, not lazily per file: a payload this function returns
+    // WITHOUT `skipped` is one the caller declares in the manifest, and a
+    // declared payload that isn't in the bundle is a crash on every machine that
+    // pulls it (`unpackWorkspace`/`mergeWorkspaceTrees` both start by reading
+    // this directory). An empty tree is a legitimate outcome — an empty project,
+    // or a hubignore broad enough to drop everything — so the empty DIRECTORY is
+    // what has to travel. It survives the tar round trip (verified).
+    mkdirSync(destDir, { recursive: true });
     forEachCarriedFile(projectPath, rules, (relPath, srcPath) => {
         const outPath = join(destDir, ...relPath.split("/"));
         mkdirSync(dirname(outPath), { recursive: true });

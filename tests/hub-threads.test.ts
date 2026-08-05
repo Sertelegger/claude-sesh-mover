@@ -27,6 +27,24 @@ describe("resolveThreads", () => {
     expect(r2[0].latest.machineId).toBe("mB"); // lexical asc wins
   });
 
+  it("breaks a total tie by machineId, so the answer never depends on index order", () => {
+    // Reachable from the milestone's own headline flow: A pushes, B pulls and
+    // continues, A pulls the continuation back and splices it into its own
+    // session. Both machines then publish the SAME lastActiveAt, the same
+    // messageCount and the same head uuid — and with every declared key equal,
+    // `newer` returned the reduce accumulator, i.e. whichever index file the
+    // hub directory happened to list first. That copy decides which machine a
+    // third machine pulls FROM, and the two copies list different bundles, so
+    // it decides what that machine receives. The module's own contract says the
+    // answer must not depend on iteration order; without a final key it did.
+    const copies = [
+      idx("mB", { t1: entry({ localSessionId: "sB" }) }),
+      idx("mA", { t1: entry({ localSessionId: "sA" }) }),
+    ];
+    expect(resolveThreads(copies)[0].latest.machineId).toBe("mA");
+    expect(resolveThreads([...copies].reverse())[0].latest.machineId).toBe("mA");
+  });
+
   it("sorts threads by latest activity desc and takes slug/summary from latest", () => {
     const r = resolveThreads([
       idx("mA", {
