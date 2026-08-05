@@ -277,6 +277,89 @@ export interface ApplyCarryOptions {
     __stamp?: string;
 }
 /**
+ * Everything the apply side has to know about a patch before it may run.
+ *
+ * Two things are being decided, and neither can be delegated to `git apply`:
+ *
+ * 1. **The `NEVER_INCLUDABLE` floor.** `git apply` refuses `.git/…` and `..`
+ *    traversal itself (measured: exit 128, "invalid path"), but it writes
+ *    `.claude-sesh-mover/config.json` — and `.claude-sesh-mover./config.json` —
+ *    without a murmur. The capture side's `FLOOR_PATHSPEC` closes the ordinary
+ *    case, but its `icase` mirrors only the CASE half of `isNeverSegment`: no
+ *    pathspec spelling folds trailing dots and whitespace without also
+ *    swallowing `.claude-sesh-moverX`. An older sesh-mover, a hand-made bundle
+ *    and that trailing-dot spelling all arrive here, and the prize is the file
+ *    deciding what this machine's NEXT push ships plus the project-scope
+ *    `config.json` that redirects `hub.path`.
+ * 2. **Symlink entries.** A STAGED symlink enters `git diff HEAD` as `new file
+ *    mode 120000` with its target as content, and `git apply` MATERIALISES it
+ *    (measured: `evil -> /etc/hosts` on the peer). The untracked copy path
+ *    drops symlinks via `lstat`; the patch path has no such guard.
+ *
+ * Both are answered by refusing the WHOLE patch rather than filtering it: a
+ * partially applied patch is worse than none, and `git apply --exclude` would
+ * leave exactly that.
+ *
+ * Two sources, because neither is complete alone:
+ *
+ * - `git apply --numstat -z` is git's own parse — authoritative and unquoted.
+ *   But for a RENAME **or a COPY** it prints only the DESTINATION (measured
+ *   both), so the source path is invisible to it: `copy from
+ *   .claude-sesh-mover/hubinclude` / `copy to stolen.txt` materialises the
+ *   RECEIVER's own plugin internals at an ordinary path, from where the next
+ *   auto-push carries them to the hub. It also cannot run at all on a machine
+ *   with no `git`, or on one whose `git` cannot read this repository.
+ * - A raw scan of the patch bytes covers every path git can name in a header:
+ *   `---`/`+++`, `rename from`/`to`, **`rename old`/`new`**, `copy from`/`to`,
+ *   the `diff --git` line itself (the only reference a mode-only change or a
+ *   binary entry has), and the `index … 120000` line of a re-pointed symlink —
+ *   which `--summary` does NOT print (measured: nothing at all for that shape).
+ *   It needs no `git`, so it is the whole floor on a machine where the other
+ *   source cannot run, and the saved README's recommendation rests on it there.
+ *
+ * The list of spellings is not a guess and not "what `git diff` emits" — it is
+ * git's own `parse_git_header` keyword table, read out of the shipped binary
+ * (`strings`, git 2.50.1). Sixteen entries; the nine path-bearing ones are the
+ * nine above. `similarity index`, `dissimilarity index`, `index` and the four
+ * mode lines carry no path. **`rename old `/`rename new ` are git's legacy
+ * spelling of `rename from`/`to`, and it still accepts them** — measured: an
+ * otherwise identical payload deleted `.claude-sesh-mover/hubinclude` and
+ * created `moved.txt`, `applied: true`, at BOTH layouts, on a receiver with a
+ * perfectly healthy `git`, because `--numstat` prints only a rename's
+ * destination and the scan did not read the source line.
+ *
+ * A body line cannot be mistaken for a header: every one carries a leading
+ * ` `, `+`, `-`, `@` or `\`, and no base85 line inside a `GIT binary patch`
+ * block can contain a space (it is not in the alphabet), so none of the header
+ * spellings below can occur inside one. The residual is a patch that DELETES a
+ * line spelled `-- a/…`, which reads as a header path — a false positive, i.e.
+ * a refusal, which is the safe direction.
+ *
+ * **How this stays right: `tests/hub-carry-header.test.ts` is a DIFFERENTIAL
+ * test, not a matrix.** Three consecutive review rounds each closed a
+ * hand-listed family of header spellings and each missed the next one, so the
+ * spellings are now generated mechanically over the axes that produced the
+ * holes (separator bytes, quoting symmetry, escape spelling, prefix pairs,
+ * trailing bytes, every path-bearing keyword) and each one is cross-checked
+ * against real `git apply --numstat -z --summary` on a scratch repo. The
+ * invariant it enforces is exactly the one this function owes its caller: **if
+ * git resolves a spelling to a path the floor forbids, this scan produces a
+ * candidate the floor forbids.** Add an axis value there when a new spelling
+ * shows up; do not add a case to a list here.
+ */
+declare function scanPatchBytes(patchPath: string): {
+    paths: string[];
+    symlink: string | null;
+} | null;
+/**
+ * The raw byte scan, exposed for `tests/hub-carry-header.test.ts` — the
+ * differential harness that cross-checks it against real `git apply` output
+ * spelling by spelling. Named `__`-first like the module's other test seams
+ * (`__stamp`): it is not part of the plugin's supported surface, and nothing in
+ * `src/` calls it through this name.
+ */
+export { scanPatchBytes as __scanPatchBytesForTests };
+/**
  * Apply a pulled carry payload to this machine's working tree (design §6.2).
  *
  * Writing another machine's uncommitted work into a real git repository is the

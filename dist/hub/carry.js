@@ -672,51 +672,99 @@ const SAVED_CARRY_RETENTION = 5;
 function stampNow(override) {
     return override ?? new Date().toISOString().replace(/[:.]/g, "-");
 }
+/** The one-character escapes `unquote_c_style` knows, and nothing else. */
+const C_QUOTE_ESCAPES = {
+    a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92,
+};
 /**
- * Decode git's C-quoted path spelling (`"caf\303\251.txt"`).
+ * Decode git's C-quoted path spelling (`"caf\303\251.txt"`), or `null` when
+ * this is not a spelling git's own `unquote_c_style` decodes.
  *
  * `core.quotePath` is on by default and it quotes at the SENDER, inside the
  * patch bytes — so no flag on this side changes it. Left encoded, a quoted
  * `".claude-sesh-mover/x"` reads as a single segment starting with `"` and
  * walks straight past the floor check.
+ *
+ * Three details are git's, not conveniences, and each one was a hole:
+ *
+ * - **It stops at the first UNESCAPED closing quote and ignores everything
+ *   after it.** Requiring the token to END with the quote (what this function
+ *   did) means one appended junk byte — `".claude-sesh-mover/hubinclude"X` —
+ *   leaves the literal token as the only reading, whose leading `"` fuses into
+ *   the first segment so `isNeverSegment` no longer matches, while git decodes
+ *   the real path and applies it. Measured on a healthy-git receiver at both
+ *   layouts: that spelling on a `rename from` line DELETED the receiver's
+ *   `.claude-sesh-mover/hubinclude`, and on a `copy from` line reproduced it at
+ *   an ordinary path from where the next auto-push would upload it.
+ * - **An octal escape is exactly three digits with the first in 0–3**; two
+ *   digits (`\56`) or a leading `4`–`7` is an ERROR, not a shorter escape.
+ * - **An unknown escape (`\z`) is an error too.**
+ *
+ * On error git's `find_name` falls back to reading the LITERAL bytes, which is
+ * why `null` here is not "no path": every caller keeps the raw token as a
+ * candidate of its own, exactly mirroring that fallback.
  */
 function unquoteGitPath(raw) {
-    if (!raw.startsWith('"') || !raw.endsWith('"') || raw.length < 2)
-        return raw;
-    const body = raw.slice(1, -1);
+    if (!raw.startsWith('"'))
+        return null;
     const bytes = [];
-    for (let i = 0; i < body.length; i++) {
-        if (body[i] !== "\\") {
-            bytes.push(body.charCodeAt(i) & 0xff);
+    for (let i = 1; i < raw.length; i++) {
+        const ch = raw[i];
+        if (ch === '"')
+            return Buffer.from(bytes).toString("utf-8");
+        if (ch !== "\\") {
+            bytes.push(raw.charCodeAt(i) & 0xff);
             continue;
         }
-        const next = body[++i];
+        const next = raw[++i];
         if (next === undefined)
-            break;
-        if (next >= "0" && next <= "7") {
-            const octal = body.slice(i, i + 3);
-            bytes.push(parseInt(octal, 8) & 0xff);
+            break; // trailing backslash: unterminated
+        if (next >= "0" && next <= "3") {
+            const d2 = raw[i + 1];
+            const d3 = raw[i + 2];
+            if (d2 === undefined || d2 < "0" || d2 > "7")
+                return null;
+            if (d3 === undefined || d3 < "0" || d3 > "7")
+                return null;
+            bytes.push(parseInt(raw.slice(i, i + 3), 8) & 0xff);
             i += 2;
             continue;
         }
-        const escapes = {
-            a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92,
-        };
-        bytes.push(escapes[next] ?? next.charCodeAt(0));
+        const code = C_QUOTE_ESCAPES[next];
+        if (code === undefined)
+            return null; // includes octal starting 4-7
+        bytes.push(code);
     }
-    return Buffer.from(bytes).toString("utf-8");
+    return null; // no closing quote — git's unquote fails and the literal wins
 }
-/** Strip a `a/`/`b/` prefix and any trailing tab-separated timestamp. */
-function patchHeaderPath(rest) {
-    const path = unquoteGitPath(rest.split("\t")[0].trim());
-    if (path === "/dev/null")
-        return null;
-    return path.replace(/^[ab]\//, "");
-}
-/** `patchHeaderPath` as a 0-or-1 element list, for the scan's flat collection. */
-function headerPath(rest) {
-    const path = patchHeaderPath(rest);
-    return path === null ? [] : [path];
+/**
+ * Every path one single-name header line (`---`, `+++`, `rename from/to`,
+ * `rename old/new`, `copy from/to`) can be read as — the decoded form AND the
+ * literal one, because git itself tries both in that order (`find_name` calls
+ * `find_name_gnu` first and falls back to `find_name_common` when the unquote
+ * fails). Collecting both is what keeps a malformed escape from hiding a path:
+ * whichever reading git ends up using, the floor has seen it.
+ *
+ * Each reading is also offered with an `a/`/`b/` prefix stripped, since that is
+ * the component git removes at `-p1`. The unstripped form is kept as well and
+ * costs nothing: `isNeverIncludable` judges EVERY segment, so a leading
+ * component can only ever add one.
+ */
+function headerPathCandidates(rest) {
+    // Traditional diffs put a tab-separated timestamp after the name and git's
+    // own parser stops at the tab too (`name_terminate`, TERM_TAB).
+    const token = rest.split("\t")[0].trim();
+    const out = [];
+    for (const reading of [token, unquoteGitPath(token)]) {
+        // `/dev/null` is git's "no such side" marker, not a path the floor judges.
+        if (reading === null || reading.length === 0 || reading === "/dev/null")
+            continue;
+        out.push(reading);
+        const stripped = reading.replace(/^[ab]\//, "");
+        if (stripped !== reading && stripped.length > 0)
+            out.push(stripped);
+    }
+    return out;
 }
 /**
  * Longest `diff --git` header this scan will parse, the most separator
@@ -725,28 +773,42 @@ function headerPath(rest) {
  * The parse below is quadratic in the number of separators, and the patch is
  * attacker-supplied, so all three are needed. Nothing git emits comes close:
  * two paths, each bounded by the platform's `PATH_MAX` even after C-quoting
- * expands every byte to four characters, separated by ONE space. Exceeding any
- * of these fails the whole scan CLOSED (`unsafe-payload`) rather than parsing a
- * prefix of the header and trusting the answer.
+ * expands every byte to four characters, separated by ONE space (a separator
+ * count is a count of spaces, TABs and CRs in the header — git C-escapes all
+ * three inside a path it quotes, so an honest header holds exactly one).
+ * Exceeding any of these fails the whole scan CLOSED (`unsafe-payload`) rather
+ * than parsing a prefix of the header and trusting the answer.
  */
 const HEADER_SCAN_MAX_LEN = 16 * 1024;
 const HEADER_SCAN_MAX_SPLITS = 256;
 const HEADER_SCAN_BUDGET = 32 * 1024 * 1024;
 /**
- * Unquote one half of a `diff --git` header.
+ * Every way one half of a `diff --git` header can be read.
  *
- * Surrounding whitespace is dropped only when what remains is a quoted string:
- * git's own parser skips whitespace between a quoted first name and the second
- * one (`"a/x"   "b/x"` is accepted, measured), while for unquoted names the
- * padding belongs to the leading component it then strips — so an unquoted half
- * is left byte-exact.
+ * Three readings rather than one, because git's parser reaches the same half by
+ * three different routes and picking one of them is how a spelling slips past:
+ *
+ * - **byte-exact** — what git compares when both names are unquoted (its final
+ *   loop demands the two halves match byte for byte).
+ * - **whitespace-trimmed** — git skips its `isspace` run between a quoted first
+ *   name and the second (`"a/x"   "b/x"` is accepted, measured), so the padding
+ *   is not part of either name there.
+ * - **C-unquoted** — the decoded path, when the trimmed form opens a quote.
+ *   `unquoteGitPath` ignores whatever trails the closing quote, as git does, so
+ *   `"b/x"JUNK` still reads as `b/x`.
+ *
+ * Extra readings can only ever make a header AGREE with more spellings, i.e.
+ * collect more candidate paths, i.e. refuse more — never write more.
  */
-function unquoteHeaderHalf(raw) {
+function halfReadings(raw) {
+    const out = [raw];
     const trimmed = raw.trim();
-    if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
-        return unquoteGitPath(trimmed);
-    }
-    return raw;
+    if (trimmed !== raw)
+        out.push(trimmed);
+    const decoded = unquoteGitPath(trimmed);
+    if (decoded !== null && decoded !== trimmed)
+        out.push(decoded);
+    return out;
 }
 /** Everything past the first `/`, or `null` when there is no component to strip. */
 function stripOneComponent(path) {
@@ -780,12 +842,34 @@ function stripOneComponent(path) {
  *   `git diff --src-prefix=c/ --dst-prefix=d/` emits, and `diff.mnemonicPrefix`
  *   (documented at the top of this file) renames them for ordinary users.
  *
- * So this mirrors git's own `git_header_name`: try EVERY separator position,
- * unquote each half, and strip ONE leading component whatever it is spelled.
- * Git accepts a header when some split makes the two halves agree, and that is
- * the question asked here. Both the stripped and the raw form are collected —
- * `git diff --no-prefix` emits a header with no component to strip and
- * `git apply -p0` then writes the path verbatim (measured).
+ * So this is a deliberate OVER-approximation of git's `git_header_name`, not a
+ * port of it: try EVERY separator position, read each half every way git can
+ * read one (`halfReadings`), and strip ONE leading component whatever it is
+ * spelled. Git accepts a header when some split makes the two halves agree, and
+ * that is the question asked here — but where git's parser is exact this one is
+ * permissive, so every header git accepts is also collected here and a few it
+ * rejects are collected too. Extra candidates only ever cause a REFUSAL.
+ *
+ * Claiming a line-for-line port was itself the bug in an earlier round: the two
+ * places this really did diverge from `git_header_name` were both holes, both
+ * measured applying on a healthy-git receiver, and neither would have existed
+ * in a faithful port —
+ *
+ * - the C-unquote demanded the half END at its closing quote, where git's
+ *   `unquote_c_style` stops at the first unescaped one and ignores the rest
+ *   (`"b/<p>"JUNK`); see `unquoteGitPath`;
+ * - the separator class was `' '`/`'\t'`, where git's is its SANE `isspace` —
+ *   `' '`, `'\t'`, `'\r'` all separate names, while `'\v'` and `'\f'` do not
+ *   (all four measured: `a/<p>\r"b/<p>"` applies, `a/<p>\v"b/<p>"` is rejected
+ *   outright with "git diff header lacks filename information").
+ *
+ * `'\v'`/`'\f'` are therefore deliberately NOT accepted here: a header git
+ * refuses to parse names nothing at all, and adding them defensively would only
+ * invent refusals. `'\n'` cannot occur — the caller splits on it.
+ *
+ * Both the stripped and the raw form are collected — `git diff --no-prefix`
+ * emits a header with no component to strip and `git apply -p0` then writes the
+ * path verbatim (measured).
  *
  * The agreement requirement is what keeps this honest rather than a
  * false-refusal machine: no split of `a/tracked.txt b/renamed.txt` agrees, and
@@ -803,24 +887,32 @@ function diffGitHeaderPaths(rest, budget) {
     let splits = 0;
     for (let i = 0; i < rest.length; i++) {
         const ch = rest[i];
-        // Git's parser accepts a TAB here as well as a space (`case '\t': case ' '`).
-        if (ch !== " " && ch !== "\t")
+        // Git's separator class here is its own `isspace` (sane_ctype): space, TAB
+        // and CR separate the two names; VT and FF do not.
+        if (ch !== " " && ch !== "\t" && ch !== "\r")
             continue;
         if (++splits > HEADER_SCAN_MAX_SPLITS)
             return null;
-        budget.left -= rest.length;
+        const lefts = halfReadings(rest.slice(0, i));
+        const rights = halfReadings(rest.slice(i + 1));
+        // The budget counts bytes COMPARED, so growing the readings per half grows
+        // the charge with it rather than silently multiplying the work behind a
+        // per-split charge. Over budget the whole scan fails closed.
+        budget.left -= rest.length * lefts.length * rights.length;
         if (budget.left < 0)
             return null;
-        const left = unquoteHeaderHalf(rest.slice(0, i));
-        const right = unquoteHeaderHalf(rest.slice(i + 1));
-        const leftStripped = stripOneComponent(left);
-        const rightStripped = stripOneComponent(right);
-        const strippedAgree = leftStripped !== null && leftStripped === rightStripped;
-        if (!strippedAgree && left !== right)
-            continue;
-        if (strippedAgree)
-            out.push(leftStripped);
-        out.push(left, right);
+        for (const left of lefts) {
+            for (const right of rights) {
+                const leftStripped = stripOneComponent(left);
+                const rightStripped = stripOneComponent(right);
+                const strippedAgree = leftStripped !== null && leftStripped === rightStripped;
+                if (!strippedAgree && left !== right)
+                    continue;
+                if (strippedAgree)
+                    out.push(leftStripped);
+                out.push(left, right);
+            }
+        }
     }
     // `/dev/null` never appears in a `diff --git` line and is not a path the
     // floor should judge; empty strings are the residue of a `a/ b/` header.
@@ -884,6 +976,18 @@ function diffGitHeaderPaths(rest, budget) {
  * spellings below can occur inside one. The residual is a patch that DELETES a
  * line spelled `-- a/…`, which reads as a header path — a false positive, i.e.
  * a refusal, which is the safe direction.
+ *
+ * **How this stays right: `tests/hub-carry-header.test.ts` is a DIFFERENTIAL
+ * test, not a matrix.** Three consecutive review rounds each closed a
+ * hand-listed family of header spellings and each missed the next one, so the
+ * spellings are now generated mechanically over the axes that produced the
+ * holes (separator bytes, quoting symmetry, escape spelling, prefix pairs,
+ * trailing bytes, every path-bearing keyword) and each one is cross-checked
+ * against real `git apply --numstat -z --summary` on a scratch repo. The
+ * invariant it enforces is exactly the one this function owes its caller: **if
+ * git resolves a spelling to a path the floor forbids, this scan produces a
+ * candidate the floor forbids.** Add an axis value there when a new spelling
+ * shows up; do not add a case to a list here.
  */
 function scanPatchBytes(patchPath) {
     let size;
@@ -916,21 +1020,21 @@ function scanPatchBytes(patchPath) {
         }
         let found = [];
         if (line.startsWith("--- ") || line.startsWith("+++ "))
-            found = headerPath(line.slice(4));
+            found = headerPathCandidates(line.slice(4));
         else if (line.startsWith("rename from "))
-            found = headerPath(line.slice(12));
+            found = headerPathCandidates(line.slice(12));
         else if (line.startsWith("rename to "))
-            found = headerPath(line.slice(10));
+            found = headerPathCandidates(line.slice(10));
         // Git's legacy spelling of the same two lines, still in its keyword table
         // and still accepted (measured end to end).
         else if (line.startsWith("rename old "))
-            found = headerPath(line.slice(11));
+            found = headerPathCandidates(line.slice(11));
         else if (line.startsWith("rename new "))
-            found = headerPath(line.slice(11));
+            found = headerPathCandidates(line.slice(11));
         else if (line.startsWith("copy from "))
-            found = headerPath(line.slice(10));
+            found = headerPathCandidates(line.slice(10));
         else if (line.startsWith("copy to "))
-            found = headerPath(line.slice(8));
+            found = headerPathCandidates(line.slice(8));
         else if (line.startsWith("diff --git ")) {
             const header = diffGitHeaderPaths(line.slice(11), headerBudget);
             // Unparseable within the budget: the floor cannot answer for this entry,
@@ -947,6 +1051,14 @@ function scanPatchBytes(patchPath) {
     }
     return { paths, symlink };
 }
+/**
+ * The raw byte scan, exposed for `tests/hub-carry-header.test.ts` — the
+ * differential harness that cross-checks it against real `git apply` output
+ * spelling by spelling. Named `__`-first like the module's other test seams
+ * (`__stamp`): it is not part of the plugin's supported surface, and nothing in
+ * `src/` calls it through this name.
+ */
+export { scanPatchBytes as __scanPatchBytesForTests };
 /** Files under a payload directory, "/"-joined, symlinks and specials dropped. */
 function listPayloadFiles(root) {
     const out = [];
@@ -1077,7 +1189,14 @@ function saveCarryPayload(opts) {
                 mkdirSync(dir, { recursive: true });
                 writeFileSync(join(dir, ".gitignore"), SAVED_CARRY_GITIGNORE, "utf-8");
                 copyPayloadTree(opts.carryDir, dir);
-                writeFileSync(join(dir, "README.md"), renderSavedReadme({ ...opts, dir }), "utf-8");
+                // Counted from what actually landed, never from `meta.untrackedCount`:
+                // the manifest is the SENDER's claim about its own payload, so a bundle
+                // declaring `0` while shipping an `untracked/` tree would get a README
+                // that never mentions the copies sitting beside it. Nothing is written
+                // either way — this only decides what the note says — but a note that
+                // describes the directory it is in has to describe THIS directory.
+                const untrackedSaved = listPayloadFiles(join(dir, "untracked")).length;
+                writeFileSync(join(dir, "README.md"), renderSavedReadme({ ...opts, dir, untrackedSaved }), "utf-8");
                 pruneSavedCarries(root, name);
                 return dir;
             }
@@ -1181,7 +1300,7 @@ function renderSavedReadme(opts) {
         `Reason: ${opts.detail}`,
         "",
         `Captured on branch \`${meta.branch}\`${meta.detached ? " (detached HEAD)" : ""} at commit \`${meta.baseCommit}\` on ${meta.capturedAt}.`,
-        `It holds a ${formatBytes(meta.patchBytes)} patch and ${meta.untrackedCount} untracked file(s).`,
+        `It holds a ${formatBytes(meta.patchBytes)} patch and ${opts.untrackedSaved} untracked file(s).`,
         "",
     ];
     if (meta.inProgress) {
@@ -1212,7 +1331,7 @@ function renderSavedReadme(opts) {
             lines.push(`\`--directory\` is not optional here: this project is the subdirectory \`${opts.applyPrefix}\` of its repository, and \`git apply\` resolves patch paths against the repository ROOT. Without it the command exits 0 and writes nothing at all.`, "");
         }
     }
-    if (meta.untrackedCount > 0) {
+    if (opts.untrackedSaved > 0) {
         lines.push((opts.advice === "unparseable"
             ? "The untracked files travelled as ordinary copies, not in the patch, so nothing above affects them. They are under `untracked/`."
             : "The untracked files are under `untracked/`.") +

@@ -2305,6 +2305,53 @@ describe("applyCarry", () => {
       "diff --git .claude-sesh-mover/config.json .claude-sesh-mover/config.json\n" +
         "new file mode 100644\nindex 0000000..e69de29\n",
     ],
+    // --- Round 4: two families the round-3 header parse still missed, both
+    // measured applying against bare `git apply` (exit 0, the file lands).
+    //
+    // (1) `unquote_c_style` stops at the first UNESCAPED closing quote and
+    // IGNORES the remainder; demanding the token END there left the literal
+    // as the only reading, and its leading `"` fuses into the first segment.
+    [
+      "trailing byte after the closing quote",
+      'diff --git a/.claude-sesh-mover/config.json "b/.claude-sesh-mover/config.json"JUNK\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    [
+      "trailing byte after both closing quotes",
+      'diff --git "a/.claude-sesh-mover/config.json" "b/.claude-sesh-mover/config.json"JUNK\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    [
+      "tab separator plus a trailing byte",
+      'diff --git a/.claude-sesh-mover/config.json\t"b/.claude-sesh-mover/config.json"JUNK\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    // The same divergence on a keyword line rather than the `diff --git` one,
+    // in the octal spelling: a traditional patch with no `diff --git` at all.
+    [
+      "octal spelling plus a trailing byte, on a traditional +++",
+      '--- /dev/null\n+++ "b/\\056claude-sesh-mover/config.json"X\n@@ -0,0 +1 @@\n+hi\n',
+    ],
+    // (2) Git's separator class here is its own `isspace`: SP, TAB and CR all
+    // separate the two names (VT and FF do not — measured rejected).
+    [
+      "CR separator",
+      'diff --git a/.claude-sesh-mover/config.json\r"b/.claude-sesh-mover/config.json"\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    [
+      "CR separator, both halves quoted",
+      'diff --git "a/.claude-sesh-mover/config.json"\r"b/.claude-sesh-mover/config.json"\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
+    // A TAB *is* present here, so the round-3 scan did split — but its
+    // `trim()`-then-quote-check left the CR inside the unquoted half, so the
+    // two halves could never agree.
+    [
+      "CR followed by a TAB",
+      'diff --git a/.claude-sesh-mover/config.json\r\t"b/.claude-sesh-mover/config.json"\n' +
+        "new file mode 100644\nindex 0000000..e69de29\n",
+    ],
   ];
 
   it("refuses `diff --git` spellings git accepts, at BOTH layouts, with no runnable git", async () => {
@@ -2417,6 +2464,60 @@ describe("applyCarry", () => {
         expect(readFileSync(join(project, ".claude-sesh-mover", "hubinclude"), "utf-8")).toBe("docs/\n");
       } finally {
         cleanup(repo, dir ?? "");
+      }
+    }
+  });
+
+  it("refuses a rename/copy SOURCE hidden behind a trailing byte, healthy git, BOTH layouts", async () => {
+    // The worst members of the round-4 family, and the reason it outranks the
+    // header spellings above: `--numstat` prints only a rename's or copy's
+    // DESTINATION, so on a receiver whose git works perfectly the byte scan is
+    // the ONLY thing reading these lines. One appended byte after the closing
+    // quote was enough to blind it while git decoded the real path — measured
+    // against bare `git apply` at BOTH layouts: exit 0, and
+    // `.claude-sesh-mover/hubinclude` (the file deciding what this machine's
+    // next push uploads) either DELETED, or reproduced at an ordinary path
+    // from where the next auto-push would carry it to the hub.
+    const F = ".claude-sesh-mover/hubinclude";
+    const payloads: Array<[string, string, string]> = [
+      [
+        "rename from, quoted with a trailing byte",
+        `diff --git a/decoy b/moved.txt\nsimilarity index 100%\nrename from "${F}"X\nrename to moved.txt\n`,
+        "moved.txt",
+      ],
+      [
+        "rename from, octal-escaped with a trailing byte",
+        'diff --git a/decoy b/moved.txt\nsimilarity index 100%\n' +
+          'rename from "\\056claude-sesh-mover/hubinclude"X\nrename to moved.txt\n',
+        "moved.txt",
+      ],
+      [
+        "copy from, quoted with a trailing byte",
+        `diff --git a/decoy b/stolen.txt\nsimilarity index 100%\ncopy from "${F}"X\ncopy to stolen.txt\n`,
+        "stolen.txt",
+      ],
+    ];
+    for (const layout of ["root", "subdir"] as const) {
+      for (const [label, patch, dest] of payloads) {
+        const { repo, project, head } = layoutRepo(`apply-trailing-${layout}`, layout);
+        let dir: string | undefined;
+        try {
+          const payload = handPayload(patch, {
+            baseCommit: head, repoPrefix: layout === "subdir" ? "pkg/app/" : "",
+          });
+          dir = payload.dir;
+          const r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+          const where = `${layout}/${label}`;
+          expect(r.applied, where).toBe(false);
+          if (r.applied) return;
+          expect(r.reason, where).toBe("unsafe-payload");
+          expect(r.savedCommands, where).toBe(false);
+          expect(existsSync(join(project, dest)), where).toBe(false);
+          expect(readFileSync(join(project, ".claude-sesh-mover", "hubinclude"), "utf-8"), where)
+            .toBe("docs/\n");
+        } finally {
+          cleanup(repo, dir ?? "");
+        }
       }
     }
   });
@@ -2538,6 +2639,48 @@ describe("applyCarry", () => {
       expect(hostileReadme).toContain("refused, not merely deferred");
       expect(hostileReadme).not.toContain("cp -R");
       rmSync(hostile.dir, { recursive: true, force: true });
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
+  it("describes the untracked files it really saved, not the count the bundle claims", async () => {
+    // `meta.untrackedCount` is the SENDER's number, and a hand-made bundle can
+    // say anything. Declaring `0` while shipping an `untracked/` tree used to
+    // produce a README that never mentioned the copies sitting right beside it
+    // — harmless (nothing is written either way) but a note describing the
+    // directory it lives in has to describe THAT directory.
+    const repo = gitRepo("apply-untracked-count");
+    let dir: string | undefined;
+    try {
+      const head = git(repo, ["rev-parse", "HEAD"]).trim();
+      const payload = handPayload("", { baseCommit: head, untrackedCount: 0, untrackedBytes: 0 });
+      dir = payload.dir;
+      mkdirSync(join(dir, "untracked"), { recursive: true });
+      writeFileSync(join(dir, "untracked", "one.txt"), "a\n");
+      writeFileSync(join(dir, "untracked", "two.txt"), "b\n");
+
+      const r = await applyCarry({
+        carryDir: dir, targetPath: repo, meta: payload.meta, saveOnly: true,
+      });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      expect(readme).toContain("2 untracked file(s)");
+      expect(readme).toContain("cp -R");
+      expect(readme).toContain("Copy-Item -Recurse -Force");
+      // …and the mirror: a bundle CLAIMING files it did not ship must not send
+      // the user looking for an `untracked/` directory that is not there.
+      const empty = handPayload("", { baseCommit: head, untrackedCount: 7, untrackedBytes: 99 });
+      const e = await applyCarry({
+        carryDir: empty.dir, targetPath: repo, meta: empty.meta, saveOnly: true,
+      });
+      expect(e.applied).toBe(false);
+      if (e.applied) return;
+      const emptyReadme = readFileSync(join(e.savedTo!, "README.md"), "utf-8");
+      expect(emptyReadme).toContain("0 untracked file(s)");
+      expect(emptyReadme).not.toContain("cp -R");
+      rmSync(empty.dir, { recursive: true, force: true });
     } finally {
       cleanup(repo, dir ?? "");
     }
