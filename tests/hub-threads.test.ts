@@ -56,4 +56,38 @@ describe("resolveThreads", () => {
     expect(r.map((t) => t.threadId)).toEqual(["t1", "t2"]);
     expect(r[0].slug).toBe("newer-t1");
   });
+
+  it("orders equal-timestamped THREADS deterministically too, not just equal copies", () => {
+    // Same invariant as the copy-level tiebreak above, one level up. The
+    // obvious `a < b ? 1 : -1` is an inconsistent comparator — it returns -1
+    // for equal values — so ties came back in whatever order the threads were
+    // built in. Both consumers pick positionally (`pull --latest` takes the
+    // first non-current thread; the SessionStart notice takes the most recent
+    // stale one), so an arbitrary winner among ties is an arbitrary answer to
+    // "which thread needs attention".
+    const same = "2026-07-21T00:00:00Z";
+    const ids = ["t5", "t1", "t9", "t3", "t7", "t2", "t8", "t4", "t6"];
+    const build = (order: string[]): string[] =>
+      resolveThreads([
+        idx("mA", Object.fromEntries(order.map((t) => [t, entry({ lastActiveAt: same })]))),
+      ]).map((t) => t.threadId);
+
+    const forward = build(ids);
+    expect(build([...ids].reverse())).toEqual(forward);
+    expect(build([...ids].sort())).toEqual(forward);
+    // Ties resolve on threadId, so the order is stated rather than incidental.
+    expect(forward).toEqual([...ids].sort());
+  });
+
+  it("still puts a genuinely newer thread first regardless of tie handling", () => {
+    // Negative control for the above: the tiebreak must not reorder threads
+    // that differ on the field that actually matters.
+    const r = resolveThreads([
+      idx("mA", {
+        zzz: entry({ lastActiveAt: "2026-07-22T00:00:00Z" }),
+        aaa: entry({ lastActiveAt: "2026-07-01T00:00:00Z" }),
+      }),
+    ]);
+    expect(r.map((t) => t.threadId)).toEqual(["zzz", "aaa"]);
+  });
 });

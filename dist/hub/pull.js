@@ -84,6 +84,24 @@ export function selectThreadBase(candidates, anchorUuid, preferred) {
  * activity, but it is not conversation, and "which copy has the most
  * conversation" is the question these fields are asked.
  */
+/**
+ * Is this path a directory we can list?
+ *
+ * Both "the bundle declares a payload it does not contain" guards use this
+ * rather than `existsSync`, because the failure they exist to close is a
+ * `readdirSync` throwing out of `hubPull` BEFORE the session import — which a
+ * plain file at that path does just as well (ENOTDIR) as a missing one
+ * (ENOENT). Any error reads as "not usable": the caller's next move is to warn
+ * and skip, which is the right answer for a permission failure too.
+ */
+function isReadableDir(path) {
+    try {
+        return statSync(path).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
 function readSessionTail(path) {
     const e = readLastConversationEntry(path);
     if (!e)
@@ -812,7 +830,12 @@ export async function hubPull(opts) {
             // those bundles are on hubs now; a hand-made or truncated one says the
             // same thing. Deliberately the same shape as the carry's own "declares it
             // but does not contain it" guard further down.
-            if (workspaceDeclared && !existsSync(incomingDir)) {
+            // `isDirectory`, not `existsSync`: a bundle whose `workspace` entry is a
+            // FILE reaches the same `readdirSync` and throws ENOTDIR out of hubPull
+            // before the session import — the identical terminal shape this guard
+            // exists to close. No sesh-mover produces that, but the sentence below
+            // claims to cover a hand-made bundle, so the check has to mean it.
+            if (workspaceDeclared && !isReadableDir(incomingDir)) {
                 warnings.push("The bundle's manifest declares a workspace payload but the bundle does not contain one, so there was nothing to apply and this project's files were left untouched. It was written by an older sesh-mover whose snapshot carried no files, damaged in transit, or not produced by sesh-mover at all.");
             }
             else if (workspaceDeclared) {
@@ -1195,7 +1218,8 @@ export async function hubPull(opts) {
         let carryApplied;
         if (lastCarry) {
             carryAvailable = lastCarry.meta;
-            if (!existsSync(lastCarry.dir)) {
+            // isDirectory, not exists — see the workspace guard above.
+            if (!isReadableDir(lastCarry.dir)) {
                 warnings.push("The bundle's manifest declares carried uncommitted changes but the bundle does not contain them, so there was nothing to apply. The bundle is damaged or was not produced by sesh-mover.");
             }
             else {

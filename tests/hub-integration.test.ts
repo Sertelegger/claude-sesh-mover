@@ -353,10 +353,14 @@ describe("hub keystone: multi-machine round trip", () => {
   it("sync-lag: a missing bundle in a real (full + continuation) chain blocks a fresh machine's pull", async () => {
     const f = await setupThroughAppendPush("sesh-keystone-lag");
     try {
-      // The thread now has a genuine two-bundle chain on the hub (A's
-      // original full push, B's continuation push) — delete the
-      // continuation bundle to simulate a sync client that hasn't finished
-      // materializing the latest file yet.
+      // Two bundles for this thread exist ON THE HUB (A's original full push,
+      // B's continuation push) — but they sit in two different machines'
+      // indexes, and a pull only ever fetches the chosen source's list, so
+      // this pull needs B's continuation alone. Deleting it simulates a sync
+      // client that hasn't finished materializing the latest file yet.
+      //
+      // Do NOT read this as evidence that a cross-machine chain pulls whole:
+      // it doesn't. See the Task 12 carry in the SDD ledger.
       const backend = createFsBackend(f.hub);
       const { indexes } = await readAllIndexes(backend, f.pushA.projectId);
       const allBundles = indexes.flatMap((idx) => Object.values(idx.threads)).flatMap((t) => t.bundles);

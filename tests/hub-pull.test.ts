@@ -3304,9 +3304,15 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(push.success).toBe(true);
       if (!push.success || !push.bundleId) return;
       expect(push.hasWorkspace).toBe(true);
-      // Strip the payload the manifest keeps declaring.
+      // Strip the payload the manifest keeps declaring, and put a plain FILE
+      // where the directory was. Both reach the same `readdirSync`: a missing
+      // path throws ENOENT, a file throws ENOTDIR, and either one escapes
+      // hubPull BEFORE the session import. Checking existence alone would only
+      // have closed the first, while the warning below claims to cover a
+      // hand-made bundle — so the guard asks whether it is a directory.
       await mutateBundleTree(hub, push.projectId, push.bundleId, (dir) => {
         rmSync(join(dir, "workspace"), { recursive: true, force: true });
+        writeFileSync(join(dir, "workspace"), "not a directory\n");
       });
 
       restore.restore();

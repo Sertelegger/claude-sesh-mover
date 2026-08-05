@@ -37,7 +37,19 @@ export function resolveThreads(indexes) {
         const latest = copies.reduce(newer);
         resolved.push({ threadId, slug: latest.slug, summary: latest.summary, copies, latest });
     }
-    resolved.sort((a, b) => (a.latest.lastActiveAt < b.latest.lastActiveAt ? 1 : -1));
+    // Same invariant as `newer` above, one level up: never depend on iteration
+    // order. The obvious `a < b ? 1 : -1` is an INCONSISTENT comparator — it
+    // returns -1 for equal values, so two equal-timestamped threads swap and
+    // fourteen come back fully reversed when the input order reverses. Both
+    // consumers pick positionally (`pull --latest` takes the first non-current
+    // thread, the SessionStart notice takes the most recent stale one), so an
+    // arbitrary winner among ties is a user-visible arbitrary answer.
+    resolved.sort((a, b) => {
+        if (a.latest.lastActiveAt !== b.latest.lastActiveAt) {
+            return a.latest.lastActiveAt < b.latest.lastActiveAt ? 1 : -1;
+        }
+        return a.threadId < b.threadId ? -1 : a.threadId > b.threadId ? 1 : 0;
+    });
     return resolved;
 }
 //# sourceMappingURL=threads.js.map
