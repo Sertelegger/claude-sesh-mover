@@ -97,6 +97,18 @@ export interface SessionManifest {
     type?: "full" | "continuation";
     lineage?: SessionLineage;
     continuation?: SessionContinuation;
+    /**
+     * One aggregate digest per auxiliary layer directory this session carries —
+     * `subagents`, `tool-results`, `file-history`. Until 0.6.0 only the session
+     * JSONL was hashed, so a corrupted `file-history` backup rode through
+     * silently and was later restored over the user's own file.
+     *
+     * A key is present only when the bundle actually contains that directory, and
+     * the whole field is absent on bundles written before it existed — see
+     * `computeLayerDigest` for the format and for why this is one digest per
+     * layer rather than one per file.
+     */
+    layerDigests?: Partial<Record<"subagents" | "tool-results" | "file-history", string>>;
 }
 export interface ExportBaseline {
     targetMachineId: string;
@@ -115,6 +127,13 @@ export interface ExportManifest {
     sessionScope: SessionScope;
     includedLayers: ExportLayer[];
     sessions: SessionManifest[];
+    /**
+     * Digest over the session inventory above — see `computeSessionsDigest` for
+     * what it covers, what it deliberately does not, and why it is damage
+     * detection rather than attestation. Optional: pre-0.6.0 bundles carry none
+     * and are verified as they always were.
+     */
+    sessionsDigest?: string;
     sourceMachineId?: string;
     sourceMachineName?: string;
     incremental?: boolean;

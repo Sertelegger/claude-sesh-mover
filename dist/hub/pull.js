@@ -20,12 +20,12 @@ import { extractArchive } from "../archiver.js";
 import { importSession } from "../importer.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
-import { computeIntegrityHashFromFile, readManifest } from "../manifest.js";
+import { computeIntegrityHashFromFile, readManifest, verifySessionsDigest } from "../manifest.js";
 import { countJsonlLines, findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
-import { readSyncState, peekSyncState, writeSyncState, setThreadId, setLastWorkspace, recordSentToPeer, knownWorkspaceGenerations, } from "../sync-state.js";
+import { readSyncState, peekSyncState, writeSyncState, getThreadId, setThreadId, setLastWorkspace, recordSentToPeer, knownWorkspaceGenerations, } from "../sync-state.js";
 /**
  * Pick which of a thread's local sessions a continuation should splice onto.
  *
@@ -731,6 +731,80 @@ export async function hubPull(opts) {
         };
         const targetProjectDir = join(opts.configDir, "projects", encodeProjectPath(effectiveProjectPath));
         /**
+         * Repair for #28's crash window, on every branch that returns before the
+         * thread-mapping block at the bottom of this function can run.
+         *
+         * THE WINDOW. `peers[...].received` is written INSIDE the bundle loop (by
+         * `importSession`, and by `recordSplice` on the append path), while
+         * `setThreadId` runs only after the whole chain, the workspace merge and the
+         * carry apply. Slice 2 widened the gap considerably. A pull interrupted in
+         * between — Ctrl-C, a crash, a laptop lid — therefore leaves this machine
+         * holding the content with the receipts to prove it, and no record of which
+         * thread it belongs to.
+         *
+         * WHAT THAT COSTS, MEASURED. The re-pull sees every bundle already received,
+         * so it answers "Already up to date with the source machine" (or, once this
+         * machine has an index entry with a matching head, "Nothing to pull: all
+         * threads are current") and returns — never reaching the mapping block. The
+         * next push then finds a local session with no thread id and MINTS A NEW
+         * THREAD for it, whose only bundle is a `continuation` with no base anywhere
+         * in its own chain: the unreconstructable thread `recordSentToPeer`'s own
+         * doc forbids. `whereis` shows two threads for one conversation.
+         *
+         * WHY EVERY CANDIDATE IS MAPPED RATHER THAN THE "RIGHT" ONE. A chain that
+         * fragmented leaves several local sessions carrying one thread's content,
+         * and picking between them here would need a preference this branch has no
+         * information to form — and any preference read off `t.copies` would be
+         * index-file ITERATION ORDER, which this module bans for anything
+         * user-visible. It does not need one: `buildIndexFile` already resolves
+         * many-sessions-to-one-thread by recency, and `selectThreadBase` picks the
+         * base by the delta's own anchor. Mapping the set is order-independent by
+         * construction and strictly more information than mapping one of them.
+         *
+         * A session already mapped to some thread is never re-pointed: this repairs
+         * an ABSENT mapping and is not a route by which a pull that fetched nothing
+         * can move a session between threads.
+         */
+        const backfillThreadMappings = (threads) => {
+            const peeked = peekSyncState(effectiveProjectPath);
+            const wanted = new Map(); // localSessionId -> threadId
+            for (const t of threads) {
+                for (const copy of t.copies) {
+                    const peer = peeked.peers[copy.machineId];
+                    if (!peer)
+                        continue;
+                    for (const b of copy.bundles) {
+                        const localId = peer.received?.[b.sessionIdInBundle]?.localSessionId;
+                        if (!localId)
+                            continue;
+                        if (getThreadId(peeked, localId))
+                            continue; // already mapped — leave it
+                        if (!existsSync(join(targetProjectDir, `${localId}.jsonl`)))
+                            continue;
+                        wanted.set(localId, t.threadId);
+                    }
+                }
+            }
+            if (wanted.size === 0)
+                return undefined;
+            // Only now is the state read for WRITING. These branches apply nothing,
+            // and `readSyncState` renames a corrupt file aside — a repair that has
+            // something to write has earned that, a run with nothing to write has not
+            // (same rule the `peekSyncState` callers around here follow).
+            const st = readSyncState(effectiveProjectPath);
+            let wrote = 0;
+            for (const [localId, threadId] of wanted) {
+                if (getThreadId(st, localId))
+                    continue;
+                setThreadId(st, hub.hubId, localId, threadId);
+                wrote++;
+            }
+            if (wrote === 0)
+                return undefined;
+            writeSyncState(st);
+            return `${wrote} local session${wrote === 1 ? "" : "s"} held this project's hub content with no thread mapping recorded — the mapping has been restored, so the next push continues the existing thread instead of starting a second one for the same conversation. That gap is what an interrupted pull leaves behind.`;
+        };
+        /**
          * A copy OTHER than this machine's that still lists bundles this machine
          * has never received — the answer to "the newest head is mine, so is there
          * anything left on the hub for me?", which is NOT the same question.
@@ -782,11 +856,13 @@ export async function hubPull(opts) {
                         alternateSource(t, peekSyncState(effectiveProjectPath)) !== undefined);
             if (!target) {
                 const split = await discloseUnfetchable(resolved);
+                const repaired = backfillThreadMappings(resolved);
                 return {
                     success: false, command: "pull",
                     error: split
                         ? `Nothing to pull: every thread is current with the machine it resolves to, but not every thread is whole here. ${split}`
                         : "Nothing to pull: all threads are current on this machine.",
+                    details: repaired,
                     suggestion: split
                         ? "Nothing is left for this machine to fetch from the machine this thread resolves to. The remaining bundles sit on a machine whose bundle list this pull did not read, and no flag makes one pull read two machines' lists, so a thread whose history is split across machines cannot be assembled here yet. Run whereis — the same threads report it as unfetchableBundles."
                         : "Run whereis to double-check thread status.",
@@ -842,6 +918,11 @@ export async function hubPull(opts) {
             warnings.push(unfetchableText);
         }
         if (needed.length === 0) {
+            // Both variants below return without reaching the mapping block — see
+            // backfillThreadMappings. This is the branch an interrupted pull's re-run
+            // actually lands in when this machine has no index entry for the thread:
+            // every bundle is already recorded as received, so `needed` is empty.
+            const repaired = backfillThreadMappings([target]);
             if (unfetchableText) {
                 // The nag loop this defect produces: whereis says the thread needs
                 // pulling, the SessionStart notice repeats it, and every pull used to
@@ -850,12 +931,14 @@ export async function hubPull(opts) {
                 return {
                     success: false, command: "pull",
                     error: `Already up to date with the source machine, but this thread is not whole here. ${unfetchableText}`,
+                    details: repaired,
                     suggestion: "Nothing is left for this machine to fetch from the machine this thread resolves to. The remaining bundles sit on a machine whose bundle list this pull did not read, and no flag makes one pull read two machines' lists, so a thread whose history is split across machines cannot be assembled here yet. Run whereis — the same threads report it as unfetchableBundles.",
                 };
             }
             return {
                 success: false, command: "pull",
                 error: "Already up to date with the source machine.",
+                details: repaired,
                 suggestion: "Run whereis to confirm.",
             };
         }
@@ -1036,6 +1119,47 @@ export async function hubPull(opts) {
             // action treats its own tempExtractDir as the exportPath (no nested
             // "bundle/" to join).
             const bundleManifest = readManifest(extractDir);
+            /**
+             * Nothing in this bundle is trusted until the manifest is shown to be the
+             * one the pushing machine's exporter wrote, and nothing it declares is
+             * trusted until the file is actually there.
+             *
+             * Both checks have to happen HERE rather than being left to
+             * `importSession` at the bottom of the loop, because everything between
+             * the two reads the manifest as fact: the workspace merge and the carry
+             * are keyed off it, and the append path splices a continuation into a
+             * transcript the user already owns after checking the delta against
+             * `bundleSession.integrityHash` — a hash out of this same manifest. A
+             * damaged session list makes that comparison meaningless, and a
+             * `sessionIdInBundle` with no file behind it used to fall through the
+             * append path's `existsSync(deltaPath)` guard into an import that counted
+             * it as imported anyway.
+             *
+             * A damaged bundle stops the whole chain rather than being skipped: bundle
+             * N+1 is anchored on bundle N's head (ledger: "a chain is not a set of
+             * independent items"), so there is no such thing as carrying on past a
+             * missing link. Returning here means earlier bundles in this pull stay
+             * applied and recorded — the same shape `importSession`'s own hard failure
+             * has always had at this call site.
+             */
+            const bundleDigestProblem = verifySessionsDigest(bundleManifest);
+            if (bundleDigestProblem) {
+                return {
+                    success: false,
+                    command: "pull",
+                    error: `Bundle ${record.bundleId} failed its integrity check: ${bundleDigestProblem}`,
+                    suggestion: "Nothing from this bundle was applied. The hub's copy is damaged or was edited after it was written — this check detects damage, not tampering. Ask the machine that pushed it to push again; the bundles applied before it in this chain are recorded and will not be refetched.",
+                };
+            }
+            const declaredJsonl = join(extractDir, "sessions", `${record.sessionIdInBundle}.jsonl`);
+            if (!existsSync(declaredJsonl)) {
+                return {
+                    success: false,
+                    command: "pull",
+                    error: `Bundle ${record.bundleId} declares session ${record.sessionIdInBundle} but does not contain it (${record.file}).`,
+                    suggestion: "Nothing from this bundle was applied. The archive on the hub is truncated or was only partially written — if the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again.",
+                };
+            }
             if (bundleManifest.workspace) {
                 chainWorkspaceBases.push(bundleManifest.workspace.basedOn?.bundleId ?? null);
             }

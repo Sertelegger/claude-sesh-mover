@@ -14,7 +14,7 @@ import { loadOrCreateMachineId } from "./machine.js";
 import { readSyncState, recordSentFromBundle, setLastAutoPush, writeSyncState, } from "./sync-state.js";
 import { acquireProjectLock } from "./hub/lock.js";
 import { readLastEntryUuid } from "./jsonl.js";
-import { createArchive, extractArchive, detectArchiveFormat, isZstdAvailable, readManifestFromArchive, } from "./archiver.js";
+import { createArchive, extractArchive, detectArchiveFormat, isZstdAvailable, ZstdNoContentChecksumError, readManifestFromArchive, } from "./archiver.js";
 import { discoverSessionById } from "./discovery.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
@@ -143,11 +143,12 @@ program
             : undefined;
         let fromPath = opts.from;
         // If archive, extract first
+        const extractWarnings = [];
         const archiveFormat = detectArchiveFormat(fromPath);
         if (archiveFormat) {
             onProgress?.({ phase: "extract", percent: 0 });
             tempExtractDir = mkdtempSync(join(tmpdir(), "sesh-mover-extract-"));
-            await extractArchive(fromPath, tempExtractDir);
+            await extractArchive(fromPath, tempExtractDir, extractWarnings);
             onProgress?.({ phase: "extract", percent: 100 });
             fromPath = tempExtractDir;
         }
@@ -164,6 +165,15 @@ program
             allowDuplicates: !!opts.allowDuplicates,
             onProgress,
         });
+        // Container-level observations belong in the same warnings array as the
+        // bundle-level ones: the user asked one question ("import this") and
+        // should get one answer. Prepended because they describe something that
+        // happened before the import did. An ErrorResult carries no `warnings`,
+        // and its `error` is the more important message — the extraction note
+        // would only bury it.
+        if (extractWarnings.length > 0 && "warnings" in result) {
+            result.warnings = [...extractWarnings, ...result.warnings];
+        }
         output(result);
     }
     catch (e) {
@@ -886,14 +896,32 @@ async function finalizeExport(params) {
             compression = "gzip";
             result.actualFormat = "archive"; // signal fallback to skill
         }
-        const ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
-        const archivePath = bundleDir + ext;
+        let ext = compression === "zstd" ? ".tar.zst" : ".tar.gz";
+        let archivePath = bundleDir + ext;
         // Archive FIRST. If this throws, the staging dir is left intact and no
         // sent-state is recorded — a failed export must not advance peer heads
         // (those entries would never actually ship, and would be silently
         // skipped on the next incremental export as "already sent").
         onProgress?.({ phase: "archive", percent: 0 });
-        await createArchive(bundleDir, archivePath, compression);
+        try {
+            await createArchive(bundleDir, archivePath, compression);
+        }
+        catch (e) {
+            // A zstd build whose default leaves the frame checksum out would give the
+            // user a container that cannot detect corruption, where the .tar.gz they
+            // did not ask for can. Second-choice format beats first-choice format
+            // with no error detection — the same trade the "zstd not found" fallback
+            // above already makes, reported through the same two channels so the
+            // skill layer needs no new branch.
+            if (!(e instanceof ZstdNoContentChecksumError))
+                throw e;
+            result.warnings.push(`${e.message} — falling back to gzip, whose CRC32 does detect it.`);
+            compression = "gzip";
+            result.actualFormat = "archive";
+            ext = ".tar.gz";
+            archivePath = bundleDir + ext;
+            await createArchive(bundleDir, archivePath, compression);
+        }
         onProgress?.({ phase: "archive", percent: 100 });
         // Record sync state from the bundle now that the archive exists — the
         // staging dir is still present at this point, so recordSentFromBundle
