@@ -31,17 +31,39 @@ binary-ish after compression) don't fit git's history model or LFS economics wel
 to justify the added complexity over a plain shared directory, which needs no git
 tooling on either machine and already satisfies the sync/network-share requirement.
 
+**Slice 2 — automation + full round-trips: shipped in v0.6.0.** A `SessionEnd` hook
+auto-pushes and a `SessionStart` hook announces newer work elsewhere, both gated on the
+project being linked; a pulled continuation is appended to the local session it continues
+instead of landing as a truncated fragment (with an explicit resolution when both machines
+diverged from the same point); a workspace payload is merged 3-way against a generation
+both trees held rather than overwriting; and a git project carries its uncommitted work
+(`git diff HEAD` + untracked files), applied only behind `--apply-carry` and a clean tree.
+See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-04).
+
 **Remaining slices** (each gets its own design pass before implementation; not scheduled):
 
-- **Slice 2 — automation.** An optional `SessionEnd` hook that auto-pushes so the hub
-  index stays current without a manual `/sesh-mover:push`; carrying a git-diff summary
-  alongside a push so `whereis`/`pull` can show what changed, not just when.
-- **Slice 3 — encryption at rest + compaction.** Age/gpg encryption of bundles in the hub
-  (closing the plaintext-at-rest gap called out in Slice 1's security notes); compaction
-  of superseded bundles so a long-lived hub directory doesn't grow unbounded.
+- **Slice 3 — cross-machine chain assembly + encryption at rest + compaction.** Assembling
+  a thread whose bundles are split across several machines' indexes by walking the
+  `fromEntryUuid`/`headEntryUuid` links, so a third machine can pull it whole
+  ([#35](https://github.com/Sertelegger/claude-sesh-mover/issues/35) — v0.6.0 discloses
+  what it could not fetch, it does not assemble it); age/gpg encryption of bundles in the
+  hub (closing the plaintext-at-rest gap called out in Slice 1's security notes);
+  compaction of superseded bundles so a long-lived hub directory doesn't grow unbounded.
+  Two hardening items belong to the same pass because Slice 2 made them reachable:
+  [#38](https://github.com/Sertelegger/claude-sesh-mover/issues/38) (stop re-implementing
+  git's patch-header parser in the carry apply path and ask git instead) and the
+  disclosure-side half of #35.
 - **Slice 4 — web service + UI.** A hosted alternative to the filesystem backend (own
   design pass — auth, multi-user access control, and a browsable UI are all out of scope
-  for the dumb-storage model above and need dedicated design work).
+  for the dumb-storage model above and need dedicated design work). **Two threat-model
+  items are hard gates on it,** both fine under Slice 1's "a folder shared between machines
+  you own" model and neither acceptable for a shared or hostile hub:
+  [#36](https://github.com/Sertelegger/claude-sesh-mover/issues/36) — the built-in
+  workspace excludes are a convenience default, not a security boundary, so an applied
+  payload can write ordinary project files — and
+  [#37](https://github.com/Sertelegger/claude-sesh-mover/issues/37) — the merge-ancestor
+  "common to both trees" guarantee is verified on our side and self-reported by the peer,
+  which no filesystem backend can attest.
 
 **Why build it (landscape as of 2026-07):** Claude Code local CLI sessions are machine-local
 with no native sync; Remote Control steers live sessions but transfers nothing and requires
@@ -53,8 +75,9 @@ handles WSL↔Windows path discrimination. The two halves of this milestone exis
 fragments across four tools — no product does both.
 
 **Inspiration backlog** (from the survey): client-side age encryption (claude-sync),
-SessionStart/SessionEnd auto-sync hooks (claude-context-sync), repo-scoped in-project
-bundles for handoff (cctrace), self-hosted E2E-encrypted relay (Happy — later, if ever).
+repo-scoped in-project bundles for handoff (cctrace), self-hosted E2E-encrypted relay
+(Happy — later, if ever). SessionStart/SessionEnd auto-sync hooks (claude-context-sync)
+shipped in Slice 2.
 
 ## Beyond Claude: multi-agent-CLI support
 

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import { applyAdapters } from "./version-adapters.js";
-import { samePlatformFamily, translatePath } from "./platform.js";
+import { detectPlatform, extractUserFromPath, getCurrentUser, samePlatformFamily, translatePath, } from "./platform.js";
 // Characters that terminate a path token embedded in free text.
 // (?<!\/) — a token immediately preceded by "/" is URL-context
 // (http://mnt/..., protocol-relative //tmp/..., file:///mnt/...) and is
@@ -116,6 +116,36 @@ export function buildPathMappings(sourcePlatform, targetPlatform, sourceProjectP
     // Sort longest-from first to prevent prefix collisions
     mappings.sort((a, b) => b.from.length - a.from.length);
     return mappings;
+}
+/**
+ * THE construction site for "rewrite this bundle's content for this machine".
+ *
+ * Every consumer of a bundle — importer.ts's session/subagent rewrite and
+ * hub/pull.ts's continuation splice — must derive its context here rather
+ * than re-deriving the mapping list locally. Two copies of this would drift,
+ * and the ordering constraint they'd drift on is silent: buildPathMappings
+ * sorts longest-`from`-first so a project path nested under the config dir
+ * (or under the home dir) wins over its own prefix. A second construction
+ * site that merely *looked* equivalent would rewrite the same entry
+ * differently, and the difference only shows up on someone's real paths.
+ *
+ * `sourceUser` is recovered from the source PROJECT path (not the config
+ * dir): a project under `/home/<user>/...` or `C:\Users\<user>\...` names the
+ * user directly, and "unknown" is the honest fallback for a project that
+ * lives outside any home directory — it only feeds the home-dir mapping,
+ * which is skipped when source and target homes come out equal anyway.
+ */
+export function buildImportRewriteContext(source, targetProjectPath, targetConfigDir) {
+    const targetPlatform = detectPlatform();
+    const sourceUser = extractUserFromPath(source.sourceProjectPath, source.sourcePlatform) ?? "unknown";
+    const targetUser = getCurrentUser();
+    return {
+        mappings: buildPathMappings(source.sourcePlatform, targetPlatform, source.sourceProjectPath, targetProjectPath, source.sourceConfigDir, targetConfigDir, sourceUser, targetUser),
+        sourcePlatform: source.sourcePlatform,
+        targetPlatform,
+        sourceUser,
+        targetUser,
+    };
 }
 function getHomePath(platform, user) {
     if (platform === "win32")

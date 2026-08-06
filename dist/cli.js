@@ -5,23 +5,25 @@ import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolveConfigDir } from "./platform.js";
-import { getDefaultConfig, readConfig, writeConfig, setConfigValue, computeEffectiveConfig, } from "./config.js";
+import { readConfig, readConfigOverrides, writeConfigOverrides, setConfigOverride, computeEffectiveConfig, } from "./config.js";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
 import { readManifest, assertSafeManifestIds } from "./manifest.js";
 import { loadOrCreateMachineId } from "./machine.js";
-import { readSyncState, recordSentFromBundle } from "./sync-state.js";
+import { readSyncState, recordSentFromBundle, setLastAutoPush, writeSyncState, } from "./sync-state.js";
+import { acquireProjectLock } from "./hub/lock.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import { createArchive, extractArchive, detectArchiveFormat, isZstdAvailable, readManifestFromArchive, } from "./archiver.js";
 import { discoverSessionById } from "./discovery.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
+import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
 const program = new Command();
 program
     .name("sesh-mover")
     .description("Export, import, and migrate Claude Code sessions")
-    .version("0.5.1");
+    .version("0.6.0");
 // --- Export ---
 program
     .command("export")
@@ -418,13 +420,19 @@ program
             ? join(process.cwd(), ".claude-sesh-mover")
             : join(homedir(), ".claude-sesh-mover");
         if (opts.reset) {
-            writeConfig(configDir, getDefaultConfig());
+            // Clear this scope's overrides rather than writing a snapshot of every
+            // default: a defaults-filled file is indistinguishable from one whose
+            // author meant those values, so `--reset --scope project` used to pin
+            // every default over the user scope (`hub.path: ""` included). The
+            // reported config is the EFFECTIVE one, which for a project-scope reset
+            // is the user's settings — that is what now applies here.
+            writeConfigOverrides(configDir, {});
             const result = {
                 success: true,
                 command: "configure",
-                config: getDefaultConfig(),
+                config: loadEffectiveConfig(resolveConfigDir(), process.cwd()),
                 scope: opts.scope,
-                message: "Config reset to defaults",
+                message: `Cleared all ${opts.scope}-scope settings; the effective config below is what applies now.`,
             };
             output(result);
             return;
@@ -447,14 +455,22 @@ program
                 const result = {
                     success: true,
                     command: "configure",
-                    config: readConfig(configDir),
+                    // Effective, like the other --set branches: machine.name lives in
+                    // machine-id.json rather than config.json, so this scope's file has
+                    // nothing to say about it either way.
+                    config: loadEffectiveConfig(resolveConfigDir(), process.cwd()),
                     scope: opts.scope,
                     message: `Set machine.name = ${identity.name}`,
                 };
                 output(result);
                 return;
             }
-            let config = readConfig(configDir);
+            // Read/write this scope's OVERRIDES, never a defaults-backfilled
+            // config: writing the latter into the project scope pins every default
+            // over the user scope, which silently unconfigured the hub for that
+            // project (`hub.path: ""` beats a user-scope hub.path). Same defect
+            // class as the read side that computeEffectiveConfig exists to fix.
+            let overrides = readConfigOverrides(configDir);
             // Parse value
             let parsedValue = value;
             if (value === "true")
@@ -470,12 +486,16 @@ program
                     return;
                 }
             }
-            config = setConfigValue(config, key, parsedValue);
-            writeConfig(configDir, config);
+            overrides = setConfigOverride(overrides, key, parsedValue);
+            writeConfigOverrides(configDir, overrides);
             const result = {
                 success: true,
                 command: "configure",
-                config,
+                // The EFFECTIVE config after the write, not this scope's file: with
+                // only the overrides on disk, that file no longer describes what
+                // applies, and what applies is the useful answer (it also shows a
+                // user-scope --set that a project-scope file still overrides).
+                config: loadEffectiveConfig(resolveConfigDir(), process.cwd()),
                 scope: opts.scope,
                 message: `Set ${key} = ${value}`,
             };
@@ -560,6 +580,144 @@ hub
         outputError("hub-reindex", e);
     }
 });
+hub
+    .command("hook-session-end")
+    .description("Internal: Claude Code SessionEnd hook — auto-push this project to the hub")
+    .action(async () => {
+    // ---------------------------------------------------------------------
+    // STDOUT CONTRACT EXCEPTION — deliberate, do not "fix".
+    //
+    // Every other sesh-mover command emits exactly one JSON result object on
+    // stdout and exits non-zero on failure. The hook endpoints speak Claude
+    // Code's HOOK protocol instead: this one writes NOTHING to stdout, ever,
+    // and ALWAYS exits 0. A broken/unreachable hub must never surface as a
+    // hook error when a user's session ends. Diagnostics go to stderr only,
+    // through writeHookDiagnostic so they can't break that promise either.
+    // ---------------------------------------------------------------------
+    // SessionEnd fires while the parent Claude Code process is tearing down,
+    // so this hook's stdio pipes can be closed out from under it. A write to
+    // a reader-less pipe EPIPEs *asynchronously*, surfacing as an 'error'
+    // event that — with no listener — terminates the process with exit 1.
+    // One listener, attached before any write, keeps the contract.
+    process.stderr.on("error", () => { });
+    try {
+        const payload = readHookPayload(await readStdin());
+        const gate = evaluateHookGate(payload, "autoPush");
+        if (!gate.ok)
+            return; // no hub / unlinked / disabled / no cwd — silent no-op
+        const projectPath = gate.projectPath;
+        const configDir = resolveConfigDir();
+        // Re-read the effective config for this project so the automatic push
+        // honors the same hub.noWorkspace / hub.carryDiff opt-outs the manual
+        // `push` does — an automated push must not upload project files, or
+        // uncommitted work, that the user opted out of. This is the only place
+        // either opt-out can be expressed for the hook: it takes no flags.
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { hubPush } = await import("./hub/push.js");
+        const result = await hubPush({
+            configDir,
+            projectPath,
+            hubPath: gate.hubPath,
+            noWorkspace: config.hub.noWorkspace,
+            noCarry: !config.hub.carryDiff,
+            // Nothing this push produces is read by a human: stdout is closed to it
+            // and stderr only carries failures. `quiet` keeps it from computing the
+            // ignored-path discovery aid nobody will see (and from walking the
+            // working tree to do it) — see HubPushOptions.quiet.
+            quiet: true,
+            claudeVersion: getClaudeVersion(),
+        });
+        // lock-busy is an expected outcome, not a failure: another sesh-mover
+        // hub operation for this project is already running, so this push is
+        // redundant by definition. Everything else is worth a stderr line.
+        const lockBusy = "reason" in result && result.reason === "lock-busy";
+        if (!result.success && !lockBusy) {
+            writeHookDiagnostic(`sesh-mover auto-push: ${JSON.stringify(result)}\n`);
+        }
+        // ...and a durable copy, because that stderr line is invisible at a clean
+        // exit. This push computes real disclosures — which gitignored-but-TRACKED
+        // files its patch carried off the machine, which hubinclude paths it
+        // re-included — and then discards every one of them. `hub status` reads
+        // this back. Never for lock-busy: that push did nothing.
+        if (!lockBusy) {
+            recordAutoPushOutcome(projectPath, result);
+        }
+    }
+    catch (e) {
+        writeHookDiagnostic(`sesh-mover auto-push failed: ${e.message}\n`);
+    }
+});
+hub
+    .command("hook-session-start")
+    .description("Internal: Claude Code SessionStart hook — announce newer sessions on other machines")
+    .action(async () => {
+    // ---------------------------------------------------------------------
+    // STDOUT CONTRACT EXCEPTION — deliberate, do not "fix".
+    //
+    // This endpoint speaks Claude Code's HOOK protocol, not sesh-mover's
+    // one-JSON-result CLI protocol. It writes either NOTHING or exactly one
+    // hook-JSON object, and ALWAYS exits 0. The object shape below was
+    // verified against the installed Claude Code build's own output schema:
+    //
+    //   E.object({ hookEventName: E.literal("SessionStart"),
+    //              additionalContext: E.string().optional(), … })
+    //
+    // Every failure mode degrades to silence: a session must never open with
+    // an error, a stack trace, or a half-written object on stdout that Claude
+    // Code would then fail to parse. Diagnostics go to stderr, which Claude
+    // Code does not show the user at exit 0.
+    // ---------------------------------------------------------------------
+    // Same asynchronous-EPIPE hazard the SessionEnd endpoint has for stderr,
+    // and this is the ONE endpoint that writes stdout: if the reader of either
+    // pipe goes away before the write lands, the write EPIPEs *asynchronously*,
+    // so a try/catch cannot see it — with no 'error' listener that terminates
+    // the process with exit 1 and a stack trace, which for SessionStart is
+    // "other exit codes → show stderr to user". One listener per pipe,
+    // attached before any write, keeps the contract above true.
+    process.stderr.on("error", () => { });
+    process.stdout.on("error", () => { });
+    try {
+        const payload = readHookPayload(await readStdin());
+        const gate = evaluateHookGate(payload, "startupNotice");
+        if (!gate.ok)
+            return; // no hub / unlinked / disabled / no cwd — silent no-op
+        const { hubWhereis } = await import("./hub/whereis.js");
+        const result = await hubWhereis({
+            configDir: resolveConfigDir(),
+            projectPath: gate.projectPath,
+            hubPath: gate.hubPath,
+        });
+        if (!result.success || !result.linked)
+            return;
+        // Newest first, so the one thread we name is the one most likely to be
+        // what the user came back for. resolveThreads' ordering is deterministic
+        // but is not recency ordering, so sorting here is not redundant.
+        const stale = result.threads
+            .filter((t) => t.pullNeeded)
+            .sort((a, b) => parseTime(b.latest.lastActiveAt) - parseTime(a.latest.lastActiveAt));
+        if (stale.length === 0)
+            return;
+        const top = stale[0];
+        // Every field below comes out of another machine's index file, so each
+        // one is sanitized and each one has a fallback: a torn or old-format
+        // entry missing `slug` would otherwise render the literal string
+        // "undefined" as the name of the thread the user is being told to pull.
+        const what = noticeField(top.slug) || noticeField(top.threadId) || "a session";
+        const where = noticeField(top.latest.machineName) ||
+            noticeField(top.latest.machineId) ||
+            "another machine";
+        const rest = stale.length > 1 ? ` (+${stale.length - 1} more)` : "";
+        const context = `sesh-mover: newer work for this project exists on another machine — ` +
+            `"${what}" on ${where}, ${describeAge(top.latest.lastActiveAt)}${rest}. ` +
+            `Run /sesh-mover:pull to bring it here.`;
+        process.stdout.write(JSON.stringify({
+            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },
+        }) + "\n");
+    }
+    catch (e) {
+        writeHookDiagnostic(`sesh-mover startup notice failed: ${e.message}\n`);
+    }
+});
 // --- Push ---
 program
     .command("push")
@@ -570,6 +728,7 @@ program
     .option("--project-id <id>", "Link to an existing hub project id")
     .option("--create-project", "Mint a new hub project for this directory")
     .option("--no-workspace", "Skip the workspace snapshot for non-git projects")
+    .option("--no-carry", "Do not carry uncommitted changes (git projects)")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     try {
@@ -590,6 +749,7 @@ program
             configDir, projectPath, hubPath,
             sessionIds: opts.sessionId,
             noWorkspace: opts.workspace === false || config.hub.noWorkspace,
+            noCarry: opts.carry === false || !config.hub.carryDiff,
             projectIdOverride: opts.projectId,
             createProject: !!opts.createProject,
             claudeVersion: getClaudeVersion(),
@@ -608,8 +768,12 @@ program
     .option("--latest", "Pull whichever thread most needs updating on this machine")
     .option("--project-path <path>", "Override project path (default: cwd)")
     .option("--target-path <path>", "Workspace unpack destination when the project directory doesn't exist locally yet")
-    .option("--force-workspace", "Merge workspace files into a non-empty target directory")
+    .option("--force-workspace", "Unpack the hub's workspace copy over a non-empty target directory, overwriting files of the same name (never a merge)")
+    .option("--apply-carry", "Apply carried uncommitted changes (requires the same base commit and a clean tree)")
     .option("--project-id <id>", "Link to an existing hub project id")
+    .option("--force-append", "Append a pulled continuation even if the local session looks recently active")
+    .option("--no-append", "Never append; import continuations as separate sessions")
+    .option("--on-divergence <mode>", "When a thread was extended on both machines: fragment | adopt-hub | skip")
     .option("--source-config-dir <path>", "Override Claude config dir")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
@@ -617,6 +781,9 @@ program
         const configDir = resolveConfigDir(opts.sourceConfigDir);
         const projectPath = opts.projectPath ?? process.cwd();
         const config = loadEffectiveConfig(configDir, projectPath);
+        // Validated before the hub lookup: a bad mode is a bad invocation, and
+        // saying so should not depend on whether a hub happens to be configured.
+        const onDivergence = parseOnDivergence(opts.onDivergence ?? config.hub.onDivergence);
         const { resolveHubPath } = await import("./hub/init.js");
         const hubPath = resolveHubPath(config);
         if (!hubPath) {
@@ -633,7 +800,11 @@ program
             latest: !!opts.latest,
             targetPath: opts.targetPath,
             forceWorkspace: !!opts.forceWorkspace,
+            applyCarry: !!opts.applyCarry,
             projectIdOverride: opts.projectId,
+            forceAppend: !!opts.forceAppend,
+            noAppend: opts.append === false || !config.hub.pullAppend,
+            onDivergence,
             claudeVersion: getClaudeVersion(),
             onProgress,
         }));
@@ -810,6 +981,14 @@ function parseScope(value, command) {
         return value;
     throw new Error(`Invalid --scope value for ${command}: "${value}". Valid: current, all.`);
 }
+// Validates BOTH the flag and hub.onDivergence from config — a typo'd config
+// value must fail loudly here rather than silently resolving to a mode the
+// user didn't pick.
+function parseOnDivergence(value) {
+    if (value === "fragment" || value === "adopt-hub" || value === "skip")
+        return value;
+    throw new Error(`Invalid --on-divergence value: "${value}". Valid: fragment, adopt-hub, skip.`);
+}
 function parseStorage(value) {
     if (value === "user" || value === "project")
         return value;
@@ -861,6 +1040,186 @@ function getClaudeVersion() {
     catch {
         return "unknown";
     }
+}
+// Timestamps in a hub index file are untrusted input (another machine wrote
+// them, and the file can be torn). Date.parse returns NaN for anything it
+// can't read, which would sort unpredictably and render as "NaN minutes ago",
+// so unparseable timestamps sort last and describe as "recently".
+function parseTime(iso) {
+    const t = Date.parse(iso);
+    return Number.isNaN(t) ? 0 : t;
+}
+// A freshness notice reads at a glance or not at all: "4320 minutes ago" is
+// noise where "3 days ago" is information.
+//
+// Every step FLOORS rather than rounds. Rounding overstates staleness — 90
+// minutes would read "2 hours ago" and 36 hours "2 days ago" — in a notice
+// whose whole job is a truthful at-a-glance read of how far behind the local
+// copy is. Flooring can only understate, which is the safe direction: it
+// never makes work sound more abandoned than it is.
+function describeAge(iso) {
+    const then = parseTime(iso);
+    if (then === 0)
+        return "recently";
+    const minutes = Math.max(0, Math.floor((Date.now() - then) / 60_000));
+    if (minutes < 1)
+        return "just now";
+    if (minutes < 60)
+        return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24)
+        return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+    const days = Math.floor(hours / 24);
+    return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+/** Longest run of index-file text allowed into an injected notice. */
+const NOTICE_FIELD_MAX = 80;
+/**
+ * Makes one field of another machine's index file safe to interpolate into
+ * the SessionStart notice.
+ *
+ * That notice is injected straight into the model's context, and a thread slug
+ * ultimately derives from a conversation-derived session title — so it is not
+ * fully machine-controlled even under the hub's "your own machines" threat
+ * model. Control characters (newlines above all) would let such a string forge
+ * structure inside the injected text, and an unbounded one would let it
+ * dominate it. Collapse whitespace, drop control characters, cap the length.
+ *
+ * Returns "" for anything absent or non-string, so every call site can fall
+ * back with `||` rather than rendering "undefined".
+ */
+function noticeField(value) {
+    if (typeof value !== "string")
+        return "";
+    // \p{C} is Unicode's "other" category: C0/C1 controls, format characters
+    // (including the bidi and zero-width overrides), surrogates and unassigned
+    // code points — i.e. everything that can move or hide text rather than show
+    // it. Nothing legible is in it, so replacing the whole category is both
+    // safer and shorter than an escape range.
+    const clean = value.replace(/\p{C}/gu, " ").replace(/\s+/g, " ").trim();
+    if (clean.length <= NOTICE_FIELD_MAX)
+        return clean;
+    // Cut on code points, not UTF-16 code units: slicing an astral character in
+    // half leaves a lone surrogate, which renders as a replacement glyph in the
+    // very notice this function exists to keep legible.
+    return [...clean].slice(0, NOTICE_FIELD_MAX - 1).join("") + "…";
+}
+// Best-effort stderr diagnostic for the hook endpoints. A hook's diagnostic
+// must never be able to change its exit code, so a failing write is swallowed
+// here: writes to a closed/broken stderr can throw synchronously (closed fd)
+// as well as emit asynchronously (EPIPE on a reader-less pipe, handled by the
+// listener the endpoints attach). The hook contract outranks the diagnostic.
+function writeHookDiagnostic(message) {
+    try {
+        process.stderr.write(message);
+    }
+    catch {
+        /* stderr is gone — stay silent rather than fail the hook */
+    }
+}
+/**
+ * Leave a durable trace of an auto-push in this project's sync-state.
+ *
+ * The SessionEnd push is the only push nobody reads: stdout is closed to it,
+ * and Claude Code shows a clean-exit hook's stderr only in debug output. Two
+ * things it computes are worth more than that — the carry disclosures (which
+ * gitignored-but-TRACKED files the patch took off the machine, which
+ * `hubinclude` paths were re-included) and the fact that it failed at all, which
+ * an unmounted share otherwise hides indefinitely. `hub status` reads this back.
+ *
+ * Best effort in every direction, because a breadcrumb must never cost a push:
+ * it takes the same project lock the push itself uses (sync-state is a
+ * read-modify-write of a file `pull` also rewrites, and the push released the
+ * lock before returning), and it gives up silently on a busy lock or any error.
+ */
+function recordAutoPushOutcome(projectPath, result) {
+    try {
+        const r = result;
+        const notes = [];
+        if (result.success) {
+            const warnings = Array.isArray(r.warnings) ? r.warnings : [];
+            notes.push(...warnings.filter((w) => typeof w === "string"));
+        }
+        else {
+            const error = typeof r.error === "string" ? r.error : JSON.stringify(result);
+            const suggestion = typeof r.suggestion === "string" ? ` ${r.suggestion}` : "";
+            notes.push(`${error}${suggestion}`);
+        }
+        // Nothing to say and nothing already on record is the overwhelmingly common
+        // case (a clean push of a project with no disclosures). Still recorded, so
+        // "the last auto-push was fine" is distinguishable from "no auto-push has
+        // ever run here" — both are answers a user asks `hub status` for.
+        const lock = acquireProjectLock(projectPath);
+        try {
+            const state = readSyncState(projectPath);
+            setLastAutoPush(state, { ok: result.success, notes });
+            writeSyncState(state);
+        }
+        finally {
+            lock.release();
+        }
+    }
+    catch {
+        /* lock busy, unreadable state, read-only home — the push already happened */
+    }
+}
+// How long a hook endpoint waits for its stdin payload before giving up and
+// proceeding with whatever arrived. Claude Code's own hook runner writes the
+// payload and calls stdin.end() immediately (verified in the installed 2.1.221
+// build: both the sync and the `async: true` spawn paths do
+// `stdin.write(json + "\n"); stdin.end()`), so in the real integration this
+// bound is never reached — a few milliseconds is the normal case. It exists
+// for every OTHER way the endpoint can be invoked.
+const HOOK_STDIN_TIMEOUT_MS = 2000;
+/**
+ * Reads a hook payload from stdin, bounded.
+ *
+ * Returns "" immediately on a TTY, so an operator who runs a hook endpoint by
+ * hand gets the same silent no-op as an empty payload instead of a process
+ * that appears to hang.
+ *
+ * The timeout is the load-bearing part. This read happens BEFORE the gate, so
+ * an un-closed stdin pipe hangs the endpoint even on a machine with no hub
+ * configured — measured at >10s and needing SIGKILL before the bound existed.
+ * That matters most at SessionEnd: Claude Code gives SessionEnd hooks a
+ * 1.5s budget (`getSessionEndHookTimeoutMs`, floor 1500ms) and then force-exits
+ * the process, so a hook that blocks on stdin is a hook that never runs.
+ * Degrading to an empty payload is always safe — an empty payload has no
+ * `cwd`, so the gate declines with "no-cwd" and the endpoint is a silent no-op.
+ */
+async function readStdin(timeoutMs = HOOK_STDIN_TIMEOUT_MS) {
+    const stdin = process.stdin;
+    if (stdin.isTTY)
+        return "";
+    const chunks = [];
+    return new Promise((resolve) => {
+        let settled = false;
+        const onData = (chunk) => {
+            chunks.push(chunk);
+        };
+        const finish = () => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            stdin.off("data", onData);
+            stdin.off("end", finish);
+            stdin.off("error", finish);
+            // Release the handle explicitly. Attaching a 'data' listener puts stdin
+            // in flowing mode, which keeps the event loop alive; if the writer never
+            // closes the pipe, resolving alone would leave the process running until
+            // something killed it — the exact hang this bound exists to prevent.
+            stdin.pause();
+            stdin.unref?.();
+            resolve(Buffer.concat(chunks).toString("utf-8"));
+        };
+        // Deliberately NOT unref'd: this timer is the guarantee that finish() runs.
+        const timer = setTimeout(finish, timeoutMs);
+        stdin.on("data", onData);
+        stdin.on("end", finish);
+        // A broken/closed stdin is "no payload", not a crash.
+        stdin.on("error", finish);
+    });
 }
 function output(result) {
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");

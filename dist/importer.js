@@ -2,8 +2,8 @@ import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendF
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, isSafeSessionId, } from "./manifest.js";
-import { rewriteJsonlStream, buildPathMappings } from "./rewriter.js";
-import { encodeProjectPath, detectPlatform, extractUserFromPath, getCurrentUser, } from "./platform.js";
+import { rewriteJsonlStream, buildImportRewriteContext } from "./rewriter.js";
+import { encodeProjectPath } from "./platform.js";
 import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
 import { readSyncState, writeSyncState } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
@@ -115,19 +115,9 @@ export async function importSession(options) {
     if (versionDiff === "source-newer") {
         warnings.push(`Export from newer Claude Code (${manifest.sourceClaudeVersion}) than target (${targetClaudeVersion}). Unknown entry types will be preserved.`);
     }
-    // Step 2: Build path mappings
-    const targetPlatform = detectPlatform();
-    const sourceUser = extractUserFromPath(manifest.sourceProjectPath, manifest.sourcePlatform) ??
-        "unknown";
-    const targetUser = getCurrentUser();
-    const mappings = buildPathMappings(manifest.sourcePlatform, targetPlatform, manifest.sourceProjectPath, targetProjectPath, manifest.sourceConfigDir, targetConfigDir, sourceUser, targetUser);
-    const ctx = {
-        mappings,
-        sourcePlatform: manifest.sourcePlatform,
-        targetPlatform,
-        sourceUser,
-        targetUser,
-    };
+    // Step 2: Build path mappings (shared with hub/pull.ts's append path — see
+    // buildImportRewriteContext for why this must not be re-derived locally)
+    const ctx = buildImportRewriteContext(manifest, targetProjectPath, targetConfigDir);
     // Step 3: Verify per-session integrity (before any rewriting)
     const integrityFailedSessions = new Set();
     for (const [sessionIndex, session] of targetSessions.entries()) {

@@ -6,7 +6,7 @@ import { createFsBackend } from "./backend.js";
 import { HUB_JSON, machinePath } from "./layout.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { detectPlatform } from "../platform.js";
-import { readConfig, writeConfig, setConfigValue } from "../config.js";
+import { readConfigOverrides, writeConfigOverrides, setConfigOverride } from "../config.js";
 export function resolveHubPath(config) {
     return config.hub.path ? config.hub.path : null;
 }
@@ -64,8 +64,10 @@ export async function hubInit(opts) {
     const configDir = opts.configScope === "project"
         ? join(opts.cwd, ".claude-sesh-mover")
         : join(homedir(), ".claude-sesh-mover");
-    const config = setConfigValue(readConfig(configDir), "hub.path", hubPath);
-    writeConfig(configDir, config);
+    // Overrides, not a defaults-backfilled config: `hub init --scope project`
+    // writing every default into the project file would pin them over the user
+    // scope for this project (the same defect the `configure --set` path had).
+    writeConfigOverrides(configDir, setConfigOverride(readConfigOverrides(configDir), "hub.path", hubPath));
     return {
         success: true,
         command: "hub-init",

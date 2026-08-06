@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, createReadStream } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,19 +8,22 @@ import { createFsBackend } from "./backend.js";
 import { HUB_JSON, bundleDir, bundleFileName, type HubBundleRecord, type HubJson } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import {
-  resolveProjectIdentity, createHubProject, linkToHubProject, localGitRemotes,
-  readLocalProjectId, type LocalProjectId,
+  resolveProjectIdentity, createHubProject, linkToHubProject, scanGitRemotes,
+  readLocalProjectId, type GitRemoteScan, type LocalProjectId,
 } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
-import { snapshotWorkspace } from "./workspace.js";
+import { snapshotWorkspace, hubincludePath, isNeverIncludable } from "./workspace.js";
+import { captureCarry, gitChildEnv, type CarryMeta } from "./carry.js";
 import { exportAllSessions } from "../exporter.js";
 import { createArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
-import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId } from "../sync-state.js";
+import {
+  readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace,
+} from "../sync-state.js";
 import type { ErrorResult, HubLockBusyResult, HubPushResult, HubUnlinkedResult, ProgressEvent } from "../types.js";
 
 export interface HubPushOptions {
@@ -28,10 +32,72 @@ export interface HubPushOptions {
   hubPath: string;
   sessionIds?: string[];
   noWorkspace?: boolean;
+  /**
+   * Skip the git-diff carry (design §6.1). Off by default: for a project with
+   * a git remote the carry is the only thing that moves work-in-progress, and
+   * it never copies a gitignored UNTRACKED file unless `hubinclude` names it.
+   * (A gitignored file that git TRACKS is a different matter: the patch carries
+   * its changes and no carry rule filters the patch — see `trackedIgnored`.)
+   */
+  noCarry?: boolean;
   projectIdOverride?: string;
   createProject?: boolean;
   claudeVersion: string;
+  /**
+   * Suppress everything whose only purpose is to be read by a human. Set by the
+   * SessionEnd auto-push hook, whose contract is that session exit is never
+   * interrupted or narrated (design §4.2) — today that means skipping the
+   * `ignoredNotCarried` discovery scan, which also spares an unattended push a
+   * `git ls-files` walk of the whole working tree.
+   */
+  quiet?: boolean;
   onProgress?: (ev: ProgressEvent) => void;
+}
+
+/** Cap on `ignoredNotCarried`: a sample the user can recognize, not an inventory. */
+const MAX_IGNORED_REPORTED = 10;
+
+/**
+ * Top-level gitignored paths, as `git` spells them — `docs/` for a wholly
+ * ignored directory, `src/generated.ts` for a single ignored file inside a
+ * carried one. Each is a valid `hubinclude` pattern for exactly that thing.
+ *
+ * `-z` is not a nicety: without it git applies `core.quotePath`, so a name with
+ * a space, a quote, a newline or any non-ASCII character comes back C-quoted
+ * and octal-escaped, and a newline in a filename would split one entry into
+ * two. This list is shown to a user and offered as a pattern to paste, so it
+ * has to be the real bytes.
+ *
+ * Every failure — no git, not a repo, timeout, output past `maxBuffer` — is the
+ * same answer: no discovery aid this time. It is a hint, never a gate.
+ */
+function listTopLevelIgnored(projectPath: string): string[] {
+  try {
+    const out = execFileSync(
+      "git",
+      ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
+      {
+        cwd: projectPath, encoding: "utf-8", timeout: 5000,
+        // Not the inherited environment (see `gitChildEnv`): these paths are
+        // offered to the user as `hubinclude` lines to paste, so they have to
+        // come from the project's own repository and its own ignore rules.
+        env: gitChildEnv(),
+        stdio: ["ignore", "pipe", "ignore"], maxBuffer: 4 * 1024 * 1024,
+      }
+    );
+    const paths = new Set<string>();
+    for (const entry of out.split("\0")) {
+      // No trimming: with -z the bytes between separators ARE the path, and a
+      // name may legitimately begin or end with a space.
+      if (!entry) continue;
+      if (isNeverIncludable(entry)) continue; // can never be carried, so never suggest it
+      paths.add(entry);
+      if (paths.size >= MAX_IGNORED_REPORTED) break;
+    }
+    return [...paths];
+  } catch {
+    return [];
+  }
 }
 
 export async function hubPush(
@@ -70,18 +136,41 @@ export async function hubPush(
     }
     const machine = loadOrCreateMachineId();
 
-    // Identity
-    let local: LocalProjectId;
+    // Identity — DECIDED here, COMMITTED after the export.
+    //
+    // Linking is the hub's consent gate: `.claude-sesh-mover/project.json`
+    // existing is what makes `evaluateHookGate` let the default-on SessionEnd
+    // auto-push run, and for a git-less project that push uploads the WHOLE
+    // project directory. So a link must not be a side effect of a push that
+    // then failed. Measured: `push --create-project` in a directory with no
+    // sessions returned the exporter's `success: false` ("No sessions found for
+    // this project") while having already written project.json and created the
+    // hub project — nothing in the result said so, commands/push.md says report
+    // and stop, and the next session end uploaded the tree, `.env` included.
+    //
+    // Deferring the write past `exportAllSessions` closes exactly that: any
+    // failure up to and including the export now leaves the project unlinked.
+    // It is committed just BEFORE the up-to-date early return, so a push that
+    // legitimately has nothing new to send still links (its `projectId` is part
+    // of that result).
+    type PendingIdentity =
+      | { kind: "linked"; local: LocalProjectId }
+      | { kind: "link"; projectId: string; note?: string }
+      | { kind: "create" };
+    let pendingIdentity: PendingIdentity;
     if (opts.projectIdOverride) {
-      local = await linkToHubProject(backend, opts.projectPath, opts.projectIdOverride);
+      pendingIdentity = { kind: "link", projectId: opts.projectIdOverride };
     } else if (opts.createProject && !readLocalProjectId(opts.projectPath)) {
-      local = await createHubProject(backend, opts.projectPath, machine.id);
+      pendingIdentity = { kind: "create" };
     } else {
       const resolution = await resolveProjectIdentity(backend, opts.projectPath);
-      if (resolution.kind === "linked") local = resolution.local;
+      if (resolution.kind === "linked") pendingIdentity = { kind: "linked", local: resolution.local };
       else if (resolution.kind === "match") {
-        local = await linkToHubProject(backend, opts.projectPath, resolution.hubProject.projectId);
-        warnings.push(`Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`);
+        pendingIdentity = {
+          kind: "link",
+          projectId: resolution.hubProject.projectId,
+          note: `Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`,
+        };
       } else {
         return {
           success: false, command: "push", reason: "unlinked",
@@ -90,6 +179,14 @@ export async function hubPush(
         };
       }
     }
+    const commitIdentity = async (): Promise<LocalProjectId> => {
+      if (pendingIdentity.kind === "linked") return pendingIdentity.local;
+      if (pendingIdentity.kind === "create") {
+        return createHubProject(backend, opts.projectPath, machine.id);
+      }
+      if (pendingIdentity.note) warnings.push(pendingIdentity.note);
+      return linkToHubProject(backend, opts.projectPath, pendingIdentity.projectId);
+    };
 
     await registerMachine(opts.hubPath);
     const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
@@ -126,9 +223,33 @@ export async function hubPush(
       },
       onProgress: opts.onProgress,
     });
-    if (!exportResult.success) return exportResult;
+    if (!exportResult.success) {
+      // Nothing is linked at this point — see `commitIdentity`. The `command`
+      // is restated as this command's own: every CLI result is keyed by the
+      // command the user ran (CLAUDE.md), and a `push` answering
+      // `"command": "export"` sends a caller that branches on it down a path
+      // that does not exist for push.
+      return { ...exportResult, command: "push" };
+    }
     const bundleStaging = exportResult.exportPath;
     const manifest = readManifest(bundleStaging);
+    // The export produced something (even if it is "nothing new"), so this push
+    // has earned the link. Everything above this line leaves an unlinked
+    // project unlinked.
+    const local = await commitIdentity();
+    // ...which means the exporter ran BEFORE the link existed, and it reads the
+    // project id off disk (`readLocalProjectId` in exporter.ts). On a
+    // `--create-project` push the staged manifest therefore carries no
+    // `projectId`, and importer.ts's identity-planting step is what leaves a
+    // machine bootstrapping from that bundle linked. Stamp it now — the same
+    // in-place manifest patch the workspace and carry blocks below already use.
+    if (manifest.projectId !== local.projectId) {
+      const manifestPath = join(bundleStaging, "manifest.json");
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      m.projectId = local.projectId;
+      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+      manifest.projectId = local.projectId;
+    }
     if (manifest.sessions.length === 0) {
       // Every discovered session's head already matches what the hub has
       // recorded as sent — nothing to push. Return before any hub write
@@ -141,18 +262,139 @@ export async function hubPush(
       };
     }
 
+    // Memoized: `git remote -v` gates both the workspace payload and the
+    // ignored-path discovery aid below, and neither runs on the up-to-date
+    // early return above — so a quiet auto-push with no workspace still spawns
+    // nothing, and a manual push of a git project spawns it once, not twice.
+    let gitScanCache: GitRemoteScan | null = null;
+    const gitScan = (): GitRemoteScan => (gitScanCache ??= scanGitRemotes(opts.projectPath));
+
+    // Neither payload is built when git could not be asked about this project's
+    // remotes (see `GitRemoteScan`). The workspace snapshot copies the whole
+    // project directory WITHOUT reading .gitignore, so taking that path on a
+    // repository whose remotes are merely unknown uploads secrets a git project
+    // never intended to publish — and this push may be the unattended SessionEnd
+    // one. The carry needs a working `git` by definition. Say so instead, in the
+    // shape the declined-carry warning already uses: no remedy is named that
+    // this invocation has already foreclosed.
+    if (
+      gitScan().kind === "unknown" &&
+      (!opts.noWorkspace || !opts.noCarry) &&
+      existsSync(opts.projectPath)
+    ) {
+      const scan = gitScan() as Extract<GitRemoteScan, { kind: "unknown" }>;
+      warnings.push(
+        `No project files or uncommitted work were included in this push: ${scan.detail}, so whether this project has a git remote could not be established. A full copy of the working tree is only safe for a project that genuinely has none — it does not read .gitignore — and the git-diff carry needs a working \`git\` of its own. The sessions pushed normally; once git can answer here, the files travel with the next push that has new session content.`
+      );
+    }
+
     // Workspace payload — projects with no git remotes (including
     // remote-less git repositories), since there's no remote to reconstruct
     // the working tree from otherwise.
     let hasWorkspace = false;
-    if (!opts.noWorkspace && localGitRemotes(opts.projectPath).length === 0 && existsSync(opts.projectPath)) {
+    if (!opts.noWorkspace && gitScan().kind === "none" && existsSync(opts.projectPath)) {
       const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));
       if (ws.symlinksSkipped > 0) warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
-      const manifestPath = join(bundleStaging, "manifest.json");
-      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
-      m.workspace = { fileCount: ws.fileCount, byteSize: ws.byteSize, snapshotAt: new Date().toISOString() };
-      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
-      hasWorkspace = true;
+      // Rule-level diagnostics (a hubinclude past a cap, an exclude set that
+      // swallowed the whole tree, a payload over the snapshot budget). Every
+      // one of them fails CLOSED — fewer files — which is invisible from the
+      // outside without this.
+      warnings.push(...ws.warnings);
+      // `skipped` = over the snapshot budget, nothing copied. The sessions
+      // still push; there is simply no payload to declare and — critically —
+      // no generation to record. Recording an un-applied generation is the one
+      // way this feature loses data quietly: the next merge would read the
+      // whole un-sent tree as "deleted here".
+      if (!ws.skipped) {
+        const manifestPath = join(bundleStaging, "manifest.json");
+        const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+        // Declare what this snapshot descends from — read BEFORE the new
+        // generation is recorded below. A puller intersects this id with its own
+        // generation history, and only a hit makes a 3-way merge legal: it is the
+        // proof that a generation was held by both trees, which neither side can
+        // establish alone (see the field's doc in types.ts). `file` and
+        // `pushedAt` ride along as diagnostics only — the puller resolves the
+        // generation through its OWN record, so nothing here becomes a path or a
+        // comparison on the other machine.
+        const basedOnRef = readSyncState(opts.projectPath).hub?.lastWorkspace;
+        m.workspace = {
+          fileCount: ws.fileCount,
+          byteSize: ws.byteSize,
+          snapshotAt: new Date().toISOString(),
+          basedOn: basedOnRef
+            ? { bundleId: basedOnRef.bundleId, file: basedOnRef.file, pushedAt: basedOnRef.pushedAt }
+            : null,
+        };
+        writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+        hasWorkspace = true;
+      }
+    }
+
+    // Git-diff carry — the complement of the workspace snapshot: a project WITH
+    // a remote reconstructs its committed state from git, so only the
+    // uncommitted part has to travel (design §6.1). This is also what finally
+    // gives `hubinclude` an effect on a git project: until this block existed
+    // its only reader was `snapshotWorkspace`, which runs exactly when there
+    // are NO remotes, so the discovery aid below offered a file that could not
+    // do anything for the project being offered it.
+    //
+    // Gated on `rawCount > 0`, not on the normalized list: a self-hosted
+    // `git@gitserver:team/repo.git` is a perfectly real remote that
+    // `normalizeGitRemote` declines to canonicalize (no dot in the host), and
+    // such a project must get the carry — the payload the .gitignore rules
+    // apply to — rather than a whole-tree snapshot.
+    let carryMeta: CarryMeta | undefined;
+    if (!opts.noCarry && gitScan().kind === "remotes" && existsSync(opts.projectPath)) {
+      const diagnostics: string[] = [];
+      // Contained deliberately, unlike the workspace snapshot above: this
+      // branch runs `git` against a real user repository whose state is
+      // unbounded (mid-rebase, submodules, 200k untracked files, a filesystem
+      // that refuses a read), and no failure of the OPTIONAL half of a push may
+      // cost the user the session bundle that is the point of the operation.
+      const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), { diagnostics })
+        .catch((e: Error) => ({ captured: false, reason: "git-failed", detail: e.message } as const));
+      warnings.push(...diagnostics);
+      if (cap.captured) {
+        carryMeta = cap.meta;
+        const manifestPath = join(bundleStaging, "manifest.json");
+        const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+        m.carry = cap.meta;
+        writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+        if (cap.meta.reIncludedCount > 0) {
+          // Say what left the machine. `.gitignore` is where `.env` lives, and
+          // `ignoredNotCarried` exists so this choice is informed — reporting
+          // the opt-in as a silent success would undercut it.
+          const shown = cap.meta.reIncluded.join(", ");
+          const more = cap.meta.reIncludedCount - cap.meta.reIncluded.length;
+          warnings.push(
+            `Carried ${cap.meta.reIncludedCount} gitignored file(s) because .claude-sesh-mover/hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`
+          );
+        }
+        if (cap.meta.trackedIgnoredCount > 0) {
+          // A different disclosure with a different remedy, which is why it is
+          // not folded into the one above: hubinclude did not put these on the
+          // hub and removing a hubinclude line will not take them off it. They
+          // are gitignored files that git TRACKS, so the patch carries their
+          // uncommitted contents and no carry rule filters the patch.
+          const shown = cap.meta.trackedIgnored.join(", ");
+          const more = cap.meta.trackedIgnoredCount - cap.meta.trackedIgnored.length;
+          warnings.push(
+            `The patch carries changes to ${cap.meta.trackedIgnoredCount} gitignored file(s) that git TRACKS, so .gitignore did not keep them off the hub: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now and nothing takes them off it; untrack them (git rm --cached) or push with --no-carry to keep the next push from carrying them again.`
+          );
+        }
+        if (cap.meta.inProgress) {
+          warnings.push(
+            `Uncommitted changes were captured during an in-progress ${cap.meta.inProgress}: the patch records the working tree as it stands, conflict markers included, and the ${cap.meta.inProgress} itself does not travel.`
+          );
+        }
+      } else if (cap.reason !== "clean" && cap.reason !== "not-git") {
+        // "clean" is the ordinary case and "not-git" cannot happen here (this
+        // branch already established a git remote), so everything else is a
+        // capture the user expected and did not get.
+        warnings.push(
+          `Uncommitted changes were not carried: ${cap.detail ?? cap.reason}. They will be picked up by the next push that has new session content.`
+        );
+      }
     }
 
     // Archive + stream into hub
@@ -171,6 +413,23 @@ export async function hubPush(
 
     // Peer bookkeeping from the staged bundle (snapshot, never live files)
     recordSentFromBundle(opts.projectPath, { id: hubPeerId, name: "hub" }, bundleStaging);
+
+    // The workspace generation this machine's tree now shares with the hub —
+    // the ancestor input for the next pull's 3-way merge (design §5.2). Only
+    // recorded once the bundle is committed to the hub: a generation the hub
+    // does not hold cannot be fetched back as an ancestor.
+    //
+    // It describes the SNAPSHOT, not the live tree: anything the user edited
+    // between snapshotWorkspace above and this line is a local change against
+    // this generation, which is exactly what the next merge should see.
+    //
+    // Read AFTER recordSentFromBundle — that helper rewrites the same file, so
+    // mutating a copy read before it would be silently discarded.
+    if (hasWorkspace) {
+      const stateWs = readSyncState(opts.projectPath);
+      setLastWorkspace(stateWs, hub.hubId, { bundleId, file: hubFile, pushedAt });
+      writeSyncState(stateWs);
+    }
 
     // Index projection
     const stateAfter = readSyncState(opts.projectPath);
@@ -206,10 +465,24 @@ export async function hubPush(
       now: pushedAt,
     }));
 
+    // Discovery aid (design §6.0): name what .gitignore kept out, so the user
+    // can opt paths back in via hubinclude without having to know the file
+    // exists. Manual pushes only — the auto-push hook must stay silent — and
+    // only until a hubinclude exists, at which point the user has met the
+    // mechanism and further nagging is noise. Existence, not pattern count, is
+    // the test: a file holding only comments still means "I know about this".
+    let ignoredNotCarried: string[] | undefined;
+    if (!opts.quiet && gitScan().kind === "remotes" && !existsSync(hubincludePath(opts.projectPath))) {
+      const ignored = listTopLevelIgnored(opts.projectPath);
+      if (ignored.length > 0) ignoredNotCarried = ignored;
+    }
+
     opts.onProgress?.({ phase: "hub-push", percent: 100 });
     return {
       success: true, command: "push", projectId: local.projectId,
       bundleId, pushedSessions, upToDate: false, hasWorkspace, warnings,
+      ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
+      ...(carryMeta ? { carry: carryMeta } : {}),
     };
   } finally {
     if (staging) rmSync(staging, { recursive: true, force: true });

@@ -17,14 +17,46 @@ export interface ContinuationInput {
   claudeVersion: string;
 }
 
+/**
+ * The uuid at a slice boundary, in the SAME representation `readEntryUuids`
+ * uses — the empty string for "this line carries no uuid".
+ *
+ * That agreement is load-bearing. Every `fromEntryUuid` in an incremental plan
+ * comes from `readEntryUuids`, and the first UNSENT line of a live transcript
+ * is usually a uuid-less bookkeeping entry (`last-prompt` / `mode` /
+ * `permission-mode` are written straight after each assistant turn). Reading
+ * `undefined` here and comparing it against that `""` rejected every such
+ * slice with a spurious "the session file changed between diff and slice".
+ *
+ * The cost is that this check cannot distinguish "no uuid" from "unparseable"
+ * — but neither can `readEntryUuids`, which maps both to `""`, so the
+ * distinction was never available to the comparison in the first place. What
+ * the check still catches is the case it exists for: a DIFFERENT uuid at the
+ * boundary. And transcripts are append-only, so an index cannot shift under it.
+ */
+function boundaryUuid(line: string): string {
+  try {
+    const uuid = (JSON.parse(line) as { uuid?: unknown }).uuid;
+    return typeof uuid === "string" ? uuid : "";
+  } catch {
+    return "";
+  }
+}
+
 // Shared by string and stream builders so header text can never drift.
 function buildContinuationHeader(
   input: Omit<ContinuationInput, "originalJsonl">,
   previousCount: number,
   newCount: number
 ): Record<string, unknown> {
+  // "on this machine" is the one thing this header must NEVER say about that
+  // id, and it used to say it twice over. The header is written on the SENDING
+  // machine and read only on the RECEIVING one, and the id here is
+  // `peerSent[...].sentAsSessionId` — the sender's id for the earlier slice.
+  // The importer mints a fresh randomUUID for every session it writes, so on
+  // the machine actually reading this line that id names nothing at all.
   const priorLocation = input.previousLocalSessionId
-    ? `live in session \`${input.previousLocalSessionId}\` on this machine`
+    ? `live in session \`${input.previousLocalSessionId}\` on \`${input.sourceMachineName}\` — that is the id there, and a copy of them synced to this machine has a different one`
     : "are not present on this machine; see the originating machine for context";
 
   const content =
@@ -54,15 +86,10 @@ export function buildContinuationJsonl(input: ContinuationInput): string {
     );
   }
 
-  let actualUuid: string | undefined;
-  try {
-    actualUuid = (JSON.parse(lines[fromEntryIndex]) as { uuid?: string }).uuid;
-  } catch {
-    actualUuid = undefined;
-  }
+  const actualUuid = boundaryUuid(lines[fromEntryIndex]);
   if (actualUuid !== fromEntryUuid) {
     throw new Error(
-      `Continuation uuid mismatch: entry at index ${fromEntryIndex} has uuid ${actualUuid ?? "(unparseable)"}, expected ${fromEntryUuid}. The session file changed between diff and slice.`
+      `Continuation uuid mismatch: entry at index ${fromEntryIndex} has uuid ${actualUuid || "(none)"}, expected ${fromEntryUuid || "(none)"}. The session file changed between diff and slice.`
     );
   }
 
@@ -91,7 +118,7 @@ export async function buildContinuationStream(
 
   // Pass 1: count + verify
   let total = 0;
-  let uuidAtIndex: string | undefined;
+  let uuidAtIndex = "";
   {
     const src = createReadStream(sourceJsonlPath, { encoding: "utf-8" });
     const rl = createInterface({ input: src, crlfDelay: Infinity });
@@ -99,11 +126,7 @@ export async function buildContinuationStream(
       for await (const line of rl) {
         if (!line) continue;
         if (total === fromEntryIndex) {
-          try {
-            uuidAtIndex = (JSON.parse(line) as { uuid?: string }).uuid;
-          } catch {
-            uuidAtIndex = undefined;
-          }
+          uuidAtIndex = boundaryUuid(line);
         }
         total++;
       }
@@ -120,7 +143,7 @@ export async function buildContinuationStream(
   }
   if (uuidAtIndex !== fromEntryUuid) {
     throw new Error(
-      `Continuation uuid mismatch: entry at index ${fromEntryIndex} has uuid ${uuidAtIndex ?? "(unparseable)"}, expected ${fromEntryUuid}. The session file changed between diff and slice.`
+      `Continuation uuid mismatch: entry at index ${fromEntryIndex} has uuid ${uuidAtIndex || "(none)"}, expected ${fromEntryUuid || "(none)"}. The session file changed between diff and slice.`
     );
   }
 

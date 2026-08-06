@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execSync, spawnSync } from "node:child_process";
+import { execSync, execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   rmSync,
   mkdirSync,
   existsSync,
   writeFileSync,
+  appendFileSync,
   readFileSync,
   readdirSync,
   chmodSync,
@@ -17,6 +18,8 @@ import * as tar from "tar";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { overrideHome, homeEnv, prependPath, tmpEnv } from "./helpers/env.js";
+import { readTextLf } from "./helpers/eol.js";
+import { runCli as sharedRunCli, type RunCliResult } from "./helpers/run-cli.js";
 
 const isWindows = platform() === "win32";
 
@@ -36,33 +39,34 @@ describe("cli", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  // String form (existing call sites): shells out via execSync, returns stdout
-  // only — unchanged behavior. Array form (new): uses spawnSync without a
-  // shell so stdout/stderr are captured separately, for tests that need to
-  // assert on stderr (e.g. --progress NDJSON) without polluting the test
-  // runner's own stderr.
+  // Thin wrapper over the shared helper that pins this suite's fixture config
+  // dir (still overridable per call). String form returns stdout and throws on
+  // a non-zero exit; array form returns { stdout, stderr, status }.
   function runCli(args: string, envOverrides?: Record<string, string>): string;
   function runCli(
     args: string[],
     envOverrides?: Record<string, string>
-  ): { stdout: string; stderr: string };
+  ): RunCliResult;
   function runCli(
     args: string | string[],
     envOverrides?: Record<string, string>
-  ): string | { stdout: string; stderr: string } {
-    const cliPath = join(import.meta.dirname, "..", "dist", "cli.js");
-    const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...envOverrides };
-    if (Array.isArray(args)) {
-      const result = spawnSync("node", [cliPath, ...args], {
-        encoding: "utf-8",
-        env,
-      });
-      return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  ): string | RunCliResult {
+    // This wrapper's second parameter is a flat ENV RECORD, not the shared
+    // helper's options object. Handing it `{ env: …, cwd: … }` silently sets
+    // two environment variables named "env" and "cwd" instead — the child then
+    // runs against the DEVELOPER'S REAL HOME, and a `hub init --scope user` in
+    // a test rewrites their actual config. That happened; this is the guard.
+    for (const [k, v] of Object.entries(envOverrides ?? {})) {
+      if (typeof v !== "string") {
+        throw new TypeError(
+          `runCli env override "${k}" must be a string — this wrapper takes a flat env record, not RunCliOptions. Use the imported sharedRunCli for cwd/input.`
+        );
+      }
     }
-    return execSync(`node "${cliPath}" ${args}`, {
-      encoding: "utf-8",
-      env,
-    });
+    const env = { CLAUDE_CONFIG_DIR: configDir, ...envOverrides };
+    return Array.isArray(args)
+      ? sharedRunCli(args, { env })
+      : sharedRunCli(args, { env });
   }
 
   describe("export command", () => {
@@ -223,6 +227,95 @@ describe("cli", () => {
       const third = JSON.parse(runCli(`${base} --suffix`));
       expect(third.success).toBe(true);
       expect(third.archivePath).toMatch(/arch-col-2\.tar\.gz$/);
+    });
+  });
+
+  describe("pull command", () => {
+    it("rejects invalid --on-divergence values before any hub lookup", () => {
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(`pull --latest --on-divergence bogus --source-config-dir "${configDir}"`);
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = { stdout: err.stdout ? err.stdout.toString() : "", status: err.status ?? 0 };
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.command).toBe("pull");
+      // Not the "no hub configured" error: the bad mode is reported on its own
+      // terms, whether or not a hub happens to be set up.
+      expect(result.error).toMatch(/on-divergence/i);
+      expect(result.error).toMatch(/adopt-hub/);
+    });
+
+    it("--apply-carry reaches the working tree, and its absence parks the payload", async () => {
+      // Exercised through the built CLI on purpose: `--apply-carry` is a
+      // src/cli.ts wiring, and a mutation there is invisible to every test that
+      // calls hubPull directly.
+      const homeA = mkdtempSync(join(tmpdir(), "sesh-cli-ac-homeA-"));
+      const homeB = mkdtempSync(join(tmpdir(), "sesh-cli-ac-homeB-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-ac-hub-"));
+      const cloneRoot = mkdtempSync(join(tmpdir(), "sesh-cli-ac-clone-"));
+      const configDirB = join(homeB, ".claude");
+      const projectPath = join(tempDir, "acproj");
+      mkdirSync(projectPath, { recursive: true });
+      const { writeLocalProjectId } = await import("../src/hub/identity.js");
+      try {
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", encodeProjectPath(projectPath)),
+          { recursive: true }
+        );
+        const g = (args: string[], cwd = projectPath): void => {
+          execFileSync("git", args, { cwd, stdio: "ignore" });
+        };
+        g(["init", "-q"]);
+        g(["config", "user.email", "t@example.com"]);
+        g(["config", "user.name", "Test"]);
+        g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v1\n");
+        g(["add", "-A"]);
+        g(["commit", "-q", "-m", "init"]);
+        const clone = join(cloneRoot, "acclone");
+        execFileSync("git", ["clone", "-q", projectPath, clone], { stdio: "ignore" });
+        writeFileSync(join(projectPath, "tracked.txt"), "v2 uncommitted\n");
+
+        runCli(["hub", "init", "--path", hubDir], homeEnv(homeA));
+        const push = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
+            homeEnv(homeA)
+          ).stdout
+        );
+        expect(push.success).toBe(true);
+
+        runCli(["hub", "init", "--path", hubDir], homeEnv(homeB));
+        writeLocalProjectId(clone, {
+          projectId: push.projectId, name: "acproj",
+          createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+        });
+
+        const pulled = JSON.parse(
+          runCli(
+            [
+              "pull", "--latest", "--apply-carry",
+              "--project-path", clone, "--source-config-dir", configDirB,
+            ],
+            { ...homeEnv(homeB), CLAUDE_CONFIG_DIR: configDirB }
+          ).stdout
+        );
+        expect(pulled.success).toBe(true);
+        expect(pulled.carryApplied.applied).toBe(true);
+        // Tracked, and `git apply` wrote it — so the clone's own EOL convention
+        // decides its line endings on Windows. See helpers/eol.ts.
+        expect(readTextLf(join(clone, "tracked.txt"))).toBe("v2 uncommitted\n");
+      } finally {
+        for (const d of [homeA, homeB, hubDir, cloneRoot]) {
+          rmSync(d, { recursive: true, force: true });
+        }
+      }
     });
   });
 
@@ -572,10 +665,21 @@ describe("cli", () => {
 
   describe("configure command", () => {
     it("shows current config", () => {
-      const output = runCli("configure --show --json");
-      const result = JSON.parse(output);
-      expect(result.success).toBe(true);
-      expect(result.config.export.storage).toBe("user");
+      // Isolated HOME on purpose: `--show` reports the EFFECTIVE config, so
+      // without one this asserts on whatever the developer running the suite
+      // happens to have configured (it read the real ~/.claude-sesh-mover).
+      const home = mkdtempSync(join(tmpdir(), "sesh-cfg-show-home-"));
+      try {
+        const output = sharedRunCli(["configure", "--show", "--json"], {
+          env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(home) },
+          cwd: home,
+        }).stdout;
+        const result = JSON.parse(output);
+        expect(result.success).toBe(true);
+        expect(result.config.export.storage).toBe("user");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     });
 
     it("sets machine.name via --set", () => {
@@ -587,6 +691,91 @@ describe("cli", () => {
         expect(result.message).toMatch(/machine\.name\s*=\s*my-laptop/);
       } finally {
         homeOverride.restore();
+      }
+    });
+
+    it("sets hub.startupNotice via --set and persists it", () => {
+      // End-to-end guard for the SessionStart notice opt-out. setConfigValue
+      // only accepts dot-paths that already exist in getDefaultConfig(), so
+      // before hub.startupNotice was added to the defaults this exact command
+      // failed with "Invalid config path" — the flag the hook gates on was
+      // documented but unsettable through the supported interface.
+      const homeOverride = overrideHome(tempDir);
+      try {
+        const output = runCli(`configure --scope user --set hub.startupNotice=false --json`);
+        const result = JSON.parse(output);
+        expect(result.success).toBe(true);
+        const shown = JSON.parse(runCli("configure --show --json"));
+        expect(shown.config.hub.startupNotice).toBe(false);
+      } finally {
+        homeOverride.restore();
+      }
+    });
+
+    // The whole-branch review's Critical 1, end to end through the real CLI:
+    // 0.6.0's release notes tell users to add `--scope project` to any of the
+    // hub opt-outs, and doing so used to write a defaults snapshot — `hub.path:
+    // ""` included — into the project file, which then beat the user-scope hub
+    // path. `hub status` answered `hubPath: null` and `push` answered "No hub
+    // configured" for that project, forever.
+    it("a project-scope --set does not unconfigure the user-scope hub", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cfg-scope-home-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cfg-scope-proj-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cfg-scope-hub-"));
+      try {
+        // sharedRunCli, not the local wrapper: this needs a cwd (that IS the
+        // project scope) as well as an isolated HOME.
+        const env = { env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(home) }, cwd: project };
+        const init = JSON.parse(
+          sharedRunCli(["hub", "init", "--scope", "user", "--path", hubDir], env).stdout
+        );
+        expect(init.success).toBe(true);
+
+        const set = JSON.parse(
+          sharedRunCli(
+            ["configure", "--set", "hub.autoPush=false", "--scope", "project", "--json"],
+            env
+          ).stdout
+        );
+        expect(set.success).toBe(true);
+        // The result reports what APPLIES now, so the regression is visible in
+        // the very output of the command that caused it.
+        expect(set.config.hub.autoPush).toBe(false);
+        expect(set.config.hub.path).toBe(hubDir);
+
+        // The file itself holds only what this scope sets.
+        const written = JSON.parse(
+          readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8")
+        );
+        expect(written).toEqual({ hub: { autoPush: false } });
+
+        // And the hub is still configured for this project.
+        const status = JSON.parse(sharedRunCli(["hub", "status"], env).stdout);
+        expect(status.hubPath).toBe(hubDir);
+        expect(status.reachable).toBe(true);
+      } finally {
+        for (const d of [home, project, hubDir]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    it("--reset clears one scope's settings instead of pinning defaults over the other", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cfg-reset-home-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cfg-reset-proj-"));
+      try {
+        const env = { env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(home) }, cwd: project };
+        sharedRunCli(["configure", "--set", "export.storage=project", "--scope", "user"], env);
+        sharedRunCli(["configure", "--set", "hub.autoPush=false", "--scope", "project"], env);
+        const reset = JSON.parse(
+          sharedRunCli(["configure", "--reset", "--scope", "project", "--json"], env).stdout
+        );
+        expect(reset.success).toBe(true);
+        expect(reset.config.hub.autoPush).toBe(true); // the project override is gone
+        expect(reset.config.export.storage).toBe("project"); // the user's setting survives
+        expect(
+          JSON.parse(readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8"))
+        ).toEqual({});
+      } finally {
+        for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
       }
     });
 
@@ -889,6 +1078,77 @@ describe("cli", () => {
         expect(again.success).toBe(true);
         expect(again.upToDate).toBe(true);
         expect(again.bundleId).toBeNull();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+
+    it("carry travels by default, and hub.carryDiff=false turns it off without a flag", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-carry-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-carry-hub-"));
+      // The project is its OWN directory here, not tempDir: the fixture config
+      // dir lives under tempDir, and a repo rooted there would carry the whole
+      // fixture as untracked files.
+      const projectPath = join(tempDir, "carryproj");
+      mkdirSync(projectPath, { recursive: true });
+      const realEncoded = encodeProjectPath(projectPath);
+      const sessionPath = join(configDir, "projects", realEncoded, `${sessionId}.jsonl`);
+      try {
+        runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", realEncoded),
+          { recursive: true }
+        );
+        const g = (args: string[]): void => {
+          execFileSync("git", args, { cwd: projectPath, stdio: "ignore" });
+        };
+        g(["init", "-q"]);
+        g(["config", "user.email", "t@example.com"]);
+        g(["config", "user.name", "Test"]);
+        g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v1\n");
+        g(["add", "-A"]);
+        g(["commit", "-q", "-m", "init"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v2 uncommitted\n");
+
+        const first = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(first.success).toBe(true);
+        expect(first.carry.baseCommit).toMatch(/^[0-9a-f]{40}$/);
+
+        // Second push, carry disabled in config only — the SessionEnd hook takes
+        // no flags, so config is the ONLY way to opt out of uploading
+        // uncommitted work and it has to be honored at the CLI boundary.
+        const homeOverride = overrideHome(home);
+        try {
+          runCli(`configure --scope user --set hub.carryDiff=false --json`, homeEnv(home));
+        } finally {
+          homeOverride.restore();
+        }
+        writeFileSync(join(projectPath, "tracked.txt"), "v3 uncommitted\n");
+        appendFileSync(
+          sessionPath,
+          JSON.stringify({
+            type: "user", uuid: "carry-cfg-1", parentUuid: null, timestamp: new Date().toISOString(),
+            cwd: projectPath, sessionId, version: "2.1.81",
+            message: { role: "user", content: "more" },
+          }) + "\n"
+        );
+        const second = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(second.success).toBe(true);
+        expect(second.upToDate).toBe(false); // a real bundle, just no carry in it
+        expect(second.carry).toBeUndefined();
       } finally {
         rmSync(home, { recursive: true, force: true });
         rmSync(hubDir, { recursive: true, force: true });

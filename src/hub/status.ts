@@ -6,6 +6,7 @@ import { resolveHubPath } from "./init.js";
 import { readMachineId } from "../machine.js";
 import { computeEffectiveConfig } from "../config.js";
 import { readLocalProjectId } from "./identity.js";
+import { peekSyncState } from "../sync-state.js";
 import type { HubStatusResult } from "../types.js";
 
 export async function hubStatus(opts: { cwd: string }): Promise<HubStatusResult> {
@@ -50,6 +51,25 @@ export async function hubStatus(opts: { cwd: string }): Promise<HubStatusResult>
   const machinesKnown = reachable ? (await backend.list("machines")).length : 0;
 
   const local = readLocalProjectId(opts.cwd);
+
+  // The auto-push breadcrumb (see SyncState.hub.lastAutoPush). peekSyncState,
+  // not readSyncState: `hub status` is documented read-only, and readSyncState
+  // renames a corrupt file aside — a write.
+  const lastAutoPush = peekSyncState(opts.cwd).hub?.lastAutoPush;
+  if (lastAutoPush && !lastAutoPush.ok) {
+    warnings.push(
+      `The last automatic push for this project (${lastAutoPush.at}) failed: ${lastAutoPush.notes[0] ?? "no detail recorded"}. Session-end pushes run detached and their output is not shown, so this is the only place it is reported.`
+    );
+  } else if (lastAutoPush && lastAutoPush.noteCount > 0) {
+    // Surfaced as a warning, not just a field, because the notes it carries are
+    // disclosures the user was promised in the push's own output and never got
+    // (a `.env` that git tracks travels in the patch, and the auto-push says so
+    // to a stderr nobody reads).
+    warnings.push(
+      `The last automatic push for this project (${lastAutoPush.at}) reported ${lastAutoPush.noteCount} warning(s) that session end could not show you: ${lastAutoPush.notes.join(" | ")}`
+    );
+  }
+
   return {
     success: true,
     command: "hub-status",
@@ -59,6 +79,7 @@ export async function hubStatus(opts: { cwd: string }): Promise<HubStatusResult>
     machineRegistered,
     machinesKnown,
     project: { linked: local !== null, projectId: local?.projectId ?? null },
+    ...(lastAutoPush ? { lastAutoPush } : {}),
     warnings,
   };
 }

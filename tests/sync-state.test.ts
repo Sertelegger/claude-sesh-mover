@@ -127,6 +127,36 @@ describe("sync-state", () => {
     expect(renamed).toBe(true);
   });
 
+  it("peekSyncState reads the same state but never writes, whatever the file holds", async () => {
+    const { peekSyncState, readSyncState, writeSyncState, syncStatePath } = await import(
+      "../src/sync-state.js"
+    );
+    const project = "/Users/sascha/Projects/foo";
+    const p = syncStatePath(project);
+
+    // A real file reads identically through both readers.
+    const state = readSyncState(project);
+    state.peers["m1"] = {
+      name: "m1", lastSentAt: null, lastReceivedAt: null, sent: {},
+      received: { s1: { localSessionId: "local-1", type: "full", importedAt: "t" } },
+    };
+    writeSyncState(state);
+    expect(peekSyncState(project)).toEqual(readSyncState(project));
+
+    // A corrupt one degrades to the default state and is LEFT ALONE — the
+    // whole reason this reader exists. `whereis` is documented as read-only
+    // and the SessionStart hook runs the same path; readSyncState renames a
+    // corrupt file aside, which is a write.
+    writeFileSync(p, "{not json", "utf-8");
+    const before = readFileSync(p, "utf-8");
+    expect(peekSyncState(project).peers).toEqual({});
+    expect(existsSync(p)).toBe(true);
+    expect(readFileSync(p, "utf-8")).toBe(before);
+    // Negative control: the writing reader does move it.
+    readSyncState(project);
+    expect(existsSync(p)).toBe(false);
+  });
+
   it("recordSentFromBundle records head uuids from the bundle snapshot, not the live file", async () => {
     const { recordSentFromBundle, readSyncState } = await import("../src/sync-state.js");
     const { writeManifest } = await import("../src/manifest.js");
@@ -312,6 +342,113 @@ describe("sync-state v2 (hub)", () => {
     const again = readSyncState("/tmp/proj-v2-b");
     expect(again.schemaVersion).toBe(2);
     expect(getThreadId(again, "sess-1")).toBe("thread-1");
+  });
+
+  it("setLastWorkspace records the generation and round-trips", async () => {
+    const { readSyncState, writeSyncState, setLastWorkspace } = await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw");
+    expect(s.hub?.lastWorkspace).toBeUndefined();
+    setLastWorkspace(s, "hub-1", {
+      bundleId: "bundle-1",
+      file: "projects/p/bundles/m/x.tar.gz",
+      pushedAt: "2026-04-11T10:00:00.000Z",
+    });
+    expect(s.schemaVersion).toBe(2);
+    expect(s.hub?.hubId).toBe("hub-1");
+    expect(s.hub?.lastWorkspace?.bundleId).toBe("bundle-1");
+    // pushedAt dates the GENERATION and is passed in; syncedAt dates our
+    // knowledge of it and is stamped here. Both are diagnostics — no decision
+    // reads either — but conflating them would destroy the only record of when
+    // the bundle was actually published.
+    expect(s.hub?.lastWorkspace?.pushedAt).toBe("2026-04-11T10:00:00.000Z");
+    expect(s.hub?.lastWorkspace?.syncedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(s.hub?.lastWorkspace?.syncedAt).not.toBe(s.hub?.lastWorkspace?.pushedAt);
+    writeSyncState(s);
+    expect(readSyncState("/tmp/proj-lw").hub?.lastWorkspace?.file).toBe(
+      "projects/p/bundles/m/x.tar.gz"
+    );
+  });
+
+  it("setLastWorkspace never disturbs existing thread mappings, and is overwritten by a newer generation", async () => {
+    const { readSyncState, writeSyncState, setLastWorkspace, setThreadId, getThreadId } =
+      await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw2");
+    setThreadId(s, "hub-1", "sess-1", "thread-1");
+    setLastWorkspace(s, "hub-1", {
+      bundleId: "bundle-1", file: "projects/p/bundles/m/1.tar.gz",
+      pushedAt: "2026-04-11T10:00:00.000Z",
+    });
+    writeSyncState(s);
+
+    const again = readSyncState("/tmp/proj-lw2");
+    expect(getThreadId(again, "sess-1")).toBe("thread-1");
+    setLastWorkspace(again, "hub-1", {
+      bundleId: "bundle-2", file: "projects/p/bundles/m/2.tar.gz",
+      pushedAt: "2026-04-12T10:00:00.000Z",
+    });
+    writeSyncState(again);
+
+    const final = readSyncState("/tmp/proj-lw2");
+    expect(getThreadId(final, "sess-1")).toBe("thread-1");
+    expect(final.hub?.lastWorkspace).toEqual({
+      bundleId: "bundle-2",
+      file: "projects/p/bundles/m/2.tar.gz",
+      pushedAt: "2026-04-12T10:00:00.000Z",
+      syncedAt: expect.any(String),
+    });
+    // The head is replaced, but the generation it replaced is REMEMBERED: that
+    // history is what lets a pull tell "the peer built on something we held"
+    // from "the peer built on a stranger", which the head alone cannot answer.
+    expect(final.hub?.workspaceGenerations?.map((g) => g.bundleId))
+      .toEqual(["bundle-2", "bundle-1"]);
+  });
+
+  it("knownWorkspaceGenerations is most-recent-first, deduped, and bounded", async () => {
+    const { readSyncState, setLastWorkspace, knownWorkspaceGenerations, MAX_WORKSPACE_GENERATIONS } =
+      await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw3");
+    expect(knownWorkspaceGenerations(s)).toEqual([]);
+
+    for (let n = 1; n <= MAX_WORKSPACE_GENERATIONS + 5; n++) {
+      setLastWorkspace(s, "hub-1", {
+        bundleId: `b${n}`, file: `projects/p/bundles/m/${n}.tar.gz`,
+        pushedAt: `2026-04-11T10:00:${String(n % 60).padStart(2, "0")}.000Z`,
+      });
+    }
+    const known = knownWorkspaceGenerations(s);
+    expect(known).toHaveLength(MAX_WORKSPACE_GENERATIONS);
+    expect(known[0]!.bundleId).toBe(`b${MAX_WORKSPACE_GENERATIONS + 5}`);
+    // Oldest entries fall off the end, never the newest — a forgotten
+    // generation costs a merge, a forgotten HEAD would cost the tree's identity.
+    expect(known.at(-1)!.bundleId).toBe("b6");
+
+    // Re-applying a generation we already hold moves it to the head instead of
+    // taking a second slot.
+    setLastWorkspace(s, "hub-1", {
+      bundleId: "b40", file: "projects/p/bundles/m/40.tar.gz",
+      pushedAt: "2026-04-11T10:00:40.000Z",
+    });
+    const after = knownWorkspaceGenerations(s);
+    expect(after).toHaveLength(MAX_WORKSPACE_GENERATIONS);
+    expect(after[0]!.bundleId).toBe("b40");
+    expect(after.filter((g) => g.bundleId === "b40")).toHaveLength(1);
+  });
+
+  it("knownWorkspaceGenerations leads with lastWorkspace when the list predates it", async () => {
+    // A state file written before the list existed (or hand-edited) still has a
+    // head, and it must still be offered as a candidate — otherwise a machine
+    // upgrading mid-project would silently lose its only known generation.
+    const { readSyncState, knownWorkspaceGenerations } = await import("../src/sync-state.js");
+    const s = readSyncState("/tmp/proj-lw4");
+    s.hub = {
+      hubId: "hub-1",
+      threadByLocalSession: {},
+      lastWorkspace: {
+        bundleId: "legacy", file: "projects/p/bundles/m/legacy.tar.gz",
+        syncedAt: "2026-04-11T10:00:00.000Z",
+      },
+    };
+    expect(knownWorkspaceGenerations(s).map((g) => g.bundleId)).toEqual(["legacy"]);
   });
 
   it("v2 files with unknown extra fields still read (forward tolerance)", async () => {

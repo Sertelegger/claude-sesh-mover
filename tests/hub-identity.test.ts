@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createFsBackend } from "../src/hub/backend.js";
 import {
-  normalizeGitRemote, localGitRemotes, resolveProjectIdentity,
+  normalizeGitRemote, localGitRemotes, scanGitRemotes, resolveProjectIdentity,
   createHubProject, linkToHubProject, readLocalProjectId, listHubProjects,
 } from "../src/hub/identity.js";
 import { projectJsonPath } from "../src/hub/layout.js";
+import { overridePath } from "./helpers/env.js";
 
 function tmp(p: string): string { return mkdtempSync(join(tmpdir(), p)); }
 
@@ -40,6 +41,155 @@ describe("localGitRemotes", () => {
       execFileSync("git", ["remote", "add", "origin", "git@github.com:User/Repo.git"], { cwd: dir });
       expect(localGitRemotes(dir)).toEqual(["github.com/user/repo"]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+// The whole-branch review's Critical 2: `localGitRemotes` returned [] for three
+// materially different situations, and `push` read all three as "this project
+// has no remote" — the condition that makes it upload the entire working tree,
+// .gitignore not consulted, unattended, from the SessionEnd hook.
+describe("scanGitRemotes", () => {
+  it('a plain directory is "none" — the case the workspace snapshot is FOR', () => {
+    const dir = tmp("sesh-scan-nogit-");
+    try { expect(scanGitRemotes(dir)).toEqual({ kind: "none" }); }
+    finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a git repo with no remotes is "none" too', () => {
+    const dir = tmp("sesh-scan-noremote-");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      expect(scanGitRemotes(dir)).toEqual({ kind: "none" });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("a remote normalizeGitRemote cannot canonicalize still counts as a remote", () => {
+    // `git@gitserver:team/repo.git` — an ordinary self-hosted server whose host
+    // carries no dot, so normalizeGitRemote returns null. Before this split the
+    // project reclassified as remote-less and its whole tree was snapshotted.
+    const dir = tmp("sesh-scan-selfhosted-");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "origin", "git@gitserver:team/repo.git"], { cwd: dir });
+      expect(normalizeGitRemote("git@gitserver:team/repo.git")).toBeNull();
+      expect(scanGitRemotes(dir)).toEqual({ kind: "remotes", normalized: [], rawCount: 1 });
+      // Linking behaviour is deliberately unchanged: no matcher to link by.
+      expect(localGitRemotes(dir)).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("reports normalized remotes alongside the raw count", () => {
+    const dir = tmp("sesh-scan-mixed-");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "origin", "git@github.com:User/Repo.git"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "internal", "git@gitserver:team/repo.git"], { cwd: dir });
+      const scan = scanGitRemotes(dir);
+      expect(scan.kind).toBe("remotes");
+      if (scan.kind !== "remotes") return;
+      expect(scan.rawCount).toBe(2);
+      expect(scan.normalized).toEqual(["github.com/user/repo"]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("counts a remote that has NO fetch url — the shape that shipped secrets", () => {
+    // `git remote -v` prints one line per URL, and a remote can have none:
+    // set `remote.origin.pushurl` with no `remote.origin.url` (a push-only
+    // mirror or deploy remote) and git emits `origin\t` — no url, and no
+    // `(fetch)` marker to count. Deriving the kind from those lines read a
+    // real git project as remote-less, which took the whole-tree snapshot
+    // path; measured, `.env` and `secrets/id_rsa` landed in a hub bundle with
+    // an empty warnings array. `git remote` lists the NAME either way, which
+    // is why the kind comes from there and only the urls come from `-v`.
+    const dir = tmp("sesh-scan-nofetch-");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "origin", "git@github.com:acme/private.git"], { cwd: dir });
+      execFileSync("git", ["config", "--unset", "remote.origin.url"], { cwd: dir });
+      execFileSync("git", ["config", "remote.origin.pushurl", "git@github.com:acme/private.git"], { cwd: dir });
+      const scan = scanGitRemotes(dir);
+      // The kind is what matters: `remotes` keeps the unfiltered snapshot away
+      // from this project. There is no fetch url to normalize, so that list is
+      // legitimately empty — and an empty `normalized` must never read as
+      // "no remotes" again.
+      expect(scan.kind).toBe("remotes");
+      if (scan.kind !== "remotes") return;
+      expect(scan.rawCount).toBe(1);
+      expect(scan.normalized).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts a remote whose URL contains spaces", () => {
+    // `git remote -v` puts the url between a tab and " (fetch)", and a
+    // local-path remote may well have a space in it. A url pattern of `\S+`
+    // matched nothing here and the project read as remote-less — the same
+    // reclassification, by a different route.
+    const dir = tmp("sesh-scan-spacey-");
+    const remote = join(tmp("sesh-scan-My Backup-"), "repo.git");
+    try {
+      execFileSync("git", ["init", "-q", "--bare", remote]);
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "origin", remote], { cwd: dir });
+      const scan = scanGitRemotes(dir);
+      expect(scan.kind).toBe("remotes");
+      if (scan.kind !== "remotes") return;
+      expect(scan.rawCount).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(remote, { recursive: true, force: true });
+    }
+  });
+
+  it('git that cannot be run inside a repository is "unknown", not "none"', () => {
+    // The dangerous one: the SessionEnd hook runs detached with whatever PATH
+    // it inherits, and a missing `git` used to read as "no remotes".
+    const dir = tmp("sesh-scan-nogitbin-");
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    const path = overridePath(tmp("sesh-scan-emptybin-"));
+    try {
+      const scan = scanGitRemotes(dir);
+      expect(scan.kind).toBe("unknown");
+      if (scan.kind !== "unknown") return;
+      expect(scan.reason).toBe("git-missing");
+    } finally {
+      path.restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('...while a NON-repository with no git is still "none"', () => {
+    const dir = tmp("sesh-scan-nogitbin-nodir-");
+    const path = overridePath(tmp("sesh-scan-emptybin2-"));
+    try {
+      expect(scanGitRemotes(dir)).toEqual({ kind: "none" });
+    } finally {
+      path.restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a project inside a repository (no .git of its own) is not mistaken for a bare directory", () => {
+    const repo = tmp("sesh-scan-monorepo-");
+    const pkg = join(repo, "packages", "app");
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/u/r.git"], { cwd: repo });
+    mkdirSync(pkg, { recursive: true });
+    try {
+      expect(scanGitRemotes(pkg)).toEqual({
+        kind: "remotes", normalized: ["github.com/u/r"], rawCount: 1,
+      });
+      // and with git gone, the ancestor walk is what keeps it out of "none"
+      const path = overridePath(tmp("sesh-scan-emptybin3-"));
+      try {
+        expect(scanGitRemotes(pkg).kind).toBe("unknown");
+      } finally {
+        path.restore();
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });
 
