@@ -26,7 +26,7 @@ export interface ResolvedThread {
 // work") — it must produce the same answer regardless of machine/index
 // iteration order, so every branch is a strict total order over the copy
 // set, never insertion order.
-function newer(a: ThreadCopy, b: ThreadCopy): ThreadCopy {
+export function newerThreadCopy(a: ThreadCopy, b: ThreadCopy): ThreadCopy {
   if (a.lastActiveAt !== b.lastActiveAt) return a.lastActiveAt > b.lastActiveAt ? a : b;
   if (a.messageCount !== b.messageCount) return a.messageCount > b.messageCount ? a : b;
   if (a.headEntryUuid !== b.headEntryUuid) return a.headEntryUuid < b.headEntryUuid ? a : b;
@@ -54,11 +54,11 @@ export function resolveThreads(indexes: HubIndexJson[]): ResolvedThread[] {
   }
   const resolved: ResolvedThread[] = [];
   for (const [threadId, copies] of byThread) {
-    const latest = copies.reduce(newer);
+    const latest = copies.reduce(newerThreadCopy);
     resolved.push({ threadId, slug: latest.slug, summary: latest.summary, copies, latest });
   }
-  // Same invariant as `newer` above, one level up: never depend on iteration
-  // order. The obvious `a < b ? 1 : -1` is an INCONSISTENT comparator — it
+  // Same invariant as `newerThreadCopy` above, one level up: never depend on
+  // iteration order. The obvious `a < b ? 1 : -1` is an INCONSISTENT comparator — it
   // returns -1 for equal values, so two equal-timestamped threads swap and
   // fourteen come back fully reversed when the input order reverses. Both
   // consumers pick positionally (`pull --latest` takes the first non-current

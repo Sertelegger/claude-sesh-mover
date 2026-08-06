@@ -1602,6 +1602,57 @@ describe("applyCarry", () => {
     }
   });
 
+  /**
+   * The saved copy is not an archive, it is a set of INSTRUCTIONS — its README
+   * hands the user `cp -R '<saved>/untracked/.' .`, and that copies dot-entries.
+   * So the routine `not-requested` path saved `untracked/.git/hooks/pre-commit`
+   * and `untracked/.claude-sesh-mover/hubinclude` verbatim and then told the
+   * user to run the command that plants them, on the one path whose sibling
+   * (`--apply-carry`) refuses both outright. Same floor, applied where the write
+   * actually happens.
+   */
+  it("keeps plugin/VCS internals out of the SAVED copy the README tells you to run", async () => {
+    const repo = gitRepo("apply-saved-floor");
+    let dir: string | undefined;
+    try {
+      const head = git(repo, ["rev-parse", "HEAD"]).trim();
+      const payload = handPayload("", { baseCommit: head });
+      dir = payload.dir;
+      // A payload no current sesh-mover produces — its capture-side floor
+      // filters the untracked enumeration — but a hand-made, damaged or
+      // pre-floor one does.
+      mkdirSync(join(dir, "untracked", ".git", "hooks"), { recursive: true });
+      writeFileSync(join(dir, "untracked", ".git", "hooks", "pre-commit"), "#!/bin/sh\necho planted\n");
+      mkdirSync(join(dir, "untracked", ".claude-sesh-mover"), { recursive: true });
+      writeFileSync(join(dir, "untracked", ".claude-sesh-mover", "hubinclude"), "*\n");
+      writeFileSync(join(dir, "untracked", "ok.txt"), "fine\n");
+
+      const r = await applyCarry({
+        carryDir: dir, targetPath: repo, meta: payload.meta, saveOnly: true,
+      });
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("not-requested");
+      expect([...r.refused].sort()).toEqual([
+        ".claude-sesh-mover/hubinclude", ".git/hooks/pre-commit",
+      ]);
+
+      const saved = r.savedTo!;
+      expect(existsSync(join(saved, "untracked", ".git", "hooks", "pre-commit"))).toBe(false);
+      expect(existsSync(join(saved, "untracked", ".claude-sesh-mover", "hubinclude"))).toBe(false);
+      // The rest of the payload is untouched — a skipped path, never a refused
+      // payload (the `--apply-carry` patch half is the one that refuses whole).
+      expect(readFileSync(join(saved, "untracked", "ok.txt"), "utf-8")).toBe("fine\n");
+      const readme = readFileSync(join(saved, "README.md"), "utf-8");
+      expect(readme).toContain("left out of this directory on purpose");
+      expect(readme).toContain(".git/hooks/pre-commit");
+      // Still gives the copy command — it is now safe to run verbatim.
+      expect(readme).toContain("cp -R");
+    } finally {
+      cleanup(repo, dir ?? "");
+    }
+  });
+
   it("refuses an unsafe payload the numstat floor sees even when only SAVING it", async () => {
     // The save is the routine branch and its README recommends applying the
     // patch by hand. Recommending one that --apply-carry would refuse as a

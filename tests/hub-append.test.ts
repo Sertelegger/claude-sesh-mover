@@ -1051,6 +1051,62 @@ describe("adoptHubBranch", () => {
     }
   });
 
+  /**
+   * The one hole left in the refuse-and-throw rule, and it guessed in the
+   * erasing direction: a failed `statSync` left `liveSize = null` and the
+   * whole-file restore went ahead anyway, over a file this operation could not
+   * prove anything about. `tryAppendContinuation` throws in exactly this
+   * situation (append.ts, the rollback's stat), so the asymmetry was the bug.
+   */
+  it("refuses the restore when the base cannot be re-measured, rather than overwriting blind", async () => {
+    const dir = tmp("sesh-adopt-");
+    try {
+      const base = makeForkedBase(dir);
+      const delta = makeHubBranch(dir);
+      const anchorOffset = await anchorOffsetOf(base, "b2");
+      const preservedPath = join(dir, "preserved.jsonl");
+
+      let err: Error | undefined;
+      try {
+        await adoptHubBranch({
+          basePath: base,
+          baseSessionId: "base-sid",
+          deltaPath: delta,
+          anchorOffset,
+          preservedSessionId: "preserved-sid",
+          preservedPath,
+          ctx: identityRewriteContext(),
+          __injectFailure: () => {
+            // Something else took the transcript out from under the adoption
+            // AFTER it had truncated and re-appended — the state in which the
+            // arithmetic that licenses a restore cannot be evaluated at all.
+            rmSync(base, { force: true });
+            throw new Error("boom");
+          },
+        });
+      } catch (e) {
+        err = e as Error;
+      }
+
+      expect(err).toBeDefined();
+      expect(err?.message).toContain("could not be re-measured");
+      expect(err?.message).toContain("boom");
+      // Nothing was written blind, and nothing half-written was left behind.
+      expect(existsSync(base)).toBe(false);
+      expect(existsSync(preservedPath)).toBe(false);
+
+      // The pre-adoption snapshot is named and kept — it is the user's only
+      // copy of what the truncate cut away.
+      const backupPath = /before adoption is at (.+?): ENOENT/.exec(err?.message ?? "")?.[1];
+      expect(backupPath).toBeDefined();
+      expect(existsSync(backupPath!)).toBe(true);
+      expect(readFileSync(backupPath!, "utf-8")).toContain("L2");
+      rmSync(backupPath!, { force: true });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // The twin of tryAppendContinuation's rollback guard, and strictly worse if
   // missing: the restore here OVERWRITES the whole file with a snapshot taken
   // before the adoption began, so a writer that lands in the window the

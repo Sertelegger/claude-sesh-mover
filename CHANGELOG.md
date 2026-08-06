@@ -118,6 +118,60 @@ Two items change behavior for existing hub users with no action on their part.
   `schemaVersion: 2`.
 
 ### Fixed
+- **A divergence you were asked about could be answered, and the answer silently
+  dropped.** When a pull met a fork it could not resolve — `--on-divergence skip`, or an
+  `adopt-hub` refused because the local transcript looked live — it left *that bundle*
+  unapplied and carried on to the next one in the same chain. The next one is anchored on
+  the head the skipped bundle would have installed, so it could never chain onto the local
+  session either: it was imported as a *third* transcript, recorded, and its own outcome
+  overwrote the `divergence.resolution` field, so a user who picked "adopt the hub's
+  branch" got a fragment with nothing saying so — and every remedy the warning named then
+  answered "Nothing to pull". A divergence now stops the **whole thread**: no later bundle
+  of the chain is fetched, applied, saved or recorded (the warning says how many were left),
+  so re-running with the answer applies it to the whole thread. Only reachable with two or
+  more pending bundles, which is why the single-bundle round trip looked correct.
+- **"The latest copy of this thread is already local" refused work that was still on the
+  hub.** That answer is about *heads*, and the question is about *bundles* — and the
+  default-on auto-push routinely separates the two: `/sesh-mover:pull` probes with
+  `--on-divergence skip` and re-runs with your answer, and one session end in between
+  publishes this machine's own diverged branch. The answer was then refused outright. A
+  pull whose newest copy is this machine now falls back to the copy that still lists
+  bundles this machine has never received, and says that it did.
+- **A failed `push` left the project linked — and linking is what arms the automation.**
+  `push --create-project` in a directory with no Claude Code sessions returned the
+  exporter's `success: false` while having already written `.claude-sesh-mover/project.json`
+  and created the hub project; the next session end then auto-pushed that directory,
+  `.env` included. The identity write is now deferred until the export has produced a
+  bundle, so any failure up to that point leaves the project unlinked. A push that fails
+  in the exporter also reports `"command": "push"` rather than `"command": "export"`.
+- **The plain-append liveness decline named the wrong writer, and its remedy was
+  overstated in both directions.** The self-write exemption covers only the pull doing the
+  asking, so sesh-mover's *own* earlier pull — whose import stamps the transcript — was
+  reported as "possible live session" with nothing running anywhere. The message now gives
+  the age and both candidates. `--force-append` is foreclosed for the bundle that declined
+  (it was imported and recorded) but not for the thread: on the *next* pull of that thread
+  it does splice, and the docs now scope it that way instead of calling it useless.
+- **The workspace no-ancestor skip promised that `--target-path` would end it.** It does
+  not: all local bookkeeping is keyed off the effective project path, which *is*
+  `--target-path` when one is given, so the generation an unpack there records belongs to
+  the fresh directory and pulls into the original keep skipping identically. Only
+  `--force-workspace` ends it for the project directory; `--target-path <fresh-dir>` is
+  the non-destructive way to *see* a payload. Corrected in the warning, `README.md`,
+  `commands/pull.md` and the skill doc.
+- **A saved carry payload could hand you a command that plants plugin/VCS internals.** The
+  saved copy's `README.md` tells you to run `cp -R '<saved>/untracked/.' .`, which copies
+  dot-entries — so an `untracked/.git/hooks/pre-commit` or
+  `untracked/.claude-sesh-mover/hubinclude` that `--apply-carry` refuses outright was saved
+  verbatim on the routine path. The floor now runs on the save too; refusals are listed in
+  `carryApplied.refused`, in the pull's warnings and in that README. Only a hand-made,
+  damaged or pre-floor bundle can contain such a path.
+- **`adoptHubBranch` restored a transcript it could not measure.** A failed `statSync`
+  after the truncate left the whole-file restore to proceed blind, where the append path
+  throws in the identical situation. It now refuses and throws, naming the pre-adoption
+  snapshot it keeps.
+- **The split-thread warning named a machine three times without distinguishing them.**
+  Machine names come from the hostname, so two default installs or a VM clone share one;
+  any name used by more than one machine in that sentence now carries its machine id.
 - **`configure --set <key> --scope project` unconfigured the hub for that project**
   (pre-existing, and this is the release that tells you to run it). A scope-targeted write
   serialized the *whole* config — every default included — so the project file then beat

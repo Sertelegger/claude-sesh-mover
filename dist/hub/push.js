@@ -94,21 +94,23 @@ export async function hubPush(opts) {
             warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress.");
         }
         const machine = loadOrCreateMachineId();
-        // Identity
-        let local;
+        let pendingIdentity;
         if (opts.projectIdOverride) {
-            local = await linkToHubProject(backend, opts.projectPath, opts.projectIdOverride);
+            pendingIdentity = { kind: "link", projectId: opts.projectIdOverride };
         }
         else if (opts.createProject && !readLocalProjectId(opts.projectPath)) {
-            local = await createHubProject(backend, opts.projectPath, machine.id);
+            pendingIdentity = { kind: "create" };
         }
         else {
             const resolution = await resolveProjectIdentity(backend, opts.projectPath);
             if (resolution.kind === "linked")
-                local = resolution.local;
+                pendingIdentity = { kind: "linked", local: resolution.local };
             else if (resolution.kind === "match") {
-                local = await linkToHubProject(backend, opts.projectPath, resolution.hubProject.projectId);
-                warnings.push(`Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`);
+                pendingIdentity = {
+                    kind: "link",
+                    projectId: resolution.hubProject.projectId,
+                    note: `Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`,
+                };
             }
             else {
                 return {
@@ -118,6 +120,16 @@ export async function hubPush(opts) {
                 };
             }
         }
+        const commitIdentity = async () => {
+            if (pendingIdentity.kind === "linked")
+                return pendingIdentity.local;
+            if (pendingIdentity.kind === "create") {
+                return createHubProject(backend, opts.projectPath, machine.id);
+            }
+            if (pendingIdentity.note)
+                warnings.push(pendingIdentity.note);
+            return linkToHubProject(backend, opts.projectPath, pendingIdentity.projectId);
+        };
         await registerMachine(opts.hubPath);
         const hub = JSON.parse((await backend.read(HUB_JSON)).toString());
         const hubPeerId = `hub:${hub.hubId}`;
@@ -153,10 +165,33 @@ export async function hubPush(opts) {
             },
             onProgress: opts.onProgress,
         });
-        if (!exportResult.success)
-            return exportResult;
+        if (!exportResult.success) {
+            // Nothing is linked at this point — see `commitIdentity`. The `command`
+            // is restated as this command's own: every CLI result is keyed by the
+            // command the user ran (CLAUDE.md), and a `push` answering
+            // `"command": "export"` sends a caller that branches on it down a path
+            // that does not exist for push.
+            return { ...exportResult, command: "push" };
+        }
         const bundleStaging = exportResult.exportPath;
         const manifest = readManifest(bundleStaging);
+        // The export produced something (even if it is "nothing new"), so this push
+        // has earned the link. Everything above this line leaves an unlinked
+        // project unlinked.
+        const local = await commitIdentity();
+        // ...which means the exporter ran BEFORE the link existed, and it reads the
+        // project id off disk (`readLocalProjectId` in exporter.ts). On a
+        // `--create-project` push the staged manifest therefore carries no
+        // `projectId`, and importer.ts's identity-planting step is what leaves a
+        // machine bootstrapping from that bundle linked. Stamp it now — the same
+        // in-place manifest patch the workspace and carry blocks below already use.
+        if (manifest.projectId !== local.projectId) {
+            const manifestPath = join(bundleStaging, "manifest.json");
+            const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+            m.projectId = local.projectId;
+            writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+            manifest.projectId = local.projectId;
+        }
         if (manifest.sessions.length === 0) {
             // Every discovered session's head already matches what the hub has
             // recorded as sent — nothing to push. Return before any hub write

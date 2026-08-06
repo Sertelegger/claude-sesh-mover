@@ -136,18 +136,41 @@ export async function hubPush(
     }
     const machine = loadOrCreateMachineId();
 
-    // Identity
-    let local: LocalProjectId;
+    // Identity — DECIDED here, COMMITTED after the export.
+    //
+    // Linking is the hub's consent gate: `.claude-sesh-mover/project.json`
+    // existing is what makes `evaluateHookGate` let the default-on SessionEnd
+    // auto-push run, and for a git-less project that push uploads the WHOLE
+    // project directory. So a link must not be a side effect of a push that
+    // then failed. Measured: `push --create-project` in a directory with no
+    // sessions returned the exporter's `success: false` ("No sessions found for
+    // this project") while having already written project.json and created the
+    // hub project — nothing in the result said so, commands/push.md says report
+    // and stop, and the next session end uploaded the tree, `.env` included.
+    //
+    // Deferring the write past `exportAllSessions` closes exactly that: any
+    // failure up to and including the export now leaves the project unlinked.
+    // It is committed just BEFORE the up-to-date early return, so a push that
+    // legitimately has nothing new to send still links (its `projectId` is part
+    // of that result).
+    type PendingIdentity =
+      | { kind: "linked"; local: LocalProjectId }
+      | { kind: "link"; projectId: string; note?: string }
+      | { kind: "create" };
+    let pendingIdentity: PendingIdentity;
     if (opts.projectIdOverride) {
-      local = await linkToHubProject(backend, opts.projectPath, opts.projectIdOverride);
+      pendingIdentity = { kind: "link", projectId: opts.projectIdOverride };
     } else if (opts.createProject && !readLocalProjectId(opts.projectPath)) {
-      local = await createHubProject(backend, opts.projectPath, machine.id);
+      pendingIdentity = { kind: "create" };
     } else {
       const resolution = await resolveProjectIdentity(backend, opts.projectPath);
-      if (resolution.kind === "linked") local = resolution.local;
+      if (resolution.kind === "linked") pendingIdentity = { kind: "linked", local: resolution.local };
       else if (resolution.kind === "match") {
-        local = await linkToHubProject(backend, opts.projectPath, resolution.hubProject.projectId);
-        warnings.push(`Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`);
+        pendingIdentity = {
+          kind: "link",
+          projectId: resolution.hubProject.projectId,
+          note: `Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`,
+        };
       } else {
         return {
           success: false, command: "push", reason: "unlinked",
@@ -156,6 +179,14 @@ export async function hubPush(
         };
       }
     }
+    const commitIdentity = async (): Promise<LocalProjectId> => {
+      if (pendingIdentity.kind === "linked") return pendingIdentity.local;
+      if (pendingIdentity.kind === "create") {
+        return createHubProject(backend, opts.projectPath, machine.id);
+      }
+      if (pendingIdentity.note) warnings.push(pendingIdentity.note);
+      return linkToHubProject(backend, opts.projectPath, pendingIdentity.projectId);
+    };
 
     await registerMachine(opts.hubPath);
     const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
@@ -192,9 +223,33 @@ export async function hubPush(
       },
       onProgress: opts.onProgress,
     });
-    if (!exportResult.success) return exportResult;
+    if (!exportResult.success) {
+      // Nothing is linked at this point — see `commitIdentity`. The `command`
+      // is restated as this command's own: every CLI result is keyed by the
+      // command the user ran (CLAUDE.md), and a `push` answering
+      // `"command": "export"` sends a caller that branches on it down a path
+      // that does not exist for push.
+      return { ...exportResult, command: "push" };
+    }
     const bundleStaging = exportResult.exportPath;
     const manifest = readManifest(bundleStaging);
+    // The export produced something (even if it is "nothing new"), so this push
+    // has earned the link. Everything above this line leaves an unlinked
+    // project unlinked.
+    const local = await commitIdentity();
+    // ...which means the exporter ran BEFORE the link existed, and it reads the
+    // project id off disk (`readLocalProjectId` in exporter.ts). On a
+    // `--create-project` push the staged manifest therefore carries no
+    // `projectId`, and importer.ts's identity-planting step is what leaves a
+    // machine bootstrapping from that bundle linked. Stamp it now — the same
+    // in-place manifest patch the workspace and carry blocks below already use.
+    if (manifest.projectId !== local.projectId) {
+      const manifestPath = join(bundleStaging, "manifest.json");
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      m.projectId = local.projectId;
+      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+      manifest.projectId = local.projectId;
+    }
     if (manifest.sessions.length === 0) {
       // Every discovered session's head already matches what the hub has
       // recorded as sent — nothing to push. Return before any hub write

@@ -255,7 +255,16 @@ export async function tryAppendContinuation(a: AppendAttempt): Promise<AppendOut
       // `--force-append` here produced a warning telling the user to re-run
       // with a flag that can no longer reach this bundle. Advice belongs where
       // the consequence is known.
-      detail: `base session was modified ${Math.round(ageMs / 1000)}s ago (possible live session)`,
+      //
+      // It does not name a CAUSE either, and that is a correction: the
+      // exemption above only covers writes from THIS operation, so an earlier
+      // sesh-mover pull that imported or spliced this very session minutes ago
+      // is the commonest writer to land here — reported as "possible live
+      // session", it accused a Claude Code session that was demonstrably not
+      // running. Until a recorded write-time makes the exemption exact (the
+      // Task 7 carry in the SDD ledger), the honest report is the age plus both
+      // candidates.
+      detail: `base session was modified ${Math.round(ageMs / 1000)}s ago, so it cannot be told apart from a live Claude Code session (an earlier sesh-mover pull that wrote this same session is the other writer that lands here)`,
     };
   }
 
@@ -660,13 +669,28 @@ export async function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome
     // window the re-check cannot see (between itself and the truncate/append).
     // Same rule as tryAppendContinuation's rollback: restore only what our own
     // mutation accounts for, and refuse loudly otherwise.
-    let liveSize: number | null = null;
+    // Symmetry with tryAppendContinuation's rollback (which throws in exactly
+    // this situation): a base that cannot be re-measured cannot be PROVEN to
+    // hold only our bytes, and this restore is a whole-file overwrite, so
+    // "fall through and let the restore try" was the one place in the
+    // refuse-and-throw rule that guessed. It guessed in the erasing direction.
+    let liveSize: number;
     try {
       liveSize = statSync(input.basePath).size;
-    } catch {
-      liveSize = null; // unreadable — fall through and let the restore try
+    } catch (statError) {
+      keepWork = true; // the pre-mutation snapshot is the only intact copy
+      // Ours by construction (proven not to exist at the start), so removing a
+      // half-written copy of it touches nothing anyone else owns.
+      try {
+        rmSync(input.preservedPath, { force: true });
+      } catch {
+        /* best effort — the throw below is the message that matters */
+      }
+      throw new Error(
+        `adopt failed (${cause}) AND the base could not be re-measured, so no restore was attempted — ${input.basePath} was left exactly as it is, mid-adoption; a complete copy of the session as it was before adoption is at ${backup}: ${(statError as Error).message}`
+      );
     }
-    if (liveSize !== null && liveSize !== mutatedSize) {
+    if (liveSize !== mutatedSize) {
       keepWork = true; // the pre-mutation snapshot is the only intact copy
       // This path is ours by construction (it was proven not to exist at the
       // start), so removing a half-written copy of it is safe and touches

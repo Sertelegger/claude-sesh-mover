@@ -257,6 +257,18 @@ export interface CarryNotApplied {
      * no README then either.
      */
     savedCommands: boolean;
+    /**
+     * Payload paths dropped from the SAVED copy because they name plugin or VCS
+     * internals (`NEVER_INCLUDABLE`) — the same floor, and the same reporting
+     * rule, as `CarryApplied.refused`.
+     *
+     * It is not a duplicate of that field: the saved README tells the user to
+     * `cp -R '<saved>/untracked/.' .`, which copies dot-entries, so a saved
+     * `.git/hooks/pre-commit` would be planted by following our own instructions
+     * on the path that never applies anything. Empty on every payload a current
+     * sesh-mover produces, and empty when `savedTo` is `null`.
+     */
+    refused: string[];
 }
 export type ApplyResult = CarryApplied | CarryNotApplied;
 export interface ApplyCarryOptions {

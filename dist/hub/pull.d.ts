@@ -73,8 +73,18 @@ export declare function selectThreadBase(candidates: ThreadBaseCandidate[], anch
  *
  * Machine names are capped at three so a hub with many machines still
  * produces one readable sentence; the full set is in the typed field.
+ *
+ * MACHINE NAMES ARE NOT UNIQUE. They come from the hostname, so a VM clone or
+ * two default installs on same-named hosts give two machine ids one name — and
+ * this sentence names a machine three times in three different roles, which
+ * with bare names degenerates to "mbp holds bundles that mbp does not list …
+ * the one machine it resolves to (mbp)". Any name shared by two of the roles in
+ * THIS sentence therefore carries its machine id.
  */
-export declare function describeUnfetchable(threadId: string, groups: UnfetchableBundleGroup[], sourceLabel: string): string;
+export declare function describeUnfetchable(threadId: string, groups: UnfetchableBundleGroup[], source: {
+    machineId: string;
+    machineName: string | null;
+}): string;
 export declare function selectNeededBundles(bundles: HubBundleRecord[], received: Record<string, {
     localSessionId: string;
 }> | undefined, localSessionFileExists: (localSessionId: string) => boolean): HubBundleRecord[];

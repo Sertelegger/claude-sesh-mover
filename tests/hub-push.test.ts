@@ -87,6 +87,55 @@ describe("hub push", () => {
     }
   });
 
+  /**
+   * Linking IS the consent gate for the default-on automation: once
+   * `.claude-sesh-mover/project.json` exists, `evaluateHookGate` lets the
+   * SessionEnd auto-push run, and for a git-less project that push uploads the
+   * WHOLE working tree without reading .gitignore. So a push that FAILED must
+   * not leave the project linked.
+   *
+   * Measured before this fix: `push --create-project` in a directory with no
+   * sessions returned `{"success":false,"command":"export","error":"No sessions
+   * found for this project"}` — the exporter's own result — while project.json
+   * and the hub project had already been written. commands/push.md says report
+   * and stop, so nothing disclosed the link, and the next session end uploaded
+   * the tree, `.env` included.
+   */
+  it("a push that fails in the exporter leaves the project unlinked and says `push`", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-nolink-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-nolink-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-nolink-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      // A real directory with a `.env` in it and NO sessions in the config dir
+      // — the shape a user lands in by running /sesh-mover:push from a fresh
+      // scratch project.
+      const sessionless = join(base, "sessionless");
+      mkdirSync(sessionless, { recursive: true });
+      writeFileSync(join(sessionless, ".env"), "DB_PASSWORD=hunter2\n");
+
+      const r = await hubPush({
+        configDir, projectPath: sessionless, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(r.success).toBe(false);
+      if (r.success) return;
+      // M1: every result is keyed by the command the user ran.
+      expect(r.command).toBe("push");
+      expect("error" in r && r.error).toContain("No sessions found");
+
+      // Nothing local was linked...
+      expect(existsSync(join(sessionless, ".claude-sesh-mover", "project.json"))).toBe(false);
+      // ...and no hub project was minted for it either.
+      expect(existsSync(join(hub, "projects"))).toBe(false);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
   it("unlinked project with no candidates and no --create-project returns unlinked", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));

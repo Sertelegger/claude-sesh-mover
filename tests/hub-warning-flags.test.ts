@@ -81,19 +81,25 @@ const REGISTRY: FlagUse[] = [
     file: "pull.ts",
     match: "skipped, nothing changed. Re-run with --on-divergence",
     klass: "retry-works",
-    why: "--on-divergence skip is the mode that deliberately applies and records nothing, precisely so the choice can be made on a re-run.",
+    why: "--on-divergence skip is the mode that deliberately applies and records nothing, precisely so the choice can be made on a re-run. Only true because the skip ABORTS THE WHOLE THREAD's chain (`divergenceAborted`): skipping just the diverged bundle left the next one in the chain to fragment-import and be recorded, which republished the index and foreclosed the re-run.",
   },
   {
     file: "pull.ts",
     match: "adopt-hub refused for thread",
     klass: "retry-works",
-    why: "The liveness refusal was given SKIP semantics for this exact reason (Task 4 fix round 2): nothing applied, nothing recorded, so --force-append on the re-run reaches the adoption.",
+    why: "The liveness refusal was given SKIP semantics for this exact reason (Task 4 fix round 2), and thread-wide ABORT semantics for the second half of it (final round): nothing applied, nothing recorded, no later bundle of the chain fetched, so --force-append on the re-run reaches the adoption. With a per-bundle skip the promise held only for a single-bundle chain.",
   },
   {
     file: "pull.ts",
     match: "was adopted anyway because --force-append was passed",
     klass: "descriptive",
     why: "Restates the consequence the user consented to, after the fact.",
+  },
+  {
+    file: "pull.ts",
+    match: "close the Claude Code session writing to that transcript before pulling",
+    klass: "future-only",
+    why: "The plain-append liveness decline. THIS bundle is fragment-imported and recorded, so no re-run reaches it — but --force-append on the NEXT pull of the thread does splice that pull's continuation (measured), so the flag is named with that scoping rather than withheld.",
   },
   {
     file: "pull.ts",

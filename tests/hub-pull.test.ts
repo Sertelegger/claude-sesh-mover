@@ -10,7 +10,9 @@ import { readTextLf } from "./helpers/eol.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
-import { hubPull, selectNeededBundles, selectThreadBase, type HubPullOptions } from "../src/hub/pull.js";
+import {
+  hubPull, selectNeededBundles, selectThreadBase, describeUnfetchable, type HubPullOptions,
+} from "../src/hub/pull.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes, writeMachineIndex } from "../src/hub/index-file.js";
@@ -87,6 +89,44 @@ describe("selectNeededBundles (pure)", () => {
 
     const keptWhenFileMissing = selectNeededBundles(bundles, received, () => false);
     expect(keptWhenFileMissing.map((b) => b.bundleId)).toEqual(["full-new", "cont-new"]);
+  });
+});
+
+describe("describeUnfetchable (pure)", () => {
+  // Machine names come from the hostname, so a VM clone or two default installs
+  // give two machine ids one name — and this sentence names a machine three
+  // times in three roles, which with bare names reads "mbp holds bundles that
+  // mbp does not list … the one machine it resolves to (mbp)".
+  it("carries the machine id when two machines share a name", () => {
+    const text = describeUnfetchable(
+      "t1",
+      [{ machineId: "id-beta", machineName: "mbp", bundleIds: ["b1", "b2"] }],
+      { machineId: "id-alpha", machineName: "mbp" }
+    );
+    expect(text).toContain("mbp [id-beta] (2 bundles)");
+    expect(text).toContain("mbp [id-alpha] does not list");
+    expect(text).toContain("resolves to (mbp [id-alpha])");
+  });
+
+  it("leaves distinct names bare", () => {
+    const text = describeUnfetchable(
+      "t1",
+      [{ machineId: "id-beta", machineName: "beta-desktop", bundleIds: ["b1"] }],
+      { machineId: "id-alpha", machineName: "alpha-laptop" }
+    );
+    expect(text).toContain("beta-desktop (1 bundle)");
+    expect(text).toContain("alpha-laptop does not list");
+    expect(text).not.toContain("[id-");
+  });
+
+  it("falls back to the id when a machine has no name at all", () => {
+    const text = describeUnfetchable(
+      "t1",
+      [{ machineId: "id-beta", machineName: null, bundleIds: ["b1"] }],
+      { machineId: "id-alpha", machineName: null }
+    );
+    expect(text).toContain("id-beta (1 bundle)");
+    expect(text).toContain("id-alpha does not list");
   });
 });
 
@@ -1459,15 +1499,24 @@ describe("hub pull — continuation append", () => {
       const after = readdirSync(a.projectDirA).filter((f) => f.endsWith(".jsonl"));
       expect(after).toHaveLength(before.length + 1);
       expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
-      expect(p.warnings.join(" ")).toContain("live session");
-      // Deliberately changed (whole-branch review, Important 4): this
-      // assertion used to require the warning to name `--force-append`, which
-      // is the foreclosure class itself. The fragment import below records the
-      // bundle, so no later run with that flag can ever reach it — the advice
-      // was impossible, and the test was pinning it in place.
-      expect(p.warnings.join(" ")).not.toContain("--force-append");
+      // The decline names the AGE and both candidate writers, and no longer
+      // asserts "possible live session" as a diagnosis. Measured with no Claude
+      // Code running anywhere: an earlier sesh-mover pull's own import stamps
+      // the base's mtime, and 28s later this guard blamed a live session that
+      // demonstrably did not exist. The self-write exemption only covers writes
+      // from the SAME operation, so that writer lands here routinely.
+      expect(p.warnings.join(" ")).toContain("live Claude Code session");
+      expect(p.warnings.join(" ")).toContain("an earlier sesh-mover pull");
+      expect(p.warnings.join(" ")).not.toContain("possible live session");
       expect(p.warnings.join(" ")).toContain("Nothing local was touched");
       expect(p.warnings.join(" ")).toContain("close the Claude Code session");
+      // `--force-append` is named again, but SCOPED to a later pull of the
+      // thread — the whole-branch round removed it entirely, and the reviewer
+      // then measured that it does work on the next pull (splice succeeded, one
+      // transcript). Foreclosed-for-this-bundle and useless-forever are
+      // different claims; only the first one is true.
+      expect(p.warnings.join(" ")).toContain("--force-append on the next pull of this thread");
+      expect(p.warnings.join(" ")).toMatch(/no re-run applies it/);
     } finally {
       a.cleanup();
     }
@@ -2203,6 +2252,125 @@ describe("hub pull — divergence resolution", () => {
     }
   });
 
+  /**
+   * THE EIGHTH FORECLOSURE, and the second to survive the guard built for the
+   * class. The single-bundle round trip above passed while this failed.
+   *
+   * With TWO pending bundles the refusal protected only its own: the loop went
+   * on to the next one, whose anchor is the head the refused bundle would have
+   * installed — so it can never chain onto the local session either. It reached
+   * the divergence branch with `adoptAvailable: false`, was fragment-imported
+   * and RECORDED. `appliedNothing` flipped, the index was republished, and
+   * `divergence.resolution` (one field for the whole pull) was overwritten
+   * "skip" -> "fragment". The user picked adopt-hub, silently got a third
+   * transcript, and the warning's own instruction then answered "Nothing to
+   * pull" / "the latest copy of this thread is already local".
+   *
+   * The fix is that a divergence stops the whole THREAD, not one bundle: a chain
+   * is not a set of independent items, so "applied and recorded nothing" is only
+   * keepable at that granularity.
+   */
+  it("a refused adoption stops the whole chain, so a two-bundle re-run still adopts", async () => {
+    const a = await arrangeDivergence();
+    try {
+      // A second continuation from B, on top of the first: the chain the
+      // single-bundle fixture above cannot produce.
+      await a.pushMoreFromB(moreEntries);
+      const before = jsonlFiles(a.projectDirA);
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+      makeLookLive(a.basePath);
+
+      const refused = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(refused.success).toBe(true);
+      if (!refused.success) return;
+      const r = refused as HubPullResult;
+
+      // The user's answer survives: still a skip, never silently rewritten to
+      // the fragment the SECOND bundle would have produced.
+      expect(r.divergence?.resolution).toBe("skip");
+      expect(r.importedSessions).toHaveLength(0);
+      expect(r.appended ?? []).toHaveLength(0);
+      // No third transcript, and the local branch is byte-identical.
+      expect(jsonlFiles(a.projectDirA)).toEqual(before);
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      // ...and the rest of the chain is named as deliberately left behind,
+      // rather than silently consumed.
+      expect(r.warnings.join(" ")).toContain("adopt-hub refused");
+      expect(r.warnings.join(" ")).toContain("1 later bundle in this thread's chain was not fetched");
+
+      // The round trip the refusal promises, on the shape that used to break it.
+      const forced = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", forceAppend: true, claudeVersion: "2.1.81",
+      });
+      expect(forced.success).toBe(true);
+      if (!forced.success) return;
+      const f = forced as HubPullResult;
+      expect(f.divergence?.resolution).toBe("adopt-hub");
+      expect(f.divergence?.preservedSessionId).toBeTruthy();
+      // BOTH bundles land, in one transcript.
+      expect(uuidsOf(a.basePath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "b-entry-4", "b-entry-5", "b-entry-6", "b-entry-7",
+      ]);
+      expect(uuidsOf(join(a.projectDirA, `${f.divergence!.preservedSessionId}.jsonl`))).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2",
+      ]);
+      // Exactly one new file — the preserved branch. No fragments.
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+      expect(f.importedSessions).toHaveLength(0);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  /**
+   * The second route into the same class, and it needs no second bundle:
+   * `/sesh-mover:pull` probes with `--on-divergence skip` and re-runs with the
+   * user's answer, and `hub.autoPush` is on by default. One SessionEnd between
+   * the two publishes this machine's own diverged branch — which is the more
+   * recently active side in the ordinary case — so the thread's newest copy
+   * becomes local and the answer was refused outright.
+   */
+  it("an auto-push between the divergence probe and the answer does not foreclose the answer", async () => {
+    const a = await arrangeDivergence();
+    try {
+      const before = jsonlFiles(a.projectDirA);
+      const probe = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(probe.success).toBe(true);
+      if (!probe.success) return;
+      const threadId = (probe as HubPullResult).threadId;
+      expect((probe as HubPullResult).divergence?.resolution).toBe("skip");
+
+      // The hook fires while the user is being asked.
+      const auto = await hubPush({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        noWorkspace: true, claudeVersion: "2.1.81",
+      });
+      expect(auto.success).toBe(true);
+
+      const answered = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        threadId, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(answered.success).toBe(true);
+      if (!answered.success) return;
+      const ans = answered as HubPullResult;
+      expect(ans.divergence?.resolution).toBe("fragment");
+      expect(ans.importedSessions).toHaveLength(1);
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(before.length + 1);
+      // ...and it says why it did not resolve to the newest copy.
+      expect(ans.warnings.join(" ")).toContain("is this machine's own");
+    } finally {
+      a.cleanup();
+    }
+  });
+
   // The same door, from the other side: a refusal must also leave `fragment`
   // reachable, since that is the other branch the warning offers.
   it("a refused adoption can still be resolved as a fragment afterwards", async () => {
@@ -2701,6 +2869,61 @@ describe("hub pull — workspace 3-way merge", () => {
       // conflict markers in a file that merely shares a name with the peer's.
       expect(readFileSync(join(w.projectB, "README.md"), "utf-8")).toBe("B's OWN readme — precious\n");
     } finally {
+      w.cleanup();
+    }
+  });
+
+  /**
+   * The skip warning used to end "Whichever you use, that machine and this one
+   * then share a generation and later payloads merge 3-way" — naming
+   * `--force-workspace` and `--target-path <fresh-dir>` as interchangeable ways
+   * out. They are not. Every piece of local bookkeeping in `hubPull` is keyed
+   * off `effectiveProjectPath`, which IS the `--target-path` when one is given,
+   * so the generation an unpack there records belongs to the FRESH directory.
+   * This project directory keeps none, and its next payload produces a
+   * byte-identical skip repeating the same promise. README.md, commands/pull.md
+   * and SKILL.md carried the same false sentence, and pull.md told the model to
+   * offer `--target-path` FIRST.
+   */
+  it("--target-path records the generation under the fresh dir, not this project", async () => {
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    const fresh = mkdtempSync(join(tmpdir(), "sesh-ws-fresh-"));
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(w.projectB, "local-work.txt"), "mine\n");
+      const skipped = await w.pullOnB();
+      expect(skipped.success).toBe(true);
+      if (!skipped.success) return;
+      const warned = (skipped as HubPullResult).warnings.join(" ");
+      // The flags are named for what each actually does, and the false
+      // equivalence is gone.
+      expect(warned).toContain("Only one thing ends that repetition for THIS directory: --force-workspace");
+      expect(warned).toContain("the generation it records belongs to that fresh directory");
+      expect(warned).not.toContain("Whichever you use");
+      expect(readSyncState(w.projectB).hub?.workspaceGenerations).toBeUndefined();
+
+      // Now take the non-destructive option the old text called equivalent.
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 3: "A-EDIT-2" }));
+      await w.pushFromA();
+      w.useB();
+      const toFresh = await w.pullOnB({ targetPath: fresh });
+      expect(toFresh.success).toBe(true);
+      if (!toFresh.success) return;
+      expect((toFresh as HubPullResult).workspaceUnpacked?.path).toBe(fresh);
+
+      // The generation landed under the FRESH directory's key...
+      expect(readSyncState(fresh).hub?.workspaceGenerations).toHaveLength(1);
+      // ...and this project directory still shares nothing with the payload, so
+      // the skip above is the standing state here, not a first-contact case.
+      expect(readSyncState(w.projectB).hub?.workspaceGenerations).toBeUndefined();
+      expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeUndefined();
+    } finally {
+      rmSync(fresh, { recursive: true, force: true });
       w.cleanup();
     }
   });
@@ -3608,11 +3831,15 @@ describe("hub pull: a thread split across two other machines", () => {
     }
   });
 
-  it('"the latest copy is already local" discloses it too', async () => {
+  it('"the latest copy is already local" now fetches the unreceived half instead of refusing', async () => {
     const f = await setupSplit("sesh-pull-split-local", { withB: true });
     try {
-      // Newest copy of all: this machine. --thread then resolves to us and
-      // returns before sync-state was ever read (Task 12b's recorded residual).
+      // Newest copy of all: this machine. That used to end the pull outright
+      // ("The latest copy of this thread is already local"), which is a
+      // statement about HEADS answering a question about BUNDLES — and the
+      // default-on auto-push makes the two come apart routinely (see
+      // `alternateSource`: probe with --on-divergence skip, one SessionEnd hook
+      // publishes the local branch, and the user's answer is then refused).
       const me = loadOrCreateMachineId();
       await writeMachineIndex(f.backend, {
         ...idx(me.id, {
@@ -3629,10 +3856,50 @@ describe("hub pull: a thread split across two other machines", () => {
       });
       expect(pull.success).toBe(false);
       if (pull.success) return;
-      const err = "error" in pull ? pull.error : "";
-      expect(err).toContain("already local");
-      expect(err).toContain("not whole here");
-      expect(err).toContain("beta-desktop");
+      // It resolved to B and reached for B's bundle. (This fixture writes index
+      // entries without the bundle archives behind them, so the pull stops at
+      // the sync check — which is exactly the proof that the source flipped.)
+      expect("reason" in pull && pull.reason).toBe("not-yet-synced");
+      expect("missing" in pull && pull.missing.join(" ")).toContain("b1");
+      expect("error" in pull ? pull.error : "").not.toContain("already local");
+    } finally {
+      cleanupSplit(f);
+    }
+  });
+
+  it('still answers "already local" when the other machine has nothing this one lacks', async () => {
+    // The control for the branch above: same shape, but B's bundle is already
+    // accounted for here, so there is genuinely nothing to fetch and the
+    // early return — with its disclosure — is the right answer.
+    const f = await setupSplit("sesh-pull-split-local-ctl", { withB: true });
+    try {
+      const me = loadOrCreateMachineId();
+      await writeMachineIndex(f.backend, {
+        ...idx(me.id, {
+          [THREAD]: entry({
+            localSessionId: FIXTURE_SESSION_ID, lastActiveAt: "2026-07-22T09:00:00Z",
+            headEntryUuid: "head-local", bundles: [],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      const st = readSyncState(f.project);
+      st.peers[MACHINE_B] = {
+        name: "beta-desktop", lastSentAt: null, lastReceivedAt: "2026-07-21T13:00:00Z",
+        sent: {},
+        received: {
+          sB: { localSessionId: FIXTURE_SESSION_ID, type: "continuation", importedAt: "2026-07-21T13:00:00Z" },
+        },
+      };
+      writeSyncState(st);
+
+      const pull = await hubPull({
+        configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
+        threadId: THREAD, claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(false);
+      if (pull.success) return;
+      expect("error" in pull && pull.error).toBe("The latest copy of this thread is already local.");
     } finally {
       cleanupSplit(f);
     }

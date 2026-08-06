@@ -104,9 +104,20 @@ const PATCH_HARDENING = [
  * strips trailing dots and whitespace (Win32 resolves `.git.` and `.git ` to
  * `.git`), and no pathspec spelling expresses that without also swallowing
  * `.claude-sesh-moverX`. So `.claude-sesh-mover./config.json` rides this patch.
- * That is deliberate and it is the RECEIVING side's job: §6.2's `git apply`
- * must run every path in the patch through `isNeverIncludable`, which does
- * fold, before writing anything. Do not treat this pathspec as the boundary.
+ * The receiving side closes that: §6.2's `git apply` runs every path in the
+ * patch through `isNeverIncludable`, which does fold, and refuses the payload
+ * whole before writing anything. Do not treat this pathspec as the boundary.
+ *
+ * BE PRECISE ABOUT WHICH HALF IS CLOSED. The receiver's floor stops such a path
+ * being WRITTEN; it does not stop it TRAVELLING. The bytes of a
+ * `.claude-sesh-mover./config.json` still leave this machine, ride the bundle,
+ * and sit on the hub in plaintext — a disclosure gap, not a planting one, and
+ * exactly the shape of the tracked-vs-untracked split documented at
+ * `trackedIgnored`. It costs nothing on POSIX, where such a name is an ordinary
+ * distinct file a user would have to create on purpose; it is Win32 where the
+ * two names resolve to one thing. Closing the sending half needs the enumeration
+ * to be filtered by `isNeverIncludable` rather than by a pathspec, which means
+ * not using a pathspec for the patch at all.
  *
  * Verified on git 2.50.1 to compose with `--relative`
  * (the pathspecs are cwd-relative, so a project that is a repo SUBDIRECTORY
@@ -932,6 +943,18 @@ export interface CarryNotApplied {
    * no README then either.
    */
   savedCommands: boolean;
+  /**
+   * Payload paths dropped from the SAVED copy because they name plugin or VCS
+   * internals (`NEVER_INCLUDABLE`) — the same floor, and the same reporting
+   * rule, as `CarryApplied.refused`.
+   *
+   * It is not a duplicate of that field: the saved README tells the user to
+   * `cp -R '<saved>/untracked/.' .`, which copies dot-entries, so a saved
+   * `.git/hooks/pre-commit` would be planted by following our own instructions
+   * on the path that never applies anything. Empty on every payload a current
+   * sesh-mover produces, and empty when `savedTo` is `null`.
+   */
+  refused: string[];
 }
 
 export type ApplyResult = CarryApplied | CarryNotApplied;
@@ -1420,13 +1443,43 @@ function listPayloadFiles(root: string): string[] {
   return out.sort();
 }
 
-/** Copy a payload tree into the saved directory, dropping symlinks. */
-function copyPayloadTree(src: string, dest: string): void {
+/**
+ * Copy a payload tree into the saved directory, dropping symlinks — and
+ * dropping anything under `untracked/` that the floor would refuse.
+ *
+ * The floor applies HERE and not only on the `--apply-carry` path because the
+ * saved directory is not an archive, it is a set of instructions: the README it
+ * ships alongside tells the user to run `cp -R '<saved>/untracked/.' .`, and
+ * that command copies dot-entries. So an `untracked/.git/hooks/pre-commit` or
+ * `untracked/.claude-sesh-mover/hubinclude` that `applyCarry` refuses outright
+ * (`refused[]`, nothing written) was planted by the routine `not-requested`
+ * path the moment the user followed our own instructions — the one path whose
+ * sibling has the defence. Only a hand-made, damaged or pre-floor bundle can
+ * contain such a path, which is what makes this defence in depth rather than a
+ * live hole; it is still the same floor, applied where the write happens.
+ *
+ * Returns the refused repo-relative paths so the README can say what is missing
+ * from the copy it is describing.
+ */
+function copyPayloadTree(src: string, dest: string): { refused: string[] } {
+  const refused: string[] = [];
   for (const rel of listPayloadFiles(src)) {
+    // `untracked/<repo-relative path>` is the only half of a payload that
+    // becomes a file in the user's tree verbatim; `changes.patch` and
+    // `carry.json` are the payload's own metadata and are judged by the patch
+    // scan instead.
+    if (rel.startsWith("untracked/")) {
+      const inner = rel.slice("untracked/".length);
+      if (isNeverIncludable(inner)) {
+        refused.push(inner);
+        continue;
+      }
+    }
     const to = join(dest, ...rel.split("/"));
     mkdirSync(dirname(to), { recursive: true });
     copyFileSync(join(src, rel), to);
   }
+  return { refused };
 }
 
 /**
@@ -1510,7 +1563,7 @@ function saveCarryPayload(opts: {
   applyPrefix: string;
   prefixKnown: boolean;
   stamp: string;
-}): string | null {
+}): { dir: string; refused: string[] } | null {
   const stamp = opts.stamp;
   const roots = [join(opts.targetPath, ".claude-sesh-mover"), join(homedir(), ".claude-sesh-mover")];
   for (const [index, root] of roots.entries()) {
@@ -1532,7 +1585,7 @@ function saveCarryPayload(opts: {
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(join(dir, ".gitignore"), SAVED_CARRY_GITIGNORE, "utf-8");
-        copyPayloadTree(opts.carryDir, dir);
+        const { refused } = copyPayloadTree(opts.carryDir, dir);
         // Counted from what actually landed, never from `meta.untrackedCount`:
         // the manifest is the SENDER's claim about its own payload, so a bundle
         // declaring `0` while shipping an `untracked/` tree would get a README
@@ -1542,11 +1595,11 @@ function saveCarryPayload(opts: {
         const untrackedSaved = listPayloadFiles(join(dir, "untracked")).length;
         writeFileSync(
           join(dir, "README.md"),
-          renderSavedReadme({ ...opts, dir, untrackedSaved }),
+          renderSavedReadme({ ...opts, dir, untrackedSaved, refused }),
           "utf-8"
         );
         pruneSavedCarries(root, name);
-        return dir;
+        return { dir, refused };
       } catch {
         // A collision with a directory created between the check and the
         // mkdir, an unwritable root, or a fault part-way through the copy.
@@ -1663,6 +1716,8 @@ function renderSavedReadme(opts: {
   prefixKnown: boolean;
   /** Untracked files really present in `dir` — see `saveCarryPayload`. */
   untrackedSaved: number;
+  /** Untracked paths the floor kept OUT of `dir` — see `copyPayloadTree`. */
+  refused: string[];
 }): string {
   const { meta } = opts;
   const patch = join(opts.dir, "changes.patch");
@@ -1680,6 +1735,15 @@ function renderSavedReadme(opts: {
   if (meta.inProgress) {
     lines.push(
       `The other machine was in the middle of a \`${meta.inProgress}\` when this was captured, so the patch contains conflict markers as ordinary content and the ${meta.inProgress} itself did not travel.`,
+      ""
+    );
+  }
+  if (opts.refused.length > 0) {
+    // Said HERE and not only in the pull's warnings, because this file is what
+    // the user reads while running the copy command below — and that command
+    // would have planted these paths verbatim.
+    lines.push(
+      `**${opts.refused.length} path(s) in this payload were left out of this directory on purpose** — they name plugin or VCS internals that sesh-mover never writes (\`.git\` or \`.claude-sesh-mover\` at some depth, in some casing): ${opts.refused.slice(0, 5).map((p) => `\`${p}\``).join(", ")}. They are not below, so the commands in this file cannot plant them. A current sesh-mover never puts such a path in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all — nothing needs re-running, but read the rest of it before you use it.`,
       ""
     );
   }
@@ -1814,18 +1878,19 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
     // the question, and only the one caller that knows better overrides it.
     advice: SavedAdvice = scanUnsafe || reason === "unsafe-payload" ? "unsafe" : "apply"
   ): CarryNotApplied => {
-    const savedTo = saveCarryPayload({
+    const saved = saveCarryPayload({
       carryDir, targetPath, meta, detail, stamp, applyPrefix, prefixKnown, advice,
     });
     return {
       applied: false,
       reason,
       detail,
-      savedTo,
+      savedTo: saved?.dir ?? null,
       // What the README actually contains, decided at the one place that knows.
       // Callers describe the save to the user and must not offer commands the
       // two withholding branches deliberately left out.
-      savedCommands: savedTo !== null && advice === "apply",
+      savedCommands: saved !== null && advice === "apply",
+      refused: saved?.refused ?? [],
     };
   };
 
