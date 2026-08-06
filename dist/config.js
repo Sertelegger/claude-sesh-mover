@@ -44,18 +44,26 @@ export function readConfig(configDir) {
         return defaults;
     }
 }
-// Raw partial config from a directory's file, WITHOUT defaults backfilled —
-// {} when the file is missing or unreadable. Used by computeEffectiveConfig
-// so an absent layer contributes nothing, instead of a full defaults-filled
-// object that would clobber a customization set only at another layer (see
-// commit adding hub.path: readConfig() alone can't tell "user left this at
-// the default" apart from "user explicitly set this to the default").
 export function readConfigOverrides(configDir) {
     const configPath = join(configDir, "config.json");
     if (!existsSync(configPath))
         return {};
     try {
-        return JSON.parse(readFileSync(configPath, "utf-8"));
+        const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+        // An empty `hub.path` is the ABSENCE of a setting, not a setting — which is
+        // exactly how resolveHubPath already treats it. Dropping it here is what
+        // heals installs written before the sparse write landed: every 0.5.x
+        // `configure --set --scope project` persisted a fully defaults-backfilled
+        // object including `"path": ""`, and that empty string then shadowed a
+        // perfectly good user-scope hub path, leaving `hub status` reporting no hub
+        // for that one project. Writing sparsely fixes new files; this fixes the
+        // ones already on disk, on first read, without discarding the other
+        // settings a `configure --reset` would take with it.
+        if (raw.hub && raw.hub.path === "") {
+            const { path: _dropped, ...rest } = raw.hub;
+            raw.hub = rest;
+        }
+        return raw;
     }
     catch {
         return {};

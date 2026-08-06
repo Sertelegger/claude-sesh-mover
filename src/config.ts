@@ -55,11 +55,35 @@ export function readConfig(configDir: string): SeshMoverConfig {
 // object that would clobber a customization set only at another layer (see
 // commit adding hub.path: readConfig() alone can't tell "user left this at
 // the default" apart from "user explicitly set this to the default").
-export function readConfigOverrides(configDir: string): Partial<SeshMoverConfig> {
+/**
+ * A sparse override file: every section optional, and every key WITHIN a
+ * section optional too. `Partial<SeshMoverConfig>` only makes the sections
+ * optional, which understated what these files hold the moment writes became
+ * sparse — a project file may legitimately be `{"hub":{"autoPush":false}}`.
+ */
+export type ConfigOverrides = {
+  [K in keyof SeshMoverConfig]?: Partial<SeshMoverConfig[K]>;
+};
+
+export function readConfigOverrides(configDir: string): ConfigOverrides {
   const configPath = join(configDir, "config.json");
   if (!existsSync(configPath)) return {};
   try {
-    return JSON.parse(readFileSync(configPath, "utf-8")) as Partial<SeshMoverConfig>;
+    const raw = JSON.parse(readFileSync(configPath, "utf-8")) as ConfigOverrides;
+    // An empty `hub.path` is the ABSENCE of a setting, not a setting — which is
+    // exactly how resolveHubPath already treats it. Dropping it here is what
+    // heals installs written before the sparse write landed: every 0.5.x
+    // `configure --set --scope project` persisted a fully defaults-backfilled
+    // object including `"path": ""`, and that empty string then shadowed a
+    // perfectly good user-scope hub path, leaving `hub status` reporting no hub
+    // for that one project. Writing sparsely fixes new files; this fixes the
+    // ones already on disk, on first read, without discarding the other
+    // settings a `configure --reset` would take with it.
+    if (raw.hub && raw.hub.path === "") {
+      const { path: _dropped, ...rest } = raw.hub;
+      raw.hub = rest;
+    }
+    return raw;
   } catch {
     return {};
   }
@@ -124,7 +148,7 @@ export function writeConfig(
  */
 export function writeConfigOverrides(
   configDir: string,
-  overrides: Partial<SeshMoverConfig>
+  overrides: ConfigOverrides
 ): void {
   if (!existsSync(configDir)) {
     mkdirSync(configDir, { recursive: true });
@@ -169,7 +193,7 @@ function assertKnownConfigPath(dotPath: string): string[] {
  * false}}`, never a snapshot of every default.
  */
 export function setConfigOverride(
-  overrides: Partial<SeshMoverConfig>,
+  overrides: ConfigOverrides,
   dotPath: string,
   value: unknown
 ): Partial<SeshMoverConfig> {

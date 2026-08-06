@@ -92,6 +92,35 @@ describe("scanGitRemotes", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it("counts a remote that has NO fetch url — the shape that shipped secrets", () => {
+    // `git remote -v` prints one line per URL, and a remote can have none:
+    // set `remote.origin.pushurl` with no `remote.origin.url` (a push-only
+    // mirror or deploy remote) and git emits `origin\t` — no url, and no
+    // `(fetch)` marker to count. Deriving the kind from those lines read a
+    // real git project as remote-less, which took the whole-tree snapshot
+    // path; measured, `.env` and `secrets/id_rsa` landed in a hub bundle with
+    // an empty warnings array. `git remote` lists the NAME either way, which
+    // is why the kind comes from there and only the urls come from `-v`.
+    const dir = tmp("sesh-scan-nofetch-");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "origin", "git@github.com:acme/private.git"], { cwd: dir });
+      execFileSync("git", ["config", "--unset", "remote.origin.url"], { cwd: dir });
+      execFileSync("git", ["config", "remote.origin.pushurl", "git@github.com:acme/private.git"], { cwd: dir });
+      const scan = scanGitRemotes(dir);
+      // The kind is what matters: `remotes` keeps the unfiltered snapshot away
+      // from this project. There is no fetch url to normalize, so that list is
+      // legitimately empty — and an empty `normalized` must never read as
+      // "no remotes" again.
+      expect(scan.kind).toBe("remotes");
+      if (scan.kind !== "remotes") return;
+      expect(scan.rawCount).toBe(1);
+      expect(scan.normalized).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("counts a remote whose URL contains spaces", () => {
     // `git remote -v` puts the url between a tab and " (fetch)", and a
     // local-path remote may well have a space in it. A url pattern of `\S+`

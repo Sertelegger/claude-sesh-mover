@@ -1,7 +1,16 @@
 import type { SeshMoverConfig } from "./types.js";
 export declare function getDefaultConfig(): SeshMoverConfig;
 export declare function readConfig(configDir: string): SeshMoverConfig;
-export declare function readConfigOverrides(configDir: string): Partial<SeshMoverConfig>;
+/**
+ * A sparse override file: every section optional, and every key WITHIN a
+ * section optional too. `Partial<SeshMoverConfig>` only makes the sections
+ * optional, which understated what these files hold the moment writes became
+ * sparse — a project file may legitimately be `{"hub":{"autoPush":false}}`.
+ */
+export type ConfigOverrides = {
+    [K in keyof SeshMoverConfig]?: Partial<SeshMoverConfig[K]>;
+};
+export declare function readConfigOverrides(configDir: string): ConfigOverrides;
 export declare function computeEffectiveConfig(userConfigDir: string, projectConfigDir: string): SeshMoverConfig;
 export declare function writeConfig(configDir: string, config: SeshMoverConfig): void;
 /**
@@ -22,14 +31,14 @@ export declare function writeConfig(configDir: string, config: SeshMoverConfig):
  * here. `writeConfig` remains for callers that genuinely hold a whole
  * effective config (published library surface).
  */
-export declare function writeConfigOverrides(configDir: string, overrides: Partial<SeshMoverConfig>): void;
+export declare function writeConfigOverrides(configDir: string, overrides: ConfigOverrides): void;
 /**
  * Set one key in a scope's OVERRIDES, creating only the containers on the way
  * to it. Same validation and same error text as `setConfigValue` (the path has
  * to exist in the defaults), but the result stays sparse: `{"hub":{"autoPush":
  * false}}`, never a snapshot of every default.
  */
-export declare function setConfigOverride(overrides: Partial<SeshMoverConfig>, dotPath: string, value: unknown): Partial<SeshMoverConfig>;
+export declare function setConfigOverride(overrides: ConfigOverrides, dotPath: string, value: unknown): Partial<SeshMoverConfig>;
 export declare function mergeConfigs(userConfig: SeshMoverConfig, projectConfig: SeshMoverConfig, cliOverrides?: Partial<Record<string, unknown>>): SeshMoverConfig;
 /**
  * Set one key in a WHOLE config object (defaults backfilled). Note what this

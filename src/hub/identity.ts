@@ -103,8 +103,28 @@ function hasGitRepoMarker(projectPath: string): boolean {
 }
 
 export function scanGitRemotes(projectPath: string): GitRemoteScan {
+  let names: string;
   let out: string;
   try {
+    // TWO calls, and the split matters. `git remote` lists every remote git
+    // knows about, one bare name per line — that is the only trustworthy
+    // answer to "does this project have a remote", which is the question that
+    // decides whether an unfiltered whole-tree snapshot leaves the machine.
+    //
+    // `git remote -v` is NOT that answer. It prints a line per URL, and a
+    // remote can have none: configure `remote.origin.pushurl` without
+    // `remote.origin.url` (a push-only mirror or deploy remote) and git emits
+    // `origin\t` with no `(fetch)` marker at all. Counting `(fetch)` lines
+    // then reads a real git project as remote-less and ships its `.gitignore`d
+    // secrets to the hub — measured, with `.env` and `secrets/id_rsa` landing
+    // in a bundle. Counting `(push)` too would fix that shape and not the
+    // URL-less-remote shape. So: names decide the KIND, `-v` supplies the
+    // normalized urls, and neither job is done by the other's output.
+    names = execFileSync("git", ["remote"], {
+      cwd: projectPath, encoding: "utf-8", timeout: 5000,
+      env: gitChildEnv(),
+      stdio: ["ignore", "pipe", "ignore"],
+    });
     out = execFileSync("git", ["remote", "-v"], {
       cwd: projectPath, encoding: "utf-8", timeout: 5000,
       // Not the inherited environment (see `gitChildEnv`): this answer is what
@@ -130,28 +150,30 @@ export function scanGitRemotes(projectPath: string): GitRemoteScan {
         err.code === "ENOENT"
           ? "`git` was not found on PATH"
           : err.signal
-            ? `\`git remote -v\` timed out (${err.signal})`
-            : "`git remote -v` failed in this repository",
+            ? `\`git remote\` timed out (${err.signal})`
+            : "`git remote` failed in this repository (a dubious-ownership refusal looks like this — try `git status` there)",
     };
   }
-  let rawCount = 0;
+  // The KIND comes from the names, never from the url lines.
+  const rawCount = names.split("\n").filter((l) => l.trim().length > 0).length;
+  if (rawCount === 0) return { kind: "none" };
+
   const urls = new Set<string>();
   for (const line of out.split("\n")) {
     // `git remote -v` prints `<name>\t<url> (fetch)`. Parsed by peeling the
     // ends off rather than with `(\S+)` for the url, because a url may contain
     // SPACES — a local-path remote such as `/Volumes/My Backup/repo.git` is the
-    // ordinary case. An unmatched line used to leave rawCount at 0, which is
-    // the same defect this function exists to fix: a project with a remote
-    // reading as one without, and taking the whole-tree snapshot path.
+    // ordinary case. A line that doesn't match is simply a url we don't get;
+    // it can no longer change the kind, which is the whole point of taking
+    // that from `git remote` above.
     const trimmed = line.trim();
     if (!trimmed.endsWith("(fetch)")) continue;
     const url = trimmed.slice(0, -"(fetch)".length).trim().replace(/^\S+\s+/, "").trim();
     if (!url) continue;
-    rawCount++;
     const norm = normalizeGitRemote(url);
     if (norm) urls.add(norm);
   }
-  return rawCount === 0 ? { kind: "none" } : { kind: "remotes", normalized: [...urls], rawCount };
+  return { kind: "remotes", normalized: [...urls], rawCount };
 }
 
 /**

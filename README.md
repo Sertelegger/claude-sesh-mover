@@ -170,7 +170,7 @@ When a pulled bundle continues a session **this machine already has**, `pull` ap
 
 Three things make it fall back to importing a **separate** session instead, and the pull says which:
 
-- the local session was written in the last five minutes, so a live Claude Code session may still be appending to it — `--force-append` overrides this one, once you've closed that session (an earlier pull's own write counts as recent, so two pulls a few minutes apart can fragment);
+- the local session was written in the last five minutes, so a live Claude Code session may still be appending to it. There is no after-the-fact remedy: the content has already arrived as a separate session and that bundle is recorded, so a re-run reports "already up to date" and never reaches the splice. The fix is preventive — close the Claude Code session writing to that transcript *before* pulling, and later continuations of the thread splice in normally. (An earlier pull's own write counts as recent, so two pulls a few minutes apart can also fragment.)
 - no local session's entry chain lines up with the continuation — nothing to append to, and `--force-append` will not help, because the chain guard is never skipped;
 - the bundle's content doesn't match its manifest hash, so it is never welded into a transcript you own.
 

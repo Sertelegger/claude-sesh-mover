@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -221,16 +221,55 @@ describe("config", () => {
       expect(effective.export.storage).toBe("user"); // untouched keys fall through to defaults
     });
 
-    it("the old defaults-backfilled write is what broke it (negative control)", async () => {
-      const { computeEffectiveConfig, readConfig, writeConfig, setConfigValue } = await import(
-        "../src/config.js"
-      );
+    it("the old defaults-backfilled write still produces the bad FILE — the read is what disarms it", async () => {
+      // Originally a negative control asserting the broken effective config.
+      // The read-side heal makes that assertion false by design, so what it
+      // pins now is the split: the old write is still the cause (the file it
+      // leaves really does carry `"path": ""`), and the fix is that reading no
+      // longer honours that key. Both halves matter — the first is why the
+      // write had to change, the second is why installs that already ran it
+      // recover without the user doing anything.
+      const { computeEffectiveConfig, readConfig, writeConfig, setConfigValue, readConfigOverrides } =
+        await import("../src/config.js");
       const userDir = join(tempDir, "u4");
       const projectDir = join(tempDir, "p4");
       writeConfig(userDir, setConfigValue(readConfig(userDir), "hub.path", "/mnt/share/hub"));
       // Exactly what cli.ts used to do for --scope project.
       writeConfig(projectDir, setConfigValue(readConfig(projectDir), "hub.autoPush", false));
-      expect(computeEffectiveConfig(userDir, projectDir).hub.path).toBe("");
+
+      // The file on disk is still the defaults-backfilled one, empty path and all.
+      const onDisk = JSON.parse(
+        readFileSync(join(projectDir, "config.json"), "utf-8")
+      ) as { hub: { path: string } };
+      expect(onDisk.hub.path).toBe("");
+      // But nothing downstream sees it any more.
+      expect(readConfigOverrides(projectDir).hub?.path).toBeUndefined();
+      expect(computeEffectiveConfig(userDir, projectDir).hub.path).toBe("/mnt/share/hub");
+    });
+
+    it("heals a legacy backfilled project file already on disk, without discarding it", async () => {
+      const { computeEffectiveConfig, readConfig, writeConfig, setConfigValue, readConfigOverrides } =
+        await import("../src/config.js");
+      const userDir = join(tempDir, "u5");
+      const projectDir = join(tempDir, "p5");
+      writeConfig(userDir, setConfigValue(readConfig(userDir), "hub.path", "/mnt/share/hub"));
+      // The file a 0.5.x `configure --set --scope project` left behind: fully
+      // defaults-backfilled, `"path": ""` and all. Writing sparsely fixes new
+      // files; these are the ones users already have, and `configure --reset`
+      // would take every other project setting with it.
+      writeConfig(
+        projectDir,
+        setConfigValue(setConfigValue(readConfig(projectDir), "hub.autoPush", false), "export.format", "zstd")
+      );
+
+      const effective = computeEffectiveConfig(userDir, projectDir);
+      expect(effective.hub.path).toBe("/mnt/share/hub"); // the empty string no longer shadows it
+      expect(effective.hub.autoPush).toBe(false); // and the project's real settings survive
+      expect(effective.export.format).toBe("zstd");
+      // Only the empty hub.path is dropped — a deliberately-set path stays.
+      writeConfig(projectDir, setConfigValue(readConfig(projectDir), "hub.path", "/other/hub"));
+      expect(readConfigOverrides(projectDir).hub?.path).toBe("/other/hub");
+      expect(computeEffectiveConfig(userDir, projectDir).hub.path).toBe("/other/hub");
     });
   });
 });
