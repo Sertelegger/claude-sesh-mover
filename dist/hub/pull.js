@@ -1676,7 +1676,7 @@ export async function hubPull(opts) {
             ? stateAfter.imported[lastSessionManifest.integrityHash]?.localSessionId
             : undefined;
         const localSessionId = threadLandedSessionId ??
-            stateAfter.peers[sourceCopy.machineId]?.received[lastRecord.sessionIdInBundle]?.localSessionId ??
+            stateAfter.peers[sourceCopy.machineId]?.received?.[lastRecord.sessionIdInBundle]?.localSessionId ??
             hashRegistryFallback ??
             null;
         if (localSessionId !== null) {

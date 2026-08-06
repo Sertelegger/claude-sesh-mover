@@ -1963,7 +1963,7 @@ export async function hubPull(
       : undefined;
     const localSessionId: string | null =
       threadLandedSessionId ??
-      stateAfter.peers[sourceCopy.machineId]?.received[lastRecord.sessionIdInBundle]?.localSessionId ??
+      stateAfter.peers[sourceCopy.machineId]?.received?.[lastRecord.sessionIdInBundle]?.localSessionId ??
       hashRegistryFallback ??
       null;
 

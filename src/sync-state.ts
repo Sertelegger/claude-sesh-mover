@@ -46,6 +46,20 @@ function parseSyncState(raw: string): SyncState | null {
     ) {
       return null;
     }
+    // Normalize each PEER's shape, not just the `peers` container. A peer
+    // entry that parses but is missing `received` or `sent` — an interrupted
+    // write, a hand edit, a hub file a older version wrote — used to reach
+    // `peer.received[id]` and throw `Cannot read properties of undefined`
+    // straight out of BOTH hub read commands (`findUnfetchableBundles` runs on
+    // every pull and every whereis). Because the file parses, `readSyncState`
+    // does not rename it aside, so the project never recovers and no message
+    // names the file. Backfilling here means every reader downstream gets the
+    // shape its types already claim.
+    for (const peer of Object.values(parsed.peers)) {
+      if (peer === null || typeof peer !== "object") continue;
+      peer.received = peer.received ?? {};
+      peer.sent = peer.sent ?? {};
+    }
     parsed.imported = parsed.imported ?? {};
     for (const entry of Object.values(parsed.imported)) {
       if (typeof entry.registered !== "boolean") entry.registered = true;
@@ -191,7 +205,13 @@ export function recordSentToPeer(
 }
 
 export function getThreadId(state: SyncState, localSessionId: string): string | null {
-  return state.hub?.threadByLocalSession[localSessionId] ?? null;
+  // `?.` after threadByLocalSession too: `parseSyncState` validates neither
+  // the `hub` block's shape nor its sub-objects, and `hub` now carries four of
+  // them. Every sibling reader is already guarded (pull.ts's `?? {}`,
+  // knownWorkspaceGenerations' check) — this was the straggler, and it is
+  // called on every push, every pull's index projection, reindex, and the
+  // unattended SessionEnd auto-push.
+  return state.hub?.threadByLocalSession?.[localSessionId] ?? null;
 }
 
 // Files stay schemaVersion 1 until hub data is first written: non-hub users
