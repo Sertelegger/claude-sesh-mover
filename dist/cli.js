@@ -412,7 +412,7 @@ program
     .option("--scope <scope>", "user or project", "user")
     .option("--set <keyvalue>", "Set a config value (key=value)")
     .option("--show", "Show current effective config")
-    .option("--reset", "Reset config to defaults")
+    .option("--reset", "Clear this scope's config file (the other scope is untouched)")
     .option("--json", "Output raw JSON")
     .action(async (opts) => {
     try {
@@ -727,8 +727,8 @@ program
     .option("--source-config-dir <path>", "Override Claude config dir")
     .option("--project-id <id>", "Link to an existing hub project id")
     .option("--create-project", "Mint a new hub project for this directory")
-    .option("--no-workspace", "Skip the workspace snapshot for non-git projects")
-    .option("--no-carry", "Do not carry uncommitted changes (git projects)")
+    .option("--no-workspace", "Skip the workspace snapshot (taken for projects with no git remote, including a git repo that has none)")
+    .option("--no-carry", "Do not carry uncommitted changes (taken for projects that have a git remote)")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     try {

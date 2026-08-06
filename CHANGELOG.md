@@ -2,7 +2,7 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
-## [0.6.0] — 2026-08-04
+## [0.6.0] — 2026-08-06
 
 The Hub, Slice 2: the hub keeps itself current, and a pulled continuation lands *in* the
 session it continues instead of beside it.
@@ -130,6 +130,18 @@ Two items change behavior for existing hub users with no action on their part.
   of the chain is fetched, applied, saved or recorded (the warning says how many were left),
   so re-running with the answer applies it to the whole thread. Only reachable with two or
   more pending bundles, which is why the single-bundle round trip looked correct.
+- **…and that stop is now honest about what it already did.** A chain is walked in order,
+  so when the fork is not the *first* bundle, the ones before it have already been spliced
+  into your transcript and recorded — while the warning still said "skipped, nothing
+  changed" and `commands/pull.md` told the assistant that `resolution: "skip"` meant
+  nothing had happened yet. Three consequences, all fixed: the carried uncommitted work of
+  an **already-recorded** bundle was thrown away rather than deferred (the re-run never
+  offers that bundle again, so the only surviving copy was the archive on the hub, and the
+  warning claimed the opposite); both stop-warnings now name what the earlier bundles
+  landed and say the re-run resumes at the diverged bundle; and the fork report no longer
+  counts entries **this same pull** just delivered as your own local divergence
+  (`divergence.localEntriesSinceAnchor` was reporting 4 where 2 of the 4 had arrived from
+  the hub moments earlier).
 - **"The latest copy of this thread is already local" refused work that was still on the
   hub.** That answer is about *heads*, and the question is about *bundles* — and the
   default-on auto-push routinely separates the two: `/sesh-mover:pull` probes with
@@ -144,6 +156,25 @@ Two items change behavior for existing hub users with no action on their part.
   `.env` included. The identity write is now deferred until the export has produced a
   bundle, so any failure up to that point leaves the project unlinked. A push that fails
   in the exporter also reports `"command": "push"` rather than `"command": "export"`.
+  A failure *after* the link is committed — a bundle upload or an index write that throws
+  — now rolls the local link back (only when this push is the one that wrote it, and only
+  when the file still names the id it wrote) and returns a typed `success: false` instead
+  of a bare throw, saying in as many words whether the project is linked, whether a bundle
+  reached the hub with no index referencing it, and — because nothing can delete a hub
+  project — the id of any hub project the failed `--create-project` left behind.
+- **`migrate --dry-run` hid the most destructive part of its own plan.** The preview
+  hardcoded `directoryRenamed: false` and emitted no rename warning, so a dry run with
+  `--rename-dir` and one without were identical — and `commands/migrate.md` told the
+  assistant to include the flag "so the preview reflects the real plan". The preview now
+  answers the rename question through the same predicate the real run uses, in every case
+  it has (would rename / target already exists / source missing / paths identical), so the
+  two can no longer disagree. `MigrateResult` gains `dryRun: true` on previews, and
+  `cleanedUp` is likewise predictive there rather than hardcoded false.
+- **`migrate` swallowed the export's warnings**, which is where `--exclude` is disclosed —
+  and on a migrate an excluded layer is *destroyed*, not left behind: cleanup deletes the
+  whole source session directory and its file-history whatever the bundle carried. The
+  `"<layer> excluded by user request"` warnings now reach the caller on both the real and
+  the dry-run path.
 - **The plain-append liveness decline named the wrong writer, and its remedy was
   overstated in both directions.** The self-write exemption covers only the pull doing the
   asking, so sesh-mover's *own* earlier pull — whose import stamps the transcript — was

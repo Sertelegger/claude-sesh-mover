@@ -249,12 +249,33 @@ export interface DryRunResult {
 export interface MigrateResult {
     success: true;
     command: "migrate";
+    /**
+     * Present and `true` only for `--dry-run`. It is the tense marker for the
+     * whole object: on a preview, `cleanedUp` and `directoryRenamed` describe
+     * what the real run WOULD do, not what happened (nothing happened).
+     *
+     * Without it those two booleans are ambiguous between prediction and fact,
+     * which is exactly how the preview came to under-report the `--rename-dir`
+     * `mv` — it reported the plan's most destructive step as `false` because
+     * `false` was true-as-a-fact. Absent on a real run.
+     */
+    dryRun?: true;
     importedSessions: ImportResult["importedSessions"];
     skippedSessions: Array<{
         originalId: string;
         reason: "duplicate" | "already-received";
     }>;
+    /**
+     * Real run: source session files were deleted. Dry run: they would be — for
+     * every id in `importedSessions[].originalId` and `skippedSessions[]`.
+     */
     cleanedUp: boolean;
+    /**
+     * Real run: the project directory was `mv`-ed from `sourcePath` to
+     * `targetPath`. Dry run: it would be. False whenever `--rename-dir` was not
+     * passed, the paths are identical, the source is missing, or the target
+     * already exists — the last three each carry an explaining `warnings` entry.
+     */
     directoryRenamed: boolean;
     sourcePath: string;
     targetPath: string;

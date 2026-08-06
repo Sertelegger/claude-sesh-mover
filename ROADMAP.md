@@ -38,7 +38,7 @@ instead of landing as a truncated fragment (with an explicit resolution when bot
 diverged from the same point); a workspace payload is merged 3-way against a generation
 both trees held rather than overwriting; and a git project carries its uncommitted work
 (`git diff HEAD` + untracked files), applied only behind `--apply-carry` and a clean tree.
-See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-04).
+See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
 
 **Remaining slices** (each gets its own design pass before implementation; not scheduled):
 
@@ -87,8 +87,9 @@ support is something Anthropic will never ship. Per-CLI adapters cover three sea
 already exist as module boundaries: session discovery (where transcripts live, how they're
 project-keyed), path-field rewriting (which fields carry paths), and resume registration.
 
-- The hub's index schema and bundle manifest are **agent-agnostic from day one** (an `agent`
-  discriminator, `"claude-code"` initially) so this stage needs no schema migration.
+- The hub's **index schema** is agent-agnostic from day one (`HubIndexJson.agent`, `"claude-code"`
+  initially), so that half needs no schema migration. The **bundle manifest** is not: `ExportManifest`
+  carries `plugin: "sesh-mover"` and no agent discriminator, so adding one there is part of this stage.
 - Explicitly out of scope: cross-CLI transcript *translation* (a Codex session stays a Codex
   session — indexed and transferable, not converted).
 

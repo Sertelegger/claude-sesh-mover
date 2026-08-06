@@ -22,6 +22,7 @@ import { loadOrCreateMachineId } from "../src/machine.js";
 import { idx, entry, bundle } from "./helpers/hub-fixtures.js";
 import { createArchive, extractArchive } from "../src/archiver.js";
 import { importSession } from "../src/importer.js";
+import { computeIntegrityHashFromFile } from "../src/manifest.js";
 import { readSyncState, writeSyncState, getThreadId } from "../src/sync-state.js";
 import { readLastEntryUuid } from "../src/jsonl.js";
 import { encodeProjectPath } from "../src/platform.js";
@@ -1126,6 +1127,20 @@ const moreEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
   },
 ];
 
+/** Two further entries again, for a THIRD continuation on top of the second. */
+const evenMoreEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
+  {
+    uuid: "b-entry-8", parentUuid, timestamp: "2026-04-13T09:00:00Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "user",
+    message: { role: "user", content: "one last thing" },
+  },
+  {
+    uuid: "b-entry-9", parentUuid: "b-entry-8", timestamp: "2026-04-13T09:00:05Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "assistant",
+    message: { model: "claude-opus-4-6", id: "msg_cont3", content: [{ type: "text", text: "Finished." }] },
+  },
+];
+
 function appendEntries(path: string, entries: Array<Record<string, unknown>>): void {
   appendFileSync(path, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
 }
@@ -1164,8 +1179,21 @@ interface ContinuationArrangement {
    * Append more entries on machine B (chained onto B's current head) and push
    * them as a further continuation, leaving HOME back on machine A.
    */
-  pushMoreFromB(makeEntries: EntryMaker): Promise<void>;
+  pushMoreFromB(makeEntries: EntryMaker, push?: { noCarry?: boolean }): Promise<void>;
   cleanup(): void;
+}
+
+/** Options for `arrangeContinuation`. */
+interface ArrangeOptions {
+  /**
+   * Make B's project a git repository with a remote and one uncommitted file,
+   * so every push from B captures a git-diff carry payload (design §6.1). Off
+   * by default: a carry costs a `git diff` per push and every other test in
+   * this file is about sessions.
+   */
+  gitB?: boolean;
+  /** Push B's FIRST continuation with --no-carry, so a later one owns the payload. */
+  noCarryFirst?: boolean;
 }
 
 /**
@@ -1183,7 +1211,8 @@ interface ContinuationArrangement {
  * is what has to translate them onto A.
  */
 async function arrangeContinuation(
-  makeEntries: EntryMaker = plainEntries
+  makeEntries: EntryMaker = plainEntries,
+  arrangeOpts: ArrangeOptions = {}
 ): Promise<ContinuationArrangement> {
   const homeA = mkdtempSync(join(tmpdir(), "sesh-app-homeA-"));
   const homeB = mkdtempSync(join(tmpdir(), "sesh-app-homeB-"));
@@ -1227,21 +1256,38 @@ async function arrangeContinuation(
     const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${localB}.jsonl`);
 
     const bProjectPath = projectB;
-    const pushFromB = async (make: EntryMaker): Promise<void> => {
+    if (arrangeOpts.gitB) {
+      const { execFileSync } = await import("node:child_process");
+      const g = (args: string[]): void => {
+        execFileSync("git", args, { cwd: bProjectPath, stdio: "ignore" });
+      };
+      writeFileSync(join(bProjectPath, "tracked.txt"), "committed\n");
+      g(["init", "-q"]);
+      g(["config", "user.email", "t@example.com"]);
+      g(["config", "user.name", "Test"]);
+      g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+      g(["add", "tracked.txt"]);
+      g(["commit", "-q", "-m", "init"]);
+      // One untracked file and one modification: the payload the carry gate is
+      // about, and the thing a suppressed carry silently loses.
+      writeFileSync(join(bProjectPath, "wip.txt"), "work in progress on B\n");
+      writeFileSync(join(bProjectPath, "tracked.txt"), "committed, then edited\n");
+    }
+    const pushFromB = async (make: EntryMaker, push?: { noCarry?: boolean }): Promise<void> => {
       const anchor = readLastEntryUuid(bJsonl);
       if (!anchor) throw new Error("arrange: B's session has no head entry");
       appendEntries(bJsonl, make(anchor, localB, bProjectPath));
-      const push = await hubPush({
+      const pushed = await hubPush({
         configDir: configDirB, projectPath: bProjectPath, hubPath: hub,
-        noWorkspace: true, claudeVersion: "2.1.81",
+        noWorkspace: true, noCarry: push?.noCarry, claudeVersion: "2.1.81",
       });
-      if (!push.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(push)}`);
-      if (push.pushedSessions[0]?.type !== "continuation") {
+      if (!pushed.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(pushed)}`);
+      if (pushed.pushedSessions[0]?.type !== "continuation") {
         throw new Error("arrange: B pushed a full bundle, not a continuation");
       }
     };
 
-    await pushFromB(makeEntries);
+    await pushFromB(makeEntries, { noCarry: arrangeOpts.noCarryFirst });
 
     restore.restore();
     restore = overrideHome(homeA);
@@ -1253,11 +1299,11 @@ async function arrangeContinuation(
     return {
       hub, configDirA, projectA, projectDirA, projectB, configDirB, bSessionId: localB,
       projectId: pushA.projectId, baseSessionId: FIXTURE_SESSION_ID, basePath, cleanup,
-      async pushMoreFromB(make: EntryMaker): Promise<void> {
+      async pushMoreFromB(make: EntryMaker, push?: { noCarry?: boolean }): Promise<void> {
         restore.restore();
         restore = overrideHome(homeB);
         try {
-          await pushFromB(make);
+          await pushFromB(make, push);
         } finally {
           restore.restore();
           restore = overrideHome(homeA);
@@ -1304,6 +1350,82 @@ async function mutateContinuationBundle(
     const outPath = join(stage, "out.tar.gz");
     await createArchive(dir, outPath, "gzip");
     await backend.writeAtomic(record.file, readFileSync(outPath));
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Re-point one continuation bundle at a different anchor entry, repairing both
+ * halves of the bundle so it is indistinguishable from a genuine push: the
+ * manifest's `integrityHash` (the pull refuses to splice a delta whose content
+ * doesn't match it) and the index record's `fromEntryUuid`.
+ *
+ * WHY A FIXTURE HAS TO DO THIS. The shape under test is a chain whose bundles
+ * belong to DIFFERENT branches of one thread — bundle 0 continues the branch
+ * this machine holds, bundle 1 continues an older one — so bundle 0 splices and
+ * bundle 1 forks. It is the ordinary product of `--on-divergence fragment`,
+ * which is the DEFAULT: a machine pulling a diverged thread without the skill
+ * layer mints a second local session `setThreadId`-mapped to the same thread,
+ * and push.ts's index projection then emits two bundle records under one thread
+ * entry. Default-on auto-push makes it routine. Arranging that end to end takes
+ * five machine-role switches and four pushes, and every natural ordering of
+ * them puts the FORKING bundle first (push order is index order), which is the
+ * `i === 0` case that already works. Re-anchoring is the same state, minted
+ * directly, and it keeps the numbers the reviewer measured pinnable.
+ */
+async function reanchorBundleEntry(
+  hubPath: string,
+  projectId: string,
+  entryUuid: string,
+  newParentUuid: string
+): Promise<void> {
+  const backend = createFsBackend(hubPath);
+  const { indexes } = await readAllIndexes(backend, projectId);
+  const stage = mkdtempSync(join(tmpdir(), "sesh-app-reanchor-"));
+  try {
+    for (const index of indexes) {
+      for (const thread of Object.values(index.threads)) {
+        for (const record of thread.bundles) {
+          if (record.type !== "continuation") continue;
+          const dir = join(stage, record.bundleId);
+          mkdirSync(dir, { recursive: true });
+          const tarPath = join(stage, `${record.bundleId}.tar.gz`);
+          writeFileSync(tarPath, await backend.read(record.file));
+          await extractArchive(tarPath, dir);
+
+          const deltaPath = join(dir, "sessions", `${record.sessionIdInBundle}.jsonl`);
+          if (!existsSync(deltaPath)) continue;
+          const lines = readFileSync(deltaPath, "utf-8").split("\n").filter((l) => l !== "");
+          const at = lines.findIndex((l) => (JSON.parse(l) as { uuid?: string }).uuid === entryUuid);
+          if (at === -1) continue;
+
+          const obj = JSON.parse(lines[at]) as Record<string, unknown>;
+          obj.parentUuid = newParentUuid;
+          lines[at] = JSON.stringify(obj);
+          writeFileSync(deltaPath, lines.join("\n") + "\n", "utf-8");
+
+          const manifestPath = join(dir, "manifest.json");
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+            sessions: Array<{ sessionId: string; integrityHash: string; continuation?: { fromEntryUuid: string } }>;
+          };
+          const session = manifest.sessions.find((s) => s.sessionId === record.sessionIdInBundle);
+          if (!session) throw new Error("reanchor: bundle manifest lists no such session");
+          session.integrityHash = await computeIntegrityHashFromFile(deltaPath);
+          if (session.continuation) session.continuation.fromEntryUuid = newParentUuid;
+          writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+          const outPath = join(stage, `${record.bundleId}-out.tar.gz`);
+          await createArchive(dir, outPath, "gzip");
+          await backend.writeAtomic(record.file, readFileSync(outPath));
+
+          record.fromEntryUuid = newParentUuid;
+          await writeMachineIndex(backend, index);
+          return;
+        }
+      }
+    }
+    throw new Error(`reanchor: no continuation bundle on the hub carries entry ${entryUuid}`);
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
@@ -2424,6 +2546,221 @@ describe("hub pull — divergence resolution", () => {
       const w = p.warnings.join(" ");
       expect(w).toContain("--force-append was passed");
       expect(w).toContain("exit it now");
+    } finally {
+      a.cleanup();
+    }
+  });
+});
+
+/**
+ * THE NINTH FORECLOSURE — created by the fix for the eighth.
+ *
+ * `2e42022` made a divergence abort the whole THREAD (break the bundle loop)
+ * instead of skipping one bundle, and the reasoning was right: a chain is not a
+ * set of independent items, so "this pull applied and recorded NOTHING for this
+ * thread" is only keepable at thread granularity.
+ *
+ * But that promise is only DELIVERED when the break lands at `i === 0`. At
+ * `i > 0` it is an abort-from-here-onward wearing thread-abort wording, and
+ * every test in the suite aborted at `i === 0` — including the two-bundle
+ * refusal test above, whose fixture puts the FORKING bundle first. Reverting
+ * the `break` to a `continue` left the suite green, so the branch
+ * `/sesh-mover:pull` always runs (`--on-divergence skip`) was unpinned.
+ *
+ * Three defects lived in that gap, and these tests pin all three:
+ *   - a carry payload out of a bundle the abort had ALREADY recorded was
+ *     dropped permanently, while the warning said it had been left in its
+ *     bundle for next time;
+ *   - both abort warnings claimed nothing had changed, on a pull that had
+ *     spliced entries into a transcript and republished this machine's index;
+ *   - the fork report counted the pull's OWN just-delivered entries as the
+ *     user's local divergence.
+ */
+describe("hub pull — a divergence that stops the chain part-way", () => {
+  /**
+   * A THREE-bundle chain: bundle 0 SPLICES onto the local session, bundle 1
+   * FORKS from it, bundle 2 sits behind the fork. The two branches of one
+   * thread are minted by re-anchoring — see `reanchorBundleEntry` for why.
+   *
+   * The third bundle is not padding. With the fork on the LAST bundle, `break`
+   * and `continue` are indistinguishable (there is nothing after it either
+   * way), which is exactly how the eighth foreclosure's own regression test
+   * came to pass while the abort semantics were unpinned. Only a bundle AFTER
+   * the fork can tell "the thread stopped" from "this bundle was skipped".
+   *
+   * `carryOn` decides which bundle carries the uncommitted work — bundle 0 (a
+   * bundle this pull records, whose payload the re-run can never offer again)
+   * or bundle 1 (the diverged one, which really is deferred).
+   */
+  async function arrangeSpliceThenFork(
+    carryOn: 0 | 1 = 0
+  ): Promise<ContinuationArrangement> {
+    const a = await arrangeContinuation(plainEntries, {
+      gitB: true, noCarryFirst: carryOn !== 0,
+    });
+    try {
+      appendEntries(a.basePath, localEntries(FIXTURE_HEAD_UUID, a.baseSessionId, a.projectA));
+      await a.pushMoreFromB(moreEntries, { noCarry: carryOn !== 1 });
+      await a.pushMoreFromB(evenMoreEntries, { noCarry: true });
+      // Bundle 0 continues A's own local head, so it splices...
+      await reanchorBundleEntry(a.hub, a.projectId, "b-entry-4", "a-local-2");
+      // ...and bundle 1 continues the older shared anchor, so it forks.
+      await reanchorBundleEntry(a.hub, a.projectId, "b-entry-6", FIXTURE_HEAD_UUID);
+      ageOutOfLiveWindow(a.basePath);
+      return a;
+    } catch (e) {
+      a.cleanup();
+      throw e;
+    }
+  }
+
+  it("applies and records the bundles before the fork, and says so instead of 'nothing changed'", async () => {
+    const a = await arrangeSpliceThenFork();
+    try {
+      const filesBefore = jsonlFiles(a.projectDirA);
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      // Bundle 0 landed in the user's own transcript and IS recorded.
+      expect(p.appended).toEqual([
+        { threadId: p.threadId, baseSessionId: a.baseSessionId, entriesAppended: 2 },
+      ]);
+      expect(uuidsOf(a.basePath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2", "b-entry-4", "b-entry-5",
+      ]);
+      // Bundle 1 did not: no third transcript, nothing imported.
+      expect(jsonlFiles(a.projectDirA)).toEqual(filesBefore);
+      expect(p.importedSessions).toHaveLength(0);
+      expect(p.divergence?.resolution).toBe("skip");
+
+      // The sentence the skill layer repeats has to be true on both sides of
+      // the boundary. "skipped, nothing changed" was measurably false here.
+      const w = p.warnings.join(" ");
+      expect(w).not.toContain("skipped, nothing changed");
+      expect(w).toContain("the fork is still undecided");
+      expect(w).toContain("1 earlier bundle in this chain was already applied and recorded");
+      expect(w).toContain(`2 entries spliced into session ${a.baseSessionId}`);
+      expect(w).toContain("the re-run resumes at this bundle, not at the start of the chain");
+      // The thread stopped, not just this bundle: bundle 2 was never fetched.
+      expect(w).toContain("1 later bundle in this thread's chain was not fetched");
+
+      // And the fork report describes the USER's divergence, not this pull's
+      // own delivery: 4 entries follow the anchor, but 2 of them are the ones
+      // bundle 0 appended moments earlier.
+      expect(p.divergence?.adoptAvailable).toBe(true);
+      expect(p.divergence?.anchorUuid).toBe(FIXTURE_HEAD_UUID);
+      expect(p.divergence?.localEntriesSinceAnchor).toBe(2);
+      expect(w).toContain("with 2 entries the hub hasn't seen");
+
+      // The promise the abort exists to keep: the re-run still reaches the
+      // bundle that forked AND the one behind it. With a per-bundle skip both
+      // were consumed by the pull above — fragment-imported and recorded — and
+      // this second one answered "Already up to date with the source machine."
+      const rerun = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(rerun.success).toBe(true);
+      if (!rerun.success) return;
+      const r = rerun as HubPullResult;
+      expect(r.divergence?.resolution).toBe("fragment");
+      expect(r.importedSessions).toHaveLength(1);
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(filesBefore.length + 1);
+      // ...and bundle 2 splices onto the fragment bundle 1 just created, so
+      // the whole deferred half really did arrive.
+      expect(r.appended).toHaveLength(1);
+      expect(uuidsOf(join(a.projectDirA, `${r.importedSessions[0].newId}.jsonl`)).slice(-4)).toEqual([
+        "b-entry-6", "b-entry-7", "b-entry-8", "b-entry-9",
+      ]);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("keeps the carry of a bundle it already recorded, and drops only the one it defers", async () => {
+    const a = await arrangeSpliceThenFork();
+    try {
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+      expect(p.divergence?.resolution).toBe("skip");
+
+      // Bundle 0's payload belongs to a bundle this pull RECORDED. Suppressing
+      // it dropped it permanently: `selectNeededBundles` never offers that
+      // bundle again, so the only surviving copy was the archive on the hub,
+      // reachable by hand-extracting a tarball.
+      expect(p.carryAvailable).toBeDefined();
+      expect(p.carryAvailable?.untrackedCount).toBeGreaterThan(0);
+      expect(p.carryApplied?.applied).toBe(false);
+      const saved = p.carryApplied?.applied === false ? p.carryApplied.savedTo : undefined;
+      expect(saved).toBeTruthy();
+      expect(readFileSync(join(saved!, "untracked", "wip.txt"), "utf-8")).toBe(
+        "work in progress on B\n"
+      );
+      // ...so the abort warning must not claim it was left behind for later.
+      expect(p.warnings.join(" ")).not.toContain("uncommitted work that bundle carried was left");
+
+      // The other half of the gate, demonstrated rather than asserted: the
+      // re-run resolves the fork and reports NO carry, because bundle 1 never
+      // carried one and bundle 0 is gone from `needed`. That is precisely why
+      // suppressing bundle 0's payload was a permanent loss and not a deferral.
+      const rerun = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(rerun.success).toBe(true);
+      if (!rerun.success) return;
+      expect((rerun as HubPullResult).carryAvailable).toBeUndefined();
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("still defers the carry of the bundle the fork stopped at, and says so", async () => {
+    // The control for the gate above: when the payload rides the DIVERGED
+    // bundle it really is deferred, so suppressing it is right and the warning
+    // that says it was left in its bundle is true.
+    const a = await arrangeSpliceThenFork(1);
+    try {
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+      expect(p.divergence?.resolution).toBe("skip");
+      expect(p.appended).toHaveLength(1);
+      expect(p.carryAvailable).toBeUndefined();
+      expect(p.carryApplied).toBeUndefined();
+      expect(p.warnings.join(" ")).toContain("uncommitted work that bundle carried was left in it");
+      expect(existsSync(join(a.projectA, ".claude-sesh-mover"))).toBe(true);
+      expect(
+        readdirSync(join(a.projectA, ".claude-sesh-mover")).some((n) => n.startsWith("carry-"))
+      ).toBe(false);
+
+      // Deferred, not dropped: the re-run delivers it.
+      const rerun = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(rerun.success).toBe(true);
+      if (!rerun.success) return;
+      const r = rerun as HubPullResult;
+      expect(r.carryAvailable).toBeDefined();
+      const saved = r.carryApplied?.applied === false ? r.carryApplied.savedTo : undefined;
+      expect(readFileSync(join(saved!, "untracked", "wip.txt"), "utf-8")).toBe(
+        "work in progress on B\n"
+      );
     } finally {
       a.cleanup();
     }
@@ -3708,9 +4045,14 @@ describe("hub pull: a thread split across two other machines", () => {
       expect(err).toContain("beta-desktop");
       expect(err).toContain("alpha-laptop"); // the machine it did resolve to
       expect(err).toContain("split across machines");
-      // No invented remedy: this branch offers no flag and no re-run.
+      // No invented remedy: this branch offers no flag.
       expect(`${err} ${sug}`).not.toMatch(/--[a-z]/);
-      expect(sug).toContain("nothing to re-run");
+      // ...and the claim it DOES make is the narrow one. "No flag pulls a
+      // thread whose bundles are split across machines" was over-broad the
+      // moment `alternateSource` landed — that is the sentence a model
+      // generalizes to the shape a plain pull now reaches.
+      expect(sug).toContain("cannot be assembled here yet");
+      expect(sug).not.toContain("nothing to re-run");
     } finally {
       cleanupSplit(f);
     }
@@ -3797,7 +4139,8 @@ describe("hub pull: a thread split across two other machines", () => {
       expect(err).toContain("not every thread is whole here");
       expect(err).toContain("beta-desktop");
       expect(err).toContain("split across machines");
-      expect(sug).toContain("nothing to re-run");
+      expect(sug).toContain("cannot be assembled here yet");
+      expect(sug).not.toContain("nothing to re-run");
       expect(`${err} ${sug}`).not.toMatch(/--[a-z]/); // no invented remedy
     } finally {
       cleanupSplit(f);

@@ -1,15 +1,17 @@
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, createReadStream } from "node:fs";
+import {
+  mkdtempSync, rmSync, rmdirSync, readFileSync, writeFileSync, existsSync, createReadStream,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { HUB_JSON, bundleDir, bundleFileName, type HubBundleRecord, type HubJson } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import {
   resolveProjectIdentity, createHubProject, linkToHubProject, scanGitRemotes,
-  readLocalProjectId, type GitRemoteScan, type LocalProjectId,
+  readLocalProjectId, localProjectIdPath, type GitRemoteScan, type LocalProjectId,
 } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
@@ -100,6 +102,110 @@ function listTopLevelIgnored(projectPath: string): string[] {
   }
 }
 
+/**
+ * What `commitIdentity` actually did, kept so a LATER failure knows how much of
+ * it is this push's to undo.
+ *
+ * Linking is the hub's consent gate (see `commitIdentity`), so deferring the
+ * write past the export only covers failures up to that point: a bundle upload
+ * that throws, an index write that throws, a workspace file that turns out to
+ * be unreadable — every one of those used to surface as a bare Error with the
+ * project silently left linked and the default-on SessionEnd auto-push armed
+ * for a push the user just watched fail (measured twice: an `ENOTDIR` at the
+ * bundle destination, and an `EACCES` inside the workspace snapshot).
+ */
+interface CommittedLink {
+  local: LocalProjectId;
+  /** Already linked when this push started — someone else's link, not ours to undo. */
+  preExisting: boolean;
+  /** `--create-project` minted a NEW hub project, which nothing can remove. */
+  mintedHubProject: boolean;
+}
+
+/**
+ * Undo the LOCAL half of a link this push made.
+ *
+ * Only the local half: there is no `backend.delete` call anywhere in src/, so a
+ * hub project a failed push created stays on the hub and in every machine's
+ * `linkCandidates` (recorded as out of scope — hub-side deletion needs
+ * ownership semantics this slice doesn't have). That asymmetry is why the
+ * caller REPORTS what is left rather than claiming a clean rollback.
+ *
+ * Re-reads before removing: the file is only ours to delete while it still
+ * names the project id this push wrote. Anything else means something changed
+ * it underneath us, and a link the user (or a concurrent operation) put there
+ * is not collateral for our failure.
+ */
+function rollbackLocalLink(
+  projectPath: string,
+  link: CommittedLink
+): { removed: boolean; detail: string } {
+  try {
+    const still = readLocalProjectId(projectPath);
+    if (!still) return { removed: true, detail: "" };
+    if (still.projectId !== link.local.projectId) {
+      return { removed: false, detail: "it now names a different hub project" };
+    }
+    const p = localProjectIdPath(projectPath);
+    rmSync(p, { force: true });
+    // The directory too, but only while it holds nothing else: `hubignore`,
+    // `hubinclude` and a project-scope config.json are the user's files and
+    // predate this push. rmdir on a non-empty directory simply fails.
+    try { rmdirSync(dirname(p)); } catch { /* not empty, or already gone */ }
+    return { removed: true, detail: "" };
+  } catch (e) {
+    return { removed: false, detail: (e as Error).message };
+  }
+}
+
+/**
+ * The result for a push that threw AFTER the identity was committed.
+ *
+ * Typed rather than thrown, like every other refusal in this file, because the
+ * one thing the user has to be told is not in the exception: whether this
+ * project is linked now. A link means the SessionEnd auto-push will run
+ * unattended, and for a git-less project that push uploads the whole working
+ * tree.
+ */
+function failedAfterLink(
+  projectPath: string,
+  link: CommittedLink,
+  bundleCommitted: boolean,
+  error: unknown
+): ErrorResult {
+  const cause = error instanceof Error ? error.message : String(error);
+  // The bundle is atomic (`writeStreamAtomic`), so it is either on the hub or
+  // it never existed — but the index that makes it findable is written after
+  // it, and a failure in between leaves a real bundle no machine can see.
+  const orphanBundle = bundleCommitted
+    ? " The bundle itself did reach the hub before the failure, but this machine's index was not updated to reference it, so no other machine can see it."
+    : "";
+  if (link.preExisting) {
+    return {
+      success: false, command: "push",
+      error: `The push failed: ${cause}`,
+      details:
+        `This project was already linked to hub project ${link.local.projectId} before this push, ` +
+        `so it stays linked and nothing about the link changed.${orphanBundle}`,
+      suggestion: "Fix the cause above and push again — the project stays linked either way.",
+    };
+  }
+  const rollback = rollbackLocalLink(projectPath, link);
+  return {
+    success: false, command: "push",
+    error: `The push failed after this project was linked to the hub: ${cause}`,
+    details: rollback.removed
+      ? `The link this push created was removed, so this project is NOT linked to the hub ` +
+        `and the SessionEnd auto-push stays off for it.${orphanBundle}`
+      : `The link this push created could NOT be removed (${rollback.detail}), so this project IS ` +
+        `linked to hub project ${link.local.projectId} and the SessionEnd auto-push is armed for it — ` +
+        `delete .claude-sesh-mover/project.json to unlink it.${orphanBundle}`,
+    suggestion: link.mintedHubProject
+      ? `Hub project ${link.local.projectId} was created before the failure and nothing removes a hub project, so pass --project-id ${link.local.projectId} on a later push to link to that one instead of minting a second.`
+      : "Fix the cause above and push again; the project links again once a push gets past this point.",
+  };
+}
+
 export async function hubPush(
   opts: HubPushOptions
 ): Promise<HubPushResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult> {
@@ -125,6 +231,12 @@ export async function hubPush(
   // Staging is created inside the protecting try so a mkdtemp failure still
   // releases the lock in the finally (review fix: post-acquire throw window).
   let staging: string | null = null;
+  // Declared out here so the catch below can see them: `committedLink` stays
+  // null until `commitIdentity()` returns, which is exactly the line that
+  // divides "a throw leaves nothing behind" from "a throw leaves this project
+  // linked". `bundleCommitted` narrows what the resulting message may claim.
+  let committedLink: CommittedLink | null = null;
+  let bundleCommitted = false;
   try {
     staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
     const backend = createFsBackend(opts.hubPath);
@@ -235,8 +347,14 @@ export async function hubPush(
     const manifest = readManifest(bundleStaging);
     // The export produced something (even if it is "nothing new"), so this push
     // has earned the link. Everything above this line leaves an unlinked
-    // project unlinked.
+    // project unlinked; everything BELOW it is covered by the catch at the
+    // bottom of this try, which rolls the local link back (see `CommittedLink`).
     const local = await commitIdentity();
+    committedLink = {
+      local,
+      preExisting: pendingIdentity.kind === "linked",
+      mintedHubProject: pendingIdentity.kind === "create",
+    };
     // ...which means the exporter ran BEFORE the link existed, and it reads the
     // project id off disk (`readLocalProjectId` in exporter.ts). On a
     // `--create-project` push the staged manifest therefore carries no
@@ -406,6 +524,7 @@ export async function hubPush(
     try {
       await pipeline(createReadStream(archiveTmp), w.stream);
       await w.commit();
+      bundleCommitted = true;
     } catch (e) {
       await w.abort();
       throw e;
@@ -484,6 +603,12 @@ export async function hubPush(
       ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
       ...(carryMeta ? { carry: carryMeta } : {}),
     };
+  } catch (e) {
+    // A throw before the identity was committed leaves nothing behind, so it
+    // keeps its existing behavior exactly: rethrow, and cli.ts turns it into an
+    // ErrorResult. Past that line the link exists and the failure has to say so.
+    if (!committedLink) throw e;
+    return failedAfterLink(opts.projectPath, committedLink, bundleCommitted, e);
   } finally {
     if (staging) rmSync(staging, { recursive: true, force: true });
     lock.release();
