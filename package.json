@@ -39,13 +39,13 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^26.1.1",
+    "@types/node": "^26.1.2",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
   "dependencies": {
     "commander": "^15.0.0",
-    "tar": "^7.0.0"
+    "tar": "^7.5.22"
   },
   "engines": {
     "node": ">=22.12.0"
