@@ -27,22 +27,44 @@ import { join } from "node:path";
  * construction, and any error names the path that actually failed, so a future
  * failure is diagnostic rather than mysterious.
  *
- * Deliberately NOT silent about anything: no skipping of vanished entries. If
- * a source tree ever really is mutating under a fixture, that should surface as
- * a loud ENOENT on the SOURCE path, not as a corrupt copy.
+ * Deliberately NOT silent by default: a vanished entry is a loud ENOENT on the
+ * SOURCE path, not a corrupt copy. A static fixture that mutates under a walk
+ * is a bug worth failing on.
+ *
+ * `live: true` opts out of that, and exists for exactly one shape: copying a
+ * real git repository. Git writes transient state into `.git` on its own
+ * schedule — lock files, temp objects, a gc's scratch — so an entry really can
+ * disappear between the `readdirSync` that listed it and the `copyFileSync`
+ * that reads it, with nothing in the test at fault. That is what failed the
+ * macOS CI leg here, and it is not the same event as a fixture mutating: the
+ * files that vanish are ones git itself was about to remove. Swallowing ENOENT
+ * for a STATIC tree would hide a real defect, which is why this is a parameter
+ * and not a softened default.
  *
  * Modes ride along (`copyFileSync` propagates the source's), which the git
  * object store depends on, and symlinks are recreated rather than followed.
  */
-export function copyTreeSync(src: string, dest: string): void {
+export function copyTreeSync(src: string, dest: string, opts: { live?: boolean } = {}): void {
   mkdirSync(dest, { recursive: true });
-  for (const entry of readdirSync(src, { withFileTypes: true })) {
+  let entries;
+  try {
+    entries = readdirSync(src, { withFileTypes: true });
+  } catch (e) {
+    if (opts.live && (e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  for (const entry of entries) {
     const from = join(src, entry.name);
     const to = join(dest, entry.name);
-    if (entry.isSymbolicLink()) symlinkSync(readlinkSync(from), to);
-    else if (entry.isDirectory()) copyTreeSync(from, to);
-    else if (entry.isFile()) copyFileSync(from, to);
-    // Anything else (socket, fifo, device) has no place in a fixture tree and
-    // is skipped rather than blocking a test on an open().
+    try {
+      if (entry.isSymbolicLink()) symlinkSync(readlinkSync(from), to);
+      else if (entry.isDirectory()) copyTreeSync(from, to, opts);
+      else if (entry.isFile()) copyFileSync(from, to);
+      // Anything else (socket, fifo, device) has no place in a fixture tree and
+      // is skipped rather than blocking a test on an open().
+    } catch (e) {
+      if (opts.live && (e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw e;
+    }
   }
 }

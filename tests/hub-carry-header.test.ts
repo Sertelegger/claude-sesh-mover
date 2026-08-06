@@ -748,7 +748,11 @@ describe("carry patch header scan — differential against real `git apply`", ()
       for (const s of sample) {
         const twin = mkdtempSync(join(tmpdir(), "sesh-hdrtwin-"));
         try {
-          copyTreeSync(seed, twin); // see copy-tree.ts: cpSync flaked on a git repo under macOS CI
+          // `live` for the same reason as hub-carry's cleanTwin: the seed is a
+          // real repository and git drops its own transient `.git` state
+          // whenever it likes. This loop copies it once per sample, so it has
+          // the most exposure of any caller.
+          copyTreeSync(seed, twin, { live: true });
           const patchFile = slot.file;
           writeFileSync(patchFile, s.patch, "latin1");
           // The cheap oracle first…
