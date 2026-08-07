@@ -102,3 +102,15 @@ Vitest with fixtures under `tests/fixtures/`. Integration tests (`tests/integrat
 2. Add the matching result shape to `src/types.ts` (every CLI result is typed).
 3. Update `commands/<name>.md` and (if the behavior needs explanation for the skill layer) `skills/session-porter/SKILL.md`. If the command is new (not just a new option on an existing one), add its `./commands/<name>.md` path to `.claude-plugin/plugin.json`'s `commands` array too — Claude Code only loads slash commands listed there, so a new doc file with no matching entry silently never appears as a slash command.
 4. Rebuild with `npm run build` **and stage the updated `dist/`** — it's committed so installed plugins pick up the change. A commit that touches `src/` without a corresponding `dist/` update will ship a stale binary.
+
+## graphify (optional, local-only — never a dependency)
+
+graphify is a personal exploration tool, not part of this project. Nothing builds, tests, lints, installs, or ships with it, and no code path references it. `graphify-out/` is gitignored, so **a fresh clone never has a graph and this entire section is inert.**
+
+**If `graphify-out/graph.json` does not exist, ignore everything below.** Do not install graphify, do not build a graph, and do not mention its absence — a machine without it is the normal, supported state.
+
+If it does exist (someone ran `/graphify` locally):
+
+- `graphify query "<question>"` / `graphify explain "<concept>"` / `graphify path "<A>" "<B>"` return a scoped subgraph — usually cheaper than reading whole files for an orientation question. `graphify-out/GRAPH_REPORT.md` carries the community and god-node summary for broad architecture review.
+- `graphify update .` after code changes keeps it current (AST-only, no API cost).
+- **Treat it as a map, not as ground truth.** The structural half is real (AST call/import edges), but the semantic half is extracted from this file, `commands/*.md`, and `skills/session-porter/SKILL.md` — so it faithfully reports what the docs *claim* an invariant is, including when the code no longer implements it. That gap is exactly where this project's defects have historically lived (see the append guards, the merge-ancestor rule, and the divergence-abort `break`, none of which prose could verify). Confirm against `src/` before acting on anything the graph asserts about behavior.

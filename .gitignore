@@ -1,6 +1,16 @@
 node_modules/
 *.tsbuildinfo
-.claude-sesh-mover/
+# Exports land in <cwd>/.claude-sesh-mover/<name>/, so the directory is
+# ignored — but hubinclude and project.json are meant to be COMMITTED (see
+# README): hubinclude only does its job if it means the same thing on every
+# clone, and project.json is what links a clone to its hub project. Ignoring
+# the whole directory silently defeats both.
+.claude-sesh-mover/*
+!.claude-sesh-mover/hubinclude
+!.claude-sesh-mover/hubignore
+!.claude-sesh-mover/project.json
 .envrc
 docs/
 .worktrees/
+graphify-out/
+.claude/settings.local.json
