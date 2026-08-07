@@ -213,11 +213,17 @@ describe("archiver", () => {
       const bent = join(tempDir, "bent.tar.gz");
       await createArchive(src, bent, "gzip");
       flipMiddleByte(bent);
-      // The CRC32 in the gzip member — this is the guarantee the zstd path has
-      // to match, and the reason a checksum-less .tar.zst is genuinely weaker.
+      // Backstopped by the CRC32 in the gzip member — this is the guarantee the
+      // zstd path has to match, and the reason a checksum-less .tar.zst is
+      // genuinely weaker. Asserted as "throws", not on a specific zlib message:
+      // tar entries carry the fixture's own mtimes, so the compressed bytes
+      // differ run to run and so does which deflate invariant the flipped byte
+      // happens to break first. The property under test is that damage is never
+      // silent, and the CRC is what makes that true even when the stream
+      // decodes.
       await expect(
         extractArchive(bent, mkdtempSync(join(tempDir, "out-bent-")))
-      ).rejects.toThrow(/incorrect data check|unexpected end of file/i);
+      ).rejects.toThrow();
     });
 
     it("zstd: an archive we create declares a content checksum, and both damage shapes throw", async () => {
@@ -274,6 +280,16 @@ describe("archiver", () => {
       // A zstd whose build/version default leaves the checksum out. Shimmed
       // rather than waited for: the archive would decompress fine and corrupt
       // silently, which is precisely what must never ship as a bundle.
+      //
+      // POSIX only, and not because the production code is: `execFileSync`
+      // goes through CreateProcess on Windows, which cannot run an
+      // extension-less `#!/bin/sh` file at all. PATHEXT resolution therefore
+      // walks straight past the shim directory to the runner's REAL zstd.exe —
+      // which is exactly why the shim block above passes on Windows CI, and
+      // exactly what would make this test assert the opposite of its name
+      // there. `zstdFrameHasContentChecksum`, the part that is genuinely
+      // platform-dependent, is covered on every OS by the test above.
+      if (process.platform === "win32") return;
       const { createArchive, ZstdNoContentChecksumError } = await import("../src/archiver.js");
       const binDir = join(tempDir, "nocheck-bin");
       mkdirSyncFs(binDir, { recursive: true });
