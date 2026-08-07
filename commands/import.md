@@ -51,14 +51,16 @@ You are running the sesh-mover import command. Follow these steps:
    node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>"
    ```
 
-10. Report the result.
-    - If `resumable` is true: tell the user they can continue the session with `claude --resume <newSessionId>`.
+10. Report the result. Read what actually landed **before** offering anything to resume — `resumable` says the importer was allowed to register sessions, not that this run created any.
+    - Import is idempotent by default, so check `skippedSessions` first. If it shows all requested sessions skipped (reason `duplicate` = identical content already imported into this project; reason `already-received` = already synced from this peer) and `importedSessions` is `[]`, tell the user nothing new was imported and why, and offer **no** resume command — a fully-skipped import still reports `resumable: true`, and there is no new session id to resume. If the user actually intended a re-import, re-run the step 9 invocation with `--allow-duplicates` appended.
+    - Otherwise, if `importedSessions` is non-empty and `resumable` is true: tell the user they can continue with `claude --resume <newId>`, using the `newId` of an entry in `importedSessions` — the importer assigns a fresh id, so never quote `originalId` or an id from the bundle.
     - If not resumable because of a version-mismatch or "session validation failed" error: offer to retry the step 9 invocation with `--no-register` appended. That imports the session content but skips the registry entry — the user won't get a `claude --resume` slot, but the JSONL is on disk. Note: after a `--no-register` import, a later normal import of the same bundle automatically imports a registered copy — the older unregistered copy remains on disk and can be deleted manually. `--allow-duplicates` is no longer needed for this case.
     - If the `--no-register` retry also fails, or if the user prefers: offer to read the imported JSONL and inject it as context into the current conversation.
-    - Import is idempotent by default: check `skippedSessions` in the result. If it shows all requested sessions skipped (reason `duplicate` = identical content already imported into this project; reason `already-received` = already synced from this peer) and `importedSessions` is empty, tell the user nothing new was imported and why. If the user actually intended a re-import, re-run the step 9 invocation with `--allow-duplicates` appended.
-    - If `manifest.incremental === true`, also include in the report:
-      - Source machine: `<manifest.sourceMachineName>` (`<manifest.sourceMachineId>`)
-      - Imported: N full sessions, M continuation sessions (for each continuation session, note "continues `<slug>`")
-      - Duplicates skipped: K (count `result.warnings` entries containing "already received")
+    - Always relay `warnings` verbatim — that is where version adaptations, integrity problems and the idempotent-skip notice surface.
+
+    **Incremental bundles.** The import result carries no manifest, so incremental detail has to come from the bundle itself — and only when the user picked an export **directory**: for a `.tar.gz`/`.tar.zst` the CLI extracts to a private temp dir and deletes it before returning, so nothing is left to read. When `--from` was a directory and `<path>/manifest.json` has `incremental: true`, read it and add to the report:
+    - Source machine: `<sourceMachineName>` (`<sourceMachineId>`)
+    - What arrived, split by kind: for each entry in `importedSessions`, find the manifest session whose `sessionId` equals that entry's `originalId` and read its `type` (`"full"` or `"continuation"`). For a continuation, its manifest `slug` is the slug of the session it continues on the source machine — report it as "continues `<slug>`".
+    - Duplicates skipped: `skippedSessions.filter(s => s.reason === "already-received").length`. Count the typed field, never warning text: the CLI pushes ONE aggregated warning no matter how many sessions were skipped, so matching on its wording reports at most 1.
 
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional/retry branches, e.g. `--no-register` for the version-mismatch fallback, `--allow-duplicates` for the duplicate-skip retry) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

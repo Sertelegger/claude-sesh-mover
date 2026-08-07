@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendFileSync, rmSync, statSync, } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, isSafeSessionId, } from "./manifest.js";
+import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, } from "./manifest.js";
 import { rewriteJsonlStream, buildImportRewriteContext } from "./rewriter.js";
 import { encodeProjectPath } from "./platform.js";
 import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
@@ -9,6 +9,19 @@ import { readSyncState, writeSyncState } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
 import { readLocalProjectId, writeLocalProjectId } from "./hub/identity.js";
+/**
+ * The three auxiliary layer directories a bundle carries for one session, in
+ * the layout the exporter writes them. Single source of truth shared by the
+ * digest verification in step 3 and the copies in step 4, so a layer can never
+ * be verified under one path and copied from another.
+ */
+function layerDirsFor(exportPath, bundleSessionId) {
+    return [
+        ["subagents", join(exportPath, "sessions", bundleSessionId, "subagents")],
+        ["tool-results", join(exportPath, "sessions", bundleSessionId, "tool-results")],
+        ["file-history", join(exportPath, "file-history", bundleSessionId)],
+    ];
+}
 export async function importSession(options) {
     const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, onProgress, } = options;
     const warnings = [];
@@ -24,6 +37,21 @@ export async function importSession(options) {
             error: `Failed to read manifest: ${e.message}`,
         };
     }
+    // Step 1a: the manifest must be the one the exporter wrote. This runs before
+    // ANY other decision — the dedup filters, the per-session hash checks and the
+    // rewrite context are all derived from the session list, so a damaged list is
+    // not something to notice halfway through. `verifySessionsDigest` returns null
+    // for a pre-0.6.0 bundle that declares no digest.
+    const digestProblem = verifySessionsDigest(manifest);
+    if (digestProblem) {
+        return {
+            success: false,
+            command: "import",
+            error: `Bundle integrity check failed: ${digestProblem}`,
+            details: "Nothing was read from the bundle beyond its manifest, and nothing was written. The manifest's session list is not the one the export produced — the bundle was damaged in transit or edited after it was written.",
+            suggestion: "Re-export or re-transfer the bundle. This check detects damage, not tampering: it cannot tell a corrupted bundle from one a sender rewrote deliberately.",
+        };
+    }
     // Filter sessions if specific IDs requested
     let targetSessions = sessionIds
         ? manifest.sessions.filter((s) => sessionIds.includes(s.sessionId))
@@ -33,6 +61,38 @@ export async function importSession(options) {
             success: false,
             command: "import",
             error: "No matching sessions found in export",
+        };
+    }
+    // Step 1b: a session the manifest declares but the bundle does not contain is
+    // an INTEGRITY FAILURE, not a skip.
+    //
+    // This gate used to be `existsSync(jsonlPath)` wrapped around the hash check
+    // in step 3, so a missing file was simply never checked: the session was
+    // counted in `importedSessions`, no file was written for it, and the result
+    // was `success: true, imported: 1, warnings: []`. That is the exact signature
+    // of a truncated transfer or a partial unpack, reported as a completed import
+    // — the worst failure mode available, because every consumer downstream
+    // (cli.ts's output, migrator.ts's `movedIds` cleanup set, hub/pull.ts's
+    // `importedSessions`/`lastImportedNewId`/`appliedNothing`) reads that array as
+    // "these sessions are now on disk". On a `migrate` it is destructive: the
+    // source session is deleted because the import claimed to have moved it.
+    //
+    // Hard failure with the same treatment a post-rewrite parse failure already
+    // gets, and for the same reason — the alternative is reporting a partial
+    // import as a complete one. It sits before the dedup filters and before any
+    // write, so there is nothing to roll back: a refused bundle leaves the target
+    // config dir byte-identical.
+    const absentFromBundle = targetSessions.filter((session) => !existsSync(join(exportPath, "sessions", `${session.sessionId}.jsonl`)));
+    if (absentFromBundle.length > 0) {
+        const named = absentFromBundle
+            .map((s) => `"${s.slug}" (${s.sessionId})`)
+            .join(", ");
+        return {
+            success: false,
+            command: "import",
+            error: `Bundle integrity check failed: ${absentFromBundle.length} session(s) declared by manifest.json have no session file in the bundle: ${named}`,
+            details: "Nothing was written and no indexes were modified. A manifest that declares a session the bundle does not contain means the transfer was truncated or the archive was only partially unpacked.",
+            suggestion: "Re-transfer or re-extract the bundle and import again. To import only the sessions that ARE present, pass --session-id with their ids.",
         };
     }
     // Compute the target project dir up front — the dedup filters below need
@@ -120,6 +180,8 @@ export async function importSession(options) {
     const ctx = buildImportRewriteContext(manifest, targetProjectPath, targetConfigDir);
     // Step 3: Verify per-session integrity (before any rewriting)
     const integrityFailedSessions = new Set();
+    /** `<sessionId>\0<layer>` for every layer directory that failed its digest. */
+    const failedLayers = new Set();
     for (const [sessionIndex, session] of targetSessions.entries()) {
         onProgress?.({
             phase: "import-verify",
@@ -128,11 +190,34 @@ export async function importSession(options) {
             sessionCount: targetSessions.length,
         });
         const jsonlPath = join(exportPath, "sessions", `${session.sessionId}.jsonl`);
-        if (existsSync(jsonlPath)) {
-            const actualHash = await computeIntegrityHashFromFile(jsonlPath);
-            if (actualHash !== session.integrityHash) {
-                integrityFailedSessions.add(session.sessionId);
-                warnings.push(`integrity check failed for session "${session.slug}" (${session.sessionId}): JSONL content doesn't match manifest hash. Data may be corrupted.`);
+        // No existsSync guard: step 1b already refused the bundle outright if any
+        // declared session file were missing. Presence is a precondition here, not
+        // a condition — that conflation is what let a bundle with no session data
+        // report a successful import.
+        const actualHash = await computeIntegrityHashFromFile(jsonlPath);
+        if (actualHash !== session.integrityHash) {
+            integrityFailedSessions.add(session.sessionId);
+            warnings.push(`integrity check failed for session "${session.slug}" (${session.sessionId}): JSONL content doesn't match manifest hash. Data may be corrupted.`);
+        }
+        // Auxiliary layers. Until 0.6.0 nothing hashed these at all, so a corrupted
+        // file-history backup arrived silently and was later restored over the
+        // user's own file by Claude Code. A layer whose digest doesn't match is NOT
+        // copied: the transcript is the primary artifact and still imports, while a
+        // backup that cannot be shown to be the backup that was taken has no
+        // business being written where something may restore it. Bundles that
+        // declare no digests (pre-0.6.0) are copied unchecked, exactly as before.
+        for (const [layer, dir] of layerDirsFor(exportPath, session.sessionId)) {
+            const declared = session.layerDigests?.[layer];
+            if (!declared)
+                continue;
+            const actual = await computeLayerDigest(dir);
+            if (actual === null) {
+                warnings.push(`bundle declares a "${layer}" layer for session "${session.slug}" (${session.sessionId}) but does not contain it — those files are missing from this import.`);
+                continue;
+            }
+            if (actual !== declared) {
+                failedLayers.add(`${session.sessionId}\0${layer}`);
+                warnings.push(`integrity check failed for the "${layer}" files of session "${session.slug}" (${session.sessionId}): they don't match the manifest digest, so they were NOT copied. The transcript itself imported normally.`);
             }
         }
     }
@@ -190,9 +275,11 @@ export async function importSession(options) {
     try {
         for (const [sessionIndex, session] of targetSessions.entries()) {
             const newSessionId = sessionIdMap.get(session.sessionId);
+            /** Verified in step 3; a mismatch means the files are not written at all. */
+            const layerOk = (layer) => !failedLayers.has(`${session.sessionId}\0${layer}`);
             // Rewrite and write JSONL
             const jsonlPath = join(exportPath, "sessions", `${session.sessionId}.jsonl`);
-            if (existsSync(jsonlPath)) {
+            {
                 const bytesTotal = statSync(jsonlPath).size;
                 const throttled = onProgress
                     ? percentThrottle(bytesTotal, (percent, bytesProcessed) => onProgress({
@@ -231,7 +318,7 @@ export async function importSession(options) {
             }
             // Copy subagents
             const subagentsDir = join(exportPath, "sessions", session.sessionId, "subagents");
-            if (existsSync(subagentsDir)) {
+            if (existsSync(subagentsDir) && layerOk("subagents")) {
                 const targetSubDir = join(targetProjectDir, newSessionId, "subagents");
                 mkdirSync(targetSubDir, { recursive: true });
                 for (const file of readdirSync(subagentsDir)) {
@@ -246,7 +333,7 @@ export async function importSession(options) {
             }
             // Copy tool results
             const toolResultsDir = join(exportPath, "sessions", session.sessionId, "tool-results");
-            if (existsSync(toolResultsDir)) {
+            if (existsSync(toolResultsDir) && layerOk("tool-results")) {
                 const targetTrDir = join(targetProjectDir, newSessionId, "tool-results");
                 mkdirSync(targetTrDir, { recursive: true });
                 for (const file of readdirSync(toolResultsDir)) {
@@ -255,7 +342,7 @@ export async function importSession(options) {
             }
             // Copy file history
             const fileHistoryDir = join(exportPath, "file-history", session.sessionId);
-            if (existsSync(fileHistoryDir)) {
+            if (existsSync(fileHistoryDir) && layerOk("file-history")) {
                 const targetFhDir = join(targetConfigDir, "file-history", newSessionId);
                 mkdirSync(targetFhDir, { recursive: true });
                 for (const file of readdirSync(fileHistoryDir)) {

@@ -16,14 +16,23 @@ You are running the sesh-mover configure command. Follow these steps:
    - **Migrate defaults:** scope (current/all)
    - **Hub defaults:** hub path (set via `/sesh-mover:hub-init`), workspace snapshot on push (on/off), git-carry on push (on/off), and the two automation switches — auto-push at session end, freshness notice at session start. Call the last two out by name when showing hub settings: they are on by default and take effect as soon as a project is linked to a hub project, so a user who has linked one is already being auto-pushed.
 
+   `--show` reports the effective config only, which is the contents of `config.json` merged across scopes. `machine.name` is not in it (see the key list below); read it from `~/.claude-sesh-mover/machine-id.json` if the user asks what this machine is called.
+
 3. Ask the user which settings they want to change.
 
 4. For each change, apply it:
    ```bash
    node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" configure --scope <user|project> --set "<key>=<value>"
    ```
+   A `--set` writes **only that key** into the targeted scope's `config.json`; the file holds what that scope actually sets and nothing else, so a `--set hub.autoPush=false --scope project` leaves a file of exactly `{"hub":{"autoPush":false}}`. A key absent from a scope's file means that scope has no opinion on it — not that it wants the default. Don't hand-write a scope's config file with a full settings snapshot: at the project scope that pins every default over the user's settings.
 
-5. Confirm what was saved and at which scope level.
+   To clear a scope rather than change a key:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" configure --scope <user|project> --reset
+   ```
+   `--reset` empties the targeted scope's file. It does **not** write defaults, and it does not touch the other scope — so clearing the project scope hands this project back to the user-scope settings, which are then what applies. Offer it when a user wants a project to stop overriding their global setup.
+
+5. Confirm what was saved, and be precise about what you are reading. In the result, `message` names the one key that was written (e.g. `Set hub.autoPush = false`) and `scope` merely echoes the `--scope` you passed. `config` is the **effective** config after the write — user scope merged with project scope — not the contents of the scope you targeted. So a project-scope `--set` will show values the project never set (they came from the user scope, or from the defaults). Report the key and scope from `message`, and describe `config` as "what applies in this project now", never as "your project settings".
 
 Configurable keys:
 - `export.storage` — "user" or "project"
@@ -34,11 +43,12 @@ Configurable keys:
 - `import.dryRunFirst` — true or false
 - `migrate.scope` — "current" or "all"
 - `hub.path` — absolute path to the hub directory ("" = not configured; normally set via `/sesh-mover:hub-init` rather than by hand)
-- `hub.noWorkspace` — true or false (when true, `push` skips the workspace snapshot for non-git projects by default)
+- `hub.noWorkspace` — true or false (when true, `push` skips the workspace snapshot by default). The snapshot is taken for a project with **no git remote** — which is not the same as "not a git project": a git repository with no remote configured takes this path too, since there is no remote to reconstruct its working tree from. It copies the project tree without reading `.gitignore` (only `.git`, `.claude-sesh-mover`, the project-local `.claude` directory — which holds `settings.local.json`'s permission allowlists — and a few convenience excludes like `node_modules` are skipped), so this is the switch for a user who does not want project files leaving the machine at all. A project *with* a remote never takes this path — its uncommitted work travels via `hub.carryDiff` instead, and `hub.noWorkspace` does nothing for it.
 - `hub.autoPush` — true or false (default true: push this project to the hub automatically when a Claude Code session ends. Inert until a hub is configured **and** this project is linked to a hub project, so it does nothing for a user who never touches the hub. The automatic push carries the same payload a manual one does, so `hub.noWorkspace` and `hub.carryDiff` govern it too — the hook takes no flags, which makes config the only way to express either opt-out for it.)
 - `hub.startupNotice` — true or false (default true: at session start, announce that a newer copy of one of this project's threads exists on another machine. Same "hub + linked" precondition as `hub.autoPush`; the notice never appears when this machine already has the latest copy of everything.)
-- `hub.carryDiff` — true or false (default true: for a project **with** a git remote, `push` carries the uncommitted work — a `git diff HEAD` patch plus untracked, non-gitignored files — alongside the sessions. `false` is the same as always passing `--no-carry`, and it is the only opt-out that reaches the session-end auto-push. Worth naming explicitly when a user asks what leaves their machine: the patch describes every *tracked* file they changed, `.gitignore` notwithstanding.)
+- `hub.carryDiff` — true or false (default true: for a project **with** a git remote, `push` carries the uncommitted work — a `git diff HEAD` patch plus untracked, non-gitignored files — alongside the sessions. `false` is the same as always passing `--no-carry`, and it is the only way to opt out of the **carry** for the session-end auto-push, which takes no flags. It is not the only opt-out that reaches that push at all: `hub.noWorkspace` governs its workspace half the same way, and `hub.autoPush=false` stops the push entirely. Worth naming explicitly when a user asks what leaves their machine: the patch describes every *tracked* file they changed, `.gitignore` notwithstanding.)
 - `hub.pullAppend` — true or false (default true: `pull` splices a continuation onto the local session it continues instead of importing it as a separate session; false is the same as always passing `--no-append`)
 - `hub.onDivergence` — "fragment", "adopt-hub", or "skip" (default "fragment": what `pull` does when a thread was extended on both machines from the same point — keep both as separate sessions, make the hub's branch canonical and preserve the local branch as a new session, or apply nothing and decide later. Same as always passing `--on-divergence <mode>`. Note `/sesh-mover:pull` passes `skip` explicitly so it can ask, so this setting is about direct CLI use.)
+- `machine.name` — this machine's display name (any string; defaults to the OS hostname). It is what other machines see for this one in `/sesh-mover:whereis`, in pull reporting and in the session-start notice, and it names this machine as a peer in incremental export/import. Settable through the same `--set` as the keys above, but it is **not a config.json setting**: it is written to `~/.claude-sesh-mover/machine-id.json`, so `--scope` has no effect on it (it is always this machine's, whichever scope you pass) and it never appears in the `config` the result reports.
 
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional branches) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { once } from "node:events";
 import { finished } from "node:stream/promises";
-import { writeManifest } from "./manifest.js";
+import { writeManifest, computeLayerDigest } from "./manifest.js";
 import { discoverSessions } from "./discovery.js";
 import { detectPlatform } from "./platform.js";
 import { extractSummaryFromFile } from "./summary.js";
@@ -12,6 +12,30 @@ import { computeIncrementalPlan } from "./diff.js";
 import { readEntryUuids } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
 import { readLocalProjectId } from "./hub/identity.js";
+/**
+ * Digest every auxiliary layer directory this session actually landed in the
+ * bundle. Hashes the BUNDLE's copies, never the source tree: the manifest
+ * describes the bundle, so a copy that silently truncated (a full disk, a
+ * hostile filesystem) must produce a digest that no longer matches its own
+ * source — which is exactly what the importer will then catch.
+ *
+ * Returns `undefined` rather than an empty object when the session carries no
+ * layers, so the manifest keeps its pre-0.6.0 shape for a bundle with none.
+ */
+async function computeSessionLayerDigests(exportPath, manifestSessionId) {
+    const dirs = {
+        subagents: join(exportPath, "sessions", manifestSessionId, "subagents"),
+        "tool-results": join(exportPath, "sessions", manifestSessionId, "tool-results"),
+        "file-history": join(exportPath, "file-history", manifestSessionId),
+    };
+    const out = {};
+    for (const [layer, dir] of Object.entries(dirs)) {
+        const digest = await computeLayerDigest(dir);
+        if (digest !== null)
+            out[layer] = digest;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+}
 function copyDirIfExists(srcDir, destDir) {
     if (!existsSync(srcDir))
         return;
@@ -173,6 +197,7 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             entrypoint: session.entrypoint,
             integrityHash: sessionHash,
             type: incremental ? "full" : undefined,
+            layerDigests: await computeSessionLayerDigests(exportPath, session.sessionId),
         });
     }
     for (const [contIndex, item] of toContinuation.entries()) {
@@ -219,6 +244,10 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             entrypoint: item.session.entrypoint,
             integrityHash,
             type: "continuation",
+            // Keyed by the CONTINUATION's freshly minted id — that is the name the
+            // layer directories were copied under a few lines above, and the name
+            // the importer will look for in the bundle.
+            layerDigests: await computeSessionLayerDigests(exportPath, newSessionId),
             continuation: {
                 continuesLocalSessionId: item.session.sessionId,
                 continuesPeerSessionId: incremental?.peerSent[item.session.sessionId]?.sentAsSessionId,
@@ -258,6 +287,11 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         sessionScope: scope,
         includedLayers,
         sessions: sessionManifests,
+        // sessionsDigest is deliberately absent here: writeManifest stamps it over
+        // the finished list, so there is exactly one place that computes it and no
+        // way for a manifest to be written with a stale one. It is a hash of the
+        // per-session hashes and layer digests above, never a second pass over
+        // content — see computeSessionsDigest for its scope and its limits.
         sourceMachineId: incremental?.sourceMachineId,
         sourceMachineName: incremental?.sourceMachineName,
         projectId: readLocalProjectId(projectPath)?.projectId,

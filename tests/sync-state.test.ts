@@ -473,4 +473,16 @@ describe("sync-state v2 (hub)", () => {
     expect(reread.schemaVersion).toBe(2);
     expect(reread.hub?.threadByLocalSession["sess-1"]).toBe("thread-1");
   });
+
+  it("getThreadId survives a v2 hub block with no threadByLocalSession", async () => {
+    const { getThreadId } = await import("../src/sync-state.js");
+    // parseSyncState validates neither the `hub` block's shape nor its four
+    // sub-objects. Every sibling reader was already guarded; getThreadId was
+    // the straggler — and it runs on every push, every pull's index
+    // projection, reindex, and the unattended SessionEnd auto-push.
+    const half = { schemaVersion: 2, projectPath: "/p", peers: {}, lineage: {}, imported: {},
+      hub: { hubId: "h" } } as unknown as Parameters<typeof getThreadId>[0];
+    expect(() => getThreadId(half, "sess")).not.toThrow();
+    expect(getThreadId(half, "sess")).toBeNull();
+  });
 });

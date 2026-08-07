@@ -2,7 +2,7 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
-## [0.6.0] — 2026-08-04
+## [0.6.0] — 2026-08-06
 
 The Hub, Slice 2: the hub keeps itself current, and a pulled continuation lands *in* the
 session it continues instead of beside it.
@@ -44,6 +44,26 @@ Two items change behavior for existing hub users with no action on their part.
   the machine that pulls.
 
 ### Added
+- **Bundle-level integrity.** `manifest.json` now carries a `sessionsDigest` over its whole
+  declared session inventory and a `layerDigests` entry per session per auxiliary layer
+  (`subagents`, `tool-results`, `file-history`), on top of the per-session `integrityHash`
+  that already existed. The digest catches a manifest that is internally self-consistent
+  but *wrong* — a session record dropped from the list, or a hash edited to match content
+  that was altered — which no per-session hash can see, since it is only ever consulted for
+  a session the manifest still lists. A layer whose digest doesn't match is **not copied**
+  (a `file-history` entry is a backup Claude Code may later restore over your own file), and
+  the import says which session and which layer while the transcript itself imports
+  normally. All of it is damage detection, not attestation: nothing is signed and anyone who
+  can rewrite a bundle can recompute it — trusting the *sender* remains
+  [#37](https://github.com/Sertelegger/claude-sesh-mover/issues/37). Bundles written by
+  earlier versions declare no digests and are verified exactly as they were before.
+- **Archive framing is verified rather than assumed.** A `.tar.zst` whose frame carries no
+  content checksum can hide a flipped byte (measured: `zstd -d` exits 0 and writes different
+  bytes), where the `.tar.gz` path's CRC32 catches the same damage loudly. `export` now
+  checks the frame it produced and falls back to gzip if the checksum is absent — reusing
+  the existing `actualFormat` signal — and an archive arriving from elsewhere without one
+  extracts with a warning rather than a refusal, since the manifest hashes cover its
+  contents anyway.
 - **Hub automation** (`hooks/hooks.json`, two internal CLI endpoints). `SessionEnd` →
   auto-push, run detached so it never delays session exit; `SessionStart` (on `startup`
   and `resume`) → a one-line notice when another machine holds newer work for this project,
@@ -118,6 +138,58 @@ Two items change behavior for existing hub users with no action on their part.
   `schemaVersion: 2`.
 
 ### Fixed
+- **A bundle missing its session data reported a successful import.** `import` gated its
+  integrity check on the session file *existing*, so a session the manifest declared but
+  the bundle did not contain was never checked at all: it was counted in
+  `importedSessions`, no file was written for it, and the result was
+  `success: true, imported: 1, warnings: []` — the exact signature of a truncated transfer
+  or a half-finished unpack, reported as a completed import. On `migrate` it was
+  destructive, because the source session is deleted on the strength of that list. It is
+  now a hard failure before anything is written, on `import`, on `migrate` and on `pull`;
+  `--session-id` still imports the sessions that *are* present. `pull` refuses such a
+  bundle by name, before the workspace merge, the carry, or a splice into a transcript you
+  already own.
+- **An interrupted pull could fork a thread in two.** `peers[…].received` is written inside
+  the bundle loop while the thread mapping is written after the whole chain, so a pull
+  interrupted between the two left this machine holding the content with no record of which
+  thread it belonged to. Every re-pull then answered "Already up to date" (or "Nothing to
+  pull: all threads are current") and returned without repairing it — and the next push
+  minted a **second thread** whose only bundle was a continuation with no base in its own
+  chain, with `whereis` showing two threads for one conversation. All three of those early
+  returns now restore the mapping from this machine's own receipt bookkeeping and say so.
+  ([#28](https://github.com/Sertelegger/claude-sesh-mover/issues/28))
+- **`whereis` could list the same machine twice.** `readAllIndexes` walked `index/`
+  *recursively* and took the machine id from the filename, so a Syncthing `.stversions/`
+  folder or a Dropbox "conflicted copy" directory — the expected environment for a hub on a
+  synced folder — produced two copies of one machine, silently feeding the "which machine
+  has my latest work" tiebreak. The scan is now confined to the immediate directory and
+  deduped by machine id, and a non-`.json` file is ignored instead of being reported as
+  "index file for machine README is unreadable". ([#28](https://github.com/Sertelegger/claude-sesh-mover/issues/28))
+- **One poisoned index record could take out a whole pull.** `readMachineIndex` validated
+  three ids but not a bundle's `file`, which becomes a hub path later — so a single bad
+  record threw a raw internal string out of `pull` and lost every other bundle in that
+  index. Bad records (unsafe `file`, `bundleId`, `sessionIdInBundle`, or thread key) are now
+  dropped individually with a warning, keeping the rest of the index.
+  ([#28](https://github.com/Sertelegger/claude-sesh-mover/issues/28))
+- **A stolen lock could be released by the machine it was stolen from.** `release()` deleted
+  the lock file unconditionally, so after another process stole a stale lock (>10 min), the
+  original holder's `release()` deleted *the thief's* lock and a third process could acquire
+  while it was mid-write — into your working tree, a real git repo, or a transcript splice,
+  with the unattended `SessionEnd` auto-push among the callers. Each acquisition now carries
+  an owner token and only deletes a lock still bearing it.
+  ([#28](https://github.com/Sertelegger/claude-sesh-mover/issues/28))
+- **An exact `lastActiveAt` tie in the index projection was broken by iteration order.**
+  `buildIndexFile` now falls back to the session id, a stable key — deliberately not
+  `newerThreadCopy`, whose `messageCount` tiebreak would prefer a stale base over a
+  continuation. ([#28](https://github.com/Sertelegger/claude-sesh-mover/issues/28))
+- **The project-local `.claude/` directory was uploaded by the default-on auto-push.** For a
+  project with no git remote, the workspace snapshot copied it whole —
+  `settings.local.json` (permission allowlists, which routinely name paths and hostnames),
+  project hooks and agents, and, if `CLAUDE_CONFIG_DIR` pointed inside the project, every
+  transcript a second time inside the *project* payload. `.claude` is now a built-in
+  workspace exclude. It is a default rather than a floor, so `hubinclude` names it back; in
+  a git project a committed `.claude/settings.json` still travels in the patch while an
+  untracked `settings.local.json` does not.
 - **A divergence you were asked about could be answered, and the answer silently
   dropped.** When a pull met a fork it could not resolve — `--on-divergence skip`, or an
   `adopt-hub` refused because the local transcript looked live — it left *that bundle*
@@ -130,6 +202,18 @@ Two items change behavior for existing hub users with no action on their part.
   of the chain is fetched, applied, saved or recorded (the warning says how many were left),
   so re-running with the answer applies it to the whole thread. Only reachable with two or
   more pending bundles, which is why the single-bundle round trip looked correct.
+- **…and that stop is now honest about what it already did.** A chain is walked in order,
+  so when the fork is not the *first* bundle, the ones before it have already been spliced
+  into your transcript and recorded — while the warning still said "skipped, nothing
+  changed" and `commands/pull.md` told the assistant that `resolution: "skip"` meant
+  nothing had happened yet. Three consequences, all fixed: the carried uncommitted work of
+  an **already-recorded** bundle was thrown away rather than deferred (the re-run never
+  offers that bundle again, so the only surviving copy was the archive on the hub, and the
+  warning claimed the opposite); both stop-warnings now name what the earlier bundles
+  landed and say the re-run resumes at the diverged bundle; and the fork report no longer
+  counts entries **this same pull** just delivered as your own local divergence
+  (`divergence.localEntriesSinceAnchor` was reporting 4 where 2 of the 4 had arrived from
+  the hub moments earlier).
 - **"The latest copy of this thread is already local" refused work that was still on the
   hub.** That answer is about *heads*, and the question is about *bundles* — and the
   default-on auto-push routinely separates the two: `/sesh-mover:pull` probes with
@@ -144,6 +228,25 @@ Two items change behavior for existing hub users with no action on their part.
   `.env` included. The identity write is now deferred until the export has produced a
   bundle, so any failure up to that point leaves the project unlinked. A push that fails
   in the exporter also reports `"command": "push"` rather than `"command": "export"`.
+  A failure *after* the link is committed — a bundle upload or an index write that throws
+  — now rolls the local link back (only when this push is the one that wrote it, and only
+  when the file still names the id it wrote) and returns a typed `success: false` instead
+  of a bare throw, saying in as many words whether the project is linked, whether a bundle
+  reached the hub with no index referencing it, and — because nothing can delete a hub
+  project — the id of any hub project the failed `--create-project` left behind.
+- **`migrate --dry-run` hid the most destructive part of its own plan.** The preview
+  hardcoded `directoryRenamed: false` and emitted no rename warning, so a dry run with
+  `--rename-dir` and one without were identical — and `commands/migrate.md` told the
+  assistant to include the flag "so the preview reflects the real plan". The preview now
+  answers the rename question through the same predicate the real run uses, in every case
+  it has (would rename / target already exists / source missing / paths identical), so the
+  two can no longer disagree. `MigrateResult` gains `dryRun: true` on previews, and
+  `cleanedUp` is likewise predictive there rather than hardcoded false.
+- **`migrate` swallowed the export's warnings**, which is where `--exclude` is disclosed —
+  and on a migrate an excluded layer is *destroyed*, not left behind: cleanup deletes the
+  whole source session directory and its file-history whatever the bundle carried. The
+  `"<layer> excluded by user request"` warnings now reach the caller on both the real and
+  the dry-run path.
 - **The plain-append liveness decline named the wrong writer, and its remedy was
   overstated in both directions.** The self-write exemption covers only the pull doing the
   asking, so sesh-mover's *own* earlier pull — whose import stamps the transcript — was

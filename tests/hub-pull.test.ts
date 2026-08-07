@@ -4,6 +4,7 @@ import {
   appendFileSync, utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { overrideHome, overridePath } from "./helpers/env.js";
 import { readTextLf } from "./helpers/eol.js";
@@ -22,10 +23,11 @@ import { loadOrCreateMachineId } from "../src/machine.js";
 import { idx, entry, bundle } from "./helpers/hub-fixtures.js";
 import { createArchive, extractArchive } from "../src/archiver.js";
 import { importSession } from "../src/importer.js";
-import { readSyncState, writeSyncState, getThreadId } from "../src/sync-state.js";
+import { computeIntegrityHashFromFile, computeSessionsDigest } from "../src/manifest.js";
+import { readSyncState, writeSyncState, getThreadId, syncStatePath } from "../src/sync-state.js";
 import { readLastEntryUuid } from "../src/jsonl.js";
 import { encodeProjectPath } from "../src/platform.js";
-import type { HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
+import type { ErrorResult, ExportManifest, HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 const FIXTURE_SESSION_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -1126,6 +1128,20 @@ const moreEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
   },
 ];
 
+/** Two further entries again, for a THIRD continuation on top of the second. */
+const evenMoreEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
+  {
+    uuid: "b-entry-8", parentUuid, timestamp: "2026-04-13T09:00:00Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "user",
+    message: { role: "user", content: "one last thing" },
+  },
+  {
+    uuid: "b-entry-9", parentUuid: "b-entry-8", timestamp: "2026-04-13T09:00:05Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "assistant",
+    message: { model: "claude-opus-4-6", id: "msg_cont3", content: [{ type: "text", text: "Finished." }] },
+  },
+];
+
 function appendEntries(path: string, entries: Array<Record<string, unknown>>): void {
   appendFileSync(path, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
 }
@@ -1164,8 +1180,21 @@ interface ContinuationArrangement {
    * Append more entries on machine B (chained onto B's current head) and push
    * them as a further continuation, leaving HOME back on machine A.
    */
-  pushMoreFromB(makeEntries: EntryMaker): Promise<void>;
+  pushMoreFromB(makeEntries: EntryMaker, push?: { noCarry?: boolean }): Promise<void>;
   cleanup(): void;
+}
+
+/** Options for `arrangeContinuation`. */
+interface ArrangeOptions {
+  /**
+   * Make B's project a git repository with a remote and one uncommitted file,
+   * so every push from B captures a git-diff carry payload (design §6.1). Off
+   * by default: a carry costs a `git diff` per push and every other test in
+   * this file is about sessions.
+   */
+  gitB?: boolean;
+  /** Push B's FIRST continuation with --no-carry, so a later one owns the payload. */
+  noCarryFirst?: boolean;
 }
 
 /**
@@ -1183,7 +1212,8 @@ interface ContinuationArrangement {
  * is what has to translate them onto A.
  */
 async function arrangeContinuation(
-  makeEntries: EntryMaker = plainEntries
+  makeEntries: EntryMaker = plainEntries,
+  arrangeOpts: ArrangeOptions = {}
 ): Promise<ContinuationArrangement> {
   const homeA = mkdtempSync(join(tmpdir(), "sesh-app-homeA-"));
   const homeB = mkdtempSync(join(tmpdir(), "sesh-app-homeB-"));
@@ -1227,21 +1257,38 @@ async function arrangeContinuation(
     const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${localB}.jsonl`);
 
     const bProjectPath = projectB;
-    const pushFromB = async (make: EntryMaker): Promise<void> => {
+    if (arrangeOpts.gitB) {
+      const { execFileSync } = await import("node:child_process");
+      const g = (args: string[]): void => {
+        execFileSync("git", args, { cwd: bProjectPath, stdio: "ignore" });
+      };
+      writeFileSync(join(bProjectPath, "tracked.txt"), "committed\n");
+      g(["init", "-q"]);
+      g(["config", "user.email", "t@example.com"]);
+      g(["config", "user.name", "Test"]);
+      g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+      g(["add", "tracked.txt"]);
+      g(["commit", "-q", "-m", "init"]);
+      // One untracked file and one modification: the payload the carry gate is
+      // about, and the thing a suppressed carry silently loses.
+      writeFileSync(join(bProjectPath, "wip.txt"), "work in progress on B\n");
+      writeFileSync(join(bProjectPath, "tracked.txt"), "committed, then edited\n");
+    }
+    const pushFromB = async (make: EntryMaker, push?: { noCarry?: boolean }): Promise<void> => {
       const anchor = readLastEntryUuid(bJsonl);
       if (!anchor) throw new Error("arrange: B's session has no head entry");
       appendEntries(bJsonl, make(anchor, localB, bProjectPath));
-      const push = await hubPush({
+      const pushed = await hubPush({
         configDir: configDirB, projectPath: bProjectPath, hubPath: hub,
-        noWorkspace: true, claudeVersion: "2.1.81",
+        noWorkspace: true, noCarry: push?.noCarry, claudeVersion: "2.1.81",
       });
-      if (!push.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(push)}`);
-      if (push.pushedSessions[0]?.type !== "continuation") {
+      if (!pushed.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(pushed)}`);
+      if (pushed.pushedSessions[0]?.type !== "continuation") {
         throw new Error("arrange: B pushed a full bundle, not a continuation");
       }
     };
 
-    await pushFromB(makeEntries);
+    await pushFromB(makeEntries, { noCarry: arrangeOpts.noCarryFirst });
 
     restore.restore();
     restore = overrideHome(homeA);
@@ -1253,11 +1300,11 @@ async function arrangeContinuation(
     return {
       hub, configDirA, projectA, projectDirA, projectB, configDirB, bSessionId: localB,
       projectId: pushA.projectId, baseSessionId: FIXTURE_SESSION_ID, basePath, cleanup,
-      async pushMoreFromB(make: EntryMaker): Promise<void> {
+      async pushMoreFromB(make: EntryMaker, push?: { noCarry?: boolean }): Promise<void> {
         restore.restore();
         restore = overrideHome(homeB);
         try {
-          await pushFromB(make);
+          await pushFromB(make, push);
         } finally {
           restore.restore();
           restore = overrideHome(homeA);
@@ -1304,6 +1351,87 @@ async function mutateContinuationBundle(
     const outPath = join(stage, "out.tar.gz");
     await createArchive(dir, outPath, "gzip");
     await backend.writeAtomic(record.file, readFileSync(outPath));
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Re-point one continuation bundle at a different anchor entry, repairing both
+ * halves of the bundle so it is indistinguishable from a genuine push: the
+ * manifest's `integrityHash` (the pull refuses to splice a delta whose content
+ * doesn't match it) and the index record's `fromEntryUuid`.
+ *
+ * WHY A FIXTURE HAS TO DO THIS. The shape under test is a chain whose bundles
+ * belong to DIFFERENT branches of one thread — bundle 0 continues the branch
+ * this machine holds, bundle 1 continues an older one — so bundle 0 splices and
+ * bundle 1 forks. It is the ordinary product of `--on-divergence fragment`,
+ * which is the DEFAULT: a machine pulling a diverged thread without the skill
+ * layer mints a second local session `setThreadId`-mapped to the same thread,
+ * and push.ts's index projection then emits two bundle records under one thread
+ * entry. Default-on auto-push makes it routine. Arranging that end to end takes
+ * five machine-role switches and four pushes, and every natural ordering of
+ * them puts the FORKING bundle first (push order is index order), which is the
+ * `i === 0` case that already works. Re-anchoring is the same state, minted
+ * directly, and it keeps the numbers the reviewer measured pinnable.
+ */
+async function reanchorBundleEntry(
+  hubPath: string,
+  projectId: string,
+  entryUuid: string,
+  newParentUuid: string
+): Promise<void> {
+  const backend = createFsBackend(hubPath);
+  const { indexes } = await readAllIndexes(backend, projectId);
+  const stage = mkdtempSync(join(tmpdir(), "sesh-app-reanchor-"));
+  try {
+    for (const index of indexes) {
+      for (const thread of Object.values(index.threads)) {
+        for (const record of thread.bundles) {
+          if (record.type !== "continuation") continue;
+          const dir = join(stage, record.bundleId);
+          mkdirSync(dir, { recursive: true });
+          const tarPath = join(stage, `${record.bundleId}.tar.gz`);
+          writeFileSync(tarPath, await backend.read(record.file));
+          await extractArchive(tarPath, dir);
+
+          const deltaPath = join(dir, "sessions", `${record.sessionIdInBundle}.jsonl`);
+          if (!existsSync(deltaPath)) continue;
+          const lines = readFileSync(deltaPath, "utf-8").split("\n").filter((l) => l !== "");
+          const at = lines.findIndex((l) => (JSON.parse(l) as { uuid?: string }).uuid === entryUuid);
+          if (at === -1) continue;
+
+          const obj = JSON.parse(lines[at]) as Record<string, unknown>;
+          obj.parentUuid = newParentUuid;
+          lines[at] = JSON.stringify(obj);
+          writeFileSync(deltaPath, lines.join("\n") + "\n", "utf-8");
+
+          const manifestPath = join(dir, "manifest.json");
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as ExportManifest;
+          const session = manifest.sessions.find((s) => s.sessionId === record.sessionIdInBundle);
+          if (!session) throw new Error("reanchor: bundle manifest lists no such session");
+          session.integrityHash = await computeIntegrityHashFromFile(deltaPath);
+          if (session.continuation) session.continuation.fromEntryUuid = newParentUuid;
+          // This helper mints a legitimate-looking fork by rewriting the session
+          // list, so it has to restamp the bundle-level digest too — otherwise
+          // every arrangement built on it is a DAMAGED bundle and the pull
+          // refuses it before the divergence logic under test is ever reached.
+          // Exactly the failure mode the digest exists to catch, which is why
+          // the fixture is the thing that changes here and not the check.
+          manifest.sessionsDigest = computeSessionsDigest(manifest.sessions);
+          writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+          const outPath = join(stage, `${record.bundleId}-out.tar.gz`);
+          await createArchive(dir, outPath, "gzip");
+          await backend.writeAtomic(record.file, readFileSync(outPath));
+
+          record.fromEntryUuid = newParentUuid;
+          await writeMachineIndex(backend, index);
+          return;
+        }
+      }
+    }
+    throw new Error(`reanchor: no continuation bundle on the hub carries entry ${entryUuid}`);
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
@@ -2424,6 +2552,221 @@ describe("hub pull — divergence resolution", () => {
       const w = p.warnings.join(" ");
       expect(w).toContain("--force-append was passed");
       expect(w).toContain("exit it now");
+    } finally {
+      a.cleanup();
+    }
+  });
+});
+
+/**
+ * THE NINTH FORECLOSURE — created by the fix for the eighth.
+ *
+ * `2e42022` made a divergence abort the whole THREAD (break the bundle loop)
+ * instead of skipping one bundle, and the reasoning was right: a chain is not a
+ * set of independent items, so "this pull applied and recorded NOTHING for this
+ * thread" is only keepable at thread granularity.
+ *
+ * But that promise is only DELIVERED when the break lands at `i === 0`. At
+ * `i > 0` it is an abort-from-here-onward wearing thread-abort wording, and
+ * every test in the suite aborted at `i === 0` — including the two-bundle
+ * refusal test above, whose fixture puts the FORKING bundle first. Reverting
+ * the `break` to a `continue` left the suite green, so the branch
+ * `/sesh-mover:pull` always runs (`--on-divergence skip`) was unpinned.
+ *
+ * Three defects lived in that gap, and these tests pin all three:
+ *   - a carry payload out of a bundle the abort had ALREADY recorded was
+ *     dropped permanently, while the warning said it had been left in its
+ *     bundle for next time;
+ *   - both abort warnings claimed nothing had changed, on a pull that had
+ *     spliced entries into a transcript and republished this machine's index;
+ *   - the fork report counted the pull's OWN just-delivered entries as the
+ *     user's local divergence.
+ */
+describe("hub pull — a divergence that stops the chain part-way", () => {
+  /**
+   * A THREE-bundle chain: bundle 0 SPLICES onto the local session, bundle 1
+   * FORKS from it, bundle 2 sits behind the fork. The two branches of one
+   * thread are minted by re-anchoring — see `reanchorBundleEntry` for why.
+   *
+   * The third bundle is not padding. With the fork on the LAST bundle, `break`
+   * and `continue` are indistinguishable (there is nothing after it either
+   * way), which is exactly how the eighth foreclosure's own regression test
+   * came to pass while the abort semantics were unpinned. Only a bundle AFTER
+   * the fork can tell "the thread stopped" from "this bundle was skipped".
+   *
+   * `carryOn` decides which bundle carries the uncommitted work — bundle 0 (a
+   * bundle this pull records, whose payload the re-run can never offer again)
+   * or bundle 1 (the diverged one, which really is deferred).
+   */
+  async function arrangeSpliceThenFork(
+    carryOn: 0 | 1 = 0
+  ): Promise<ContinuationArrangement> {
+    const a = await arrangeContinuation(plainEntries, {
+      gitB: true, noCarryFirst: carryOn !== 0,
+    });
+    try {
+      appendEntries(a.basePath, localEntries(FIXTURE_HEAD_UUID, a.baseSessionId, a.projectA));
+      await a.pushMoreFromB(moreEntries, { noCarry: carryOn !== 1 });
+      await a.pushMoreFromB(evenMoreEntries, { noCarry: true });
+      // Bundle 0 continues A's own local head, so it splices...
+      await reanchorBundleEntry(a.hub, a.projectId, "b-entry-4", "a-local-2");
+      // ...and bundle 1 continues the older shared anchor, so it forks.
+      await reanchorBundleEntry(a.hub, a.projectId, "b-entry-6", FIXTURE_HEAD_UUID);
+      ageOutOfLiveWindow(a.basePath);
+      return a;
+    } catch (e) {
+      a.cleanup();
+      throw e;
+    }
+  }
+
+  it("applies and records the bundles before the fork, and says so instead of 'nothing changed'", async () => {
+    const a = await arrangeSpliceThenFork();
+    try {
+      const filesBefore = jsonlFiles(a.projectDirA);
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+
+      // Bundle 0 landed in the user's own transcript and IS recorded.
+      expect(p.appended).toEqual([
+        { threadId: p.threadId, baseSessionId: a.baseSessionId, entriesAppended: 2 },
+      ]);
+      expect(uuidsOf(a.basePath)).toEqual([
+        "entry-1", "entry-2", FIXTURE_HEAD_UUID, "a-local-1", "a-local-2", "b-entry-4", "b-entry-5",
+      ]);
+      // Bundle 1 did not: no third transcript, nothing imported.
+      expect(jsonlFiles(a.projectDirA)).toEqual(filesBefore);
+      expect(p.importedSessions).toHaveLength(0);
+      expect(p.divergence?.resolution).toBe("skip");
+
+      // The sentence the skill layer repeats has to be true on both sides of
+      // the boundary. "skipped, nothing changed" was measurably false here.
+      const w = p.warnings.join(" ");
+      expect(w).not.toContain("skipped, nothing changed");
+      expect(w).toContain("the fork is still undecided");
+      expect(w).toContain("1 earlier bundle in this chain was already applied and recorded");
+      expect(w).toContain(`2 entries spliced into session ${a.baseSessionId}`);
+      expect(w).toContain("the re-run resumes at this bundle, not at the start of the chain");
+      // The thread stopped, not just this bundle: bundle 2 was never fetched.
+      expect(w).toContain("1 later bundle in this thread's chain was not fetched");
+
+      // And the fork report describes the USER's divergence, not this pull's
+      // own delivery: 4 entries follow the anchor, but 2 of them are the ones
+      // bundle 0 appended moments earlier.
+      expect(p.divergence?.adoptAvailable).toBe(true);
+      expect(p.divergence?.anchorUuid).toBe(FIXTURE_HEAD_UUID);
+      expect(p.divergence?.localEntriesSinceAnchor).toBe(2);
+      expect(w).toContain("with 2 entries the hub hasn't seen");
+
+      // The promise the abort exists to keep: the re-run still reaches the
+      // bundle that forked AND the one behind it. With a per-bundle skip both
+      // were consumed by the pull above — fragment-imported and recorded — and
+      // this second one answered "Already up to date with the source machine."
+      const rerun = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(rerun.success).toBe(true);
+      if (!rerun.success) return;
+      const r = rerun as HubPullResult;
+      expect(r.divergence?.resolution).toBe("fragment");
+      expect(r.importedSessions).toHaveLength(1);
+      expect(jsonlFiles(a.projectDirA)).toHaveLength(filesBefore.length + 1);
+      // ...and bundle 2 splices onto the fragment bundle 1 just created, so
+      // the whole deferred half really did arrive.
+      expect(r.appended).toHaveLength(1);
+      expect(uuidsOf(join(a.projectDirA, `${r.importedSessions[0].newId}.jsonl`)).slice(-4)).toEqual([
+        "b-entry-6", "b-entry-7", "b-entry-8", "b-entry-9",
+      ]);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("keeps the carry of a bundle it already recorded, and drops only the one it defers", async () => {
+    const a = await arrangeSpliceThenFork();
+    try {
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+      expect(p.divergence?.resolution).toBe("skip");
+
+      // Bundle 0's payload belongs to a bundle this pull RECORDED. Suppressing
+      // it dropped it permanently: `selectNeededBundles` never offers that
+      // bundle again, so the only surviving copy was the archive on the hub,
+      // reachable by hand-extracting a tarball.
+      expect(p.carryAvailable).toBeDefined();
+      expect(p.carryAvailable?.untrackedCount).toBeGreaterThan(0);
+      expect(p.carryApplied?.applied).toBe(false);
+      const saved = p.carryApplied?.applied === false ? p.carryApplied.savedTo : undefined;
+      expect(saved).toBeTruthy();
+      expect(readFileSync(join(saved!, "untracked", "wip.txt"), "utf-8")).toBe(
+        "work in progress on B\n"
+      );
+      // ...so the abort warning must not claim it was left behind for later.
+      expect(p.warnings.join(" ")).not.toContain("uncommitted work that bundle carried was left");
+
+      // The other half of the gate, demonstrated rather than asserted: the
+      // re-run resolves the fork and reports NO carry, because bundle 1 never
+      // carried one and bundle 0 is gone from `needed`. That is precisely why
+      // suppressing bundle 0's payload was a permanent loss and not a deferral.
+      const rerun = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(rerun.success).toBe(true);
+      if (!rerun.success) return;
+      expect((rerun as HubPullResult).carryAvailable).toBeUndefined();
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("still defers the carry of the bundle the fork stopped at, and says so", async () => {
+    // The control for the gate above: when the payload rides the DIVERGED
+    // bundle it really is deferred, so suppressing it is right and the warning
+    // that says it was left in its bundle is true.
+    const a = await arrangeSpliceThenFork(1);
+    try {
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const p = result as HubPullResult;
+      expect(p.divergence?.resolution).toBe("skip");
+      expect(p.appended).toHaveLength(1);
+      expect(p.carryAvailable).toBeUndefined();
+      expect(p.carryApplied).toBeUndefined();
+      expect(p.warnings.join(" ")).toContain("uncommitted work that bundle carried was left in it");
+      expect(existsSync(join(a.projectA, ".claude-sesh-mover"))).toBe(true);
+      expect(
+        readdirSync(join(a.projectA, ".claude-sesh-mover")).some((n) => n.startsWith("carry-"))
+      ).toBe(false);
+
+      // Deferred, not dropped: the re-run delivers it.
+      const rerun = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "fragment", claudeVersion: "2.1.81",
+      });
+      expect(rerun.success).toBe(true);
+      if (!rerun.success) return;
+      const r = rerun as HubPullResult;
+      expect(r.carryAvailable).toBeDefined();
+      const saved = r.carryApplied?.applied === false ? r.carryApplied.savedTo : undefined;
+      expect(readFileSync(join(saved!, "untracked", "wip.txt"), "utf-8")).toBe(
+        "work in progress on B\n"
+      );
     } finally {
       a.cleanup();
     }
@@ -3708,9 +4051,14 @@ describe("hub pull: a thread split across two other machines", () => {
       expect(err).toContain("beta-desktop");
       expect(err).toContain("alpha-laptop"); // the machine it did resolve to
       expect(err).toContain("split across machines");
-      // No invented remedy: this branch offers no flag and no re-run.
+      // No invented remedy: this branch offers no flag.
       expect(`${err} ${sug}`).not.toMatch(/--[a-z]/);
-      expect(sug).toContain("nothing to re-run");
+      // ...and the claim it DOES make is the narrow one. "No flag pulls a
+      // thread whose bundles are split across machines" was over-broad the
+      // moment `alternateSource` landed — that is the sentence a model
+      // generalizes to the shape a plain pull now reaches.
+      expect(sug).toContain("cannot be assembled here yet");
+      expect(sug).not.toContain("nothing to re-run");
     } finally {
       cleanupSplit(f);
     }
@@ -3797,7 +4145,8 @@ describe("hub pull: a thread split across two other machines", () => {
       expect(err).toContain("not every thread is whole here");
       expect(err).toContain("beta-desktop");
       expect(err).toContain("split across machines");
-      expect(sug).toContain("nothing to re-run");
+      expect(sug).toContain("cannot be assembled here yet");
+      expect(sug).not.toContain("nothing to re-run");
       expect(`${err} ${sug}`).not.toMatch(/--[a-z]/); // no invented remedy
     } finally {
       cleanupSplit(f);
@@ -3952,6 +4301,246 @@ describe("hub pull: a thread split across two other machines", () => {
       expect(w.threads.every((t) => t.unfetchableBundles === undefined)).toBe(true);
     } finally {
       cleanupSplit(f);
+    }
+  });
+});
+
+// --- Bundle integrity, and the interrupted-pull thread mapping ------------
+
+/**
+ * Two failure classes a pull could previously walk straight through:
+ *
+ *   1. A DAMAGED bundle. `readManifest` only checks JSON shape and id safety,
+ *      so a bundle whose session inventory had been edited, or that declared a
+ *      session it did not contain, went on to drive the workspace merge, the
+ *      carry, and the append path — which splices into a transcript the user
+ *      already owns after checking the delta against a hash out of that same
+ *      manifest.
+ *   2. An INTERRUPTED pull (#28). `peers[...].received` is written inside the
+ *      bundle loop; `setThreadId` runs after the whole chain. A crash between
+ *      the two leaves this machine holding the content with no record of which
+ *      thread it belongs to, and every re-pull returns early without repairing
+ *      it — so the next push mints a SECOND thread for the same conversation.
+ */
+describe("hub pull — bundle integrity and interrupted-pull repair", () => {
+  /** A pushed thread on a hub, pulled (or not yet) by machine B. */
+  async function twoMachines(label: string) {
+    const homeA = mkdtempSync(join(tmpdir(), `${label}-homeA-`));
+    const homeB = mkdtempSync(join(tmpdir(), `${label}-homeB-`));
+    const hub = mkdtempSync(join(tmpdir(), `${label}-hub-`));
+    const base = mkdtempSync(join(tmpdir(), `${label}-fix-`));
+    let restore = overrideHome(homeA);
+    const { configDir: configDirA } = createFixtureTree(base);
+    const projectA = createRealProject(base, configDirA, "projA");
+    await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+    const pushResult = await hubPush({
+      configDir: configDirA, projectPath: projectA, hubPath: hub,
+      createProject: true, noWorkspace: true, claudeVersion: "2.1.81",
+    });
+    if (!pushResult.success) throw new Error("setup push failed");
+
+    restore.restore();
+    restore = overrideHome(homeB);
+    const configDirB = join(homeB, ".claude");
+    const projectB = mkdtempSync(join(tmpdir(), `${label}-projB-`));
+    writeLocalProjectId(projectB, {
+      projectId: pushResult.projectId, name: "projA",
+      createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+    });
+    return {
+      hub, projectId: pushResult.projectId, configDirB, projectB,
+      projectDirB: join(configDirB, "projects", encodeProjectPath(projectB)),
+      pull: (over: Record<string, unknown> = {}) =>
+        hubPull({
+          configDir: configDirB, projectPath: projectB, hubPath: hub,
+          latest: true, claudeVersion: "2.1.81", ...over,
+        } as Parameters<typeof hubPull>[0]),
+      push: () =>
+        hubPush({
+          configDir: configDirB, projectPath: projectB, hubPath: hub,
+          noWorkspace: true, claudeVersion: "2.1.81",
+        }),
+      whereis: () => hubWhereis({ configDir: configDirB, projectPath: projectB, hubPath: hub }),
+      cleanup: () => {
+        restore.restore();
+        for (const d of [homeA, homeB, hub, base, projectB]) {
+          rmSync(d, { recursive: true, force: true });
+        }
+      },
+    };
+  }
+
+  /** Rewrite the FULL bundle on the hub in place. */
+  async function mutateFullBundle(
+    hubPath: string,
+    projectId: string,
+    mutate: (bundleDir: string) => void
+  ): Promise<void> {
+    const backend = createFsBackend(hubPath);
+    const { indexes } = await readAllIndexes(backend, projectId);
+    const record = indexes
+      .flatMap((i) => Object.values(i.threads))
+      .flatMap((t) => t.bundles)[0];
+    if (!record) throw new Error("no bundle on the hub to mutate");
+    const stage = mkdtempSync(join(tmpdir(), "sesh-pull-mutate-full-"));
+    try {
+      const tarPath = join(stage, "in.tar.gz");
+      writeFileSync(tarPath, await backend.read(record.file));
+      const dir = join(stage, "bundle");
+      mkdirSync(dir, { recursive: true });
+      await extractArchive(tarPath, dir);
+      mutate(dir);
+      const outPath = join(stage, "out.tar.gz");
+      await createArchive(dir, outPath, "gzip");
+      await backend.writeAtomic(record.file, readFileSync(outPath));
+    } finally {
+      rmSync(stage, { recursive: true, force: true });
+    }
+  }
+
+  it("refuses a bundle whose manifest session list no longer hashes to its own digest", async () => {
+    const f = await twoMachines("sesh-pull-digest");
+    try {
+      await mutateFullBundle(f.hub, f.projectId, (dir) => {
+        const p = join(dir, "manifest.json");
+        const m = JSON.parse(readFileSync(p, "utf-8"));
+        expect(m.sessionsDigest).toMatch(/^sha256:/);
+        m.sessions[0].integrityHash = "sha256:0000";
+        writeFileSync(p, JSON.stringify(m, null, 2) + "\n");
+      });
+
+      const result = await f.pull();
+      expect(result.success).toBe(false);
+      expect((result as ErrorResult).error).toMatch(/failed its integrity check/);
+      // Nothing landed, and nothing was recorded as received — the bundle stays
+      // fetchable once the pushing machine replaces it.
+      expect(existsSync(f.projectDirB) ? readdirSync(f.projectDirB) : []).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("refuses a bundle that declares a session it does not contain, instead of counting it imported", async () => {
+    const f = await twoMachines("sesh-pull-missing");
+    try {
+      await mutateFullBundle(f.hub, f.projectId, (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf-8"));
+        rmSync(join(dir, "sessions", `${m.sessions[0].sessionId}.jsonl`));
+      });
+
+      const result = await f.pull();
+      expect(result.success).toBe(false);
+      expect((result as ErrorResult).error).toMatch(/does not contain it/);
+      expect(existsSync(f.projectDirB) ? readdirSync(f.projectDirB) : []).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("an interrupted pull's lost thread mapping is restored on the re-pull, so the next push does not fork the thread", async () => {
+    const f = await twoMachines("sesh-pull-crashwin");
+    try {
+      const first = await f.pull();
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      const threadId = (first as HubPullResult).threadId;
+      const localId = (first as HubPullResult).localSessionId!;
+      expect(localId).toBeTruthy();
+
+      // The crash window, reproduced exactly: `received` survives (written
+      // inside the bundle loop by importSession), the thread mapping does not
+      // (written after the chain, the workspace merge and the carry).
+      const st = readSyncState(f.projectB);
+      delete st.hub!.threadByLocalSession[localId];
+      writeSyncState(st);
+      expect(getThreadId(readSyncState(f.projectB), localId)).toBeNull();
+
+      // The re-pull fetches nothing — every bundle is already recorded — and
+      // this is the branch that used to return without repairing anything.
+      const second = await f.pull();
+      expect(second.success).toBe(false);
+      expect((second as ErrorResult).details).toMatch(/mapping has been restored/);
+      expect(getThreadId(readSyncState(f.projectB), localId)).toBe(threadId);
+
+      // The consequence that made it matter: B's next push continues the
+      // existing thread rather than minting a second one whose only bundle is
+      // a continuation with no base in its own chain.
+      appendFileSync(
+        join(f.projectDirB, `${localId}.jsonl`),
+        JSON.stringify({
+          uuid: "b-new-1", parentUuid: readLastEntryUuid(join(f.projectDirB, `${localId}.jsonl`)),
+          timestamp: "2026-07-22T10:00:00Z", sessionId: localId, cwd: f.projectB,
+          version: "2.1.81", type: "user", message: { role: "user", content: "more" },
+        }) + "\n"
+      );
+      const pushed = await f.push();
+      expect(pushed.success).toBe(true);
+      const w = await f.whereis();
+      expect(w.threads.map((t) => t.threadId)).toEqual([threadId]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("stops a re-hashed continuation BEFORE the splice, where the per-session hash cannot help", async () => {
+    // The case the bundle-level digest exists for, and the reason it is checked
+    // in pull.ts rather than left to importSession: edit the delta AND the
+    // `integrityHash` that describes it, and every per-session check agrees
+    // with itself. The append path would then weld that content into a
+    // transcript the user already owns, irreversibly. The digest is the only
+    // thing that notices the inventory was rewritten.
+    const a = await arrangeContinuation();
+    try {
+      const baseBefore = readFileSync(a.basePath, "utf-8");
+      const filesBefore = jsonlFiles(a.projectDirA);
+      await mutateContinuationBundle(a.hub, a.projectId, (dir) => {
+        const manifestPath = join(dir, "manifest.json");
+        const m = JSON.parse(readFileSync(manifestPath, "utf-8")) as ExportManifest;
+        const delta = join(dir, "sessions", `${m.sessions[0].sessionId}.jsonl`);
+        appendFileSync(
+          delta,
+          JSON.stringify({
+            uuid: "smuggled", parentUuid: "b-entry-5", timestamp: "2026-04-11T09:09:09Z",
+            sessionId: m.sessions[0].sessionId, cwd: "/x", version: "2.1.81",
+            type: "user", message: { role: "user", content: "content the exporter never hashed" },
+          }) + "\n"
+        );
+        // Re-hashed so the per-session check PASSES. The digest is stale.
+        m.sessions[0].integrityHash = `sha256:${createHash("sha256")
+          .update(readFileSync(delta))
+          .digest("hex")}`;
+        writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+      });
+
+      const result = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(false);
+      expect((result as ErrorResult).error).toMatch(/failed its integrity check/);
+      // The user's transcript is byte-identical and no fragment was minted.
+      expect(readFileSync(a.basePath, "utf-8")).toBe(baseBefore);
+      expect(jsonlFiles(a.projectDirA)).toEqual(filesBefore);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("touches nothing when every local session already carries its thread mapping", async () => {
+    // The repair must be invisible on the ordinary "already up to date" answer:
+    // it may not rewrite sync-state, and it may not put a `details` line on a
+    // result where nothing was wrong.
+    const f = await twoMachines("sesh-pull-nobackfill");
+    try {
+      expect((await f.pull()).success).toBe(true);
+      const statePath = syncStatePath(f.projectB);
+      const before = readFileSync(statePath, "utf-8");
+      const second = await f.pull();
+      expect(second.success).toBe(false);
+      expect((second as ErrorResult).details).toBeUndefined();
+      expect(readFileSync(statePath, "utf-8")).toBe(before);
+    } finally {
+      f.cleanup();
     }
   });
 });

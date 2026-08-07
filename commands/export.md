@@ -41,6 +41,8 @@ You are running the sesh-mover export command. Follow these steps:
    - Slot 4 (when peers.length ≤ 2): "Incremental since another export…" → prompt for path, add `--incremental --since <path>`
    - Slot 4 (when peers.length > 2): "Other…" → follow-up question listing the remaining peers and the `--since` option.
 
+   `--since` takes a **directory** export — the path must contain a `manifest.json`. A `.tar.gz`/`.tar.zst` archive is rejected outright ("does not contain a manifest.json"), so if the user names an archive, ask for a directory export instead rather than re-running.
+
    Incremental composes with --scope. Default --scope to `all` when --incremental is selected unless the user picks "This session only".
 
    Only ask for individual exclusion of memory, plans, or subagents if the user explicitly requests that granularity after seeing the grouped option.
@@ -62,7 +64,13 @@ You are running the sesh-mover export command. Follow these steps:
 
 6. If archive was requested, the result's `archivePath` is the single artifact — the staging directory is removed automatically. Report `archivePath` as the destination; do not mention a separate directory.
 
-7. Report what was exported: session name, summary, layers included, destination path.
+   **Report the format that was actually produced, not the one requested.** `actualFormat` is present only when the CLI could not honour the request: `--format zstd` on a machine without the `zstd` binary falls back to gzip, writes a `.tar.gz`, and sets `actualFormat` to `"archive"`. Its values are the same three `--format` takes — `dir`, `archive` (tar.gz), `zstd` (tar.zst). When it is present, say plainly that zstd was unavailable and a gzip archive was written instead, and offer the install if the user wants zstd next time:
+   - macOS: `brew install zstd`
+   - Debian/Ubuntu/WSL: `sudo apt-get install -y zstd`
+
+7. Relay the result's `warnings` — do not drop them. This is the only channel for the zstd fallback ("zstd not found on system, falling back to gzip") and for anything the incremental planner reports; an export whose warnings are dropped looks like it did exactly what was asked. The routine `"<layer> excluded by user request"` entries are the exception worth folding into the layers line of step 8 rather than listing one by one — they just echo the `--exclude` the user already chose.
+
+8. Report what was exported: session name, summary, layers included, destination path, and the format actually produced (step 6).
 
 **See also:** for ongoing cross-machine sync through a shared hub folder instead of a one-off export/import round-trip, use `/sesh-mover:push` (requires `/sesh-mover:hub-init` once).
 

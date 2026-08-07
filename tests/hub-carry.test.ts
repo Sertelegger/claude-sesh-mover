@@ -52,8 +52,12 @@ function writeHubRules(repo: string, file: "hubinclude" | "hubignore", body: str
 function cleanTwin(repo: string): string {
   const twin = mkdtempSync(join(tmpdir(), "sesh-twin-"));
   // copyTreeSync, not cpSync: see its doc — cpSync of a git repo threw a
-  // destination-side ENOENT on macOS CI from inside its C++ walk.
-  copyTreeSync(repo, twin);
+  // destination-side ENOENT on macOS CI from inside its C++ walk. `live`
+  // because the source is a real repository: git removes its own transient
+  // `.git` state (locks, temp objects) whenever it likes, so an entry can
+  // vanish between being listed and being read. That surfaced as a macOS-only
+  // ENOENT on the SOURCE path once the C++ walk was replaced by this one.
+  copyTreeSync(repo, twin, { live: true });
   git(twin, ["reset", "-q", "--hard", "HEAD"]);
   git(twin, ["clean", "-qfdx"]);
   return twin;

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, cpSync, existsSync, truncateSync,
+  chmodSync, readdirSync,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -763,6 +764,277 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
       if (!result.success) return;
       expect(result.hasWorkspace).toBe(true);
       expect(result.ignoredNotCarried).toBeUndefined();
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * The other half of "a failed push must not leave the project linked".
+ *
+ * Deferring the identity write past the export (see the exporter-failure test
+ * above) only covers failures UP TO that point. Everything after
+ * `commitIdentity()` — the archive, the bundle upload, the index write, an
+ * unreadable file the workspace snapshot trips over — used to surface as a bare
+ * thrown Error with `.claude-sesh-mover/project.json` sitting in the project
+ * directory, which is precisely what arms the default-on SessionEnd auto-push:
+ * the next session end then uploads the whole working tree of a push the user
+ * watched fail.
+ *
+ * Reproduced before the fix, twice, exactly as these tests inject it: `ENOTDIR`
+ * when the bundle's parent directory path on the hub is already a FILE, and
+ * `EACCES` inside the workspace snapshot. Both threw; both left project.json
+ * behind.
+ *
+ * The hub half is NOT closed here and cannot be: nothing in src/ deletes a hub
+ * file, so a `--create-project` push that fails afterwards leaves a hub project
+ * nothing can remove. That one is reported instead — with the flag that links
+ * to it rather than minting a second.
+ */
+describe("hub push — a failure after the link is committed", () => {
+  const PROJECT_ID = "11111111-2222-3333-4444-555555555555";
+
+  /** A hub project some other machine created, ready to be linked to. */
+  function seedHubProject(hub: string, projectId = PROJECT_ID): string {
+    mkdirSync(join(hub, "projects", projectId), { recursive: true });
+    writeFileSync(
+      join(hub, "projects", projectId, "project.json"),
+      JSON.stringify({
+        schemaVersion: 1, projectId, name: "seeded", matchers: { gitRemotes: [] },
+        createdAt: "2026-07-01T00:00:00.000Z", createdByMachine: "some-other-machine",
+      }, null, 2) + "\n"
+    );
+    return projectId;
+  }
+
+  /**
+   * Make the bundle undeliverable: `writeStreamAtomic` mkdir's the bundle
+   * directory, and a FILE already sitting at that path is an ENOTDIR the push
+   * cannot route around. Chosen over a permission bit because it behaves the
+   * same on every platform and says nothing about the user running the suite.
+   */
+  function blockBundleDir(hub: string, projectId = PROJECT_ID): void {
+    writeFileSync(join(hub, "projects", projectId, "bundles"), "not a directory\n");
+  }
+
+  const linkPath = (projectPath: string): string =>
+    join(projectPath, ".claude-sesh-mover", "project.json");
+
+  it("rolls the link back and reports the project as NOT linked", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-rb-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-rb-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-rb-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      seedHubProject(hub);
+      blockBundleDir(hub);
+      expect(existsSync(linkPath(projectPath))).toBe(false);
+
+      const r = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+      });
+
+      // Typed refusal, not a thrown Error: the one thing the user has to be
+      // told — whether this project is linked now — is not in an exception.
+      expect(r.success).toBe(false);
+      if (r.success) return;
+      expect(r.command).toBe("push");
+      expect("error" in r && r.error).toMatch(/ENOTDIR|not a directory/);
+      expect("details" in r && r.details).toMatch(/NOT linked/);
+
+      // The consent gate is closed again: no project.json, so the SessionEnd
+      // auto-push stays inert for this project.
+      expect(existsSync(linkPath(projectPath))).toBe(false);
+      // ...and the directory the link write created goes with it, since
+      // nothing else of the user's lives in it.
+      expect(existsSync(join(projectPath, ".claude-sesh-mover"))).toBe(false);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a hubignore in place while removing only the link it wrote", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-rb2-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-rb2-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-rb2-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      // The user's own rules file, written long before this push.
+      mkdirSync(join(projectPath, ".claude-sesh-mover"), { recursive: true });
+      writeFileSync(join(projectPath, ".claude-sesh-mover", "hubignore"), "build/\n");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      seedHubProject(hub);
+      blockBundleDir(hub);
+
+      const r = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+      });
+      expect(r.success).toBe(false);
+      expect(existsSync(linkPath(projectPath))).toBe(false);
+      expect(readFileSync(join(projectPath, ".claude-sesh-mover", "hubignore"), "utf-8")).toBe("build/\n");
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("a link that pre-dates the push survives the failure, and the result says so", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-keep-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-keep-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-keep-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      seedHubProject(hub);
+      // Linked before this push ever ran — committed to the repo, in the real
+      // flow. A failure of OURS is not licence to delete it.
+      mkdirSync(join(projectPath, ".claude-sesh-mover"), { recursive: true });
+      const preExisting = JSON.stringify({
+        projectId: PROJECT_ID, name: "seeded",
+        createdAt: "2026-07-01T00:00:00.000Z", createdByMachine: "some-other-machine",
+      }, null, 2) + "\n";
+      writeFileSync(linkPath(projectPath), preExisting);
+      blockBundleDir(hub);
+
+      const r = await hubPush({ configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81" });
+      expect(r.success).toBe(false);
+      if (r.success) return;
+      expect(r.command).toBe("push");
+      expect("details" in r && r.details).toMatch(/already linked/);
+      expect("details" in r && r.details).toMatch(/stays linked/);
+      expect(readFileSync(linkPath(projectPath), "utf-8")).toBe(preExisting);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("names the hub project a failed --create-project left behind, and how to link to it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-orph-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-orph-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-orph-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      // `--create-project` mints a hub project id nobody can predict, so the
+      // fault has to sit outside the hub: an unreadable file the workspace
+      // snapshot's copy pass trips over (EACCES), which is the second shape the
+      // reviewer reproduced. Mode bits say nothing when the suite runs as root.
+      const locked = join(projectPath, "locked.txt");
+      writeFileSync(locked, "nope\n");
+      chmodSync(locked, 0o000);
+      let enforced = false;
+      try { readFileSync(locked); } catch { enforced = true; }
+      if (!enforced) { chmodSync(locked, 0o644); return; }
+
+      let r;
+      try {
+        r = await hubPush({
+          configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+        });
+      } finally {
+        chmodSync(locked, 0o644); // so the temp tree can be cleaned up
+      }
+
+      expect(r.success).toBe(false);
+      if (r.success) return;
+      expect(r.command).toBe("push");
+      expect("error" in r && r.error).toMatch(/EACCES|permission denied/);
+      expect(existsSync(linkPath(projectPath))).toBe(false);
+
+      // The half that cannot be rolled back: the hub project exists and nothing
+      // removes it. It has to be named, with the flag that links to that one
+      // rather than minting a second on the next attempt.
+      const orphans = readdirSync(join(hub, "projects"));
+      expect(orphans).toHaveLength(1);
+      expect("suggestion" in r && r.suggestion).toContain(`--project-id ${orphans[0]}`);
+      expect("details" in r && r.details).toMatch(/NOT linked/);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("discloses a bundle that reached the hub before the index write failed", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-idx-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-idx-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-idx-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      seedHubProject(hub);
+      // Bundle upload fine; the index write behind it is the ENOTDIR. The
+      // bundle is atomic, so it really is on the hub when this throws.
+      writeFileSync(join(hub, "projects", PROJECT_ID, "index"), "not a directory\n");
+
+      const r = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+      });
+      expect(r.success).toBe(false);
+      if (r.success) return;
+      expect(existsSync(linkPath(projectPath))).toBe(false);
+      expect("details" in r && r.details).toMatch(/did reach the hub/);
+      // ...and it is really there, unreferenced by any index.
+      expect(
+        readdirSync(join(hub, "projects", PROJECT_ID, "bundles"), { recursive: true }).length
+      ).toBeGreaterThan(0);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("the up-to-date no-op push still links the project", async () => {
+    // The deliberate exception the rollback must not swallow: `commitIdentity`
+    // runs BEFORE the "nothing new to send" early return, so a push that
+    // legitimately has nothing to do still leaves the project linked (its
+    // projectId is part of that result).
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-utd-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-utd-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-utd-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      seedHubProject(hub);
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      // Unlink it again — project.json is a committed file a user can lose, and
+      // the re-link on an otherwise no-op push is what puts it back.
+      rmSync(linkPath(projectPath), { force: true });
+
+      const second = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect(second.upToDate).toBe(true);
+      expect(existsSync(linkPath(projectPath))).toBe(true);
+      expect(JSON.parse(readFileSync(linkPath(projectPath), "utf-8")).projectId).toBe(PROJECT_ID);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });

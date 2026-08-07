@@ -318,6 +318,208 @@ describe("importer", () => {
     });
   });
 
+  /**
+   * Bundle-level integrity. Everything here is about the bundle NOT being what
+   * its manifest says it is — as opposed to a session whose bytes don't match
+   * their own hash, which is the pre-existing warn-and-import case above.
+   */
+  describe("bundle integrity", () => {
+    const targetProjectPath = "/Users/newuser/Projects/newproject";
+
+    /** Every .jsonl now in the target project dir. */
+    async function landedSessions(): Promise<string[]> {
+      const { encodeProjectPath } = await import("../src/platform.js");
+      const { readdirSync, existsSync } = await import("node:fs");
+      const dir = join(targetConfigDir, "projects", encodeProjectPath(targetProjectPath));
+      return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".jsonl")) : [];
+    }
+
+    it("refuses a bundle whose manifest declares a session the bundle does not contain", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { rmSync } = await import("node:fs");
+
+      // The measured signature of a truncated transfer or a half-finished
+      // unpack: manifest.json intact, session data gone. Before this check the
+      // answer was `success: true, importedSessions: [1 entry], warnings: []`
+      // for a bundle holding no session data at all — the existsSync gate that
+      // used to wrap the hash check meant a missing file was never CHECKED.
+      rmSync(join(exportPath, "sessions", `${sessionId}.jsonl`));
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+
+      expect(result.success).toBe(false);
+      const err = result as ErrorResult;
+      expect(err.error).toContain("no session file in the bundle");
+      expect(err.error).toContain(sessionId);
+      // The whole point: nothing may be reported as imported, and nothing may
+      // reach disk. A `migrate` deletes its source on the strength of that list.
+      expect((result as unknown as ImportResult).importedSessions).toBeUndefined();
+      expect(await landedSessions()).toHaveLength(0);
+    });
+
+    it("refuses the same bundle on a dry run rather than previewing an import it cannot do", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { rmSync } = await import("node:fs");
+      rmSync(join(exportPath, "sessions", `${sessionId}.jsonl`));
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: true,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("still imports the sessions that ARE present when --session-id names them", async () => {
+      // The refusal is scoped to what this invocation was asked to import, so
+      // the suggestion it prints is one the user can actually act on.
+      const { importSession } = await import("../src/importer.js");
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+        sessionIds: [sessionId],
+      });
+      expect(result.success).toBe(true);
+      expect(await landedSessions()).toHaveLength(1);
+    });
+
+    it("refuses a bundle whose manifest session list no longer hashes to its own digest", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { readFileSync, writeFileSync } = await import("node:fs");
+
+      // Edited in RAW JSON, not through writeManifest: writeManifest restamps
+      // the digest, which is exactly why it is the single place that computes
+      // it. This is what damage looks like from outside the tool.
+      const manifestPath = join(exportPath, "manifest.json");
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      expect(m.sessionsDigest).toMatch(/^sha256:/);
+      m.sessions[0].messageCount = 999;
+      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+      expect(result.success).toBe(false);
+      expect((result as ErrorResult).error).toContain("Bundle integrity check failed");
+      expect(await landedSessions()).toHaveLength(0);
+    });
+
+    it("refuses a manifest that lost a session record entirely — the case per-session hashes cannot see", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { readFileSync, writeFileSync } = await import("node:fs");
+      const manifestPath = join(exportPath, "manifest.json");
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      m.sessions = [];
+      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+      // Not "No matching sessions found in export" — the inventory is damaged,
+      // which is a different statement from "this bundle is empty".
+      expect(result.success).toBe(false);
+      expect((result as ErrorResult).error).toContain("Bundle integrity check failed");
+    });
+
+    it("imports a pre-0.6.0 bundle that declares no digest at all, unchanged", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { readFileSync, writeFileSync } = await import("node:fs");
+      const manifestPath = join(exportPath, "manifest.json");
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      delete m.sessionsDigest;
+      for (const s of m.sessions) delete s.layerDigests;
+      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect((result as ImportResult).warnings).toEqual([]);
+      expect(await landedSessions()).toHaveLength(1);
+    });
+
+    it("does not copy a file-history layer whose digest fails, imports the transcript, and says so", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { writeFileSync, existsSync, readFileSync } = await import("node:fs");
+
+      // A corrupted backup is the layer that matters: Claude Code restores
+      // file-history over the user's own file.
+      const backup = join(exportPath, "file-history", sessionId, "abc123@v1");
+      expect(existsSync(backup)).toBe(true);
+      const manifest = JSON.parse(readFileSync(join(exportPath, "manifest.json"), "utf-8"));
+      expect(manifest.sessions[0].layerDigests["file-history"]).toMatch(/^sha256:/);
+      writeFileSync(backup, "corrupted backup content\n");
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const r = result as ImportResult;
+      expect(r.importedSessions).toHaveLength(1);
+      expect(r.warnings.some((w) => w.includes("file-history") && w.includes("NOT copied"))).toBe(true);
+      // The transcript arrived; the unverifiable backup did not.
+      expect(await landedSessions()).toHaveLength(1);
+      const newId = r.importedSessions[0].newId;
+      expect(existsSync(join(targetConfigDir, "file-history", newId))).toBe(false);
+      // Untouched layers are unaffected — this is per layer, not per bundle.
+      const { encodeProjectPath } = await import("../src/platform.js");
+      expect(
+        existsSync(
+          join(targetConfigDir, "projects", encodeProjectPath(targetProjectPath), newId, "subagents")
+        )
+      ).toBe(true);
+    });
+
+    it("warns when the manifest declares a layer the bundle does not contain", async () => {
+      const { importSession } = await import("../src/importer.js");
+      const { rmSync } = await import("node:fs");
+      rmSync(join(exportPath, "file-history", sessionId), { recursive: true, force: true });
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(
+        (result as ImportResult).warnings.some((w) => w.includes('declares a "file-history" layer'))
+      ).toBe(true);
+    });
+  });
+
   it("records lineage and peer state when importing an incremental bundle", async () => {
     const { mkdtempSync, rmSync, mkdirSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");

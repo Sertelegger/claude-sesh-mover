@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
+import { encodeProjectPath } from "../src/platform.js";
 
 describe("migrator", () => {
   let tempDir: string;
@@ -417,6 +418,285 @@ describe("migrator", () => {
       ).toBe(false);
       // …but the stray file the import never touched must survive.
       expect(existsSync(strayPath)).toBe(true);
+    });
+
+  });
+
+  // The dry-run preview used to hardcode `directoryRenamed: false` and emit no
+  // rename warning, so a preview WITH --rename-dir was indistinguishable from
+  // one without it — the plan's most destructive step (an `mv` of the user's
+  // project directory) was missing from the screen the user confirms against.
+  // These tests pin the preview to the same preconditions the apply path uses.
+  describe("migrateSession dry-run --rename-dir preview", () => {
+    /** A real on-disk project dir plus a session registered for it. */
+    function seedRealProject(name: string): {
+      projectPath: string;
+      seededSessionId: string;
+    } {
+      const projectPath = join(tempDir, name);
+      mkdirSync(projectPath, { recursive: true });
+      writeFileSync(join(projectPath, "marker.txt"), "project payload\n");
+
+      const seededSessionId = "11111111-2222-3333-4444-555555555555";
+      const encoded = encodeProjectPath(projectPath);
+      const projectDir = join(configDir, "projects", encoded);
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(
+        join(projectDir, `${seededSessionId}.jsonl`),
+        JSON.stringify({
+          uuid: "seed-1",
+          timestamp: "2026-04-14T10:00:00Z",
+          sessionId: seededSessionId,
+          cwd: projectPath,
+          version: "2.1.81",
+          slug: "seeded-session",
+          type: "user",
+          message: { role: "user", content: "seeded" },
+        }) + "\n"
+      );
+      return { projectPath, seededSessionId };
+    }
+
+    function baseOpts(source: string, target: string, id: string) {
+      return {
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: source,
+        targetProjectPath: target,
+        scope: "current" as const,
+        sessionId: id,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: tempDir,
+      };
+    }
+
+    /** Nothing the preview promises not to touch may have changed. */
+    function expectUntouched(source: string, sourceSessionId: string) {
+      expect(existsSync(source)).toBe(true);
+      expect(existsSync(join(source, "marker.txt"))).toBe(true);
+      expect(
+        existsSync(
+          join(
+            configDir,
+            "projects",
+            encodeProjectPath(source),
+            `${sourceSessionId}.jsonl`
+          )
+        )
+      ).toBe(true);
+    }
+
+    it("dry-run with renameDir reports the planned directory rename", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const { projectPath, seededSessionId } = seedRealProject("rename-src");
+      const target = join(tempDir, "rename-dst");
+
+      const result = await migrateSession({
+        ...baseOpts(projectPath, target, seededSessionId),
+        dryRun: true,
+        renameDir: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.dryRun).toBe(true);
+      // The preview must say the mv is part of the plan.
+      expect(result.directoryRenamed).toBe(true);
+      expect(
+        result.warnings.some(
+          (w) => w.includes("would be renamed") && w.includes(target)
+        )
+      ).toBe(true);
+      // …and must not have performed any part of it.
+      expectUntouched(projectPath, seededSessionId);
+      expect(existsSync(target)).toBe(false);
+    });
+
+    it("dry-run without renameDir reports no directory rename", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const { projectPath, seededSessionId } = seedRealProject("norename-src");
+      const target = join(tempDir, "norename-dst");
+
+      const result = await migrateSession({
+        ...baseOpts(projectPath, target, seededSessionId),
+        dryRun: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.directoryRenamed).toBe(false);
+      expect(result.warnings.every((w) => !w.includes("renamed"))).toBe(true);
+      expectUntouched(projectPath, seededSessionId);
+      expect(existsSync(target)).toBe(false);
+    });
+
+    it("dry-run with renameDir reports the skip when the target directory already exists", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const { projectPath, seededSessionId } = seedRealProject("collide-src");
+      const target = join(tempDir, "collide-dst");
+      mkdirSync(target, { recursive: true });
+      writeFileSync(join(target, "occupant.txt"), "already here\n");
+
+      const result = await migrateSession({
+        ...baseOpts(projectPath, target, seededSessionId),
+        dryRun: true,
+        renameDir: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // Same conditional the apply path takes: target exists => no rename.
+      expect(result.directoryRenamed).toBe(false);
+      expect(
+        result.warnings.some(
+          (w) => w.includes("already exists") && w.includes("skipped")
+        )
+      ).toBe(true);
+      expectUntouched(projectPath, seededSessionId);
+      expect(existsSync(join(target, "occupant.txt"))).toBe(true);
+    });
+
+    it("dry-run with renameDir reports the skip when the source directory does not exist", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        ...baseOpts(
+          "/Users/testuser/Projects/testproject",
+          "/Users/testuser/Projects/newproject",
+          sessionId
+        ),
+        dryRun: true,
+        renameDir: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.directoryRenamed).toBe(false);
+      expect(
+        result.warnings.some((w) => w.includes("does not exist"))
+      ).toBe(true);
+    });
+
+    it("dry-run with renameDir explains that identical paths leave nothing to rename", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const { projectPath, seededSessionId } = seedRealProject("same-src");
+      const otherConfig = join(tempDir, "other-claude-same");
+      mkdirSync(join(otherConfig, "projects"), { recursive: true });
+
+      const result = await migrateSession({
+        ...baseOpts(projectPath, projectPath, seededSessionId),
+        targetConfigDir: otherConfig,
+        dryRun: true,
+        renameDir: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.directoryRenamed).toBe(false);
+      expect(
+        result.warnings.some((w) => w.includes("identical"))
+      ).toBe(true);
+      expectUntouched(projectPath, seededSessionId);
+    });
+
+    it("the dry-run rename prediction matches what the real run then does", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const { projectPath, seededSessionId } = seedRealProject("parity-src");
+      const target = join(tempDir, "parity-dst");
+
+      const preview = await migrateSession({
+        ...baseOpts(projectPath, target, seededSessionId),
+        dryRun: true,
+        renameDir: true,
+      });
+      expect(preview.success).toBe(true);
+      if (!preview.success) return;
+
+      const real = await migrateSession({
+        ...baseOpts(projectPath, target, seededSessionId),
+        renameDir: true,
+      });
+      expect(real.success).toBe(true);
+      if (!real.success) return;
+
+      expect(real.directoryRenamed).toBe(preview.directoryRenamed);
+      expect(real.directoryRenamed).toBe(true);
+      expect(real.cleanedUp).toBe(preview.cleanedUp);
+      // Real runs carry no dryRun marker.
+      expect(real.dryRun).toBeUndefined();
+      // And the mv really happened.
+      expect(existsSync(projectPath)).toBe(false);
+      expect(existsSync(join(target, "marker.txt"))).toBe(true);
+    });
+
+    it("an excluded layer is destroyed rather than left behind (migrate is not export)", async () => {
+      // Cleanup deletes the whole session subdirectory and file-history dir for
+      // every moved session, whatever the export carried — so `--exclude` on a
+      // migrate is permanent loss, not "leave it at the source". Pinned here
+      // because commands/migrate.md now warns the user about exactly this.
+      const { migrateSession } = await import("../src/migrator.js");
+      const srcEncoded = "-Users-testuser-Projects-testproject";
+      const tgtEncoded = "-Users-testuser-Projects-newproject";
+
+      expect(existsSync(join(configDir, "file-history", sessionId))).toBe(true);
+
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: ["file-history", "subagents", "tool-results"],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const newId = result.importedSessions[0].newId;
+
+      // Gone from the source…
+      expect(existsSync(join(configDir, "file-history", sessionId))).toBe(false);
+      expect(
+        existsSync(join(configDir, "projects", srcEncoded, sessionId))
+      ).toBe(false);
+      // …and never written to the target.
+      expect(existsSync(join(configDir, "file-history", newId))).toBe(false);
+      expect(
+        existsSync(join(configDir, "projects", tgtEncoded, newId))
+      ).toBe(false);
+
+      // And the user is TOLD. The exporter's "<layer> excluded by user request"
+      // warnings were being dropped on the floor — migrate returned only the
+      // IMPORT's warnings — so the one message that discloses a destructive
+      // exclusion never reached anyone.
+      const w = result.warnings.join(" ");
+      for (const layer of ["file-history", "subagents", "tool-results"]) {
+        expect(w).toContain(`${layer} excluded by user request`);
+      }
+    });
+
+    it("a dry run discloses the same exclusions, before anything is deleted", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: ["file-history"],
+        dryRun: true,
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.warnings.join(" ")).toContain("file-history excluded by user request");
+      // Still a preview: the source layer is untouched.
+      expect(existsSync(join(configDir, "file-history", sessionId))).toBe(true);
     });
   });
 });

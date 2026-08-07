@@ -8,6 +8,59 @@ function isWithin(child, parent) {
     const rel = relative(parent, child);
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
+/**
+ * Single source of truth for the `--rename-dir` preconditions, shared by the
+ * dry-run preview and the apply path.
+ *
+ * It exists because the two used to disagree: the preview hardcoded
+ * `directoryRenamed: false` and emitted no rename warning, so a dry-run with
+ * `--rename-dir` was byte-identical to one without it — and the model reading
+ * that preview reported "the directory will not be renamed" immediately before
+ * the real run `mv`-ed it. A preview that omits the most destructive step of
+ * the plan is worse than no preview, so both paths now ask the same question
+ * here and only the tense of the prose differs.
+ *
+ * Evaluating this at dry-run time is faithful: cleanup (step 3) only ever
+ * deletes files under `<configDir>/projects/…`, never the project directories
+ * themselves, so the existence checks the apply path makes after cleanup see
+ * exactly what these see. It performs no filesystem mutation in either mode.
+ */
+function planDirectoryRename(renameDir, sourceProjectPath, targetProjectPath, mode) {
+    if (!renameDir)
+        return { rename: false };
+    if (sourceProjectPath === targetProjectPath) {
+        return {
+            rename: false,
+            // The apply path is silent here (nothing happens, nothing to undo); a
+            // preview owes the user the reason its requested rename isn't in the plan.
+            warning: mode === "dry-run"
+                ? `DRY RUN: --rename-dir was requested, but the source and target project paths are identical (${sourceProjectPath}) — no directory would be renamed.`
+                : undefined,
+        };
+    }
+    if (!existsSync(sourceProjectPath)) {
+        return {
+            rename: false,
+            warning: mode === "dry-run"
+                ? `DRY RUN: source directory ${sourceProjectPath} does not exist — the rename would be skipped. It may have already been moved.`
+                : `Source directory ${sourceProjectPath} does not exist — cannot rename. It may have already been moved.`,
+        };
+    }
+    if (existsSync(targetProjectPath)) {
+        return {
+            rename: false,
+            warning: mode === "dry-run"
+                ? `DRY RUN: target directory ${targetProjectPath} already exists — the rename would be skipped to avoid overwriting. Move files manually if needed.`
+                : `Target directory ${targetProjectPath} already exists — skipping rename to avoid overwriting. Move files manually if needed.`,
+        };
+    }
+    return {
+        rename: true,
+        warning: mode === "dry-run"
+            ? `DRY RUN: the project directory ${sourceProjectPath} would be renamed to ${targetProjectPath}.`
+            : undefined,
+    };
+}
 export async function migrateSession(options) {
     const { sourceConfigDir, targetConfigDir, sourceProjectPath, targetProjectPath, scope, sessionId, excludeLayers, claudeVersion, dryRun, renameDir, currentCwd, force, onProgress, } = options;
     const isSelfMigration = !!currentCwd && isWithin(currentCwd, sourceProjectPath);
@@ -68,21 +121,36 @@ export async function migrateSession(options) {
         if (!importResult.success) {
             return importResult;
         }
-        // If dry-run, return preview without cleanup
+        // If dry-run, return preview without cleanup.
+        //
+        // `dryRun: true` marks EVERY field below as a prediction: `cleanedUp` and
+        // `directoryRenamed` answer "would this happen", not "did this happen".
+        // Nothing outside the (temp) export staging dir is touched on this path.
         if (dryRun) {
             const dryResult = importResult;
+            const renamePlan = planDirectoryRename(renameDir, sourceProjectPath, targetProjectPath, "dry-run");
+            // Cleanup deletes the source copy of every session the real run would
+            // move — imported plus skipped-as-duplicate (see step 3 below).
+            const wouldCleanUp = dryResult.importedSessions.length + dryResult.skippedSessions.length > 0;
             return {
                 success: true,
                 command: "migrate",
+                dryRun: true,
                 importedSessions: dryResult.importedSessions,
                 skippedSessions: dryResult.skippedSessions,
-                cleanedUp: false,
-                directoryRenamed: false,
+                cleanedUp: wouldCleanUp,
+                directoryRenamed: renamePlan.rename,
                 sourcePath: sourceProjectPath,
                 targetPath: targetProjectPath,
                 warnings: [
                     ...selfMigrationWarnings,
+                    // The export runs for real even on a dry run (into a temp staging
+                    // dir), so its warnings are already true of what the real migrate
+                    // would carry — including the `--exclude` disclosure the apply path
+                    // relays for the same reason.
+                    ...exported.warnings,
                     ...dryResult.warnings,
+                    ...(renamePlan.warning ? [renamePlan.warning] : []),
                     "DRY RUN: no files were modified or deleted",
                 ],
             };
@@ -109,29 +177,26 @@ export async function migrateSession(options) {
                 rmSync(fileHistoryDir, { recursive: true });
             cleanedUp = true;
         }
-        // Step 4: Optionally rename the actual project directory
+        // Step 4: Optionally rename the actual project directory. The
+        // preconditions are decided by the same helper the dry-run preview uses,
+        // so the preview can never again disagree with what happens here.
         let directoryRenamed = false;
-        if (renameDir && sourceProjectPath !== targetProjectPath) {
-            if (existsSync(sourceProjectPath) && !existsSync(targetProjectPath)) {
-                try {
-                    // Ensure parent directory of target exists
-                    const targetParent = dirname(targetProjectPath);
-                    if (!existsSync(targetParent)) {
-                        const { mkdirSync } = await import("node:fs");
-                        mkdirSync(targetParent, { recursive: true });
-                    }
-                    renameSync(sourceProjectPath, targetProjectPath);
-                    directoryRenamed = true;
+        const renamePlan = planDirectoryRename(renameDir, sourceProjectPath, targetProjectPath, "apply");
+        if (renamePlan.warning)
+            imported.warnings.push(renamePlan.warning);
+        if (renamePlan.rename) {
+            try {
+                // Ensure parent directory of target exists
+                const targetParent = dirname(targetProjectPath);
+                if (!existsSync(targetParent)) {
+                    const { mkdirSync } = await import("node:fs");
+                    mkdirSync(targetParent, { recursive: true });
                 }
-                catch (e) {
-                    imported.warnings.push(`Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${e.message}. You may need to rename it manually.`);
-                }
+                renameSync(sourceProjectPath, targetProjectPath);
+                directoryRenamed = true;
             }
-            else if (!existsSync(sourceProjectPath)) {
-                imported.warnings.push(`Source directory ${sourceProjectPath} does not exist — cannot rename. It may have already been moved.`);
-            }
-            else if (existsSync(targetProjectPath)) {
-                imported.warnings.push(`Target directory ${targetProjectPath} already exists — skipping rename to avoid overwriting. Move files manually if needed.`);
+            catch (e) {
+                imported.warnings.push(`Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${e.message}. You may need to rename it manually.`);
             }
         }
         return {
@@ -143,7 +208,13 @@ export async function migrateSession(options) {
             directoryRenamed,
             sourcePath: sourceProjectPath,
             targetPath: targetProjectPath,
-            warnings: [...selfMigrationWarnings, ...imported.warnings],
+            // The EXPORT's warnings ride along too, and they are not decoration on a
+            // migrate: `--exclude` drops a layer from the bundle, but cleanup then
+            // deletes the whole source session directory and its file-history
+            // regardless — so the excluded layer is destroyed rather than left
+            // behind. "<layer> excluded by user request" is the only thing that says
+            // so, and returning only the IMPORT's warnings swallowed it.
+            warnings: [...selfMigrationWarnings, ...exported.warnings, ...imported.warnings],
         };
     }
     finally {

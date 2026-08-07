@@ -26,7 +26,13 @@ export function resolveThreads(indexes) {
     const byThread = new Map();
     for (const index of indexes) {
         for (const [threadId, entry] of Object.entries(index.threads)) {
-            const copy = { machineId: index.machineId, ...entry };
+            // Spread FIRST, then the file-derived id — never the other way round.
+            // A thread entry is peer-authored data; with the id first, an entry
+            // carrying its own `machineId` key overrides the one derived from the
+            // index file's NAME, which is the only trustworthy source. That id now
+            // selects `state.peers[...]` and feeds `alternateSource`, i.e. it decides
+            // which machine a pull fetches from.
+            const copy = { ...entry, machineId: index.machineId };
             const list = byThread.get(threadId) ?? [];
             list.push(copy);
             byThread.set(threadId, list);
@@ -122,7 +128,7 @@ export function findUnfetchableBundles(args) {
         let consumedThrough = -1;
         for (let i = 0; i < c.bundles.length; i++) {
             const r = c.bundles[i];
-            const rec = peer?.received[r.sessionIdInBundle];
+            const rec = peer?.received?.[r.sessionIdInBundle];
             const heldHead = rec ? peer?.sent[rec.localSessionId]?.headEntryUuid : undefined;
             // Both sides can legitimately be "" (a bundle boundary landing on a
             // uuid-less bookkeeping line), and two empty strings are not a match.
@@ -135,7 +141,7 @@ export function findUnfetchableBundles(args) {
             const r = c.bundles[i];
             if (offered.has(r.bundleId) || seen.has(r.bundleId))
                 continue;
-            const accounted = consumedThrough >= 0 ? i <= consumedThrough : !!peer?.received[r.sessionIdInBundle];
+            const accounted = consumedThrough >= 0 ? i <= consumedThrough : !!peer?.received?.[r.sessionIdInBundle];
             if (accounted)
                 continue;
             seen.add(r.bundleId);

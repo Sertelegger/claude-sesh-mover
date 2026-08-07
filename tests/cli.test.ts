@@ -1049,17 +1049,24 @@ describe("cli", () => {
 
         // Hub identity writes .claude-sesh-mover/project.json under the real
         // project directory, so (unlike plain export/import/migrate) push
-        // needs a real, writable projectPath. Reuse tempDir (already real,
-        // from beforeEach) and relocate the fixture's session data to
-        // tempDir's own encoded name so discovery finds it there.
+        // needs a real, writable projectPath. The project is its OWN directory
+        // here, not tempDir — the same reason the carry test below gives: the
+        // fixture config dir lives under tempDir, so pushing tempDir itself
+        // snapshotted `<tempDir>/.claude`, i.e. this test's own bundle carried
+        // the fixture's transcripts inside the WORKSPACE payload. Relocate the
+        // fixture's session data to that directory's encoded name so discovery
+        // finds it there.
+        const projectPath = join(tempDir, "pushproj");
+        mkdirSync(projectPath, { recursive: true });
+        writeFileSync(join(projectPath, "README.md"), "hello\n");
         const fixtureEncoded = "-Users-testuser-Projects-testproject";
-        const realEncoded = encodeProjectPath(tempDir);
+        const realEncoded = encodeProjectPath(projectPath);
         cpSync(join(configDir, "projects", fixtureEncoded), join(configDir, "projects", realEncoded), {
           recursive: true,
         });
 
         const { stdout, stderr } = await runCli(
-          ["push", "--project-path", tempDir, "--create-project", "--source-config-dir", configDir],
+          ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
           homeEnv(home)
         );
         expect(stderr.trim()).toBe(""); // no --progress: stderr stays pristine
@@ -1072,7 +1079,7 @@ describe("cli", () => {
         // Repeat push with no changes: up to date, no new bundle.
         const again = JSON.parse(
           (
-            await runCli(["push", "--project-path", tempDir, "--source-config-dir", configDir], homeEnv(home))
+            await runCli(["push", "--project-path", projectPath, "--source-config-dir", configDir], homeEnv(home))
           ).stdout
         );
         expect(again.success).toBe(true);

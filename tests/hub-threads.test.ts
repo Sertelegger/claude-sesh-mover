@@ -27,6 +27,18 @@ describe("resolveThreads", () => {
     expect(r2[0].latest.machineId).toBe("mB"); // lexical asc wins
   });
 
+  it("takes machineId from the index FILE, not from a thread entry that claims one", () => {
+    // A thread entry is peer-authored data. With `{ machineId, ...entry }` the
+    // entry won, so a hostile or corrupt index could rename itself — and that
+    // id now selects `state.peers[...]` in findUnfetchableBundles and feeds
+    // pull's alternateSource, i.e. it decides which machine a pull fetches
+    // from. A prototype key here was one route into the same crash the
+    // `received` guard closes.
+    const poisoned = idx("mA", { t1: entry({ localSessionId: "sA" }) });
+    (poisoned.threads.t1 as unknown as Record<string, unknown>).machineId = "SPOOFED";
+    expect(resolveThreads([poisoned])[0].latest.machineId).toBe("mA");
+  });
+
   it("breaks a total tie by machineId, so the answer never depends on index order", () => {
     // Reachable from the milestone's own headline flow: A pushes, B pulls and
     // continues, A pulls the continuation back and splices it into its own
@@ -99,6 +111,33 @@ describe("resolveThreads", () => {
 // The FALSE-POSITIVE property is the load-bearing one: this must be silent on
 // the ordinary two-machine flow, or it fires on every pull and gets ignored.
 describe("findUnfetchableBundles", () => {
+  // Both hub READ commands (`pull` and `whereis`) run this. A peers entry that
+  // PARSES but lacks `received` — an interrupted write, a hand edit, a file an
+  // older version wrote — used to reach `peer.received[id]` and throw
+  // `Cannot read properties of undefined` straight out of both. It never
+  // self-healed: the file parses, so readSyncState does not rename it aside,
+  // and no message named it. Guarded at the access AND normalized in
+  // parseSyncState, because either alone leaves the other reader exposed.
+  it("survives a peers entry with no `received`, instead of wedging pull and whereis", () => {
+    const malformed = {
+      schemaVersion: 1 as const, projectPath: "/p", lineage: {}, imported: {},
+      // Deliberately NOT built by peer(): the whole point is a shape the
+      // parser accepts and the types claim cannot happen.
+      peers: { mB: { name: "b", lastSentAt: null, lastReceivedAt: null } },
+    } as unknown as Parameters<typeof findUnfetchableBundles>[0]["state"];
+    const copies = [
+      copy("mA", { bundles: [bundle({ bundleId: "b1", sessionIdInBundle: "sA" })] }),
+      copy("mB", { bundles: [bundle({ bundleId: "b2", sessionIdInBundle: "sB" })] }),
+    ];
+    expect(() =>
+      findUnfetchableBundles({ copies, sourceMachineId: "mA", localMachineId: "mC", state: malformed })
+    ).not.toThrow();
+    // And it still answers correctly rather than swallowing the thread.
+    expect(
+      findUnfetchableBundles({ copies, sourceMachineId: "mA", localMachineId: "mC", state: malformed })
+    ).toEqual([{ machineId: "mB", bundleIds: ["b2"] }]);
+  });
+
   const A = "machine-a";
   const B = "machine-b";
   const C = "machine-c";

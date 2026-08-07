@@ -49,6 +49,54 @@ describe("workspace snapshot", () => {
     } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
   });
 
+  it("never snapshots the project-local .claude tree — settings, hooks, and a config dir living inside the project", async () => {
+    // A workspace snapshot is a plain file copy, so before `.claude` was a
+    // built-in exclude every git-less project's push uploaded it whole:
+    // settings.local.json (permission allowlists, which routinely name paths and
+    // hostnames), project-local hooks, and — whenever CLAUDE_CONFIG_DIR points
+    // inside the project — every transcript a SECOND time, in the workspace
+    // payload rather than the sessions payload the "sessions are secrets"
+    // handling applies to. Measured in a real bundle as
+    // bundle/workspace/.claude/settings.json and
+    // bundle/workspace/.claude/projects/-tmp-…/<session>.jsonl. The default-on
+    // SessionEnd auto-push is what made it the ordinary case rather than
+    // something a user chose per push.
+    const src = tmp("sesh-ws-claude-src-");
+    const dest = tmp("sesh-ws-claude-dest-");
+    try {
+      const encoded = "-tmp-sesh-ws-claude-src";
+      const transcript = `${encoded}/550e8400-e29b-41d4-a716-446655440000.jsonl`;
+      mkdirSync(join(src, ".claude", "projects", encoded), { recursive: true });
+      mkdirSync(join(src, ".claude", "hooks"), { recursive: true });
+      mkdirSync(join(src, "src"), { recursive: true });
+      writeFileSync(join(src, ".claude", "settings.json"), '{"model":"opus"}\n');
+      writeFileSync(
+        join(src, ".claude", "settings.local.json"),
+        '{"permissions":{"allow":["Bash(ssh prod-01:*)"]}}\n'
+      );
+      writeFileSync(join(src, ".claude", "hooks", "notify.sh"), "#!/bin/sh\ncurl -d @- https://x\n");
+      writeFileSync(join(src, ".claude", "projects", ...transcript.split("/")), '{"type":"user"}\n');
+      writeFileSync(join(src, "app.ts"), "real project content\n");
+      writeFileSync(join(src, "src", "index.ts"), "more\n");
+
+      const r = await snapshotWorkspace(src, dest);
+      expect(existsSync(join(dest, ".claude"))).toBe(false);
+      expect(r.fileCount).toBe(2); // app.ts + src/index.ts, and nothing out of .claude
+      expect(existsSync(join(dest, "app.ts"))).toBe(true);
+      expect(existsSync(join(dest, "src", "index.ts"))).toBe(true);
+
+      // The same rule filters the carry's UNTRACKED half (carry.ts runs
+      // `git ls-files --others` through isCarriedPath), so an untracked
+      // settings.local.json in a git project stops travelling too. Its TRACKED
+      // sibling still rides the `git diff HEAD` patch, which only the
+      // NEVER_INCLUDABLE floor filters — see README's tracked/untracked split.
+      const rules = readCarryRules(src);
+      expect(isCarriedPath(".claude/settings.local.json", rules)).toBe(false);
+      expect(isCarriedPath(`.claude/projects/${transcript}`, rules)).toBe(false);
+      expect(isCarriedPath("app.ts", rules)).toBe(true);
+    } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
   it("creates the payload directory even when it carries nothing, so a declared payload is never absent", async () => {
     // Every other snapshot test here hands `snapshotWorkspace` a dest that
     // mkdtempSync already created, which is why this went unnoticed: the real
@@ -694,6 +742,43 @@ describe("hubinclude", () => {
       expect(existsSync(join(dest, "build", "out.js"))).toBe(false);
       expect(r.fileCount).toBe(1);
     } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it("a hubinclude line naming .claude re-includes it — it is a DEFAULT, not the floor", async () => {
+    // The pair to the test below this one, and the reason `.claude` went into
+    // DEFAULT_WORKSPACE_EXCLUDES rather than NEVER_INCLUDABLE: the floor holds
+    // the names that decide where the hub is and what the next push ships, and
+    // nothing names those back. `.claude` is excluded because of what leaves
+    // the machine, which is the user's own call — a project-level settings.json
+    // or a set of shared agents is ordinary content to carry between your own
+    // machines. So the same file, in the same run, must move `.claude` and must
+    // not move `.git`.
+    const src = tmp("sesh-inc-claude-src-");
+    const before = tmp("sesh-inc-claude-before-");
+    const after = tmp("sesh-inc-claude-after-");
+    try {
+      mkdirSync(join(src, ".claude", "agents"), { recursive: true });
+      mkdirSync(join(src, ".git"), { recursive: true });
+      writeFileSync(join(src, ".claude", "settings.json"), '{"model":"opus"}\n');
+      writeFileSync(join(src, ".claude", "agents", "reviewer.md"), "shared agent\n");
+      writeFileSync(join(src, ".git", "config"), "[remote]\n  url = SECRET\n");
+      writeFileSync(join(src, "app.ts"), "ok\n");
+
+      // Default: dropped, like every other convenience exclude.
+      const plain = await snapshotWorkspace(src, before);
+      expect(existsSync(join(before, ".claude"))).toBe(false);
+      expect(plain.fileCount).toBe(1); // app.ts alone
+
+      // Named back: carried, subtree and all — while the floor does not move.
+      writeInclude(src, ".claude\n.git\n");
+      const r = await snapshotWorkspace(src, after);
+      expect(existsSync(join(after, ".claude", "settings.json"))).toBe(true);
+      expect(existsSync(join(after, ".claude", "agents", "reviewer.md"))).toBe(true);
+      expect(existsSync(join(after, ".git"))).toBe(false);
+      expect(r.fileCount).toBe(3); // app.ts + both .claude files, never .git/config
+    } finally {
+      for (const d of [src, before, after]) rmSync(d, { recursive: true, force: true });
+    }
   });
 
   it("no hubinclude pattern can put .git or .claude-sesh-mover into a snapshot", async () => {

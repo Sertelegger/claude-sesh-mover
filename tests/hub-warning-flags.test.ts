@@ -85,6 +85,12 @@ const REGISTRY: FlagUse[] = [
   },
   {
     file: "pull.ts",
+    match: "this bundle was skipped and the fork is still undecided, but",
+    klass: "retry-works",
+    why: "The same divergence skip, worded for a break part-way through a chain. Still retry-works, and for the same reason: nothing is applied or recorded for THIS bundle or any later one, so the re-run reaches the fork. What changed is the honesty of the rest of the sentence — the bundles BEFORE it in the chain were applied and recorded, and the old text claimed the whole pull had changed nothing.",
+  },
+  {
+    file: "pull.ts",
     match: "adopt-hub refused for thread",
     klass: "retry-works",
     why: "The liveness refusal was given SKIP semantics for this exact reason (Task 4 fix round 2), and thread-wide ABORT semantics for the second half of it (final round): nothing applied, nothing recorded, no later bundle of the chain fetched, so --force-append on the re-run reaches the adoption. With a per-bundle skip the promise held only for a single-bundle chain.",
@@ -119,6 +125,12 @@ const REGISTRY: FlagUse[] = [
     match: "untrack them (git rm --cached) or push with --no-carry",
     klass: "future-only",
     why: "The files are already on the hub; both remedies are about what the NEXT push carries.",
+  },
+  {
+    file: "push.ts",
+    match: "on a later push to link to that one instead of minting a second",
+    klass: "future-only",
+    why: "A push that failed AFTER committing the identity link now rolls the local link back and reports the orphaned hub project by id. That hub project cannot be removed (there is no backend.delete call anywhere in src/), so this push cannot be repaired in place — --project-id is how the NEXT push links to the orphan instead of minting a second one. The existing 'Pass --project-id <id> to link to an existing hub project, or --create-project' entry does not fit: this message has to name the specific orphaned id.",
   },
   // ---- everything else -----------------------------------------------------
   {
@@ -178,6 +190,33 @@ function flagLines(): Array<{ file: string; line: number; text: string; flag: st
       if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) continue;
       const m = pattern.exec(text);
       if (m) out.push({ file, line: i + 1, text, flag: m[0] });
+    }
+  }
+  return out;
+}
+
+/**
+ * The docs the model actually reads: every slash-command doc, the skill doc and
+ * the README. `flagLines()` deliberately stops at `src/hub/` (the registry above
+ * is a per-branch judgement about shipped CODE), but the --force-workspace check
+ * at the bottom of this file is a claim about a flag's MEANING, and a wrong one
+ * does more damage here than in a warning string — the fifth instance of that
+ * defect shipped in commands/pull.md's AskUserQuestion label.
+ */
+function docLines(): Array<{ file: string; line: number; text: string }> {
+  const root = join(import.meta.dirname, "..");
+  const files = [
+    ...readdirSync(join(root, "commands"))
+      .filter((f) => f.endsWith(".md"))
+      .sort()
+      .map((f) => join("commands", f)),
+    "README.md",
+    join("skills", "session-porter", "SKILL.md"),
+  ];
+  const out: Array<{ file: string; line: number; text: string }> = [];
+  for (const rel of files) {
+    for (const [i, text] of readFileSync(join(root, rel), "utf-8").split("\n").entries()) {
+      out.push({ file: rel, line: i + 1, text });
     }
   }
   return out;
@@ -253,10 +292,40 @@ describe("every shipped message naming a CLI flag is classified", () => {
     // one emitted at the exact point chooseMergeAncestor had ruled a merge out.
     // The flag skips the 3-way merge by definition — it means "give me the
     // hub's copy wholesale".
-    const MERGEY = /--force-workspace[^.]{0,120}?\bmerg(e|ing) (into|it into|the existing)\b|\bmerge into the existing\b/i;
-    const offenders = flagLines()
-      .filter((l) => l.text.includes("--force-workspace") && MERGEY.test(l.text))
+    //
+    // The FIFTH instance hid in commands/pull.md's AskUserQuestion label, which
+    // this guard could not see while it read src/hub/ only — so the sweep now
+    // covers the docs too. That needs tuning, because a markdown "line" is a
+    // whole paragraph and the flag legitimately appears next to the word merge
+    // all over them ("--force-workspace overrides the 3-way merge", "overwrite,
+    // not merge", "it is not a merge and never becomes one") — all of which
+    // must pass, so a bare co-occurrence is not the test. Two shapes are:
+    //   1. a merge/combine verb reaching a TARGET within the same clause —
+    //      "merge into the existing tree", "merge the hub copy into your
+    //      current files" (the AskUserQuestion shape that got through),
+    //      "combines with your local files";
+    //   2. the original src/ pattern kept verbatim: a bare "merge into" /
+    //      "merging into" in the same sentence as the flag (no `.` between).
+    // The bounded gap is what admits an object between the verb and its
+    // preposition without letting the match wander into the next clause. It
+    // reads the CLAIM's shape, not its polarity, so a negation spelled "does
+    // not merge it into your tree" would trip it — negate the way this file's
+    // subjects already do ("it is not a merge") and that never comes up.
+    const MERGEY = [
+      /\bmerg(?:e|es|ed|ing)\b[^.]{0,30}?\b(?:into|with)\s+(?:the\s+)?(?:existing|current|local|your)\b/i,
+      /\bcombine(?:s|d)?\b[^.]{0,30}?\bwith\s+(?:the\s+)?(?:existing|current|local|your)\b/i,
+      /--force-workspace[^.]{0,120}?\bmerg(e|ing) (into|it into|the existing)\b|\bmerge into the existing\b/i,
+    ];
+    const offenders = [
+      ...flagLines().map((l) => ({ file: `src/hub/${l.file}`, line: l.line, text: l.text })),
+      ...docLines(),
+    ]
+      .filter((l) => l.text.includes("--force-workspace") && MERGEY.some((r) => r.test(l.text)))
       .map((l) => `${l.file}:${l.line}`);
-    expect(offenders).toEqual([]);
+    expect(
+      offenders,
+      "--force-workspace OVERWRITES on collision — it is not a merge into the existing tree. " +
+        "Reword the line, or tighten MERGEY if this is a false positive."
+    ).toEqual([]);
   });
 });

@@ -1,3 +1,21 @@
+/**
+ * The convenience excludes every carry path starts from. Each of these is a
+ * DEFAULT, not a floor: `.claude-sesh-mover/hubinclude` names any of them back
+ * (the floor that nothing names back is `NEVER_INCLUDABLE`, below).
+ *
+ * `.claude` is the one entry here that is not about size or noise. It is the
+ * project-local Claude Code directory, and a workspace snapshot is a plain file
+ * copy of the project, so without this line every git-less project's push
+ * uploaded `settings.local.json` (permission allowlists, which routinely name
+ * paths and hostnames) and any project-local hooks — and, whenever
+ * `CLAUDE_CONFIG_DIR` points inside the project, every transcript a SECOND
+ * time, inside the workspace payload rather than the `sessions/` payload the
+ * "sessions are secrets" handling applies to. Measured in a real bundle:
+ * `bundle/workspace/.claude/settings.json` and
+ * `bundle/workspace/.claude/projects/<encoded>/<session>.jsonl`. The
+ * default-on SessionEnd auto-push is what made that the ordinary case rather
+ * than something a user chose per push.
+ */
 export declare const DEFAULT_WORKSPACE_EXCLUDES: string[];
 /**
  * Names that can never be carried, re-included, or applied — at ANY depth, on
@@ -18,9 +36,22 @@ export declare const DEFAULT_WORKSPACE_EXCLUDES: string[];
  *   a workspace payload into an exfiltration primitive. So it is refused on the
  *   apply side too, not only on the carry side.
  *
- * Everything else in `DEFAULT_WORKSPACE_EXCLUDES` (`node_modules`, `.venv`,
- * `__pycache__`, `.DS_Store`) is a convenience default and stays re-includable
- * on purpose — a user who names it has said what they mean.
+ * Everything else in `DEFAULT_WORKSPACE_EXCLUDES` (`.claude`, `node_modules`,
+ * `.venv`, `__pycache__`, `.DS_Store`) is a convenience default and stays
+ * re-includable on purpose — a user who names it has said what they mean.
+ *
+ * `.claude` is the entry in that list that has to argue for itself, because it
+ * is excluded for a disclosure reason rather than a size one (see
+ * `DEFAULT_WORKSPACE_EXCLUDES`) and the two lists are one line apart. It is
+ * deliberately NOT here, and the dividing line is what a name can do rather
+ * than what it contains: this floor holds the two directories that decide where
+ * the hub is, what the next push ships, and whether a VCS store survives being
+ * written over — a payload that reaches either of those subverts sesh-mover
+ * itself. `.claude` does none of that. Its risk is that its contents leave the
+ * machine, which is the user's own call to make: a project-level
+ * `.claude/settings.json` or a set of shared agents is ordinary project content
+ * someone may well want carried between their own machines, and writing
+ * `.claude` in `hubinclude` is exactly how they say so.
  */
 export declare const NEVER_INCLUDABLE: readonly string[];
 export declare class WorkspaceTargetNotEmptyError extends Error {

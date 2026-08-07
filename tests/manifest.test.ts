@@ -43,14 +43,21 @@ describe("manifest", () => {
   }
 
   describe("writeManifest / readManifest", () => {
-    it("round-trips a manifest to disk", async () => {
-      const { writeManifest, readManifest } = await import(
+    it("round-trips a manifest to disk, stamping the sessions digest", async () => {
+      const { writeManifest, readManifest, computeSessionsDigest } = await import(
         "../src/manifest.js"
       );
       const manifest = makeTestManifest();
       writeManifest(tempDir, manifest);
       const readBack = readManifest(tempDir);
-      expect(readBack).toEqual(manifest);
+      // writeManifest is the single place the digest is computed, so a caller
+      // that edits the session list can never leave a stale one behind — and
+      // the input object is not mutated on the way through.
+      expect(manifest.sessionsDigest).toBeUndefined();
+      expect(readBack).toEqual({
+        ...manifest,
+        sessionsDigest: computeSessionsDigest(manifest.sessions),
+      });
     });
   });
 
@@ -231,6 +238,118 @@ describe("manifest", () => {
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe("computeLayerDigest", () => {
+    // The gap this closes: until 0.6.0 only session JSONL carried a hash, so a
+    // corrupted file-history backup rode through import silently and was later
+    // restored over the user's own file.
+    let dir: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "sesh-layer-"));
+      mkdirSync(join(dir, "file-history"), { recursive: true });
+      writeFileSync(join(dir, "file-history", "aaa@v1"), "backup one\n");
+      writeFileSync(join(dir, "file-history", "bbb@v1"), "backup two\n");
+    });
+
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+    it("is null for a directory that does not exist, and stable for one that does", async () => {
+      const { computeLayerDigest } = await import("../src/manifest.js");
+      expect(await computeLayerDigest(join(dir, "nope"))).toBeNull();
+      const a = await computeLayerDigest(join(dir, "file-history"));
+      const b = await computeLayerDigest(join(dir, "file-history"));
+      expect(a).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(a).toBe(b);
+    });
+
+    it("changes when a file's CONTENT changes, at identical name and size", async () => {
+      const { computeLayerDigest } = await import("../src/manifest.js");
+      const before = await computeLayerDigest(join(dir, "file-history"));
+      writeFileSync(join(dir, "file-history", "aaa@v1"), "backup 0ne\n"); // same length
+      expect(await computeLayerDigest(join(dir, "file-history"))).not.toBe(before);
+    });
+
+    it("changes when a file is added or removed", async () => {
+      const { computeLayerDigest } = await import("../src/manifest.js");
+      const before = await computeLayerDigest(join(dir, "file-history"));
+      writeFileSync(join(dir, "file-history", "ccc@v1"), "backup three\n");
+      const added = await computeLayerDigest(join(dir, "file-history"));
+      expect(added).not.toBe(before);
+      rmSync(join(dir, "file-history", "ccc@v1"));
+      rmSync(join(dir, "file-history", "bbb@v1"));
+      expect(await computeLayerDigest(join(dir, "file-history"))).not.toBe(before);
+    });
+
+    it("ignores directories, so it covers exactly the flat file set the copy paths copy", async () => {
+      const { computeLayerDigest } = await import("../src/manifest.js");
+      const before = await computeLayerDigest(join(dir, "file-history"));
+      mkdirSync(join(dir, "file-history", "sub"));
+      writeFileSync(join(dir, "file-history", "sub", "x"), "ignored\n");
+      expect(await computeLayerDigest(join(dir, "file-history"))).toBe(before);
+    });
+  });
+
+  describe("computeSessionsDigest", () => {
+    it("is independent of key order and of array identity", async () => {
+      const { computeSessionsDigest } = await import("../src/manifest.js");
+      const a = makeTestManifest().sessions;
+      const reordered = a.map((s) => {
+        const out: Record<string, unknown> = {};
+        for (const k of Object.keys(s).reverse()) out[k] = (s as Record<string, unknown>)[k];
+        return out as unknown as (typeof a)[number];
+      });
+      expect(computeSessionsDigest(reordered)).toBe(computeSessionsDigest(a));
+    });
+
+    it("treats an absent optional field and an explicitly-undefined one as the same", async () => {
+      const { computeSessionsDigest } = await import("../src/manifest.js");
+      // The export path builds `type: incremental ? "full" : undefined`, which
+      // JSON.stringify drops on the way to disk. The digest is computed over
+      // the in-memory object at write time and over the parsed one at read
+      // time, so those two spellings have to agree or every bundle would fail
+      // its own check on import.
+      const withUndefined = makeTestManifest().sessions.map((s) => ({ ...s, type: undefined }));
+      expect(computeSessionsDigest(withUndefined)).toBe(
+        computeSessionsDigest(makeTestManifest().sessions)
+      );
+    });
+
+    it("changes when any declared hash, layer digest or count changes", async () => {
+      const { computeSessionsDigest } = await import("../src/manifest.js");
+      const base = computeSessionsDigest(makeTestManifest().sessions);
+
+      const rehashed = makeTestManifest().sessions;
+      rehashed[0].integrityHash = "sha256:deadbeef";
+      expect(computeSessionsDigest(rehashed)).not.toBe(base);
+
+      const relayered = makeTestManifest().sessions;
+      relayered[0].layerDigests = { "file-history": "sha256:cafe" };
+      expect(computeSessionsDigest(relayered)).not.toBe(base);
+
+      // The case per-session hashes structurally cannot catch: a session record
+      // dropped from the inventory. Every surviving record still verifies.
+      expect(computeSessionsDigest([])).not.toBe(base);
+    });
+  });
+
+  describe("verifySessionsDigest", () => {
+    it("passes a pre-0.6.0 manifest that declares no digest at all", async () => {
+      const { verifySessionsDigest } = await import("../src/manifest.js");
+      expect(verifySessionsDigest(makeTestManifest())).toBeNull();
+    });
+
+    it("passes a stamped manifest and names the mismatch on an edited one", async () => {
+      const { verifySessionsDigest, computeSessionsDigest } = await import(
+        "../src/manifest.js"
+      );
+      const m = makeTestManifest();
+      m.sessionsDigest = computeSessionsDigest(m.sessions);
+      expect(verifySessionsDigest(m)).toBeNull();
+      m.sessions[0].messageCount = 999;
+      expect(verifySessionsDigest(m)).toMatch(/hashes to sha256:/);
     });
   });
 });
