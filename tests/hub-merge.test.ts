@@ -483,19 +483,19 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
     }
   });
 
-  it("the target's hubignore vetoes an incoming path — the BUILT-IN excludes do not", async () => {
-    // The two are different kinds of rule. `hubignore` is an explicit local
+  it("the target's ignore list vetoes an incoming path — the BUILT-IN excludes do not", async () => {
+    // The two are different kinds of rule. `.sesh-mover-ignore` is an explicit local
     // statement ("this path is not the hub's business"), so it still keeps an
     // incoming copy off that path — and now says so instead of dropping it
     // silently. The built-in convenience excludes are a CARRY-side default the
     // sender already applied: re-applying them here is what discarded files a
-    // `hubinclude` had explicitly carried, so a payload path under one of them
+    // `.sesh-mover-include` had explicitly carried, so a payload path under one of them
     // is applied. A payload only contains such a path because the sender chose
     // to share it.
     const { root, a, i, t } = trees();
     try {
       mkdirSync(join(t, ".sesh-mover"), { recursive: true });
-      writeFileSync(join(t, ".sesh-mover-hubignore"), "# mine\n*.log\n");
+      writeFileSync(join(t, ".sesh-mover-ignore"), "# mine\n*.log\n");
       put(a, "debug.log", "old\n");
       put(t, "debug.log", "local log\n");
       put(i, "debug.log", "remote log\n");
@@ -539,21 +539,21 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
   });
 });
 
-describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", () => {
-  it("applies what hubinclude deliberately carried, with NO rule files on the receiving machine", async () => {
+describe("mergeWorkspaceTrees — include-list parity with the other apply path", () => {
+  it("applies what the include list deliberately carried, with NO rule files on the receiving machine", async () => {
     // The merge filtered its three trees through the excludes while knowing
-    // nothing about hubinclude, so a file the user had explicitly listed was
+    // nothing about the include list, so a file the user had explicitly listed was
     // snapshotted, archived, uploaded, downloaded — and then discarded here,
     // with no report row, on the ROUTINE pull path, while a --force-workspace
     // unpack of the same bundle applied it. Newly reachable in this milestone:
-    // before hubinclude, nothing excluded could ever be in an incoming tree.
+    // before the include list, nothing excluded could ever be in an incoming tree.
     //
     // The target deliberately has NO rule files, which is the real product
-    // shape: `hubinclude`/`hubignore` live under `.sesh-mover`, which
+    // shape: `.sesh-mover-include`/`.sesh-mover-ignore` live under `.sesh-mover`, which
     // never travels in a payload, and a workspace payload only exists for a
     // project with no git remote — so the receiving tree came from the hub and
     // has no copy of the rules that built the bundle. Consulting the target's
-    // own `hubinclude` would have fixed this only where the user had written
+    // own `.sesh-mover-include` would have fixed this only where the user had written
     // that file on both machines by hand.
     const { root, a, i, t } = trees();
     try {
@@ -592,7 +592,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
     // payload, unpackWorkspace's applied set and mergeWorkspaceTrees' applied
     // set are the SAME set. The sender's rules decide what the payload is;
     // both apply paths then apply the payload minus the NEVER floor, and the
-    // merge's one extra veto (the target's own hubignore) is absent here
+    // merge's one extra veto (the target's own ignore list) is absent here
     // because the target has none.
     const root = tmp("sesh-parity-");
     try {
@@ -603,10 +603,10 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
       const ancestor = join(root, "ancestor");
       for (const d of [src, unpackTarget, mergeTarget, ancestor]) mkdirSync(d, { recursive: true });
 
-      put(src, ".sesh-mover-hubinclude", "build/\n*.keepme\nnode_modules/local-pkg/\n");
-      put(src, ".sesh-mover-hubignore", "*.log\nbuild\n");
+      put(src, ".sesh-mover-include", "build/\n*.keepme\nnode_modules/local-pkg/\n");
+      put(src, ".sesh-mover-ignore", "*.log\nbuild\n");
       put(src, "app.ts", "code\n");
-      put(src, "debug.log", "noise\n");                      // hubignore'd
+      put(src, "debug.log", "noise\n");                      // ignore-listed
       put(src, join("build", "keep.js"), "generated\n");      // build/ re-included
       put(src, join("build", "sub", "deep.js"), "deep\n");
       put(src, join("node_modules", "local-pkg", "i.js"), "vendored\n");
@@ -645,14 +645,14 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
     const { root, a, i, t } = trees();
     try {
       put(i, join(".git", "config"), "[remote]\n");
-      put(i, ".sesh-mover-hubinclude", "*\n");
+      put(i, ".sesh-mover-include", "*\n");
       put(i, "ok.txt", "fine\n");
       const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
       expect(r.created).toEqual(["ok.txt"]);
       expect(r.skipped.map((s) => ({ path: s.path, reason: s.reason })).sort((x, y) => x.path.localeCompare(y.path)))
         .toEqual([
           { path: ".git", reason: "payload-internals" },
-          { path: ".sesh-mover-hubinclude", reason: "payload-internals" },
+          { path: ".sesh-mover-include", reason: "payload-internals" },
         ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -662,7 +662,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
 
 describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
   it("a payload can never contribute plugin or VCS internals, whatever their casing", async () => {
-    // .sesh-mover-hubinclude decides what the NEXT push ships, so a
+    // .sesh-mover-include decides what the NEXT push ships, so a
     // payload that plants it turns a workspace merge into an exfiltration
     // primitive; .git is a store that a peer's copy corrupts rather than
     // merges. The default excludes name both, but case-SENSITIVELY, while the
@@ -672,8 +672,10 @@ describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
     const { root, a, i, t } = trees();
     try {
       put(i, join(".GIT", "config"), "[remote]\n");
-      put(i, join(".Claude-Sesh-Mover", "hubinclude"), "*\n");
-      put(i, ".Sesh-Mover-HubInclude", "*\n");
+      put(i, join(".Claude-Sesh-Mover", "hubinclude"), "*\n"); // pre-0.7.0 shape
+      put(i, ".Sesh-Mover-HubInclude", "*\n");                 // 0.7.0 root dotfile
+      put(i, ".Sesh-Mover-Include", "*\n");                    // 0.8.0 root dotfile
+      put(i, ".Sesh-Mover-Ignore", "*\n");
       put(i, join("sub", ".sesh-mover", "config.json"), '{"hub":{"path":"/evil"}}');
       put(i, "ok.txt", "fine\n");
       const r = await mergeWorkspaceTrees({
@@ -683,6 +685,8 @@ describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
       expect(existsSync(join(t, ".GIT"))).toBe(false);
       expect(existsSync(join(t, ".Claude-Sesh-Mover"))).toBe(false);
       expect(existsSync(join(t, ".Sesh-Mover-HubInclude"))).toBe(false);
+      expect(existsSync(join(t, ".Sesh-Mover-Include"))).toBe(false);
+      expect(existsSync(join(t, ".Sesh-Mover-Ignore"))).toBe(false);
       expect(existsSync(join(t, "sub"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });

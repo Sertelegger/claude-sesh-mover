@@ -19,18 +19,29 @@ import { join } from "node:path";
  * ## Why the split by lifecycle
  *
  * `.claude-sesh-mover/` held two things with opposite lifecycles: generated
- * exports (must never be committed) and user config plus identity (`hubinclude`,
- * `hubignore`, `project.json` — must be committed, or they do not work). One
+ * exports (must never be committed) and user config plus identity (the include
+ * list, the ignore list, `project.json` — must be committed, or they do not
+ * work). One
  * directory cannot be both, which is why `.gitignore` needed a negation
  * (`.claude-sesh-mover/*` plus three `!` lines) to make this repo able to follow
  * its own README. That was a symptom. Splitting by lifecycle is the fix:
  *
  * - `<project>/.sesh-mover/` — generated exports only. Plainly gitignored.
- * - `<project>/.sesh-mover-hubinclude`, `-hubignore`, `-project.json` — the
+ * - `<project>/.sesh-mover-include`, `-ignore`, `-project.json` — the
  *   committed files, as ordinary root dotfiles, the way every comparable tool
  *   spells a per-project config.
  * - `~/.sesh-mover/` — machine identity, sync state, locks, user-scope exports
  *   and config.
+ *
+ * ## Why the include/ignore files dropped "hub" in 0.8.0
+ *
+ * They were `.sesh-mover-hubinclude` / `.sesh-mover-hubignore` for exactly one
+ * release, because the hub was the only thing that read them. It is not any
+ * more: `export` and `import` carry the same workspace and git-diff payloads
+ * (#47), so a hub-less user configuring what travels was reading a file whose
+ * name asserted a feature they never touch. The rename went in AHEAD of that
+ * feature so the names were already right when it landed, and so anyone still
+ * on 0.6.x has ONE migration rather than two.
  */
 
 /** Per-project directory: generated exports only, and gitignored. */
@@ -47,11 +58,24 @@ export const USER_DIR_NAME = ".sesh-mover";
  */
 export const LEGACY_DIR_NAME = ".claude-sesh-mover";
 
-/** Committed: the opt-in re-include list (`hubinclude`), at the project root. */
-export const HUBINCLUDE_FILE_NAME = ".sesh-mover-hubinclude";
+/** Committed: the opt-in re-include list, at the project root. */
+export const INCLUDE_FILE_NAME = ".sesh-mover-include";
 
-/** Committed: the per-segment exclusion list (`hubignore`), at the project root. */
-export const HUBIGNORE_FILE_NAME = ".sesh-mover-hubignore";
+/** Committed: the per-segment exclusion list, at the project root. */
+export const IGNORE_FILE_NAME = ".sesh-mover-ignore";
+
+/**
+ * The 0.7.0-only spellings of the two lists above.
+ *
+ * Read by nothing — a project holding one of these is simply not configured, the
+ * same call 0.7.0 made about the pre-0.7.0 `.claude-sesh-mover/hubinclude`. They
+ * exist for ONE reason: the `NEVER_INCLUDABLE` floor, which never drops a name.
+ * See `PLUGIN_STATE_NAMES` below.
+ */
+export const LEGACY_INCLUDE_FILE_NAME = ".sesh-mover-hubinclude";
+
+/** The 0.7.0-only spelling of the ignore list. Floor-only — see above. */
+export const LEGACY_IGNORE_FILE_NAME = ".sesh-mover-hubignore";
 
 /** Committed: this project's hub identity (`projectId`), at the project root. */
 export const PROJECT_JSON_FILE_NAME = ".sesh-mover-project.json";
@@ -62,12 +86,23 @@ export const PROJECT_JSON_FILE_NAME = ".sesh-mover-project.json";
  * Order matters only for readability. The floor (`NEVER_INCLUDABLE` in
  * `hub/workspace.ts`) is built from this list plus `.git`, so adding a name here
  * protects it on the carry side and the apply side at once.
+ *
+ * **THIS LIST ONLY EVER GROWS.** Three of its seven entries are names no current
+ * version of this plugin writes or reads: `.claude-sesh-mover` (pre-0.7.0) and
+ * the two 0.7.0 `hub*` spellings. Bundles carrying every one of them are already
+ * sitting on hubs and inside export archives, and removing a name un-protects
+ * exactly those — a payload could then plant a legacy include list that an older
+ * peer still reads, which is the Slice-2 exfiltration primitive in a new shape.
+ * A retired name costs two array entries and two `git` pathspecs; dropping one
+ * costs a security property. Add, never replace.
  */
 export const PLUGIN_STATE_NAMES: readonly string[] = Object.freeze([
   PROJECT_DIR_NAME,
   LEGACY_DIR_NAME,
-  HUBINCLUDE_FILE_NAME,
-  HUBIGNORE_FILE_NAME,
+  INCLUDE_FILE_NAME,
+  IGNORE_FILE_NAME,
+  LEGACY_INCLUDE_FILE_NAME,
+  LEGACY_IGNORE_FILE_NAME,
   PROJECT_JSON_FILE_NAME,
 ]);
 
@@ -91,14 +126,14 @@ export function projectSeshMoverDir(projectPath: string): string {
   return join(projectPath, PROJECT_DIR_NAME);
 }
 
-/** `<projectPath>/.sesh-mover-hubinclude`. */
-export function hubincludeFilePath(projectPath: string): string {
-  return join(projectPath, HUBINCLUDE_FILE_NAME);
+/** `<projectPath>/.sesh-mover-include`. */
+export function includeFilePath(projectPath: string): string {
+  return join(projectPath, INCLUDE_FILE_NAME);
 }
 
-/** `<projectPath>/.sesh-mover-hubignore`. */
-export function hubignoreFilePath(projectPath: string): string {
-  return join(projectPath, HUBIGNORE_FILE_NAME);
+/** `<projectPath>/.sesh-mover-ignore`. */
+export function ignoreFilePath(projectPath: string): string {
+  return join(projectPath, IGNORE_FILE_NAME);
 }
 
 /** `<projectPath>/.sesh-mover-project.json`. */
@@ -198,7 +233,7 @@ export function resolveUserSeshMoverDir(): UserDirResolution {
         dir: current,
         state: "migrated",
         warning:
-          `sesh-mover moved ${legacy} to ${current} (the directory dropped its \`claude-\` prefix in 0.7.0). Nothing was copied or recreated, so this machine keeps its identity, its hub sync state and its exports. Project-level files did NOT move: if a project has a \`.claude-sesh-mover/\` directory, recreate \`hubinclude\`/\`hubignore\`/\`project.json\` as \`.sesh-mover-hubinclude\`/\`.sesh-mover-hubignore\`/\`.sesh-mover-project.json\` at the project root.`,
+          `sesh-mover moved ${legacy} to ${current} (the directory dropped its \`claude-\` prefix in 0.7.0). Nothing was copied or recreated, so this machine keeps its identity, its hub sync state and its exports. Project-level files did NOT move: if a project has a \`.claude-sesh-mover/\` directory, recreate \`hubinclude\`/\`hubignore\`/\`project.json\` as \`${INCLUDE_FILE_NAME}\`/\`${IGNORE_FILE_NAME}\`/\`${PROJECT_JSON_FILE_NAME}\` at the project root. If you are coming from 0.7.0 instead, the two list files dropped their \`hub\` in 0.8.0 — rename \`${LEGACY_INCLUDE_FILE_NAME}\` to \`${INCLUDE_FILE_NAME}\` and \`${LEGACY_IGNORE_FILE_NAME}\` to \`${IGNORE_FILE_NAME}\`; \`${PROJECT_JSON_FILE_NAME}\` is unchanged.`,
       };
     } catch (e) {
       result = {

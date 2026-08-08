@@ -1,6 +1,6 @@
 /**
  * The convenience excludes every carry path starts from. Each of these is a
- * DEFAULT, not a floor: `.sesh-mover-hubinclude` names any of them back
+ * DEFAULT, not a floor: `.sesh-mover-include` names any of them back
  * (the floor that nothing names back is `NEVER_INCLUDABLE`, below).
  *
  * `.claude` is the one entry here that is not about size or noise. It is the
@@ -21,7 +21,7 @@ export declare const DEFAULT_WORKSPACE_EXCLUDES: string[];
  * Names that can never be carried, re-included, or applied — at ANY depth, on
  * any path, by any pattern (design §6.0).
  *
- * `hubinclude` exists to make the exclusion logic say "yes" where it used to
+ * `.sesh-mover-include` exists to make the exclusion logic say "yes" where it used to
  * say "no", so this list is the floor it can never dig under:
  *
  * - `.git` is a VCS store, not project content: it holds credentials in some
@@ -32,21 +32,25 @@ export declare const DEFAULT_WORKSPACE_EXCLUDES: string[];
  * - Everything in `PLUGIN_STATE_NAMES` holds this plugin's own project state —
  *   `.sesh-mover-project.json` (planted by pull independently), the
  *   project-scope `config.json` under `.sesh-mover/` (which can redirect
- *   `hub.path`), and `.sesh-mover-hubinclude` ITSELF. A payload able to write
+ *   `hub.path`), and `.sesh-mover-include` ITSELF. A payload able to write
  *   any of those could rewrite the list deciding what the next push ships,
  *   turning a workspace payload into an exfiltration primitive. So they are
  *   refused on the apply side too, not only on the carry side.
  *
- * TWO THINGS ABOUT THIS LIST ARE PERMANENT, not incidental to the 0.7.0 rename:
+ * TWO THINGS ABOUT THIS LIST ARE PERMANENT, not incidental to whichever rename
+ * happened most recently:
  *
- * 1. **`.claude-sesh-mover` stays here forever.** Bundles carrying that path are
- *    already sitting on hubs, written by every version before 0.7.0. Dropping
- *    the old name would un-protect every one of them and reopen the exact
+ * 1. **Every retired name stays here forever.** That is `.claude-sesh-mover`
+ *    (pre-0.7.0) and the two 0.7.0 spellings `.sesh-mover-hubinclude` /
+ *    `.sesh-mover-hubignore`. Bundles carrying each of them are already sitting
+ *    on hubs and inside export archives, written by the version that used them.
+ *    Dropping an old name un-protects exactly those bundles and reopens the
  *    exfiltration primitive above in a new shape — a payload writing a legacy
- *    `hubinclude` that an older peer still reads.
- * 2. **The three root dotfiles need the floor MORE than the directory did.**
+ *    include list that an older peer still reads. `PLUGIN_STATE_NAMES` only ever
+ *    grows; see its comment.
+ * 2. **The root dotfiles need the floor MORE than the directory did.**
  *    They are ordinary files at the project root, so there is no directory name
- *    between a payload and them: `.sesh-mover-hubinclude` can be named directly.
+ *    between a payload and them: `.sesh-mover-include` can be named directly.
  *    The check is per SEGMENT and fold-tolerant (`isNeverSegment`), so it holds
  *    at any depth and in every spelling the directory names already survive.
  *
@@ -65,20 +69,18 @@ export declare const DEFAULT_WORKSPACE_EXCLUDES: string[];
  * machine, which is the user's own call to make: a project-level
  * `.claude/settings.json` or a set of shared agents is ordinary project content
  * someone may well want carried between their own machines, and writing
- * `.claude` in `hubinclude` is exactly how they say so.
+ * `.claude` in `.sesh-mover-include` is exactly how they say so.
  */
 export declare const NEVER_INCLUDABLE: readonly string[];
 export declare class WorkspaceTargetNotEmptyError extends Error {
     readonly targetPath: string;
     constructor(targetPath: string);
 }
-export declare function readHubignore(projectPath: string): string[];
-/** Where a project's `hubinclude` lives. */
-export declare function hubincludePath(projectPath: string): string;
+export declare function readIgnorePatterns(projectPath: string): string[];
 /**
- * hubinclude: the opt-in re-include list (design §6.0). Sibling to `hubignore`,
- * same syntax, and meant to be COMMITTED so it travels with the repo and means
- * the same thing on every clone.
+ * The include list (`.sesh-mover-include`): the opt-in re-include list (design
+ * §6.0). Sibling to `.sesh-mover-ignore`, same syntax, and meant to be COMMITTED
+ * so it travels with the repo and means the same thing on every clone.
  *
  * It exists because `.gitignore` is also where `.env` and credential files
  * live: ignored files are never carried by default, and this is the explicit,
@@ -86,10 +88,10 @@ export declare function hubincludePath(projectPath: string): string;
  * normalization happens in `isReIncluded`, so what a user wrote is what a
  * caller can echo back to them.
  *
- * Bounds are asymmetric with `readHubignore` on purpose: an ignore pattern
+ * Bounds are asymmetric with `readIgnorePatterns` on purpose: an ignore pattern
  * fails safe (it only ever removes files), an include pattern fails OPEN. Over
- * `MAX_HUBINCLUDE_BYTES` the file is ignored entirely; past
- * `MAX_HUBINCLUDE_PATTERNS` the tail is dropped.
+ * `MAX_INCLUDE_BYTES` the file is ignored entirely; past
+ * `MAX_INCLUDE_PATTERNS` the tail is dropped.
  *
  * Both bounds fail CLOSED — fewer re-includes — which from the outside is
  * indistinguishable from "my files silently stopped syncing". So a caller that
@@ -97,11 +99,11 @@ export declare function hubincludePath(projectPath: string): string;
  * appends a sentence naming the file, the limit and the consequence.
  * `snapshotWorkspace` threads them into the push's `warnings`.
  */
-export declare function readHubinclude(projectPath: string, diagnostics?: string[]): string[];
+export declare function readIncludePatterns(projectPath: string, diagnostics?: string[]): string[];
 /** Does any segment of this path name something that can never be carried? */
 export declare function isNeverIncludable(relPath: string): boolean;
 /**
- * Does `hubinclude` name this workspace-relative path?
+ * Does `.sesh-mover-include` name this workspace-relative path?
  *
  * Matching is on the RELATIVE PATH, not a bare segment, so a pattern carries a
  * subtree. Two shapes, both segment-wise with `*` globs:
@@ -113,7 +115,7 @@ export declare function isNeverIncludable(relPath: string): boolean;
  *   is rooted, trailing one included: `docs/` is `docs` at the project root,
  *   never `vendor/x/docs`.
  * - **bare** (`*.keepme`, `secrets`) — no separator at all, so it matches that
- *   name at any depth, the same way a `hubignore` line does. `snapshotWorkspace`
+ *   name at any depth, the same way a `.sesh-mover-ignore` line does. `snapshotWorkspace`
  *   walks excluded directories when a bare pattern exists precisely so this
  *   predicate and the payload it builds can never disagree (§6.0: one meaning
  *   in the product).
@@ -180,9 +182,9 @@ export declare function classifyDestination(targetDir: string, rel: string, expe
 };
 /** The two pattern lists that together decide what a tree contributes. */
 export interface CarryRules {
-    /** `DEFAULT_WORKSPACE_EXCLUDES` + `hubignore`: matched per path SEGMENT. */
+    /** `DEFAULT_WORKSPACE_EXCLUDES` + `.sesh-mover-ignore`: matched per path SEGMENT. */
     excludePatterns: string[];
-    /** `hubinclude`: re-admits excluded paths. Empty is the ordinary case. */
+    /** `.sesh-mover-include`: re-admits excluded paths. Empty is the ordinary case. */
     includePatterns: string[];
 }
 /** Why the walk dropped an entry — see `forEachCarriedFile`'s `onDropped`. */
@@ -198,7 +200,7 @@ export type CarryDropReason =
  *
  * It is shared rather than duplicated because the two disagreed in production:
  * `mergeWorkspaceTrees` filtered its three trees through the excludes while
- * knowing nothing about `hubinclude`, so a file the user had explicitly listed
+ * knowing nothing about `.sesh-mover-include`, so a file the user had explicitly listed
  * was snapshotted, archived, uploaded, downloaded — and then dropped on the
  * ordinary pull path with no report row, while a `--force-workspace` unpack of
  * the same bundle applied it. Given the same rule files on both machines (they
@@ -263,7 +265,7 @@ export declare function readCarryRules(projectPath: string, diagnostics?: string
  * anything is copied. The FALLBACK, like `CARRY_MAX_BYTES`: the real one comes
  * from `hub.workspaceMaxMb` via `snapshotWorkspace`'s `maxBytes`.
  *
- * The guard exists because `hubinclude` made an unbounded payload reachable: a
+ * The guard exists because `.sesh-mover-include` made an unbounded payload reachable: a
  * single `*` line re-admits every built-in exclude, and a measured
  * `node_modules` alone is 6,021 files. Before that the built-in excludes made
  * an over-budget payload nearly impossible, so there was nothing to bound.
@@ -284,11 +286,11 @@ export declare function readCarryRules(projectPath: string, diagnostics?: string
 export declare const WORKSPACE_MAX_BYTES: number;
 /**
  * Copy a project's working tree into `destDir`, minus the excluded paths and
- * plus whatever `hubinclude` names back in (design §5, §6.0). The rules
+ * plus whatever `.sesh-mover-include` names back in (design §5, §6.0). The rules
  * themselves live in `forEachCarriedFile`, which the apply side shares.
  *
  * `warnings` carries anything the user would otherwise have to infer from an
- * empty or surprising payload: a `hubinclude` big enough to be ignored, a
+ * empty or surprising payload: a `.sesh-mover-include` big enough to be ignored, a
  * truncated pattern list, or an exclude set that swallowed the whole tree.
  *
  * `skipped` means the payload was over `maxBytes` and NOTHING was copied — see
@@ -328,7 +330,7 @@ export declare function formatBytes(bytes: number): string;
  * attack: a hand-made or damaged bundle; a bundle written by a version older
  * than this guard, on a case-insensitive filesystem where a store spelled
  * `.GIT` slipped past the case-sensitive exclude list; and a deliberately
- * planted payload, whose prize is `.sesh-mover-hubinclude` — the file
+ * planted payload, whose prize is `.sesh-mover-include` — the file
  * deciding what the NEXT push ships. Callers must not name a culprit. Refusing
  * here is what keeps the two apply paths (merge and unpack) saying the same
  * thing, the same argument that moved `classifyDestination` into this module.

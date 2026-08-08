@@ -1,8 +1,8 @@
 node_modules/
 *.tsbuildinfo
 # Project-scope exports land in <cwd>/.sesh-mover/<name>/ and nothing else does,
-# so a plain ignore is all this needs. The committed files — .sesh-mover-hubinclude,
-# .sesh-mover-hubignore, .sesh-mover-project.json — are root dotfiles outside it
+# so a plain ignore is all this needs. The committed files — .sesh-mover-include,
+# .sesh-mover-ignore, .sesh-mover-project.json — are root dotfiles outside it
 # on purpose: config and identity have the opposite lifecycle to generated
 # exports, and one directory holding both is what forced the `!` negations this
 # replaces.

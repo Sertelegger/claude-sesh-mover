@@ -522,7 +522,7 @@ function describeCarryApply(result, meta, bundleFile) {
             // The same disclosure `workspaceRefused` carries, and the same rule: do
             // not accuse the sender. An older sesh-mover, on a case-insensitive
             // filesystem, legitimately produced payloads this guard now refuses.
-            out.push("That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-hubinclude, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it.");
+            out.push("That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-include, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it.");
         }
         return out;
     }
@@ -1244,7 +1244,7 @@ export async function hubPull(opts) {
             // the optional half taking down the transcripts that are the point of the
             // operation. Every sesh-mover before the accompanying snapshotWorkspace
             // fix wrote exactly this bundle whenever a snapshot carried no files (an
-            // empty project, or a hubignore broad enough to drop the whole tree), so
+            // empty project, or an ignore list broad enough to drop the whole tree), so
             // those bundles are on hubs now; a hand-made or truncated one says the
             // same thing. Deliberately the same shape as the carry's own "declares it
             // but does not contain it" guard further down.

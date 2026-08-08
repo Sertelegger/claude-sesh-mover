@@ -6,7 +6,7 @@ import { type DestinationBlock } from "./workspace.js";
  * payload is the worse failure: the apply side (§6.2) copies untracked files
  * into the peer's tree, and half a dependency tree or half a generated
  * directory reads there as a corrupt install, not as a truncated upload. The
- * decline names the largest contributors so the offending `hubinclude` line is
+ * decline names the largest contributors so the offending `.sesh-mover-include` line is
  * obvious.
  *
  * This is the FALLBACK for a caller that passes no budget. The real one comes
@@ -27,7 +27,7 @@ export declare const CARRY_MAX_BYTES: number;
  * parent's, minus `SCRUBBED_GIT_ENV`. Exported because the decision is about
  * `git` children, not about carry: `identity.ts` decides carry-vs-snapshot from
  * `git remote -v`, `push.ts` offers `ls-files --ignored` output as a
- * `hubinclude` line to paste, and `merge.ts` runs `git merge-file` from a
+ * `.sesh-mover-include` line to paste, and `merge.ts` runs `git merge-file` from a
  * scratch directory precisely to escape ambient repository config — an escape
  * `GIT_DIR` walks straight through (verified: a repo-local `merge.conflictStyle`
  * that merge-file rejects makes it exit 128 from the scratch dir when `GIT_DIR`
@@ -79,7 +79,7 @@ export interface CarryMeta {
     patchBytes: number;
     /**
      * How many carried files are gitignored and travelled only because
-     * `hubinclude` names them. `.gitignore` is where `.env` lives, so this is the
+     * `.sesh-mover-include` names them. `.gitignore` is where `.env` lives, so this is the
      * security-relevant subset and it is stated rather than left to be inferred.
      */
     reIncludedCount: number;
@@ -87,24 +87,24 @@ export interface CarryMeta {
      * The first `MAX_REPORTED_REINCLUDED` of those paths, for the push warning —
      * a sample the user can recognize, not an inventory (`reIncludedCount` is the
      * true size). Deliberately capped rather than complete: `CarryMeta` is
-     * embedded in the bundle manifest, and `hubinclude` can legitimately name
+     * embedded in the bundle manifest, and `.sesh-mover-include` can legitimately name
      * thousands of files, so a full list would put hundreds of KB of paths into
      * every manifest. The full set is re-derivable on the sending machine from
      * two files the user already has — `git ls-files --others --ignored
-     * --exclude-standard` filtered by `.sesh-mover-hubinclude`.
+     * --exclude-standard` filtered by `.sesh-mover-include`.
      */
     reIncluded: string[];
     /**
      * Gitignored files that are ALSO TRACKED and whose uncommitted changes are in
      * `changes.patch`. Nothing re-included these and no rule can drop them: every
-     * filter this module applies — `.gitignore`, `hubignore`, the built-in
+     * filter this module applies — `.gitignore`, `.sesh-mover-ignore`, the built-in
      * excludes — governs the UNTRACKED enumeration, while `git diff HEAD`
      * describes every tracked file that changed. A `.env` that was committed once
      * and gitignored later (without `git rm --cached`) is the common shape, and
      * its new value travels in plaintext in the patch.
      *
      * Reported separately from `reIncluded` on purpose: `reIncluded` means "you
-     * opted in via hubinclude, remove the line to stop it", which is a remedy that
+     * opted in via the include list, remove the line to stop it", which is a remedy that
      * does nothing here. The remedy for these is `git rm --cached`, or `--no-carry`.
      */
     trackedIgnoredCount: number;
@@ -129,10 +129,10 @@ export type CaptureResult = {
 export interface CaptureCarryOptions {
     /**
      * Somewhere to put anything that silently shrank the payload — an over-cap
-     * `hubinclude`, an unreadable file. Every one of them fails CLOSED, which
+     * `.sesh-mover-include`, an unreadable file. Every one of them fails CLOSED, which
      * from the outside is indistinguishable from "my files stopped syncing".
      * `hubPush` threads these into the push's `warnings` (same contract as
-     * `readHubinclude`'s `diagnostics`).
+     * `readIncludePatterns`'s `diagnostics`).
      */
     diagnostics?: string[];
     /**
@@ -165,13 +165,13 @@ export interface CaptureCarryOptions {
  *   repo-root-relative paths while the untracked list (which git already scopes
  *   to the cwd) describes just this subtree, and neither half applies.
  * - untracked, non-ignored files, minus what the carry rules drop.
- * - every gitignored path `hubinclude` names (design §6.0) — the deliberate,
+ * - every gitignored path `.sesh-mover-include` names (design §6.0) — the deliberate,
  *   committed, reviewable exception, and the only way an UNTRACKED gitignored
  *   file travels.
  *
  * What the filters do and do NOT cover, stated exactly because the short version
  * ("gitignored files never travel") is false in one direction: `.gitignore`,
- * `hubignore`, the built-in excludes and `hubinclude` all govern the UNTRACKED
+ * `.sesh-mover-ignore`, the built-in excludes and `.sesh-mover-include` all govern the UNTRACKED
  * enumeration. `git diff HEAD` describes every TRACKED file that changed, and no
  * user-facing rule filters it — a file that is gitignored AND tracked (committed
  * once, ignored later, never `git rm --cached`; or `git add -f`) carries its
@@ -338,7 +338,7 @@ export interface ApplyCarryOptions {
  * - `git apply --numstat -z` is git's own parse — authoritative and unquoted.
  *   But for a RENAME **or a COPY** it prints only the DESTINATION (measured
  *   both), so the source path is invisible to it: `copy from
- *   .sesh-mover-hubinclude` / `copy to stolen.txt` materialises the
+ *   .sesh-mover-include` / `copy to stolen.txt` materialises the
  *   RECEIVER's own plugin internals at an ordinary path, from where the next
  *   auto-push carries them to the hub. It also cannot run at all on a machine
  *   with no `git`, or on one whose `git` cannot read this repository.
@@ -356,7 +356,7 @@ export interface ApplyCarryOptions {
  * nine above. `similarity index`, `dissimilarity index`, `index` and the four
  * mode lines carry no path. **`rename old `/`rename new ` are git's legacy
  * spelling of `rename from`/`to`, and it still accepts them** — measured: an
- * otherwise identical payload deleted `.sesh-mover-hubinclude` and
+ * otherwise identical payload deleted `.sesh-mover-include` and
  * created `moved.txt`, `applied: true`, at BOTH layouts, on a receiver with a
  * perfectly healthy `git`, because `--numstat` prints only a rename's
  * destination and the scan did not read the source line.

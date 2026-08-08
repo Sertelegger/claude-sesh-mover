@@ -43,7 +43,7 @@ function listFiles(root: string, rel = ""): string[] {
   return out.sort();
 }
 
-function writeHubRules(repo: string, file: "hubinclude" | "hubignore", body: string): void {
+function writeCarryRules(repo: string, file: "include" | "ignore", body: string): void {
   writeFileSync(join(repo, `.sesh-mover-${file}`), body);
 }
 
@@ -67,7 +67,7 @@ function cleanup(...dirs: string[]): void {
 }
 
 describe("captureCarry", () => {
-  it("declines on a clean tree with no hubinclude matches", async () => {
+  it("declines on a clean tree with no include-list matches", async () => {
     const repo = gitRepo();
     const dest = tempDest();
     try {
@@ -107,7 +107,7 @@ describe("captureCarry", () => {
     }
   });
 
-  it("carries a gitignored path listed in hubinclude — and NOT one that isn't", async () => {
+  it("carries a gitignored path listed in the include list — and NOT one that isn't", async () => {
     const repo = gitRepo();
     const dest = tempDest();
     try {
@@ -115,7 +115,7 @@ describe("captureCarry", () => {
       mkdirSync(join(repo, "docs", "superpowers"), { recursive: true });
       writeFileSync(join(repo, "docs", "superpowers", "spec.md"), "# spec\n");
       writeFileSync(join(repo, "secrets.env"), "TOKEN=shh\n");
-      writeHubRules(repo, "hubinclude", "docs/superpowers/\n");
+      writeCarryRules(repo, "include", "docs/superpowers/\n");
       git(repo, ["add", "-A"]);
       git(repo, ["commit", "-q", "-m", "ignore"]);
 
@@ -133,14 +133,14 @@ describe("captureCarry", () => {
     }
   });
 
-  it("captures on a clean tree when hubinclude alone matches files", async () => {
+  it("captures on a clean tree when the include list alone matches files", async () => {
     const repo = gitRepo();
     const dest = tempDest();
     try {
       writeFileSync(join(repo, ".gitignore"), "docs/\n");
       mkdirSync(join(repo, "docs"), { recursive: true });
       writeFileSync(join(repo, "docs", "spec.md"), "# spec\n");
-      writeHubRules(repo, "hubinclude", "docs/\n");
+      writeCarryRules(repo, "include", "docs/\n");
       git(repo, ["add", "-A"]);
       git(repo, ["commit", "-q", "-m", "clean but included"]);
       expect(git(repo, ["status", "--porcelain"])).toBe("");
@@ -675,11 +675,18 @@ describe("captureCarry — what must never travel", () => {
     const dest = tempDest();
     try {
       mkdirSync(join(repo, ".sesh-mover"), { recursive: true });
-      // The project-scope config can redirect hub.path, and hubinclude decides
+      // The project-scope config can redirect hub.path, and the include list decides
       // what the NEXT push ships: a payload able to plant either is the
       // exfiltration primitive Task 9 closed on the workspace path.
       writeFileSync(join(repo, ".sesh-mover", "config.json"), '{"hub":{"path":"/tmp/evil"}}\n');
+      writeFileSync(join(repo, ".sesh-mover-include"), "*\n");
+      writeFileSync(join(repo, ".sesh-mover-ignore"), "*\n");
+      // The retired 0.7.0 spellings too. Nothing READS them any more, which is
+      // exactly why they are easy to drop from the floor by accident — and a
+      // bundle written by 0.7.0 carries them, so dropping one un-protects a
+      // payload that is already sitting on somebody's hub.
       writeFileSync(join(repo, ".sesh-mover-hubinclude"), "*\n");
+      writeFileSync(join(repo, ".sesh-mover-hubignore"), "*\n");
       writeFileSync(join(repo, "real.txt"), "work\n");
       const r = await captureCarry(repo, dest);
       expect(r.captured).toBe(true);
@@ -695,7 +702,7 @@ describe("captureCarry — what must never travel", () => {
     // The untracked filter never sees a tracked file, and `git diff HEAD`
     // describes every tracked file that changed. Committing
     // `.sesh-mover/` is what this project's own docs recommend (it is
-    // where `hubinclude` and `project.json` live), so the leak is the ordinary
+    // where `.sesh-mover-include` and `project.json` live), so the leak is the ordinary
     // shape rather than an exotic one — and Task 11's `git apply` will write
     // whatever the patch names.
     const repo = gitRepo("carryplugintracked");
@@ -703,16 +710,27 @@ describe("captureCarry — what must never travel", () => {
     try {
       mkdirSync(join(repo, ".sesh-mover", "nested"), { recursive: true });
       writeFileSync(join(repo, ".sesh-mover", "config.json"), '{"hub":{"path":"/orig"}}\n');
+      writeFileSync(join(repo, ".sesh-mover-include"), "docs/\n");
+      writeFileSync(join(repo, ".sesh-mover-ignore"), "docs/\n");
+      // Both retired 0.7.0 spellings, tracked, at the root and nested. They are
+      // the ones a floor edit is most likely to drop, since no reader is left
+      // to break — and a 0.7.0 bundle carrying them is on hubs today.
       writeFileSync(join(repo, ".sesh-mover-hubinclude"), "docs/\n");
+      writeFileSync(join(repo, ".sesh-mover-hubignore"), "docs/\n");
       // A nested one too: the floor is a per-segment rule at ANY depth, so the
       // pathspec that mirrors it has to be depth-independent as well.
       mkdirSync(join(repo, "pkg", ".sesh-mover"), { recursive: true });
       writeFileSync(join(repo, "pkg", ".sesh-mover", "config.json"), "{}\n");
+      writeFileSync(join(repo, "pkg", ".sesh-mover-hubinclude"), "docs/\n");
       git(repo, ["add", "-A", "-f"]);
       git(repo, ["commit", "-q", "-m", "track plugin state"]);
       writeFileSync(join(repo, ".sesh-mover", "config.json"), '{"hub":{"path":"/EVIL"}}\n');
-      writeFileSync(join(repo, ".sesh-mover-hubinclude"), "*\n");
+      writeFileSync(join(repo, ".sesh-mover-include"), "*\nEVIL\n");
+      writeFileSync(join(repo, ".sesh-mover-ignore"), "*\nEVIL\n");
+      writeFileSync(join(repo, ".sesh-mover-hubinclude"), "*\nEVIL\n");
+      writeFileSync(join(repo, ".sesh-mover-hubignore"), "*\nEVIL\n");
       writeFileSync(join(repo, "pkg", ".sesh-mover", "config.json"), '{"x":"EVIL"}\n');
+      writeFileSync(join(repo, "pkg", ".sesh-mover-hubinclude"), "*\nEVIL\n");
       writeFileSync(join(repo, "tracked.txt"), "real work\n");
 
       const r = await captureCarry(repo, dest);
@@ -729,10 +747,10 @@ describe("captureCarry — what must never travel", () => {
 
   it("reports gitignored files that git TRACKS, whose changes the patch carries anyway", async () => {
     // The disclosure the guarantee's wording used to hide: `.gitignore`,
-    // `hubignore` and the built-in excludes all filter the UNTRACKED
+    // `.sesh-mover-ignore` and the built-in excludes all filter the UNTRACKED
     // enumeration only. A `.env` committed once and gitignored later (without
     // `git rm --cached`) travels in full, and `reIncludedCount` stays 0 because
-    // `hubinclude` had nothing to do with it.
+    // `.sesh-mover-include` had nothing to do with it.
     const repo = gitRepo("carrytrackedignored");
     const dest = tempDest();
     try {
@@ -742,23 +760,23 @@ describe("captureCarry — what must never travel", () => {
       git(repo, ["add", "-A"]);
       git(repo, ["commit", "-q", "-m", "before the gitignore"]);
       writeFileSync(join(repo, ".gitignore"), ".env\nsecrets/\n");
-      writeHubRules(repo, "hubignore", "secrets");
+      writeCarryRules(repo, "ignore", "secrets");
       git(repo, ["add", ".gitignore"]);
       git(repo, ["commit", "-q", "-m", "ignore them, but they stay tracked"]);
       writeFileSync(join(repo, ".env"), "DB_PASSWORD=hunter2_NEW\n");
       writeFileSync(join(repo, "secrets", "creds.txt"), "creds=v2\n");
-      writeFileSync(join(repo, "secrets", "other.txt"), "untracked\n"); // dropped by hubignore
+      writeFileSync(join(repo, "secrets", "other.txt"), "untracked\n"); // dropped by the ignore list
 
       const r = await captureCarry(repo, dest);
       expect(r.captured).toBe(true);
       if (!r.captured) return;
       const patch = readFileSync(join(dest, "changes.patch"), "utf-8");
       expect(patch).toContain("+DB_PASSWORD=hunter2_NEW");     // it really does travel
-      expect(patch).toContain("+creds=v2");                    // hubignore does not stop it
+      expect(patch).toContain("+creds=v2");                    // the ignore list does not stop it
       expect(existsSync(join(dest, "untracked"))).toBe(false); // …but it does stop the untracked one
       expect(r.meta.untrackedCount).toBe(0);
       // Named as its own set, with its own remedy — NOT folded into reIncluded,
-      // where "remove the hubinclude line" would be advice that does nothing.
+      // where "remove the include-list line" would be advice that does nothing.
       expect(r.meta.trackedIgnored).toEqual([".env", "secrets/creds.txt"]);
       expect(r.meta.trackedIgnoredCount).toBe(2);
       expect(r.meta.reIncludedCount).toBe(0);
@@ -853,11 +871,11 @@ exit 0
     }
   });
 
-  it("honors hubignore on the untracked set, and hubinclude names a path back", async () => {
+  it("honors the ignore list on the untracked set, and the include list names a path back", async () => {
     const repo = gitRepo("carryrules");
     const dest = tempDest();
     try {
-      writeHubRules(repo, "hubignore", "build\n");
+      writeCarryRules(repo, "ignore", "build\n");
       mkdirSync(join(repo, "build"), { recursive: true });
       writeFileSync(join(repo, "build", "out.js"), "junk\n");
       writeFileSync(join(repo, "build", "keep.txt"), "keep\n");
@@ -867,12 +885,12 @@ exit 0
       expect(listFiles(join(dest, "untracked"))).toEqual(["real.txt"]);
 
       rmSync(dest, { recursive: true, force: true });
-      writeHubRules(repo, "hubinclude", "build/keep.txt\n");
+      writeCarryRules(repo, "include", "build/keep.txt\n");
       const second = await captureCarry(repo, dest);
       expect(second.captured).toBe(true);
       expect(listFiles(join(dest, "untracked"))).toEqual(["build/keep.txt", "real.txt"]);
       if (!second.captured) return;
-      // hubinclude beating hubignore is not a gitignore re-inclusion, so it is
+      // the include list beating the ignore list is not a gitignore re-inclusion, so it is
       // not reported as one.
       expect(second.meta.reIncludedCount).toBe(0);
     } finally {
@@ -880,7 +898,7 @@ exit 0
     }
   });
 
-  it("drops a built-in-excluded untracked directory unless hubinclude names it", async () => {
+  it("drops a built-in-excluded untracked directory unless the include list names it", async () => {
     const repo = gitRepo("carrydefaults");
     const dest = tempDest();
     try {
@@ -1012,19 +1030,19 @@ exit 0
     }
   });
 
-  it("surfaces an over-cap hubinclude as a diagnostic on the git path too", async () => {
+  it("surfaces an over-cap include list as a diagnostic on the git path too", async () => {
     const repo = gitRepo("carrydiag");
     const dest = tempDest();
     try {
-      writeHubRules(repo, "hubinclude", "x".repeat(70 * 1024));
+      writeCarryRules(repo, "include", "x".repeat(70 * 1024));
       writeFileSync(join(repo, "new.txt"), "x\n");
       const diagnostics: string[] = [];
       const r = await captureCarry(repo, dest, { diagnostics });
       expect(r.captured).toBe(true);
-      // Without threading these through, a git project's over-cap hubinclude
+      // Without threading these through, a git project's over-cap include list
       // fails closed in total silence — snapshotWorkspace, which reports them,
       // never runs for a project with remotes.
-      expect(diagnostics.join(" ")).toMatch(/hubinclude/);
+      expect(diagnostics.join(" ")).toMatch(/sesh-mover-include/);
     } finally {
       cleanup(repo, dest);
     }
@@ -1228,6 +1246,50 @@ describe("applyCarry", () => {
     }
   });
 
+  it("refuses a patch naming the include/ignore list under EITHER era's spelling", async () => {
+    // The root dotfiles need the floor more than `.sesh-mover/` does: there is
+    // no directory segment between a payload and a file it can name directly,
+    // and this file is the one that decides what the NEXT push uploads.
+    //
+    // BOTH eras, because the floor only ever grows: bundles written by 0.7.0
+    // spell it `.sesh-mover-hubinclude`, and those bundles are on hubs now.
+    // Dropping a retired name from `PLUGIN_STATE_NAMES` un-protects exactly
+    // them — a payload could plant a legacy list that an older peer still reads.
+    // A repo-relative nested spelling and a Win32 trailing dot are in here too,
+    // since the guard is per SEGMENT and fold-tolerant, not a root-only match.
+    const repo = gitRepo("apply-listfloor");
+    let twin: string | undefined;
+    try {
+      twin = cleanTwin(repo);
+      const head = git(twin, ["rev-parse", "HEAD"]).trim();
+      for (const path of [
+        ".sesh-mover-include",
+        ".sesh-mover-ignore",
+        ".sesh-mover-hubinclude",
+        ".sesh-mover-hubignore",
+        "pkg/app/.sesh-mover-include",
+        "pkg/app/.sesh-mover-hubinclude",
+        ".SESH-MOVER-INCLUDE",
+        ".SESH-MOVER-HUBINCLUDE",
+        ".sesh-mover-include.",
+        ".sesh-mover-hubinclude.",
+      ]) {
+        const patch =
+          `diff --git a/${path} b/${path}\nnew file mode 100644\nindex 0000000..d95f3ad\n` +
+          `--- /dev/null\n+++ b/${path}\n@@ -0,0 +1 @@\n+*\n`;
+        const payload = handPayload(patch, { baseCommit: head });
+        const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+        expect([path, r.applied]).toEqual([path, false]);
+        if (r.applied) return;
+        expect([path, r.reason]).toEqual([path, "unsafe-payload"]);
+        expect([path, existsSync(join(twin, path))]).toEqual([path, false]);
+        rmSync(payload.dir, { recursive: true, force: true });
+      }
+    } finally {
+      cleanup(repo, twin ?? "");
+    }
+  });
+
   it("refuses a patch containing a symlink entry rather than materialising it", async () => {
     if (process.platform === "win32") return; // symlink creation needs privileges
     const repo = gitRepo("apply-symlink");
@@ -1313,7 +1375,7 @@ describe("applyCarry", () => {
 
   it("refuses a patch that renames a plugin-internal file AWAY, which numstat cannot see", async () => {
     // `git apply --numstat -z` prints only the DESTINATION of a rename
-    // (measured), so a patch spelled `rename from .sesh-mover-hubinclude
+    // (measured), so a patch spelled `rename from .sesh-mover-include
     // / rename to moved.txt` reads as a perfectly ordinary write to
     // `moved.txt` — and it applies cleanly, deleting the file that decides what
     // this machine's NEXT push uploads. Only the raw scan of the patch's own
@@ -1322,14 +1384,14 @@ describe("applyCarry", () => {
     let twin: string | undefined;
     try {
       mkdirSync(join(repo, ".sesh-mover"), { recursive: true });
-      writeFileSync(join(repo, ".sesh-mover-hubinclude"), "docs/\n");
+      writeFileSync(join(repo, ".sesh-mover-include"), "docs/\n");
       writeFileSync(join(repo, ".sesh-mover", "café"), "CAFE\n");
       git(repo, ["add", "-A"]);
       git(repo, ["commit", "-q", "-m", "plugin state committed"]);
       twin = cleanTwin(repo);
       const head = git(twin, ["rev-parse", "HEAD"]).trim();
 
-      for (const from of [".sesh-mover-hubinclude", '".sesh-mover/caf\\303\\251"']) {
+      for (const from of [".sesh-mover-include", '".sesh-mover/caf\\303\\251"']) {
         const patch =
           `diff --git a/x b/moved.txt\nsimilarity index 100%\nrename from ${from}\nrename to moved.txt\n`;
         const payload = handPayload(patch, { baseCommit: head });
@@ -1342,7 +1404,7 @@ describe("applyCarry", () => {
       // Both files are still where they were: the second spelling is git's own
       // C-quoted form, which reads as a segment starting with `"` unless it is
       // decoded first.
-      expect(readTextLf(join(twin, ".sesh-mover-hubinclude"))).toBe("docs/\n");
+      expect(readTextLf(join(twin, ".sesh-mover-include"))).toBe("docs/\n");
       expect(existsSync(join(twin, ".sesh-mover", "café"))).toBe(true);
       expect(existsSync(join(twin, "moved.txt"))).toBe(false);
     } finally {
@@ -1522,14 +1584,14 @@ describe("applyCarry", () => {
   // were REFUSED at repo root and APPLIED at a subdirectory project.
 
   /** A repo whose PROJECT is the subdirectory `pkg/app`, with a plugin dir in it. */
-  function subdirRepo(name: string, seedHubinclude: boolean): {
+  function subdirRepo(name: string, seedIncludeList: boolean): {
     repo: string; project: string; head: string;
   } {
     const repo = gitRepo(name);
     const project = join(repo, "pkg", "app");
     mkdirSync(join(project, ".sesh-mover"), { recursive: true });
-    if (seedHubinclude) {
-      writeFileSync(join(project, ".sesh-mover-hubinclude"), "docs/\n");
+    if (seedIncludeList) {
+      writeFileSync(join(project, ".sesh-mover-include"), "docs/\n");
     }
     writeFileSync(join(project, "f.txt"), "v1\n");
     git(repo, ["add", "-A", "-f"]);
@@ -1545,7 +1607,7 @@ describe("applyCarry", () => {
     let dir: string | undefined;
     try {
       writeFileSync(
-        join(project, ".sesh-mover-hubinclude"),
+        join(project, ".sesh-mover-include"),
         Buffer.from([0, 1, 2, 3, 0, 255])
       );
       git(repo, ["add", "-A", "-f"]);
@@ -1567,8 +1629,8 @@ describe("applyCarry", () => {
       expect(r.reason).toBe("unsafe-payload");
       // git's own parse reports the path with the prefix applied, which is
       // where it would really have landed.
-      expect(r.detail).toContain("pkg/app/.sesh-mover-hubinclude");
-      expect(existsSync(join(project, ".sesh-mover-hubinclude"))).toBe(false);
+      expect(r.detail).toContain("pkg/app/.sesh-mover-include");
+      expect(existsSync(join(project, ".sesh-mover-include"))).toBe(false);
       // Refused whole means refused whole: the saved copy carries no command.
       expect(readFileSync(join(r.savedTo!, "README.md"), "utf-8")).not.toContain("git apply");
     } finally {
@@ -1605,10 +1667,10 @@ describe("applyCarry", () => {
     const { repo, project, head } = subdirRepo("apply-subdir-mode", true);
     let dir: string | undefined;
     try {
-      const target = join(project, ".sesh-mover-hubinclude");
+      const target = join(project, ".sesh-mover-include");
       const before = statSync(target).mode & 0o777;
       const payload = handPayload(
-        "diff --git a/.sesh-mover-hubinclude b/.sesh-mover-hubinclude\n" +
+        "diff --git a/.sesh-mover-include b/.sesh-mover-include\n" +
           "old mode 100644\nnew mode 100755\n",
         { baseCommit: head, repoPrefix: "pkg/app/" }
       );
@@ -1670,7 +1732,7 @@ describe("applyCarry", () => {
    * The saved copy is not an archive, it is a set of INSTRUCTIONS — its README
    * hands the user `cp -R '<saved>/untracked/.' .`, and that copies dot-entries.
    * So the routine `not-requested` path saved `untracked/.git/hooks/pre-commit`
-   * and `untracked/.sesh-mover-hubinclude` verbatim and then told the
+   * and `untracked/.sesh-mover-include` verbatim and then told the
    * user to run the command that plants them, on the one path whose sibling
    * (`--apply-carry`) refuses both outright. Same floor, applied where the write
    * actually happens.
@@ -1688,7 +1750,7 @@ describe("applyCarry", () => {
       mkdirSync(join(dir, "untracked", ".git", "hooks"), { recursive: true });
       writeFileSync(join(dir, "untracked", ".git", "hooks", "pre-commit"), "#!/bin/sh\necho planted\n");
       mkdirSync(join(dir, "untracked", ".sesh-mover"), { recursive: true });
-      writeFileSync(join(dir, "untracked", ".sesh-mover-hubinclude"), "*\n");
+      writeFileSync(join(dir, "untracked", ".sesh-mover-include"), "*\n");
       writeFileSync(join(dir, "untracked", "ok.txt"), "fine\n");
 
       const r = await applyCarry({
@@ -1698,12 +1760,12 @@ describe("applyCarry", () => {
       if (r.applied) return;
       expect(r.reason).toBe("not-requested");
       expect([...r.refused].sort()).toEqual([
-        ".git/hooks/pre-commit", ".sesh-mover-hubinclude",
+        ".git/hooks/pre-commit", ".sesh-mover-include",
       ]);
 
       const saved = r.savedTo!;
       expect(existsSync(join(saved, "untracked", ".git", "hooks", "pre-commit"))).toBe(false);
-      expect(existsSync(join(saved, "untracked", ".sesh-mover-hubinclude"))).toBe(false);
+      expect(existsSync(join(saved, "untracked", ".sesh-mover-include"))).toBe(false);
       // The rest of the payload is untouched — a skipped path, never a refused
       // payload (the `--apply-carry` patch half is the one that refuses whole).
       expect(readFileSync(join(saved, "untracked", "ok.txt"), "utf-8")).toBe("fine\n");
@@ -1965,7 +2027,7 @@ describe("applyCarry", () => {
       const head = git(twin, ["rev-parse", "HEAD"]).trim();
       const payload = handPayload("", { baseCommit: head });
       dir = payload.dir;
-      for (const rel of [".sesh-mover-hubinclude", ".git/config", "ok.txt"]) {
+      for (const rel of [".sesh-mover-include", ".git/config", "ok.txt"]) {
         const dest = join(dir, "untracked", ...rel.split("/"));
         mkdirSync(join(dest, ".."), { recursive: true });
         writeFileSync(dest, "planted\n");
@@ -1974,9 +2036,9 @@ describe("applyCarry", () => {
       const r = await applyCarry({ carryDir: dir, targetPath: twin, meta: payload.meta });
       expect(r.applied).toBe(true);
       if (!r.applied) return;
-      expect(r.refused.sort()).toEqual([".git/config", ".sesh-mover-hubinclude"]);
+      expect(r.refused.sort()).toEqual([".git/config", ".sesh-mover-include"]);
       expect(readFileSync(join(twin, "ok.txt"), "utf-8")).toBe("planted\n");
-      expect(existsSync(join(twin, ".sesh-mover-hubinclude"))).toBe(false);
+      expect(existsSync(join(twin, ".sesh-mover-include"))).toBe(false);
       expect(readFileSync(join(twin, ".git", "config"), "utf-8")).not.toContain("planted");
     } finally {
       cleanup(repo, twin ?? "", dir ?? "");
@@ -2157,7 +2219,7 @@ describe("applyCarry", () => {
     const repo = gitRepo(name);
     const project = layout === "root" ? repo : join(repo, "pkg", "app");
     mkdirSync(join(project, ".sesh-mover"), { recursive: true });
-    writeFileSync(join(project, ".sesh-mover-hubinclude"), "docs/\n");
+    writeFileSync(join(project, ".sesh-mover-include"), "docs/\n");
     writeFileSync(join(project, "f.txt"), "v1\n");
     git(repo, ["add", "-A", "-f"]);
     git(repo, ["commit", "-q", "-m", "seed"]);
@@ -2170,8 +2232,8 @@ describe("applyCarry", () => {
     "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-v1\n+v2\n";
 
   const COPY_OUT_PATCH =
-    "diff --git a/.sesh-mover-hubinclude b/stolen.txt\nsimilarity index 100%\n" +
-    "copy from .sesh-mover-hubinclude\ncopy to stolen.txt\n";
+    "diff --git a/.sesh-mover-include b/stolen.txt\nsimilarity index 100%\n" +
+    "copy from .sesh-mover-include\ncopy to stolen.txt\n";
 
   it("refuses a patch that COPIES a plugin-internal file out, at BOTH layouts", async () => {
     // `git apply --numstat` prints only the DESTINATION of a COPY, exactly as
@@ -2195,7 +2257,7 @@ describe("applyCarry", () => {
         if (r.applied) return;
         expect(r.reason, layout).toBe("unsafe-payload");
         expect(existsSync(join(project, "stolen.txt")), layout).toBe(false);
-        expect(readFileSync(join(project, ".sesh-mover-hubinclude"), "utf-8")).toBe("docs/\n");
+        expect(readFileSync(join(project, ".sesh-mover-include"), "utf-8")).toBe("docs/\n");
         // Refused whole: the saved copy carries no command to finish the job.
         expect(readFileSync(join(r.savedTo!, "README.md"), "utf-8")).not.toContain("git apply");
       } finally {
@@ -2242,7 +2304,7 @@ describe("applyCarry", () => {
     const { repo, project, head } = layoutRepo("apply-nogit-header", "root");
     let empty: string | undefined;
     try {
-      writeFileSync(join(project, ".sesh-mover-hubinclude"), Buffer.from([0, 1, 2, 0, 255]));
+      writeFileSync(join(project, ".sesh-mover-include"), Buffer.from([0, 1, 2, 0, 255]));
       git(repo, ["add", "-A", "-f"]);
       const binary = git(repo, ["diff", "HEAD", "--binary", "--src-prefix=a/", "--dst-prefix=b/"]);
       git(repo, ["reset", "-q", "--hard", "HEAD"]);
@@ -2252,7 +2314,7 @@ describe("applyCarry", () => {
         ["binary entry", binary],
         [
           "mode-only change",
-          "diff --git a/.sesh-mover-hubinclude b/.sesh-mover-hubinclude\n" +
+          "diff --git a/.sesh-mover-include b/.sesh-mover-include\n" +
             "old mode 100644\nnew mode 100755\n",
         ],
         [
@@ -2370,7 +2432,7 @@ describe("applyCarry", () => {
         // internals. Hostile outranks damaged: that user gets the security
         // wording, not "looks damaged".
         const hostile = handPayload(
-          "this is not a patch at all\nrename from .sesh-mover-hubinclude\n",
+          "this is not a patch at all\nrename from .sesh-mover-include\n",
           { baseCommit: head }
         );
         const h = await applyCarry({
@@ -2587,7 +2649,7 @@ describe("applyCarry", () => {
     ],
     [
       "TAB inside a traditional --- name, with a timestamp (a DELETE)",
-      "--- b\tQ/.sesh-mover-hubinclude\t2024-01-02 00:00:00.000000000 +0000\n" +
+      "--- b\tQ/.sesh-mover-include\t2024-01-02 00:00:00.000000000 +0000\n" +
         "+++ /dev/null\n@@ -1 +0,0 @@\n-docs/\n",
     ],
     [
@@ -2688,7 +2750,7 @@ describe("applyCarry", () => {
       // that matters: the payload could not reach the file that decides what
       // this machine's next push uploads, and the plugin directory holds
       // nothing but the saved copy.
-      expect(readFileSync(join(project, ".sesh-mover-hubinclude"), "utf-8")).toBe("docs/\n");
+      expect(readFileSync(join(project, ".sesh-mover-include"), "utf-8")).toBe("docs/\n");
       expect(readdirSync(join(project, ".sesh-mover")).every((n) => n.startsWith("carry-")))
         .toBe(true);
       expect(existsSync(join(project, p))).toBe(false);
@@ -2705,15 +2767,15 @@ describe("applyCarry", () => {
     // accepted, and `--numstat` prints only a rename's DESTINATION. So unlike
     // the header spellings above this one was live even on a receiver with a
     // perfectly healthy git: measured `applied: true` at BOTH layouts, with
-    // `.sesh-mover-hubinclude` — the file deciding what this machine's
+    // `.sesh-mover-include` — the file deciding what this machine's
     // NEXT push uploads — deleted and `moved.txt` created in its place.
     for (const layout of ["root", "subdir"] as const) {
       const { repo, project, head } = layoutRepo(`apply-renameold-${layout}`, layout);
       let dir: string | undefined;
       try {
         const payload = handPayload(
-          "diff --git a/.sesh-mover-hubinclude b/moved.txt\nsimilarity index 100%\n" +
-            "rename old .sesh-mover-hubinclude\nrename new moved.txt\n",
+          "diff --git a/.sesh-mover-include b/moved.txt\nsimilarity index 100%\n" +
+            "rename old .sesh-mover-include\nrename new moved.txt\n",
           { baseCommit: head, repoPrefix: layout === "subdir" ? "pkg/app/" : "" }
         );
         dir = payload.dir;
@@ -2722,7 +2784,7 @@ describe("applyCarry", () => {
         if (r.applied) return;
         expect(r.reason, layout).toBe("unsafe-payload");
         expect(existsSync(join(project, "moved.txt")), layout).toBe(false);
-        expect(readFileSync(join(project, ".sesh-mover-hubinclude"), "utf-8")).toBe("docs/\n");
+        expect(readFileSync(join(project, ".sesh-mover-include"), "utf-8")).toBe("docs/\n");
       } finally {
         cleanup(repo, dir ?? "");
       }
@@ -2736,10 +2798,10 @@ describe("applyCarry", () => {
     // the ONLY thing reading these lines. One appended byte after the closing
     // quote was enough to blind it while git decoded the real path — measured
     // against bare `git apply` at BOTH layouts: exit 0, and
-    // `.sesh-mover-hubinclude` (the file deciding what this machine's
+    // `.sesh-mover-include` (the file deciding what this machine's
     // next push uploads) either DELETED, or reproduced at an ordinary path
     // from where the next auto-push would carry it to the hub.
-    const F = ".sesh-mover-hubinclude";
+    const F = ".sesh-mover-include";
     const payloads: Array<[string, string, string]> = [
       [
         "rename from, quoted with a trailing byte",
@@ -2774,7 +2836,7 @@ describe("applyCarry", () => {
           expect(r.reason, where).toBe("unsafe-payload");
           expect(r.savedCommands, where).toBe(false);
           expect(existsSync(join(project, dest)), where).toBe(false);
-          expect(readFileSync(join(project, ".sesh-mover-hubinclude"), "utf-8"), where)
+          expect(readFileSync(join(project, ".sesh-mover-include"), "utf-8"), where)
             .toBe("docs/\n");
         } finally {
           cleanup(repo, dir ?? "");
@@ -2896,7 +2958,7 @@ describe("applyCarry", () => {
       }
       // The refused variant still says nothing at all, which is its point.
       const hostile = handPayload(
-        "this is not a patch at all\nrename from .sesh-mover-hubinclude\n",
+        "this is not a patch at all\nrename from .sesh-mover-include\n",
         { baseCommit: head, untrackedCount: 2 }
       );
       const h = await applyCarry({ carryDir: hostile.dir, targetPath: repo, meta: hostile.meta });

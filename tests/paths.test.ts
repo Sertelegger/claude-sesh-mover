@@ -7,8 +7,11 @@ import { join } from "node:path";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 import {
   isPluginStateName, resolveUserSeshMoverDir, userDirWarnings, userSeshMoverDir,
-  hubincludeFilePath, hubignoreFilePath, projectJsonFilePath, projectSeshMoverDir,
+  includeFilePath, ignoreFilePath, projectJsonFilePath, projectSeshMoverDir,
+  PLUGIN_STATE_NAMES, INCLUDE_FILE_NAME, IGNORE_FILE_NAME, LEGACY_DIR_NAME,
+  LEGACY_INCLUDE_FILE_NAME, LEGACY_IGNORE_FILE_NAME,
 } from "../src/paths.js";
+import { readIncludePatterns, readIgnorePatterns } from "../src/hub/workspace.js";
 
 /**
  * The user-scope directory migration, case by case.
@@ -188,21 +191,78 @@ describe("user directory migration", () => {
 describe("project-scope names", () => {
   it("the three committed files are ROOT dotfiles, and exports keep their own directory", () => {
     const project = "/tmp/example-project";
-    expect(hubincludeFilePath(project)).toBe(join(project, ".sesh-mover-hubinclude"));
-    expect(hubignoreFilePath(project)).toBe(join(project, ".sesh-mover-hubignore"));
+    expect(includeFilePath(project)).toBe(join(project, ".sesh-mover-include"));
+    expect(ignoreFilePath(project)).toBe(join(project, ".sesh-mover-ignore"));
     expect(projectJsonFilePath(project)).toBe(join(project, ".sesh-mover-project.json"));
     expect(projectSeshMoverDir(project)).toBe(join(project, ".sesh-mover"));
   });
 
-  it("isPluginStateName knows every name this plugin owns, including the pre-0.7.0 one", () => {
+  it("isPluginStateName knows every name this plugin owns, retired ones included", () => {
     for (const n of [
       ".sesh-mover", ".claude-sesh-mover",
-      ".sesh-mover-hubinclude", ".sesh-mover-hubignore", ".sesh-mover-project.json",
+      ".sesh-mover-include", ".sesh-mover-ignore", ".sesh-mover-project.json",
+      ".sesh-mover-hubinclude", ".sesh-mover-hubignore",
     ]) {
       expect([n, isPluginStateName(n)]).toEqual([n, true]);
     }
     for (const n of ["src", "README.md", ".git", ".claude", ".sesh-mover-notes"]) {
       expect([n, isPluginStateName(n)]).toEqual([n, false]);
+    }
+  });
+
+  it("PLUGIN_STATE_NAMES only ever GROWS — every retired spelling is still on it", () => {
+    // This is the single list `NEVER_INCLUDABLE` is built from, so it is the
+    // one place where deleting a line silently un-protects bundles that already
+    // exist. Two renames have happened (0.7.0 dropped the `claude-` prefix and
+    // moved the committed files to root dotfiles; 0.8.0 dropped `hub` from the
+    // two list files), and NOTHING reads the three retired names any more —
+    // which is exactly what makes them easy to remove by accident. A payload
+    // able to plant `.sesh-mover-hubinclude` rewrites the list an 0.7.0 peer
+    // still consults to decide what its next push uploads.
+    //
+    // Exact contents, in order. A failure because a name was ADDED is a
+    // one-line update; a failure because one was REMOVED is the finding.
+    expect(PLUGIN_STATE_NAMES).toEqual([
+      ".sesh-mover",
+      ".claude-sesh-mover",
+      ".sesh-mover-include",
+      ".sesh-mover-ignore",
+      ".sesh-mover-hubinclude",
+      ".sesh-mover-hubignore",
+      ".sesh-mover-project.json",
+    ]);
+    for (const retired of [
+      LEGACY_DIR_NAME, LEGACY_INCLUDE_FILE_NAME, LEGACY_IGNORE_FILE_NAME,
+    ]) {
+      expect([retired, PLUGIN_STATE_NAMES.includes(retired)]).toEqual([retired, true]);
+    }
+    // And the current pair is genuinely a rename, not an alias: the readers
+    // point at the new names only.
+    expect(INCLUDE_FILE_NAME).toBe(".sesh-mover-include");
+    expect(IGNORE_FILE_NAME).toBe(".sesh-mover-ignore");
+    expect(INCLUDE_FILE_NAME).not.toBe(LEGACY_INCLUDE_FILE_NAME);
+    expect(IGNORE_FILE_NAME).not.toBe(LEGACY_IGNORE_FILE_NAME);
+  });
+
+  it("a project holding only the 0.7.0 names is read as having NO lists at all", () => {
+    // The deliberate call, same as 0.7.0's: no migration and no fallback read.
+    // A silently HALF-read list would be worse than none — an include list is
+    // security-relevant (it decides what leaves the machine), so "not
+    // configured" is the recoverable failure and "partly configured from a file
+    // you thought you had renamed" is not.
+    const dir = mkdtempSync(join(tmpdir(), "sesh-legacy-lists-"));
+    try {
+      writeFileSync(join(dir, ".sesh-mover-hubinclude"), "docs/\n");
+      writeFileSync(join(dir, ".sesh-mover-hubignore"), "build\n");
+      expect(readIncludePatterns(dir)).toEqual([]);
+      expect(readIgnorePatterns(dir)).toEqual([]);
+      // ...and the new names are what a reader picks up.
+      writeFileSync(join(dir, ".sesh-mover-include"), "docs/\n");
+      writeFileSync(join(dir, ".sesh-mover-ignore"), "build\n");
+      expect(readIncludePatterns(dir)).toEqual(["docs/"]);
+      expect(readIgnorePatterns(dir)).toEqual(["build"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

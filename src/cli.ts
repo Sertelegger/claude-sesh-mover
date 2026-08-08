@@ -58,7 +58,7 @@ const program = new Command();
 program
   .name("sesh-mover")
   .description("Export, import, and migrate Claude Code sessions")
-  .version("0.7.0");
+  .version("0.8.0");
 
 // --- Export ---
 program
@@ -751,7 +751,7 @@ hub
       }
       // ...and a durable copy, because that stderr line is invisible at a clean
       // exit. This push computes real disclosures — which gitignored-but-TRACKED
-      // files its patch carried off the machine, which hubinclude paths it
+      // files its patch carried off the machine, which include-list paths it
       // re-included — and then discards every one of them. `hub status` reads
       // this back. Never for lock-busy: that push did nothing.
       if (!lockBusy) {
@@ -1346,7 +1346,7 @@ function writeHookDiagnostic(message: string): void {
  * and Claude Code shows a clean-exit hook's stderr only in debug output. Two
  * things it computes are worth more than that — the carry disclosures (which
  * gitignored-but-TRACKED files the patch took off the machine, which
- * `hubinclude` paths were re-included) and the fact that it failed at all, which
+ * `.sesh-mover-include` paths were re-included) and the fact that it failed at all, which
  * an unmounted share otherwise hides indefinitely. `hub status` reads this back.
  *
  * Best effort in every direction, because a breadcrumb must never cost a push:

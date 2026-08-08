@@ -57,7 +57,7 @@ export type SkipReason =
  | "payload-internals"
 /**
  * The incoming tree carried a path THIS machine's rules exclude — its
- * `hubignore`, or a built-in exclude its `hubinclude` does not name back.
+ * `.sesh-mover-ignore`, or a built-in exclude its `.sesh-mover-include` does not name back.
  * A payload built from the same (committed) rule files never contains one,
  * so this row means the two machines' rule files disagree. The local copy,
  * if any, is deliberately left alone; the incoming one stays on the hub.
@@ -202,11 +202,11 @@ export declare function isBinaryFile(path: string): boolean;
  *
  * **What a payload is filtered by here** (the rule split is argued at the call
  * site): the `NEVER_INCLUDABLE` floor, and the *target's* own
- * `.sesh-mover-hubignore` minus whatever its `hubinclude` names back —
+ * `.sesh-mover-ignore` minus whatever its `.sesh-mover-include` names back —
  * so a file this machine deliberately keeps out of the hub can never be
  * overwritten by an incoming copy of the same name. The built-in convenience
  * excludes take no part: they are the sender's to apply, and re-applying them
- * discarded files a `hubinclude` had explicitly carried. Everything this
+ * discarded files a `.sesh-mover-include` had explicitly carried. Everything this
  * function does drop is reported in `skipped` (`locally-excluded`, or
  * `payload-internals` for the hard floor) rather than vanishing, so the two
  * apply paths differ only by that one explicit, visible veto — which
@@ -224,12 +224,12 @@ export declare function mergeWorkspaceTrees(opts: {
     targetDir: string;
     /**
      * Override the apply-side veto patterns; defaults to the target's
-     * `hubignore`. The built-in workspace excludes are NOT part of this: they
+     * `.sesh-mover-ignore`. The built-in workspace excludes are NOT part of this: they
      * prune the local tree scan unconditionally and never veto a payload path
      * (see the rule split inside).
      */
     excludePatterns?: string[];
-    /** Override the re-include patterns; defaults to the target's `hubinclude`. */
+    /** Override the re-include patterns; defaults to the target's `.sesh-mover-include`. */
     includePatterns?: string[];
     /**
      * Test seam: the timestamp baked into sidecar names, defaulting to now.

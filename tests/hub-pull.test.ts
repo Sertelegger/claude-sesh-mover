@@ -363,7 +363,7 @@ describe("hub pull", () => {
     // The whole path, not just applyCarry: a bundle sitting on the hub is
     // rewritten to carry a patch that writes `.sesh-mover./config.json`
     // — the trailing-dot spelling the sender's own pathspec floor cannot
-    // express — plus a planted `hubinclude`, i.e. the file deciding what THIS
+    // express — plus a planted `.sesh-mover-include`, i.e. the file deciding what THIS
     // machine's next push uploads and the one that redirects hub.path.
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
     const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
@@ -404,7 +404,7 @@ describe("hub pull", () => {
             `--- /dev/null\n+++ b/${hostile}\n@@ -0,0 +1 @@\n+{"hub":{"path":"/tmp/attacker"}}\n`
         );
         mkdirSync(join(dir, "carry", "untracked", ".sesh-mover"), { recursive: true });
-        writeFileSync(join(dir, "carry", "untracked", ".sesh-mover-hubinclude"), "*\n");
+        writeFileSync(join(dir, "carry", "untracked", ".sesh-mover-include"), "*\n");
       });
 
       restore.restore();
@@ -439,7 +439,7 @@ describe("hub pull", () => {
       }
       expect(existsSync(join(projectB, ".sesh-mover.")))
         .toBe(false);
-      expect(existsSync(join(projectB, ".sesh-mover-hubinclude"))).toBe(false);
+      expect(existsSync(join(projectB, ".sesh-mover-include"))).toBe(false);
       expect(existsSync(join(projectB, ".sesh-mover", "config.json"))).toBe(false);
       // Only the plugin's own linking artifact and the saved payload are there.
       expect(readdirSync(join(projectB, ".sesh-mover")).sort().join(",")).toMatch(
@@ -693,7 +693,7 @@ describe("hub pull", () => {
   it("a workspace payload carrying plugin/VCS internals cannot plant them, and says so", async () => {
     // The hub is a plain directory, so a bundle is peer-supplied data. The one
     // file such a payload would most want to write is
-    // `.sesh-mover-hubinclude` — the list deciding what THIS machine's
+    // `.sesh-mover-include` — the list deciding what THIS machine's
     // next push ships — which would turn a workspace payload into an
     // exfiltration primitive. `.git` is the other: a store, not content.
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
@@ -719,7 +719,7 @@ describe("hub pull", () => {
         const ws = join(dir, "workspace");
         mkdirSync(join(ws, ".sesh-mover"), { recursive: true });
         mkdirSync(join(ws, ".git"), { recursive: true });
-        writeFileSync(join(ws, ".sesh-mover-hubinclude"), "*\n");
+        writeFileSync(join(ws, ".sesh-mover-include"), "*\n");
         writeFileSync(join(ws, ".git", "config"), "[remote]\n");
       });
 
@@ -747,7 +747,7 @@ describe("hub pull", () => {
       // `.sesh-mover` exists — pull plants its OWN project.json there —
       // but nothing of the payload's is inside it.
       expect(existsSync(join(targetPath, ".sesh-mover-project.json"))).toBe(true);
-      expect(existsSync(join(targetPath, ".sesh-mover-hubinclude"))).toBe(false);
+      expect(existsSync(join(targetPath, ".sesh-mover-include"))).toBe(false);
       expect(
         p.warnings.some((w) => w.includes("refused") && w.includes(".sesh-mover"))
       ).toBe(true);
@@ -755,7 +755,7 @@ describe("hub pull", () => {
       // command produces, and the milestone's cross-layer rule is that a skill
       // discriminator keys on fields, never on warning text.
       expect(p.workspaceRefused?.slice().sort())
-        .toEqual([".git", ".sesh-mover", ".sesh-mover-hubinclude"]);
+        .toEqual([".git", ".sesh-mover", ".sesh-mover-include"]);
       // …and the warning does not accuse the sender: a sesh-mover older than
       // this guard, on a case-insensitive filesystem, legitimately shipped a
       // `.GIT` store, which is exactly the leak the guard closed.
@@ -3815,7 +3815,7 @@ describe("hub pull — workspace 3-way merge", () => {
 
   it("a project whose workspace snapshot carries no files still pulls, sessions and all", async () => {
     // The empty-project shape (`mkdir scratch && cd scratch && claude`), and
-    // the same thing an over-broad hubignore produces. push declares
+    // the same thing an over-broad ignore list produces. push declares
     // `manifest.workspace` for it — fileCount 0 is a legitimate snapshot, not a
     // skipped one — so the puller runs its apply step, and before
     // snapshotWorkspace created the payload directory unconditionally there was

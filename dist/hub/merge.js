@@ -3,7 +3,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readHubignore, readHubinclude, } from "./workspace.js";
+import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readIgnorePatterns, readIncludePatterns, } from "./workspace.js";
 import { gitChildEnv } from "./carry.js";
 /**
  * Thrown when `mergeWorkspaceTrees` is called without an ancestor tree.
@@ -159,7 +159,7 @@ function sameContent(a, b) {
  * own layout uses. `join()` normalizes them back to native separators.
  *
  * The rules are `forEachCarriedFile`'s, i.e. the SAME ones that built the
- * payload: excludes, `hubinclude` re-includes on top of them, and the
+ * payload: excludes, `.sesh-mover-include` re-includes on top of them, and the
  * `NEVER_INCLUDABLE` floor under all of it. Filtering by excludes alone (what
  * this used to do) meant a file the user had explicitly re-included was
  * snapshotted and shipped and then dropped here, unreported, while an unpack of
@@ -283,11 +283,11 @@ function writeSidecar(targetDir, rel, incomingPath, stamp) {
  *
  * **What a payload is filtered by here** (the rule split is argued at the call
  * site): the `NEVER_INCLUDABLE` floor, and the *target's* own
- * `.sesh-mover-hubignore` minus whatever its `hubinclude` names back —
+ * `.sesh-mover-ignore` minus whatever its `.sesh-mover-include` names back —
  * so a file this machine deliberately keeps out of the hub can never be
  * overwritten by an incoming copy of the same name. The built-in convenience
  * excludes take no part: they are the sender's to apply, and re-applying them
- * discarded files a `hubinclude` had explicitly carried. Everything this
+ * discarded files a `.sesh-mover-include` had explicitly carried. Everything this
  * function does drop is reported in `skipped` (`locally-excluded`, or
  * `payload-internals` for the hard floor) rather than vanishing, so the two
  * apply paths differ only by that one explicit, visible veto — which
@@ -310,7 +310,7 @@ export async function mergeWorkspaceTrees(opts) {
     // a payload of the same lineage) is filtered by on the apply side:
     //
     // - The `NEVER_INCLUDABLE` floor, always. Nothing overrides it.
-    // - The target's own `hubignore`, minus whatever its `hubinclude` names back.
+    // - The target's own `.sesh-mover-ignore`, minus whatever its `.sesh-mover-include` names back.
     //   That is an explicit local statement — "this path is not the hub's
     //   business" — and honoring it is what keeps a file this machine
     //   deliberately keeps out of the hub from being overwritten by an incoming
@@ -318,21 +318,21 @@ export async function mergeWorkspaceTrees(opts) {
     // - The built-in convenience excludes deliberately do NOT apply here. They
     //   are a CARRY-side default that the sender already applied, and re-applying
     //   them on the apply side silently discarded exactly the files a user had
-    //   listed in `hubinclude` in order to get them carried (measured: an
+    //   listed in `.sesh-mover-include` in order to get them carried (measured: an
     //   incoming `node_modules/local-pkg/lib/index.js` that the snapshot proves
     //   is carried never landed, with no report row, while a `--force-workspace`
     //   unpack of the same bundle applied it).
     //
-    // Re-deciding the sender's carry rules here is not even possible: `hubignore`
-    // and `hubinclude` live under `.sesh-mover`, which never travels in a
+    // Re-deciding the sender's carry rules here is not even possible: both rule
+    // files are on the `NEVER_INCLUDABLE` floor, so neither ever travels in a
     // payload, and a workspace payload exists only for a project with no git
     // remote — so the receiving tree usually has NO copy of the rules that built
-    // the bundle it just received. Consulting the target's `hubinclude` alone
+    // the bundle it just received. Consulting the target's `.sesh-mover-include` alone
     // would therefore have fixed the defect only in the rare case where the user
     // had written that file on both machines by hand.
     const payloadRules = {
-        excludePatterns: opts.excludePatterns ?? readHubignore(opts.targetDir),
-        includePatterns: opts.includePatterns ?? readHubinclude(opts.targetDir),
+        excludePatterns: opts.excludePatterns ?? readIgnorePatterns(opts.targetDir),
+        includePatterns: opts.includePatterns ?? readIncludePatterns(opts.targetDir),
     };
     const incomingFiles = new Set(listTree(opts.incomingDir, payloadRules, {
         onDropped: (rel, reason, isDirectory) => {
