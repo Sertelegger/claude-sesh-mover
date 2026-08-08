@@ -10,7 +10,7 @@ import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, createHubProject, linkToHubProject, scanGitRemotes, readLocalProjectId, localProjectIdPath, } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
-import { snapshotWorkspace, hubincludePath, isNeverIncludable } from "./workspace.js";
+import { snapshotWorkspace, isNeverIncludable } from "./workspace.js";
 import { captureCarry, gitChildEnv } from "./carry.js";
 import { exportAllSessions } from "../exporter.js";
 import { createArchive } from "../archiver.js";
@@ -19,13 +19,13 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, } from "../sync-state.js";
-import { userDirWarnings } from "../paths.js";
+import { includeFilePath } from "../paths.js";
 /** Cap on `ignoredNotCarried`: a sample the user can recognize, not an inventory. */
 const MAX_IGNORED_REPORTED = 10;
 /**
  * Top-level gitignored paths, as `git` spells them — `docs/` for a wholly
  * ignored directory, `src/generated.ts` for a single ignored file inside a
- * carried one. Each is a valid `hubinclude` pattern for exactly that thing.
+ * carried one. Each is a valid `.sesh-mover-include` pattern for exactly that thing.
  *
  * `-z` is not a nicety: without it git applies `core.quotePath`, so a name with
  * a space, a quote, a newline or any non-ASCII character comes back C-quoted
@@ -41,7 +41,7 @@ function listTopLevelIgnored(projectPath) {
         const out = execFileSync("git", ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], {
             cwd: projectPath, encoding: "utf-8", timeout: 5000,
             // Not the inherited environment (see `gitChildEnv`): these paths are
-            // offered to the user as `hubinclude` lines to paste, so they have to
+            // offered to the user as `.sesh-mover-include` lines to paste, so they have to
             // come from the project's own repository and its own ignore rules.
             env: gitChildEnv(),
             stdio: ["ignore", "pipe", "ignore"], maxBuffer: 4 * 1024 * 1024,
@@ -88,8 +88,8 @@ function rollbackLocalLink(projectPath, link) {
         }
         const p = localProjectIdPath(projectPath);
         rmSync(p, { force: true });
-        // The directory too, but only while it holds nothing else: `hubignore`,
-        // `hubinclude` and a project-scope config.json are the user's files and
+        // The directory too, but only while it holds nothing else: `.sesh-mover-ignore`,
+        // `.sesh-mover-include` and a project-scope config.json are the user's files and
         // predate this push. rmdir on a non-empty directory simply fails.
         try {
             rmdirSync(dirname(p));
@@ -175,8 +175,6 @@ export async function hubPush(opts) {
         staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
         const backend = createFsBackend(opts.hubPath);
         const warnings = [];
-        // See hub/status.ts: the user-directory migration notice, if there is one.
-        warnings.push(...userDirWarnings());
         // A budget that could not be read as written. Said once, up front, rather
         // than folded into the decline it causes — the two are different facts, and
         // on an unattended session-end push this is the only trace of the typo.
@@ -330,7 +328,7 @@ export async function hubPush(opts) {
             });
             if (ws.symlinksSkipped > 0)
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
-            // Rule-level diagnostics (a hubinclude past a cap, an exclude set that
+            // Rule-level diagnostics (an include list past a cap, an exclude set that
             // swallowed the whole tree, a payload over the snapshot budget). Every
             // one of them fails CLOSED — fewer files — which is invisible from the
             // outside without this.
@@ -367,7 +365,7 @@ export async function hubPush(opts) {
         // Git-diff carry — the complement of the workspace snapshot: a project WITH
         // a remote reconstructs its committed state from git, so only the
         // uncommitted part has to travel (design §6.1). This is also what finally
-        // gives `hubinclude` an effect on a git project: until this block existed
+        // gives `.sesh-mover-include` an effect on a git project: until this block existed
         // its only reader was `snapshotWorkspace`, which runs exactly when there
         // are NO remotes, so the discovery aid below offered a file that could not
         // do anything for the project being offered it.
@@ -402,12 +400,12 @@ export async function hubPush(opts) {
                     // the opt-in as a silent success would undercut it.
                     const shown = cap.meta.reIncluded.join(", ");
                     const more = cap.meta.reIncludedCount - cap.meta.reIncluded.length;
-                    warnings.push(`Carried ${cap.meta.reIncludedCount} gitignored file(s) because .sesh-mover-hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`);
+                    warnings.push(`Carried ${cap.meta.reIncludedCount} gitignored file(s) because .sesh-mover-include names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`);
                 }
                 if (cap.meta.trackedIgnoredCount > 0) {
                     // A different disclosure with a different remedy, which is why it is
-                    // not folded into the one above: hubinclude did not put these on the
-                    // hub and removing a hubinclude line will not take them off it. They
+                    // not folded into the one above: the include list did not put these on the
+                    // hub and removing an include-list line will not take them off it. They
                     // are gitignored files that git TRACKS, so the patch carries their
                     // uncommitted contents and no carry rule filters the patch.
                     const shown = cap.meta.trackedIgnored.join(", ");
@@ -494,13 +492,13 @@ export async function hubPush(opts) {
             now: pushedAt,
         }));
         // Discovery aid (design §6.0): name what .gitignore kept out, so the user
-        // can opt paths back in via hubinclude without having to know the file
+        // can opt paths back in via the include list without having to know the file
         // exists. Manual pushes only — the auto-push hook must stay silent — and
-        // only until a hubinclude exists, at which point the user has met the
+        // only until an include list exists, at which point the user has met the
         // mechanism and further nagging is noise. Existence, not pattern count, is
         // the test: a file holding only comments still means "I know about this".
         let ignoredNotCarried;
-        if (!opts.quiet && gitScan().kind === "remotes" && !existsSync(hubincludePath(opts.projectPath))) {
+        if (!opts.quiet && gitScan().kind === "remotes" && !existsSync(includeFilePath(opts.projectPath))) {
             const ignored = listTopLevelIgnored(opts.projectPath);
             if (ignored.length > 0)
                 ignoredNotCarried = ignored;

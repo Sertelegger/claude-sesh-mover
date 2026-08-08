@@ -361,7 +361,7 @@ export interface HubStatusResult {
      *
      * `notes` are that push's own warnings verbatim (capped), which is where the
      * carry disclosures live: gitignored-but-TRACKED files whose contents rode
-     * the patch off this machine, and `hubinclude` paths that were re-included.
+     * the patch off this machine, and `.sesh-mover-include` paths that were re-included.
      * On a failed push it is the error instead.
      */
     lastAutoPush?: {
@@ -391,9 +391,9 @@ export interface HubPushResult {
      * 10 — a sample to recognize, not an inventory.
      *
      * Present only on a MANUAL push of a project with a git remote that has no
-     * `.sesh-mover-hubinclude` yet. Absent otherwise, and never emitted by
+     * `.sesh-mover-include` yet. Absent otherwise, and never emitted by
      * the auto-push hook, whose contract is silence at session exit. Each entry
-     * is a valid `hubinclude` pattern for exactly the thing it names, which is
+     * is a valid `.sesh-mover-include` pattern for exactly the thing it names, which is
      * why they are reported as git gives them rather than summarized up to their
      * top-level directory: re-include is the permissive direction, so a broader
      * spelling would carry more than the user pointed at.
@@ -406,7 +406,7 @@ export interface HubPushResult {
      * Two separate disclosures, both also surfaced as warnings, and deliberately
      * not merged — they have different causes and different remedies:
      * `reIncluded` names gitignored UNTRACKED paths that travelled only because
-     * `hubinclude` lists them (remedy: edit `hubinclude`), while `trackedIgnored`
+     * `.sesh-mover-include` lists them (remedy: edit `.sesh-mover-include`), while `trackedIgnored`
      * names gitignored paths that git TRACKS, whose changes the patch carries
      * because no carry rule filters the patch at all (remedy: `git rm --cached`,
      * or `--no-carry`).
@@ -528,7 +528,7 @@ export interface HubPullResult {
      * casing (see `NEVER_INCLUDABLE`). Absent on every ordinary pull.
      *
      * It is a result FIELD rather than warning prose because a skill layer has to
-     * be able to branch on it: a payload naming `.sesh-mover-hubinclude`
+     * be able to branch on it: a payload naming `.sesh-mover-include`
      * is trying to rewrite the list that decides what this machine's NEXT push
      * ships, which is the strongest signal this command produces, and warning
      * text is not an interface (see `commands/pull.md`). Nothing from these paths
@@ -786,7 +786,7 @@ export interface SyncState {
          * only in Claude Code's debug output, so everything it computes for a human
          * is discarded — including the disclosures that exist precisely to be read:
          * `carry.trackedIgnored` (gitignored-but-TRACKED files whose contents left
-         * the machine in the patch) and the re-included `hubinclude` paths. It is
+         * the machine in the patch) and the re-included `.sesh-mover-include` paths. It is
          * also where a chronically failing push (an unmounted share) would
          * otherwise be invisible. This is the durable breadcrumb for both, surfaced
          * by `hub status`.

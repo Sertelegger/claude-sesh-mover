@@ -11,7 +11,27 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - name: Create GitHub Release with generated notes
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # The release body is the CHANGELOG entry, not `--generate-notes`.
+      # Auto-generation lists merged PR titles plus a compare link, which for
+      # v0.7.0 — a release that renamed every path the plugin owns on disk and
+      # broke project-level config — came to a single line, while the changelog
+      # carried ninety. The changelog is written deliberately and reviewed in
+      # the PR that ships it; this makes it the thing users actually read.
+      #
+      # The extractor exits non-zero when the section is missing or empty, and
+      # that failure is wanted: a tag pushed without a changelog entry should
+      # fail the release rather than publish blank notes. Re-run after adding
+      # the section — the tag does not need to move.
+      - name: Build release notes from CHANGELOG
+        run: node scripts/changelog-section.mjs "$GITHUB_REF_NAME" > /tmp/release-notes.md
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release-notes.md

@@ -2,6 +2,93 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.8.0] — 2026-08-08
+
+> [!WARNING]
+> **Breaking, and there is no migration — this release is a clean break.**
+>
+> 0.8.0 does not read, move, or warn about anything a previous version wrote. Two
+> per-project files are renamed, and every pre-0.8.0 path is simply ignored.
+>
+> **What you do, per project:** recreate `.sesh-mover-include` and
+> `.sesh-mover-ignore` (renamed from `.sesh-mover-hubinclude` /
+> `.sesh-mover-hubignore`). Copy `.sesh-mover-project.json` across verbatim to keep
+> that project's hub link, or let the next push re-link by git remote.
+>
+> **What you do, per machine:** nothing is required. `~/.claude-sesh-mover/` and any
+> `<project>/.claude-sesh-mover/` are no longer read and can be deleted. A machine
+> coming from 0.6.x gets a fresh identity and re-uploads sessions as full bundles
+> on its first push — expected, not an error.
+>
+> **Coming from 0.6.x?** 0.7.0 and 0.8.0 are one break, not two. Follow this note
+> only; the 0.7.0 instructions are superseded.
+
+### Changed
+
+- **The two per-project list files drop `hub` from their names.** `.sesh-mover-hubinclude`
+  becomes **`.sesh-mover-include`** and `.sesh-mover-hubignore` becomes
+  **`.sesh-mover-ignore`**. `.sesh-mover-project.json` is genuinely hub-specific and is
+  **unchanged**.
+
+  | before (0.7.0) | after (0.8.0) |
+  |---|---|
+  | `<project>/.sesh-mover-hubinclude` | `<project>/.sesh-mover-include` |
+  | `<project>/.sesh-mover-hubignore` | `<project>/.sesh-mover-ignore` |
+  | `<project>/.sesh-mover-project.json` | *unchanged* |
+
+  The hub was the only thing that read these files, which is where the name came from. That
+  stops being true next release: `export` and `import` will carry the same workspace and
+  git-diff payloads that `push` and `pull` already do, so a user who never touches a hub will
+  be configuring what travels through a file whose name claims otherwise. Renaming *ahead* of
+  that feature means the files are already correct when it lands — and, together with the
+  clean break below, it means anyone still on 0.6.x recreates two files once rather than
+  twice.
+
+### Removed
+
+- **⚠️ BREAKING — 0.8.0 is a clean break. Pre-0.8.0 state is neither read nor migrated.**
+  Every piece of backwards-compatibility machinery the last two releases carried is gone:
+  no fallback read of an old path, no rename-on-first-run of the user directory, no
+  stale-name warning. If you are coming from 0.6.x, treat 0.7.0 and 0.8.0 as **one** break;
+  if you are coming from 0.7.0, it is still a break, because that release's `hub*` list
+  files are not read either. These are the only paths 0.8.0 knows:
+
+  | What | Where it lives |
+  |---|---|
+  | Machine identity, sync state, locks, user-scope exports and config | `~/.sesh-mover/` |
+  | Project-scope exports and parked carry payloads | `<project>/.sesh-mover/` |
+  | The opt-in re-include list (committed) | `<project>/.sesh-mover-include` |
+  | The exclusion list (committed) | `<project>/.sesh-mover-ignore` |
+  | This project's hub identity (committed) | `<project>/.sesh-mover-project.json` |
+
+  What to do, in full:
+
+  - **Recreate `.sesh-mover-include` and `.sesh-mover-ignore`** at the project root with the
+    contents of whatever you had before. A file left under an old name is not read, so the
+    project behaves as if it had no list at all — recoverable, and deliberately preferred to
+    a list that is silently read in part.
+  - **Copy `.sesh-mover-project.json` across verbatim to keep a project's hub link**, or do
+    nothing and let the next push re-link the project by its git remote (or offer a fresh
+    hub project).
+  - **Delete `~/.claude-sesh-mover/` and any `<project>/.claude-sesh-mover/`.** Nothing reads
+    them. A machine that never took the 0.7.0 upgrade gets a new machine identity and starts
+    its hub bookkeeping fresh; its sessions are still on the hub and still pullable.
+
+  This is a deliberate call, not an oversight: the tool stops carrying history it has no
+  users for. The version that migrated the user directory (0.7.0) has shipped, and a machine
+  that took it keeps its identity across this release with nothing to do.
+
+- **The `NEVER_INCLUDABLE` floor SHRANK, for the first time.** It is now exactly `.git`,
+  `.sesh-mover`, `.sesh-mover-include`, `.sesh-mover-ignore` and `.sesh-mover-project.json`
+  — at any depth, in any casing, with trailing dots and spaces folded, and re-includable by
+  no pattern or spelling, on the carry side and the apply side alike. `.claude-sesh-mover`,
+  `.sesh-mover-hubinclude` and `.sesh-mover-hubignore` came off it. **This is safe only
+  because of the break above:** a floor entry stops a payload planting a file that some
+  reader later consults, and 0.8.0 reads none of those three — a bundle that writes one now
+  leaves inert clutter, not a redirect. All five still derive from the one
+  `PLUGIN_STATE_NAMES` list in `src/paths.ts`, so the workspace walk, the merge, the unpack,
+  the `git` pathspecs and the patch byte scan cannot disagree about them.
+
 ## [0.7.0] — 2026-08-07
 
 ### Changed

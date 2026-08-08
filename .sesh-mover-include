@@ -1,4 +1,4 @@
-# Paths carried to the hub even though .gitignore / hubignore / the built-in
+# Paths carried even though .gitignore, .sesh-mover-ignore or the built-in
 # excludes would drop them. Committed on purpose: it means the same thing on
 # every clone and every machine.
 #
@@ -15,6 +15,6 @@
 # a machine move means re-deriving all of it, so they travel with the sessions.
 #
 # A pattern with a `/` anywhere in it is rooted at the project; a bare pattern
-# matches that name at any depth. See README's hubinclude section.
+# matches that name at any depth. See README's include-list section.
 docs/
 .superpowers/

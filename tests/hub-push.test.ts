@@ -422,20 +422,20 @@ describe("hub push — git-diff carry", () => {
     }
   });
 
-  it("names the gitignored files hubinclude sent to the hub, in the warnings", async () => {
+  it("names the gitignored files the include list sent to the hub, in the warnings", async () => {
     const { result, extractDir, cleanup } = await pushAndExtract((p) => {
       writeFileSync(join(p, ".gitignore"), "docs/\nsecret.env\n");
       mkdirSync(join(p, "docs"), { recursive: true });
       writeFileSync(join(p, "docs", "spec.md"), "# spec\n");
       writeFileSync(join(p, "secret.env"), "TOKEN=1\n");
       mkdirSync(join(p, ".sesh-mover"), { recursive: true });
-      writeFileSync(join(p, ".sesh-mover-hubinclude"), "docs/\n");
+      writeFileSync(join(p, ".sesh-mover-include"), "docs/\n");
     });
     try {
       expect(result.success).toBe(true);
       if (!result.success || !("carry" in result) || !result.carry) throw new Error("no carry");
       expect(result.carry.reIncluded).toEqual(["docs/spec.md"]);
-      expect(result.warnings.some((w) => w.includes("docs/spec.md") && w.includes("hubinclude"))).toBe(true);
+      expect(result.warnings.some((w) => w.includes("docs/spec.md") && w.includes("sesh-mover-include"))).toBe(true);
       expect(existsSync(join(extractDir, "carry", "untracked", "docs", "spec.md"))).toBe(true);
       expect(existsSync(join(extractDir, "carry", "untracked", "secret.env"))).toBe(false);
     } finally {
@@ -446,8 +446,8 @@ describe("hub push — git-diff carry", () => {
   it("names the gitignored files git TRACKS separately, with the remedy that actually works", async () => {
     const { result, extractDir, cleanup } = await pushAndExtract((p) => {
       // Committed first, gitignored after — the common shape, and the one the
-      // "gitignored files never travel" wording used to hide. hubinclude never
-      // touched it, so "remove the hubinclude line" is not the remedy.
+      // "gitignored files never travel" wording used to hide. The include list never
+      // touched it, so "remove the include-list line" is not the remedy.
       writeFileSync(join(p, ".env"), "DB_PASSWORD=old\n");
       execFileSync("git", ["add", ".env"], { cwd: p, stdio: "ignore" });
       execFileSync("git", ["commit", "-q", "-m", "oops"], { cwd: p, stdio: "ignore" });
@@ -464,7 +464,7 @@ describe("hub push — git-diff carry", () => {
       const warning = result.warnings.find((w) => w.includes(".env"));
       expect(warning).toBeDefined();
       expect(warning).toContain("git rm --cached");
-      expect(warning).not.toContain("hubinclude");
+      expect(warning).not.toContain("sesh-mover-include");
       // And it really is on the hub, in the bundle that just left the machine.
       expect(readFileSync(join(extractDir, "carry", "changes.patch"), "utf-8"))
         .toContain("+DB_PASSWORD=hunter2_NEW");
@@ -618,7 +618,7 @@ describe("hub push — git-diff carry", () => {
 describe("hub push — ignoredNotCarried discovery aid", () => {
   // A git project's payload ships tracked/untracked-but-not-ignored files only
   // (Task 10 builds it); .gitignore is also where .env lives, so an ignored
-  // path never travels unless hubinclude names it. This field is how a user
+  // path never travels unless the include list names it. This field is how a user
   // finds out the mechanism exists — it names what stayed behind.
   function makeGitProject(base: string, configDir: string, ignoreBody: string): string {
     const projectPath = createRealProject(base, configDir);
@@ -658,7 +658,7 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
     }
   }
 
-  it("reports top-level ignored paths not carried when hubinclude is absent", async () => {
+  it("reports top-level ignored paths not carried when the include list is absent", async () => {
     const reported = await pushIgnoreFixture("docs/\nnode_modules/\nsecret.env\n", (p) => {
       mkdirSync(join(p, "docs", "specs"), { recursive: true });
       mkdirSync(join(p, "node_modules", "pkg"), { recursive: true });
@@ -672,14 +672,14 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
     expect(reported).toContain("secret.env");
   });
 
-  it("omits ignoredNotCarried once a hubinclude exists", async () => {
+  it("omits ignoredNotCarried once an include list exists", async () => {
     const reported = await pushIgnoreFixture("docs/\n", (p) => {
       mkdirSync(join(p, "docs"), { recursive: true });
       writeFileSync(join(p, "docs", "design.md"), "spec\n");
       // Present but empty of patterns: the user has already met the mechanism,
       // so the discovery aid has done its job and must stop nagging.
       mkdirSync(join(p, ".sesh-mover"), { recursive: true });
-      writeFileSync(join(p, ".sesh-mover-hubinclude"), "# nothing yet\n");
+      writeFileSync(join(p, ".sesh-mover-include"), "# nothing yet\n");
     });
     expect(reported).toBeUndefined();
   });
@@ -867,7 +867,7 @@ describe("hub push — a failure after the link is committed", () => {
     }
   });
 
-  it("leaves a hubignore in place while removing only the link it wrote", async () => {
+  it("leaves an ignore list in place while removing only the link it wrote", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-push-rb2-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-push-rb2-hub-"));
     const base = mkdtempSync(join(tmpdir(), "sesh-push-rb2-fix-"));
@@ -877,7 +877,7 @@ describe("hub push — a failure after the link is committed", () => {
       const projectPath = createRealProject(base, configDir);
       // The user's own rules file, written long before this push.
       mkdirSync(join(projectPath, ".sesh-mover"), { recursive: true });
-      writeFileSync(join(projectPath, ".sesh-mover-hubignore"), "build/\n");
+      writeFileSync(join(projectPath, ".sesh-mover-ignore"), "build/\n");
       await hubInit({ hubPath: hub, configScope: "user", cwd: home });
       seedHubProject(hub);
       blockBundleDir(hub);
@@ -888,7 +888,7 @@ describe("hub push — a failure after the link is committed", () => {
       });
       expect(r.success).toBe(false);
       expect(existsSync(linkPath(projectPath))).toBe(false);
-      expect(readFileSync(join(projectPath, ".sesh-mover-hubignore"), "utf-8")).toBe("build/\n");
+      expect(readFileSync(join(projectPath, ".sesh-mover-ignore"), "utf-8")).toBe("build/\n");
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });

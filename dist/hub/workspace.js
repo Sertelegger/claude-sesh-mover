@@ -1,10 +1,10 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, } from "node:fs";
 import { dirname, join } from "node:path";
-import { HUBIGNORE_FILE_NAME, HUBINCLUDE_FILE_NAME, PLUGIN_STATE_NAMES, PROJECT_DIR_NAME, hubignoreFilePath, hubincludeFilePath, isPluginStateName, } from "../paths.js";
+import { IGNORE_FILE_NAME, INCLUDE_FILE_NAME, PLUGIN_STATE_NAMES, PROJECT_DIR_NAME, ignoreFilePath, includeFilePath, isPluginStateName, } from "../paths.js";
 import { DEFAULT_WORKSPACE_MAX_MB } from "../config.js";
 /**
  * The convenience excludes every carry path starts from. Each of these is a
- * DEFAULT, not a floor: `.sesh-mover-hubinclude` names any of them back
+ * DEFAULT, not a floor: `.sesh-mover-include` names any of them back
  * (the floor that nothing names back is `NEVER_INCLUDABLE`, below).
  *
  * `.claude` is the one entry here that is not about size or noise. It is the
@@ -27,7 +27,7 @@ export const DEFAULT_WORKSPACE_EXCLUDES = [
  * Names that can never be carried, re-included, or applied — at ANY depth, on
  * any path, by any pattern (design §6.0).
  *
- * `hubinclude` exists to make the exclusion logic say "yes" where it used to
+ * `.sesh-mover-include` exists to make the exclusion logic say "yes" where it used to
  * say "no", so this list is the floor it can never dig under:
  *
  * - `.git` is a VCS store, not project content: it holds credentials in some
@@ -38,21 +38,27 @@ export const DEFAULT_WORKSPACE_EXCLUDES = [
  * - Everything in `PLUGIN_STATE_NAMES` holds this plugin's own project state —
  *   `.sesh-mover-project.json` (planted by pull independently), the
  *   project-scope `config.json` under `.sesh-mover/` (which can redirect
- *   `hub.path`), and `.sesh-mover-hubinclude` ITSELF. A payload able to write
+ *   `hub.path`), and `.sesh-mover-include` ITSELF. A payload able to write
  *   any of those could rewrite the list deciding what the next push ships,
  *   turning a workspace payload into an exfiltration primitive. So they are
  *   refused on the apply side too, not only on the carry side.
  *
- * TWO THINGS ABOUT THIS LIST ARE PERMANENT, not incidental to the 0.7.0 rename:
+ * TWO THINGS ABOUT THIS LIST ARE PERMANENT, not incidental to whichever rename
+ * happened most recently:
  *
- * 1. **`.claude-sesh-mover` stays here forever.** Bundles carrying that path are
- *    already sitting on hubs, written by every version before 0.7.0. Dropping
- *    the old name would un-protect every one of them and reopen the exact
- *    exfiltration primitive above in a new shape — a payload writing a legacy
- *    `hubinclude` that an older peer still reads.
- * 2. **The three root dotfiles need the floor MORE than the directory did.**
+ * 1. **There is exactly one copy of it.** The list is `PLUGIN_STATE_NAMES` plus
+ *    `.git`, and every side derives from it: the workspace walk, the merge, the
+ *    unpack, carry.ts's `git` pathspecs and its patch byte scan. A second,
+ *    hand-written copy is how a name ends up protected on the carry side and not
+ *    on the apply side — so add a name in `paths.ts` and nowhere else. 0.8.0
+ *    SHRANK this list (it dropped three spellings no version reads any more, as
+ *    part of that release's clean break), which is exactly the kind of edit that
+ *    has to be deliberate: a name leaving here is a security change, pinned by
+ *    exact-contents assertions in `tests/paths.test.ts` and two sites in
+ *    `tests/hub-workspace.test.ts`.
+ * 2. **The root dotfiles need the floor MORE than the directory did.**
  *    They are ordinary files at the project root, so there is no directory name
- *    between a payload and them: `.sesh-mover-hubinclude` can be named directly.
+ *    between a payload and them: `.sesh-mover-include` can be named directly.
  *    The check is per SEGMENT and fold-tolerant (`isNeverSegment`), so it holds
  *    at any depth and in every spelling the directory names already survive.
  *
@@ -71,16 +77,16 @@ export const DEFAULT_WORKSPACE_EXCLUDES = [
  * machine, which is the user's own call to make: a project-level
  * `.claude/settings.json` or a set of shared agents is ordinary project content
  * someone may well want carried between their own machines, and writing
- * `.claude` in `hubinclude` is exactly how they say so.
+ * `.claude` in `.sesh-mover-include` is exactly how they say so.
  */
 export const NEVER_INCLUDABLE = Object.freeze([
     ".git",
     ...PLUGIN_STATE_NAMES,
 ]);
-/** Byte cap on `hubinclude`; a bigger file is ignored outright (fail closed). */
-const MAX_HUBINCLUDE_BYTES = 64 * 1024;
+/** Byte cap on `.sesh-mover-include`; a bigger file is ignored outright (fail closed). */
+const MAX_INCLUDE_BYTES = 64 * 1024;
 /** Pattern cap: every pattern is tested against every candidate path. */
-const MAX_HUBINCLUDE_PATTERNS = 500;
+const MAX_INCLUDE_PATTERNS = 500;
 export class WorkspaceTargetNotEmptyError extends Error {
     targetPath;
     constructor(targetPath) {
@@ -94,26 +100,28 @@ export class WorkspaceTargetNotEmptyError extends Error {
         this.targetPath = targetPath;
     }
 }
-// hubignore: one pattern per line, '#' comments and blank lines skipped.
-// Patterns are matched against individual path segments at any depth,
-// literal or with '*' wildcards — deliberately NOT full gitignore semantics.
+// The ignore list (`.sesh-mover-ignore`): one pattern per line, '#' comments and
+// blank lines skipped. Patterns are matched against individual path segments at
+// any depth, literal or with '*' wildcards — deliberately NOT full gitignore
+// semantics.
 //
 // A trailing slash is stripped so `build/` and `build` mean the same thing.
 // Without that, `build/` was a SILENT NO-OP: isExcluded compares a pattern to a
 // bare directory entry name, which never carries a slash, so the directory was
 // carried anyway.
 //
-// This is where hubignore and hubinclude DELIBERATELY DIVERGE, and the asymmetry
-// is intentional rather than an oversight to be tidied away. Every hubignore
-// pattern is matched per SEGMENT, so it has no way to express rooting and a
-// trailing slash can only be decoration. hubinclude matches whole relative paths,
-// so there a trailing slash is the difference between `docs` at the top level and
-// every `docs` at any depth — and it must stay significant, because it is the
-// exact shape `ignoredNotCarried` hands the user to paste. Net: `docs/` in this
-// file excludes a `docs` anywhere; `docs/` in hubinclude names back only the top
-// -level one. Do not "harmonize" them by making one follow the other.
-export function readHubignore(projectPath) {
-    const p = hubignoreFilePath(projectPath);
+// This is where the ignore list and the include list DELIBERATELY DIVERGE, and
+// the asymmetry is intentional rather than an oversight to be tidied away. Every
+// ignore-list pattern is matched per SEGMENT, so it has no way to express rooting
+// and a trailing slash can only be decoration. The include list matches whole
+// relative paths, so there a trailing slash is the difference between `docs` at
+// the top level and every `docs` at any depth — and it must stay significant,
+// because it is the exact shape `ignoredNotCarried` hands the user to paste.
+// Net: `docs/` in this file excludes a `docs` anywhere; `docs/` in the include
+// list names back only the top-level one. Do not "harmonize" them by making one
+// follow the other.
+export function readIgnorePatterns(projectPath) {
+    const p = ignoreFilePath(projectPath);
     if (!existsSync(p))
         return [];
     return readFileSync(p, "utf-8")
@@ -121,14 +129,10 @@ export function readHubignore(projectPath) {
         .map((l) => l.trim().replace(/\/+$/, ""))
         .filter((l) => l.length > 0 && !l.startsWith("#"));
 }
-/** Where a project's `hubinclude` lives. */
-export function hubincludePath(projectPath) {
-    return hubincludeFilePath(projectPath);
-}
 /**
- * hubinclude: the opt-in re-include list (design §6.0). Sibling to `hubignore`,
- * same syntax, and meant to be COMMITTED so it travels with the repo and means
- * the same thing on every clone.
+ * The include list (`.sesh-mover-include`): the opt-in re-include list (design
+ * §6.0). Sibling to `.sesh-mover-ignore`, same syntax, and meant to be COMMITTED
+ * so it travels with the repo and means the same thing on every clone.
  *
  * It exists because `.gitignore` is also where `.env` and credential files
  * live: ignored files are never carried by default, and this is the explicit,
@@ -136,10 +140,10 @@ export function hubincludePath(projectPath) {
  * normalization happens in `isReIncluded`, so what a user wrote is what a
  * caller can echo back to them.
  *
- * Bounds are asymmetric with `readHubignore` on purpose: an ignore pattern
+ * Bounds are asymmetric with `readIgnorePatterns` on purpose: an ignore pattern
  * fails safe (it only ever removes files), an include pattern fails OPEN. Over
- * `MAX_HUBINCLUDE_BYTES` the file is ignored entirely; past
- * `MAX_HUBINCLUDE_PATTERNS` the tail is dropped.
+ * `MAX_INCLUDE_BYTES` the file is ignored entirely; past
+ * `MAX_INCLUDE_PATTERNS` the tail is dropped.
  *
  * Both bounds fail CLOSED — fewer re-includes — which from the outside is
  * indistinguishable from "my files silently stopped syncing". So a caller that
@@ -147,8 +151,8 @@ export function hubincludePath(projectPath) {
  * appends a sentence naming the file, the limit and the consequence.
  * `snapshotWorkspace` threads them into the push's `warnings`.
  */
-export function readHubinclude(projectPath, diagnostics) {
-    const p = hubincludePath(projectPath);
+export function readIncludePatterns(projectPath, diagnostics) {
+    const p = includeFilePath(projectPath);
     let st;
     try {
         st = statSync(p);
@@ -156,26 +160,26 @@ export function readHubinclude(projectPath, diagnostics) {
     catch {
         return [];
     }
-    // isFile() also refuses a directory and a device node (a `hubinclude ->
+    // isFile() also refuses a directory and a device node (a `.sesh-mover-include ->
     // /dev/zero` symlink would otherwise be read forever).
     if (!st.isFile()) {
         if (st.isDirectory()) {
-            diagnostics?.push(`${HUBINCLUDE_FILE_NAME} is a directory, not a file — it was ignored entirely, so no re-includes are in effect.`);
+            diagnostics?.push(`${INCLUDE_FILE_NAME} is a directory, not a file — it was ignored entirely, so no re-includes are in effect.`);
         }
         return [];
     }
-    if (st.size > MAX_HUBINCLUDE_BYTES) {
-        diagnostics?.push(`${HUBINCLUDE_FILE_NAME} is ${st.size} bytes, over the ${MAX_HUBINCLUDE_BYTES}-byte cap — it was ignored ENTIRELY, so none of its re-includes are in effect and every path it names was left out of this snapshot.`);
+    if (st.size > MAX_INCLUDE_BYTES) {
+        diagnostics?.push(`${INCLUDE_FILE_NAME} is ${st.size} bytes, over the ${MAX_INCLUDE_BYTES}-byte cap — it was ignored ENTIRELY, so none of its re-includes are in effect and every path it names was left out of this snapshot.`);
         return [];
     }
     const all = readFileSync(p, "utf-8")
         .split("\n")
         .map((l) => l.trim())
         .filter((l) => l.length > 0 && !l.startsWith("#"));
-    if (all.length > MAX_HUBINCLUDE_PATTERNS) {
-        diagnostics?.push(`${HUBINCLUDE_FILE_NAME} has ${all.length} patterns, over the ${MAX_HUBINCLUDE_PATTERNS}-pattern cap — only the first ${MAX_HUBINCLUDE_PATTERNS} are in effect and the rest were dropped.`);
+    if (all.length > MAX_INCLUDE_PATTERNS) {
+        diagnostics?.push(`${INCLUDE_FILE_NAME} has ${all.length} patterns, over the ${MAX_INCLUDE_PATTERNS}-pattern cap — only the first ${MAX_INCLUDE_PATTERNS} are in effect and the rest were dropped.`);
     }
-    return all.slice(0, MAX_HUBINCLUDE_PATTERNS);
+    return all.slice(0, MAX_INCLUDE_PATTERNS);
 }
 /**
  * Is this ONE path segment a name that can never be carried?
@@ -195,7 +199,7 @@ function isNeverSegment(segment) {
  * project-relative path at all (absolute, UNC, drive-rooted, or escaping via
  * `..`). `null` always means "no" at every call site — never "match anything".
  *
- * Backslashes are treated as separators on EVERY platform. `hubinclude` is
+ * Backslashes are treated as separators on EVERY platform. `.sesh-mover-include` is
  * committed and shared, so a pattern written on Windows has to work on macOS
  * and vice versa; and on the path side it is load-bearing for safety, since a
  * `\`-spelled `.git\config` would otherwise read as one exotic filename and
@@ -240,7 +244,7 @@ export function isNeverIncludable(relPath) {
  * Patterns are normalized once per array identity: `isReIncluded` runs per
  * directory entry during a walk, and re-splitting the same strings for every
  * candidate path is pure waste. Callers must treat a patterns array they have
- * handed in as immutable (they all read it straight from `readHubinclude`).
+ * handed in as immutable (they all read it straight from `readIncludePatterns`).
  */
 const patternCache = new WeakMap();
 function parsePatterns(patterns) {
@@ -256,7 +260,7 @@ function parsePatterns(patterns) {
         // belt-and-braces and INCOMPLETE by construction (`.g*` names the same
         // directory and is not caught here) — the per-segment check on the PATH
         // side is the load-bearing guard. It earns its place by making the file's
-        // contract legible: writing `.git` in hubinclude does nothing, ever.
+        // contract legible: writing `.git` in the include list does nothing, ever.
         // (Removing this line survives the whole suite — it is unobservable BY
         // CONSTRUCTION, since the path-side check answers first for every path such
         // a pattern could match. Kept as documentation, not as a guard.)
@@ -270,7 +274,7 @@ function parsePatterns(patterns) {
     return parsed;
 }
 /**
- * Does `hubinclude` name this workspace-relative path?
+ * Does `.sesh-mover-include` name this workspace-relative path?
  *
  * Matching is on the RELATIVE PATH, not a bare segment, so a pattern carries a
  * subtree. Two shapes, both segment-wise with `*` globs:
@@ -282,7 +286,7 @@ function parsePatterns(patterns) {
  *   is rooted, trailing one included: `docs/` is `docs` at the project root,
  *   never `vendor/x/docs`.
  * - **bare** (`*.keepme`, `secrets`) — no separator at all, so it matches that
- *   name at any depth, the same way a `hubignore` line does. `snapshotWorkspace`
+ *   name at any depth, the same way a `.sesh-mover-ignore` line does. `snapshotWorkspace`
  *   walks excluded directories when a bare pattern exists precisely so this
  *   predicate and the payload it builds can never disagree (§6.0: one meaning
  *   in the product).
@@ -351,7 +355,7 @@ function matchesSegment(pattern, segment) {
  * `a`s makes the backtracking engine explore ~n^7 paths. Measured through the
  * shipped `isReIncluded`, at eight wildcards — inside the wildcard cap that was
  * supposed to prevent exactly this — a 56-character name took 4.7 s and a
- * 64-character one 13.7 s; filenames go to 255 bytes, and `hubignore` had no
+ * 64-character one 13.7 s; filenames go to 255 bytes, and `.sesh-mover-ignore` had no
  * cap at all (a ten-star line against a 44-character name measured 9.6 s).
  *
  * The two-pointer form below is the standard one: walk both strings, remember
@@ -368,7 +372,7 @@ function matchesSegment(pattern, segment) {
  * must match). One deliberate behaviour change: `*` now crosses a newline,
  * where `RegExp`'s `.` did not. A filename may legitimately contain one, and an
  * ignore pattern that silently stopped matching such a name was the unsafe
- * direction; for `hubinclude` it changes nothing about the hard exclusions,
+ * direction; for `.sesh-mover-include` it changes nothing about the hard exclusions,
  * which are decided per segment by `isNeverSegment`, not by the glob.
  */
 function globMatch(pattern, name) {
@@ -459,7 +463,7 @@ export function classifyDestination(targetDir, rel, expect = "file") {
  *
  * It is shared rather than duplicated because the two disagreed in production:
  * `mergeWorkspaceTrees` filtered its three trees through the excludes while
- * knowing nothing about `hubinclude`, so a file the user had explicitly listed
+ * knowing nothing about `.sesh-mover-include`, so a file the user had explicitly listed
  * was snapshotted, archived, uploaded, downloaded — and then dropped on the
  * ordinary pull path with no report row, while a `--force-workspace` unpack of
  * the same bundle applied it. Given the same rule files on both machines (they
@@ -510,7 +514,7 @@ export function forEachCarriedFile(root, rules, visit, hooks) {
             // Hard exclusions first, and independently of `excludePatterns`:
             // isExcluded compares case-SENSITIVELY, but macOS and Windows filesystems
             // do not, so a git store renamed `.GIT` still works there and still
-            // readdirs as ".GIT" — and it used to land in the payload, hubinclude or
+            // readdirs as ".GIT" — and it used to land in the payload, include list or
             // not, because an entry the excludes never matched never reached a
             // re-include check.
             if (isNeverSegment(entry.name)) {
@@ -580,8 +584,8 @@ export function isCarriedPath(relPath, rules) {
 /** The exclude/include rule pair a project's own files are carried under. */
 export function readCarryRules(projectPath, diagnostics) {
     return {
-        excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES, ...readHubignore(projectPath)],
-        includePatterns: readHubinclude(projectPath, diagnostics),
+        excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES, ...readIgnorePatterns(projectPath)],
+        includePatterns: readIncludePatterns(projectPath, diagnostics),
     };
 }
 /** Entry names in a directory, or `[]` if it cannot be read (missing, EACCES). */
@@ -598,7 +602,7 @@ function listDirSafely(dir) {
  * anything is copied. The FALLBACK, like `CARRY_MAX_BYTES`: the real one comes
  * from `hub.workspaceMaxMb` via `snapshotWorkspace`'s `maxBytes`.
  *
- * The guard exists because `hubinclude` made an unbounded payload reachable: a
+ * The guard exists because `.sesh-mover-include` made an unbounded payload reachable: a
  * single `*` line re-admits every built-in exclude, and a measured
  * `node_modules` alone is 6,021 files. Before that the built-in excludes made
  * an over-budget payload nearly impossible, so there was nothing to bound.
@@ -625,11 +629,11 @@ export const WORKSPACE_MAX_BYTES = DEFAULT_WORKSPACE_MAX_MB * 1024 * 1024;
 const PER_FILE_BYTES = 512;
 /**
  * Copy a project's working tree into `destDir`, minus the excluded paths and
- * plus whatever `hubinclude` names back in (design §5, §6.0). The rules
+ * plus whatever `.sesh-mover-include` names back in (design §5, §6.0). The rules
  * themselves live in `forEachCarriedFile`, which the apply side shares.
  *
  * `warnings` carries anything the user would otherwise have to infer from an
- * empty or surprising payload: a `hubinclude` big enough to be ignored, a
+ * empty or surprising payload: a `.sesh-mover-include` big enough to be ignored, a
  * truncated pattern list, or an exclude set that swallowed the whole tree.
  *
  * `skipped` means the payload was over `maxBytes` and NOTHING was copied — see
@@ -693,7 +697,7 @@ export async function snapshotWorkspace(projectPath, destDir, opts) {
             largest.pop();
     });
     if (cost > maxBytes) {
-        warnings.push(`The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so this push carries no project files (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with ${HUBIGNORE_FILE_NAME} — and check ${HUBINCLUDE_FILE_NAME} for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`);
+        warnings.push(`The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so this push carries no project files (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with ${IGNORE_FILE_NAME} — and check ${INCLUDE_FILE_NAME} for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`);
         return { fileCount: 0, byteSize: measured, symlinksSkipped: 0, skipped: true, warnings };
     }
     // Created up front, not lazily per file: a payload this function returns
@@ -701,7 +705,7 @@ export async function snapshotWorkspace(projectPath, destDir, opts) {
     // declared payload that isn't in the bundle is a crash on every machine that
     // pulls it (`unpackWorkspace`/`mergeWorkspaceTrees` both start by reading
     // this directory). An empty tree is a legitimate outcome — an empty project,
-    // or a hubignore broad enough to drop everything — so the empty DIRECTORY is
+    // or an ignore list broad enough to drop everything — so the empty DIRECTORY is
     // what has to travel. It survives the tar round trip (verified).
     mkdirSync(destDir, { recursive: true });
     forEachCarriedFile(projectPath, rules, (relPath, srcPath) => {
@@ -712,11 +716,11 @@ export async function snapshotWorkspace(projectPath, destDir, opts) {
         byteSize += statSync(srcPath).size;
     }, { onSymlinkSkipped: () => { symlinksSkipped++; } });
     // An empty payload is a legitimate outcome (an empty project), but it is also
-    // what one over-broad line produces: `*/` in hubignore excludes every
+    // what one over-broad line produces: `*/` in the ignore list excludes every
     // top-level directory, so the snapshot silently carried nothing. Say so
     // whenever there WAS something to carry.
     if (fileCount === 0 && listDirSafely(projectPath).some((n) => !isPluginStateName(n))) {
-        warnings.push(`The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by ${HUBIGNORE_FILE_NAME}, so this push carries no project files. Check it for an over-broad pattern (\`*\` and \`*/\` match everything at a level), or pass --no-workspace on future pushes if that is what you meant.`);
+        warnings.push(`The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by ${IGNORE_FILE_NAME}, so this push carries no project files. Check it for an over-broad pattern (\`*\` and \`*/\` match everything at a level), or pass --no-workspace on future pushes if that is what you meant.`);
     }
     return { fileCount, byteSize, symlinksSkipped, skipped: false, warnings };
 }
@@ -745,7 +749,7 @@ export function formatBytes(bytes) {
  * attack: a hand-made or damaged bundle; a bundle written by a version older
  * than this guard, on a case-insensitive filesystem where a store spelled
  * `.GIT` slipped past the case-sensitive exclude list; and a deliberately
- * planted payload, whose prize is `.sesh-mover-hubinclude` — the file
+ * planted payload, whose prize is `.sesh-mover-include` — the file
  * deciding what the NEXT push ships. Callers must not name a culprit. Refusing
  * here is what keeps the two apply paths (merge and unpack) saying the same
  * thing, the same argument that moved `classifyDestination` into this module.

@@ -85,12 +85,12 @@ import { copyTreeSync } from "./helpers/copy-tree.js";
  */
 const FLOOR = ".sesh-mover/config.json";
 /**
- * The 0.7.0 addition: the committed rule file is now a ROOT DOTFILE, so a
- * payload can name it with no directory component in the way. One segment, so
- * it adds no new axis to the corpus above — but it is the file that decides
- * what this machine's next push uploads, so the scan has to meet it too.
+ * The committed rule file is a ROOT DOTFILE, so a payload can name it with no
+ * directory component in the way. One segment, so it adds no new axis to the
+ * corpus above — but it is the file that decides what this machine's next push
+ * uploads, so the scan has to meet it too.
  */
-const ROOT_DOTFILE_FLOOR = ".sesh-mover-hubinclude";
+const ROOT_DOTFILE_FLOOR = ".sesh-mover-include";
 /**
  * The same floor, reached at the LEAF instead of a middle component.
  *

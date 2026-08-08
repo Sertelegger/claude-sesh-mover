@@ -11,7 +11,7 @@ import { DEFAULT_CARRY_MAX_MB } from "../config.js";
  * payload is the worse failure: the apply side (§6.2) copies untracked files
  * into the peer's tree, and half a dependency tree or half a generated
  * directory reads there as a corrupt install, not as a truncated upload. The
- * decline names the largest contributors so the offending `hubinclude` line is
+ * decline names the largest contributors so the offending `.sesh-mover-include` line is
  * obvious.
  *
  * This is the FALLBACK for a caller that passes no budget. The real one comes
@@ -32,7 +32,7 @@ export const CARRY_MAX_BYTES = DEFAULT_CARRY_MAX_MB * 1024 * 1024;
  *
  * A pure byte budget bounds the wrong thing: 200,000 zero-byte files measure
  * zero and sail through, then cost a copy syscall here, a tar header each, and
- * a file the peer has to write on every pull. `hubinclude: *` over a tree of
+ * a file the peer has to write on every pull. An include list of `*` over a tree of
  * tiny generated files is exactly that shape. 512 bytes is one tar header —
  * small enough to be invisible for ordinary files (a 20 KB source file moves
  * the needle by 2.5%), decisive for a payload made of nothing but entries.
@@ -98,7 +98,7 @@ const PATCH_HARDENING = [
  * `isCarriedPath` filters the UNTRACKED enumeration; nothing filtered the patch,
  * and `git diff HEAD` happily describes changes to a TRACKED
  * `.sesh-mover/config.json` (which can redirect `hub.path`) or
- * `.sesh-mover-hubinclude` (which decides what the next push ships).
+ * `.sesh-mover-include` (which decides what the next push ships).
  * Committing that directory is what this project's own docs RECOMMEND, so the
  * shape is ordinary rather than exotic — and while today's pull ignores the
  * carry payload entirely, §6.2's `git apply` will not, and a patch is not
@@ -205,7 +205,7 @@ const SCRUBBED_GIT_ENV_PREFIXES = Object.freeze([
  * parent's, minus `SCRUBBED_GIT_ENV`. Exported because the decision is about
  * `git` children, not about carry: `identity.ts` decides carry-vs-snapshot from
  * `git remote -v`, `push.ts` offers `ls-files --ignored` output as a
- * `hubinclude` line to paste, and `merge.ts` runs `git merge-file` from a
+ * `.sesh-mover-include` line to paste, and `merge.ts` runs `git merge-file` from a
  * scratch directory precisely to escape ambient repository config — an escape
  * `GIT_DIR` walks straight through (verified: a repo-local `merge.conflictStyle`
  * that merge-file rejects makes it exit 128 from the scratch dir when `GIT_DIR`
@@ -306,7 +306,7 @@ function detectInProgress(gitDir) {
  * Everything is filtered through `isCarriedPath`, which is the same rule the
  * workspace walk applies — including the `NEVER_INCLUDABLE` floor, which is
  * what stops `.sesh-mover/config.json` (a file that can redirect
- * `hub.path`) and `.sesh-mover-hubinclude` (the file deciding what the
+ * `hub.path`) and `.sesh-mover-include` (the file deciding what the
  * NEXT push ships) from riding along as ordinary untracked files. They are
  * untracked and usually NOT gitignored, so nothing else would have stopped them.
  *
@@ -365,7 +365,7 @@ function describeLargest(files, patchBytes) {
  * Gitignored files that are also TRACKED and that the patch actually changes.
  *
  * This is the honest answer to "what gitignored content left my machine", and
- * it is not `reIncluded`: `hubinclude` had nothing to do with it and no
+ * it is not `reIncluded`: `.sesh-mover-include` had nothing to do with it and no
  * exclusion rule in this module can drop it, because every one of them filters
  * the untracked enumeration while the patch describes tracked files.
  *
@@ -413,13 +413,13 @@ function findTrackedIgnored(projectPath, diagnostics) {
  *   repo-root-relative paths while the untracked list (which git already scopes
  *   to the cwd) describes just this subtree, and neither half applies.
  * - untracked, non-ignored files, minus what the carry rules drop.
- * - every gitignored path `hubinclude` names (design §6.0) — the deliberate,
+ * - every gitignored path `.sesh-mover-include` names (design §6.0) — the deliberate,
  *   committed, reviewable exception, and the only way an UNTRACKED gitignored
  *   file travels.
  *
  * What the filters do and do NOT cover, stated exactly because the short version
  * ("gitignored files never travel") is false in one direction: `.gitignore`,
- * `hubignore`, the built-in excludes and `hubinclude` all govern the UNTRACKED
+ * `.sesh-mover-ignore`, the built-in excludes and `.sesh-mover-include` all govern the UNTRACKED
  * enumeration. `git diff HEAD` describes every TRACKED file that changed, and no
  * user-facing rule filters it — a file that is gitignored AND tracked (committed
  * once, ignored later, never `git rm --cached`; or `git add -f`) carries its
@@ -522,7 +522,7 @@ export async function captureCarry(projectPath, destDir, opts) {
     const candidates = new Map(); // rel -> came from re-inclusion
     for (const rel of splitZ(untracked.stdout))
         candidates.set(rel, false);
-    // hubinclude re-adds deliberately-ignored paths (this repo's own
+    // the include list re-adds deliberately-ignored paths (this repo's own
     // docs/superpowers is the canonical case). Everything else gitignored stays
     // put — .gitignore is also where secrets live, so inclusion is opt-in,
     // committed and reviewable. `isReIncluded` decides it, on the full
@@ -671,7 +671,7 @@ const APPLY_CONFIG = ["-c", "apply.ignoreWhitespace=no"];
  *   nothing written — measured). Applied to `--numstat` that means a
  *   subdirectory project reports NO entries at all, so a floor check reading
  *   its output passes vacuously: measured, a `GIT binary patch` creating
- *   `.sesh-mover-hubinclude` was refused at a repo-root project and
+ *   `.sesh-mover-include` was refused at a repo-root project and
  *   APPLIED at a subdirectory one, as were an empty-file creation of
  *   `.sesh-mover/config.json` and an `old mode`/`new mode` chmod. The
  *   same omission zeroed `filesChanged` on every subdirectory project.
@@ -743,12 +743,12 @@ const C_QUOTE_ESCAPES = {
  *
  * - **It stops at the first UNESCAPED closing quote and ignores everything
  *   after it.** Requiring the token to END with the quote (what this function
- *   did) means one appended junk byte — `".sesh-mover-hubinclude"X` —
+ *   did) means one appended junk byte — `".sesh-mover-include"X` —
  *   leaves the literal token as the only reading, whose leading `"` fuses into
  *   the first segment so `isNeverSegment` no longer matches, while git decodes
  *   the real path and applies it. Measured on a healthy-git receiver at both
  *   layouts: that spelling on a `rename from` line DELETED the receiver's
- *   `.sesh-mover-hubinclude`, and on a `copy from` line reproduced it at
+ *   `.sesh-mover-include`, and on a `copy from` line reproduced it at
  *   an ordinary path from where the next auto-push would upload it.
  * - **An octal escape is exactly three digits with the first in 0–3**; two
  *   digits (`\56`) or a leading `4`–`7` is an ERROR, not a shorter escape.
@@ -915,7 +915,7 @@ function stripOneComponent(path) {
  *
  * **The standard here is what `git apply` ACCEPTS, not what `git diff` emits.**
  * The threat model for this line is a hand-crafted payload — that is the only
- * way `copy from .sesh-mover-hubinclude` arises either — so covering
+ * way `copy from .sesh-mover-include` arises either — so covering
  * git's own output is not enough. Two spellings real git accepts walked past an
  * earlier "split at the midpoint, require the halves to match after stripping
  * `a/`/`b/`" reading of this header, both measured end to end (`--numstat`
@@ -1035,7 +1035,7 @@ function diffGitHeaderPaths(rest, budget) {
  * - `git apply --numstat -z` is git's own parse — authoritative and unquoted.
  *   But for a RENAME **or a COPY** it prints only the DESTINATION (measured
  *   both), so the source path is invisible to it: `copy from
- *   .sesh-mover-hubinclude` / `copy to stolen.txt` materialises the
+ *   .sesh-mover-include` / `copy to stolen.txt` materialises the
  *   RECEIVER's own plugin internals at an ordinary path, from where the next
  *   auto-push carries them to the hub. It also cannot run at all on a machine
  *   with no `git`, or on one whose `git` cannot read this repository.
@@ -1053,7 +1053,7 @@ function diffGitHeaderPaths(rest, budget) {
  * nine above. `similarity index`, `dissimilarity index`, `index` and the four
  * mode lines carry no path. **`rename old `/`rename new ` are git's legacy
  * spelling of `rename from`/`to`, and it still accepts them** — measured: an
- * otherwise identical payload deleted `.sesh-mover-hubinclude` and
+ * otherwise identical payload deleted `.sesh-mover-include` and
  * created `moved.txt`, `applied: true`, at BOTH layouts, on a receiver with a
  * perfectly healthy `git`, because `--numstat` prints only a rename's
  * destination and the scan did not read the source line.
@@ -1187,7 +1187,7 @@ function listPayloadFiles(root) {
  * saved directory is not an archive, it is a set of instructions: the README it
  * ships alongside tells the user to run `cp -R '<saved>/untracked/.' .`, and
  * that command copies dot-entries. So an `untracked/.git/hooks/pre-commit` or
- * `untracked/.sesh-mover-hubinclude` that `applyCarry` refuses outright
+ * `untracked/.sesh-mover-include` that `applyCarry` refuses outright
  * (`refused[]`, nothing written) was planted by the routine `not-requested`
  * path the moment the user followed our own instructions — the one path whose
  * sibling has the defence. Only a hand-made, damaged or pre-floor bundle can
@@ -1436,7 +1436,7 @@ function renderSavedReadme(opts) {
         lines.push(`**${opts.refused.length} path(s) in this payload were left out of this directory on purpose** — they name plugin or VCS internals that sesh-mover never writes (\`.git\` or \`.sesh-mover\` at some depth, in some casing): ${opts.refused.slice(0, 5).map((p) => `\`${p}\``).join(", ")}. They are not below, so the commands in this file cannot plant them. A current sesh-mover never puts such a path in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all — nothing needs re-running, but read the rest of it before you use it.`, "");
     }
     if (opts.advice === "unsafe") {
-        lines.push("**This payload was refused, not merely deferred.** It names paths that can never be written by sesh-mover (`.git` or `.sesh-mover` at some depth) or it carries symbolic links. Read it before you do anything with it — `.sesh-mover-hubinclude` decides what this machine's next push uploads, and the project-scope `config.json` decides where the hub is. No apply command is given here on purpose.", "");
+        lines.push("**This payload was refused, not merely deferred.** It names paths that can never be written by sesh-mover (`.git` or `.sesh-mover` at some depth) or it carries symbolic links. Read it before you do anything with it — `.sesh-mover-include` decides what this machine's next push uploads, and the project-scope `config.json` decides where the hub is. No apply command is given here on purpose.", "");
         return lines.join("\n") + "\n";
     }
     if (opts.advice === "unparseable") {
