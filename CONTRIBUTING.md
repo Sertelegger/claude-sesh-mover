@@ -59,6 +59,7 @@ The three names are intentionally different and must stay in sync:
 - npm package / GitHub repo: `claude-sesh-mover`
 - Plugin name (`.claude-plugin/plugin.json`): `sesh-mover` — drives slash command prefixes
 - CLI bin: `sesh-mover`
+- On-disk paths: `sesh-mover` — a dotfile spells the short name, never the package name. `~/.sesh-mover/`, `<project>/.sesh-mover/` (generated exports, gitignored), and the three committed root dotfiles `.sesh-mover-hubinclude` / `.sesh-mover-hubignore` / `.sesh-mover-project.json`. They are declared once in `src/paths.ts` and imported from there; don't hand-write one of these literals anywhere else. The pre-0.7.0 `.claude-sesh-mover` survives in two places only — the one-time user-directory migration in `paths.ts`, and the `NEVER_INCLUDABLE` floor, which keeps it permanently because bundles carrying that path are already on hubs.
 
 Don't change any of these without updating the others plus every slash command reference in `commands/*.md` and the skill doc.
 

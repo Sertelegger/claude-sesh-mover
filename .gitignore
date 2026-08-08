@@ -1,14 +1,14 @@
 node_modules/
 *.tsbuildinfo
-# Exports land in <cwd>/.claude-sesh-mover/<name>/, so the directory is
-# ignored — but hubinclude and project.json are meant to be COMMITTED (see
-# README): hubinclude only does its job if it means the same thing on every
-# clone, and project.json is what links a clone to its hub project. Ignoring
-# the whole directory silently defeats both.
-.claude-sesh-mover/*
-!.claude-sesh-mover/hubinclude
-!.claude-sesh-mover/hubignore
-!.claude-sesh-mover/project.json
+# Project-scope exports land in <cwd>/.sesh-mover/<name>/ and nothing else does,
+# so a plain ignore is all this needs. The committed files — .sesh-mover-hubinclude,
+# .sesh-mover-hubignore, .sesh-mover-project.json — are root dotfiles outside it
+# on purpose: config and identity have the opposite lifecycle to generated
+# exports, and one directory holding both is what forced the `!` negations this
+# replaces.
+.sesh-mover/
+# The pre-0.7.0 directory, in case an older sesh-mover is still installed somewhere.
+.claude-sesh-mover/
 .envrc
 docs/
 .worktrees/

@@ -199,9 +199,9 @@ describe("identity resolution", () => {
     const hub = tmp("sesh-id-hub-");
     try {
       const backend = createFsBackend(hub);
-      mkdirSync(join(dir, ".claude-sesh-mover"), { recursive: true });
+      mkdirSync(join(dir, ".sesh-mover"), { recursive: true });
       writeFileSync(
-        join(dir, ".claude-sesh-mover", "project.json"),
+        join(dir, ".sesh-mover-project.json"),
         JSON.stringify({ projectId: "p-1", name: "x", createdAt: "t", createdByMachine: "m" })
       );
       const r = await resolveProjectIdentity(backend, dir);

@@ -19,6 +19,7 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, } from "../sync-state.js";
+import { userDirWarnings } from "../paths.js";
 /** Cap on `ignoredNotCarried`: a sample the user can recognize, not an inventory. */
 const MAX_IGNORED_REPORTED = 10;
 /**
@@ -135,7 +136,7 @@ function failedAfterLink(projectPath, link, bundleCommitted, error) {
                 `and the SessionEnd auto-push stays off for it.${orphanBundle}`
             : `The link this push created could NOT be removed (${rollback.detail}), so this project IS ` +
                 `linked to hub project ${link.local.projectId} and the SessionEnd auto-push is armed for it — ` +
-                `delete .claude-sesh-mover/project.json to unlink it.${orphanBundle}`,
+                `delete .sesh-mover-project.json to unlink it.${orphanBundle}`,
         suggestion: link.mintedHubProject
             ? `Hub project ${link.local.projectId} was created before the failure and nothing removes a hub project, so pass --project-id ${link.local.projectId} on a later push to link to that one instead of minting a second.`
             : "Fix the cause above and push again; the project links again once a push gets past this point.",
@@ -174,6 +175,12 @@ export async function hubPush(opts) {
         staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
         const backend = createFsBackend(opts.hubPath);
         const warnings = [];
+        // See hub/status.ts: the user-directory migration notice, if there is one.
+        warnings.push(...userDirWarnings());
+        // A budget that could not be read as written. Said once, up front, rather
+        // than folded into the decline it causes — the two are different facts, and
+        // on an unattended session-end push this is the only trace of the typo.
+        warnings.push(...(opts.budgets?.warnings ?? []));
         if (lock.stoleStale) {
             warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress.");
         }
@@ -318,7 +325,9 @@ export async function hubPush(opts) {
         // the working tree from otherwise.
         let hasWorkspace = false;
         if (!opts.noWorkspace && gitScan().kind === "none" && existsSync(opts.projectPath)) {
-            const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));
+            const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"), {
+                maxBytes: opts.budgets?.workspaceMaxBytes,
+            });
             if (ws.symlinksSkipped > 0)
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
             // Rule-level diagnostics (a hubinclude past a cap, an exclude set that
@@ -376,7 +385,9 @@ export async function hubPush(opts) {
             // unbounded (mid-rebase, submodules, 200k untracked files, a filesystem
             // that refuses a read), and no failure of the OPTIONAL half of a push may
             // cost the user the session bundle that is the point of the operation.
-            const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), { diagnostics })
+            const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), {
+                diagnostics, maxBytes: opts.budgets?.carryMaxBytes,
+            })
                 .catch((e) => ({ captured: false, reason: "git-failed", detail: e.message }));
             warnings.push(...diagnostics);
             if (cap.captured) {
@@ -391,7 +402,7 @@ export async function hubPush(opts) {
                     // the opt-in as a silent success would undercut it.
                     const shown = cap.meta.reIncluded.join(", ");
                     const more = cap.meta.reIncludedCount - cap.meta.reIncluded.length;
-                    warnings.push(`Carried ${cap.meta.reIncludedCount} gitignored file(s) because .claude-sesh-mover/hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`);
+                    warnings.push(`Carried ${cap.meta.reIncludedCount} gitignored file(s) because .sesh-mover-hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`);
                 }
                 if (cap.meta.trackedIgnoredCount > 0) {
                     // A different disclosure with a different remedy, which is why it is

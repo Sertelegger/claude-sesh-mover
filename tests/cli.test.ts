@@ -446,7 +446,7 @@ describe("cli", () => {
 
     it("reports an archive's REAL origin platform, not the local one", async () => {
       const homeDir = join(tempDir, "browse-home");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       await writeForeignArchive(join(store, "2026-07-25-faraway.tar.gz"));
 
@@ -471,7 +471,7 @@ describe("cli", () => {
 
     it("marks an unreadable archive honestly instead of inventing values", () => {
       const homeDir = join(tempDir, "browse-home-broken");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       writeFileSync(join(store, "2026-01-01-broken.tar.gz"), "definitely not a tar archive");
 
@@ -493,7 +493,7 @@ describe("cli", () => {
 
     it("reads real metadata for a date-prefixed archive dropped in the project root", async () => {
       // Covers the second fabrication site: the cwd scan below the
-      // .claude-sesh-mover scan, which keeps its date-prefix filename filter.
+      // .sesh-mover scan, which keeps its date-prefix filename filter.
       const projectDir = join(tempDir, "dropped-in-root");
       mkdirSync(projectDir, { recursive: true });
       const homeDir = join(tempDir, "empty-home");
@@ -529,7 +529,7 @@ describe("cli", () => {
       // batching must not drop, duplicate, or reorder-away any entry.
       const total = 24;
       const homeDir = join(tempDir, "many-home");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       const seed = join(tempDir, "seed.tar.gz");
       await writeForeignArchive(seed);
@@ -569,7 +569,7 @@ describe("cli", () => {
       "degrades only the archive that hits a resource failure and still lists the rest",
       async () => {
         const homeDir = join(tempDir, "mixed-home");
-        const store = join(homeDir, ".claude-sesh-mover");
+        const store = join(homeDir, ".sesh-mover");
         mkdirSync(store, { recursive: true });
 
         // A directory export (read without touching an archive at all)...
@@ -625,7 +625,7 @@ describe("cli", () => {
       // escaped as a rejection and Promise.all failed the WHOLE command —
       // success:false with zero entries, worse than the bug being fixed.
       const homeDir = join(tempDir, "notmp-home");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       const dirExport = join(store, "2026-07-25-dir-export");
       mkdirSync(dirExport, { recursive: true });
@@ -667,7 +667,7 @@ describe("cli", () => {
     it("shows current config", () => {
       // Isolated HOME on purpose: `--show` reports the EFFECTIVE config, so
       // without one this asserts on whatever the developer running the suite
-      // happens to have configured (it read the real ~/.claude-sesh-mover).
+      // happens to have configured (it read the real ~/.sesh-mover).
       const home = mkdtempSync(join(tmpdir(), "sesh-cfg-show-home-"));
       try {
         const output = sharedRunCli(["configure", "--show", "--json"], {
@@ -745,7 +745,7 @@ describe("cli", () => {
 
         // The file itself holds only what this scope sets.
         const written = JSON.parse(
-          readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8")
+          readFileSync(join(project, ".sesh-mover", "config.json"), "utf-8")
         );
         expect(written).toEqual({ hub: { autoPush: false } });
 
@@ -772,11 +772,56 @@ describe("cli", () => {
         expect(reset.config.hub.autoPush).toBe(true); // the project override is gone
         expect(reset.config.export.storage).toBe("project"); // the user's setting survives
         expect(
-          JSON.parse(readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8"))
+          JSON.parse(readFileSync(join(project, ".sesh-mover", "config.json"), "utf-8"))
         ).toEqual({});
       } finally {
         for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
       }
+    });
+
+    it("--set stores a NUMERIC config key as a number, not as a string", () => {
+      // `--set` used to parse only `true`/`false` and a leading `[`, leaving
+      // everything else a string. `hub.carryMaxMb=100` would then persist
+      // `"100"`, which `resolveBudgetMb` reads as "not a size" — so every push
+      // afterwards silently fell back to the default while warning about a
+      // value the user typed correctly.
+      const homeOverride = overrideHome(tempDir);
+      try {
+        expect(JSON.parse(runCli(`configure --scope user --set hub.carryMaxMb=100 --json`)).success)
+          .toBe(true);
+        const shown = JSON.parse(runCli("configure --show --json"));
+        expect(shown.config.hub.carryMaxMb).toBe(100);
+        // …and it is on disk as a number, not as a quoted string.
+        const raw = JSON.parse(
+          readFileSync(join(tempDir, ".sesh-mover", "config.json"), "utf-8")
+        );
+        expect(raw.hub.carryMaxMb).toBe(100);
+        // 0 is a legitimate setting (carry nothing), so it must not be
+        // mistaken for "unset" anywhere on the way in.
+        expect(JSON.parse(runCli(`configure --scope user --set hub.workspaceMaxMb=0 --json`)).success)
+          .toBe(true);
+        expect(JSON.parse(runCli("configure --show --json")).config.hub.workspaceMaxMb).toBe(0);
+      } finally {
+        homeOverride.restore();
+      }
+    });
+
+    it("--set refuses a non-numeric value for a numeric key instead of storing it", () => {
+      const homeOverride = overrideHome(tempDir);
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(`configure --scope user --set hub.carryMaxMb=lots --json`);
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = { stdout: err.stdout ? err.stdout.toString() : "", status: err.status ?? 0 };
+      } finally {
+        homeOverride.restore();
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("hub.carryMaxMb");
     });
 
     it("returns clean ErrorResult JSON for malformed --set JSON values", () => {
@@ -837,7 +882,7 @@ describe("cli", () => {
 
       try {
         // Seed machine identity so loadOrCreateMachineId() picks it up deterministically.
-        const seshDir = join(tempHome, ".claude-sesh-mover");
+        const seshDir = join(tempHome, ".sesh-mover");
         mkdirSync(seshDir, { recursive: true });
         writeFileSync(
           join(seshDir, "machine-id.json"),
@@ -1047,7 +1092,7 @@ describe("cli", () => {
       try {
         await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
 
-        // Hub identity writes .claude-sesh-mover/project.json under the real
+        // Hub identity writes .sesh-mover-project.json under the real
         // project directory, so (unlike plain export/import/migrate) push
         // needs a real, writable projectPath. The project is its OWN directory
         // here, not tempDir — the same reason the carry test below gives: the
@@ -1162,6 +1207,84 @@ describe("cli", () => {
       }
     });
 
+    it("hub.carryMaxMb reaches the payload builder — 0 declines, a bad value warns", () => {
+      // The wiring test for the budgets, not the arithmetic (config.test.ts has
+      // that): a budget nothing threads through the CLI is a setting that does
+      // not exist, and the push that matters most is the unattended SessionEnd
+      // one, which takes no flags at all.
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-budget-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-budget-hub-"));
+      const projectPath = join(tempDir, "budgetproj");
+      mkdirSync(projectPath, { recursive: true });
+      const realEncoded = encodeProjectPath(projectPath);
+      const sessionPath = join(configDir, "projects", realEncoded, `${sessionId}.jsonl`);
+      try {
+        runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", realEncoded),
+          { recursive: true }
+        );
+        const g = (args: string[]): void => {
+          execFileSync("git", args, { cwd: projectPath, stdio: "ignore" });
+        };
+        g(["init", "-q"]);
+        g(["config", "user.email", "t@example.com"]);
+        g(["config", "user.name", "Test"]);
+        g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v1\n");
+        g(["add", "-A"]);
+        g(["commit", "-q", "-m", "init"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v2 uncommitted\n");
+
+        const homeOverride = overrideHome(home);
+        try {
+          runCli(`configure --scope user --set hub.carryMaxMb=0 --json`, homeEnv(home));
+        } finally {
+          homeOverride.restore();
+        }
+        const zero = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(zero.success).toBe(true);
+        // Fails CLOSED and says so: no carry in the bundle, and a warning that
+        // names the setting rather than a size.
+        expect(zero.carry).toBeUndefined();
+        expect(zero.warnings.join(" ")).toContain("hub.carryMaxMb");
+
+        // A value that is not a size: the default applies and the push says so
+        // — silence here is indistinguishable from the setting working.
+        writeFileSync(
+          join(home, ".sesh-mover", "config.json"),
+          JSON.stringify({ hub: { path: hubDir, carryMaxMb: "lots" } }, null, 2) + "\n"
+        );
+        writeFileSync(join(projectPath, "tracked.txt"), "v3 uncommitted\n");
+        appendFileSync(
+          sessionPath,
+          JSON.stringify({
+            type: "user", uuid: "budget-cfg-1", parentUuid: null, timestamp: new Date().toISOString(),
+            cwd: projectPath, sessionId, version: "2.1.81",
+            message: { role: "user", content: "more" },
+          }) + "\n"
+        );
+        const bad = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(bad.success).toBe(true);
+        expect(bad.warnings.join(" ")).toContain("hub.carryMaxMb");
+        expect(bad.carry.baseCommit).toMatch(/^[0-9a-f]{40}$/); // the default applied
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+
     it("push without a configured hub returns an error", async () => {
       const home = mkdtempSync(join(tmpdir(), "sesh-cli-push-nohub-home-"));
       try {
@@ -1187,7 +1310,7 @@ describe("cli", () => {
         await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
 
         // Same real-directory arrangement as the plain push CLI test above —
-        // hub identity writes .claude-sesh-mover/project.json under the real
+        // hub identity writes .sesh-mover-project.json under the real
         // project directory.
         const fixtureEncoded = "-Users-testuser-Projects-testproject";
         const realEncoded = encodeProjectPath(tempDir);

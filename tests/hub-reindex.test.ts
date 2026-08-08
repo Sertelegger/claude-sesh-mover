@@ -16,7 +16,7 @@ import type { HubIndexJson } from "../src/hub/layout.js";
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
 // Same real-directory technique hub-push.test.ts uses: identity linking
-// writes `.claude-sesh-mover/project.json` under the real project directory,
+// writes `.sesh-mover-project.json` under the real project directory,
 // which this sandbox can't do against a virtual "/Users/..." root.
 function createRealProject(base: string, configDir: string): string {
   const realProj = join(base, "realproj");

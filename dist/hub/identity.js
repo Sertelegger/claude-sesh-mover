@@ -4,8 +4,9 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { projectJsonPath, assertSafeHubId } from "./layout.js";
 import { gitChildEnv } from "./carry.js";
+import { projectJsonFilePath } from "../paths.js";
 export function localProjectIdPath(projectPath) {
-    return join(projectPath, ".claude-sesh-mover", "project.json");
+    return projectJsonFilePath(projectPath);
 }
 export function readLocalProjectId(projectPath) {
     const p = localProjectIdPath(projectPath);

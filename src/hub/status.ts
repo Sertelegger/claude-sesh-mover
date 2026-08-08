@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend } from "./backend.js";
 import { HUB_JSON, machinePath, type HubJson } from "./layout.js";
@@ -7,13 +6,19 @@ import { readMachineId } from "../machine.js";
 import { computeEffectiveConfig } from "../config.js";
 import { readLocalProjectId } from "./identity.js";
 import { peekSyncState } from "../sync-state.js";
+import { projectSeshMoverDir, userDirWarnings, userSeshMoverDir } from "../paths.js";
 import type { HubStatusResult } from "../types.js";
 
 export async function hubStatus(opts: { cwd: string }): Promise<HubStatusResult> {
   const warnings: string[] = [];
+  // The one-time `~/.claude-sesh-mover` -> `~/.sesh-mover` move, or the reason
+  // it did not happen. Surfaced here and on push because those are the two
+  // commands a hub user runs; the resolution itself is memoized, so this is a
+  // field read rather than a second filesystem probe.
+  warnings.push(...userDirWarnings());
   const config = computeEffectiveConfig(
-    join(homedir(), ".claude-sesh-mover"),
-    join(opts.cwd, ".claude-sesh-mover")
+    userSeshMoverDir(),
+    projectSeshMoverDir(opts.cwd)
   );
   const hubPath = resolveHubPath(config);
 

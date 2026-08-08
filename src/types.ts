@@ -260,11 +260,24 @@ export interface SeshMoverConfig {
     // Carry uncommitted work (a `git diff HEAD` patch plus untracked files)
     // alongside the sessions, for a project with a git remote. Set false (or
     // pass --no-carry) to push sessions only. Never carries a gitignored
-    // UNTRACKED file unless .claude-sesh-mover/hubinclude names it — but a
+    // UNTRACKED file unless .sesh-mover-hubinclude names it — but a
     // gitignored file that git TRACKS has its changes carried in the patch
     // regardless, since no carry rule filters the patch (reported back as
     // `carry.trackedIgnored`).
     carryDiff: boolean;
+    // Byte budget for the git-diff carry, in MB (default 50). Over it the WHOLE
+    // payload is declined with a warning, never partially sent. `0` means carry
+    // nothing; a negative, non-finite or non-numeric value falls back to the
+    // default with a warning; anything over 1024 MB is clamped. See
+    // `resolveBudgetMb` in config.ts for why each of those is what it is.
+    //
+    // Worth knowing before raising it: the carry rides a bundle pushed on EVERY
+    // session end, unattended, and the hub keeps every bundle — so a 50 MB
+    // carry on a synced folder is 50 MB of sync traffic per session end.
+    carryMaxMb: number;
+    // The same, for the whole-project workspace snapshot a project with no git
+    // remotes pushes instead of a carry (default 50).
+    workspaceMaxMb: number;
   };
 }
 
@@ -459,7 +472,7 @@ export interface HubPushResult {
    * 10 — a sample to recognize, not an inventory.
    *
    * Present only on a MANUAL push of a project with a git remote that has no
-   * `.claude-sesh-mover/hubinclude` yet. Absent otherwise, and never emitted by
+   * `.sesh-mover-hubinclude` yet. Absent otherwise, and never emitted by
    * the auto-push hook, whose contract is silence at session exit. Each entry
    * is a valid `hubinclude` pattern for exactly the thing it names, which is
    * why they are reported as git gives them rather than summarized up to their
@@ -582,11 +595,11 @@ export interface HubPullResult {
   workspaceMerge?: WorkspaceMergeReport;
   /**
    * Paths the workspace payload carried that can NEVER be applied, whatever a
-   * pattern says — `.git` and `.claude-sesh-mover` at any depth and in any
+   * pattern says — `.git` and `.sesh-mover` at any depth and in any
    * casing (see `NEVER_INCLUDABLE`). Absent on every ordinary pull.
    *
    * It is a result FIELD rather than warning prose because a skill layer has to
-   * be able to branch on it: a payload naming `.claude-sesh-mover/hubinclude`
+   * be able to branch on it: a payload naming `.sesh-mover-hubinclude`
    * is trying to rewrite the list that decides what this machine's NEXT push
    * ships, which is the strongest signal this command produces, and warning
    * text is not an interface (see `commands/pull.md`). Nothing from these paths
@@ -629,7 +642,7 @@ export interface HubPullResult {
    * A field rather than warning prose because there is a real decision behind
    * it — `reason: "not-requested"` is the routine "you did not pass
    * --apply-carry", while `"unsafe-payload"` means a bundle tried to write
-   * `.claude-sesh-mover` or a symbolic link — and warning text is not an
+   * `.sesh-mover` or a symbolic link — and warning text is not an
    * interface (see `commands/pull.md`).
    */
   carryApplied?: ApplyResult;

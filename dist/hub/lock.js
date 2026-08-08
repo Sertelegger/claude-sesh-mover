@@ -1,8 +1,8 @@
 import { mkdirSync, openSync, closeSync, writeSync, rmSync, readFileSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { encodeProjectPath } from "../platform.js";
+import { userSeshMoverDir } from "../paths.js";
 export const LOCK_STALE_MS = 10 * 60 * 1000;
 export class LockBusyError extends Error {
     holderPid;
@@ -15,7 +15,7 @@ export class LockBusyError extends Error {
     }
 }
 function lockPath(projectPath) {
-    return join(homedir(), ".claude-sesh-mover", "locks", `${encodeProjectPath(projectPath)}.lock`);
+    return join(userSeshMoverDir(), "locks", `${encodeProjectPath(projectPath)}.lock`);
 }
 // Cross-platform advisory lock for hub operations on a given project. Uses
 // exclusive-create ("wx") for atomicity: two processes racing to create the
@@ -25,7 +25,7 @@ function lockPath(projectPath) {
 // dead holder would wedge the project's hub operations forever.
 export function acquireProjectLock(projectPath) {
     const p = lockPath(projectPath);
-    mkdirSync(join(homedir(), ".claude-sesh-mover", "locks"), { recursive: true });
+    mkdirSync(join(userSeshMoverDir(), "locks"), { recursive: true });
     const tryAcquire = () => {
         try {
             return openSync(p, "wx"); // atomic create-if-absent

@@ -1,8 +1,9 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { classifyDestination, formatBytes, isCarriedPath, isNeverIncludable, isReIncluded, NEVER_INCLUDABLE, readCarryRules, } from "./workspace.js";
+import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
+import { DEFAULT_CARRY_MAX_MB } from "../config.js";
 /**
  * Byte budget for one carry payload: the diff plus every file copied beside it.
  *
@@ -12,8 +13,20 @@ import { classifyDestination, formatBytes, isCarriedPath, isNeverIncludable, isR
  * directory reads there as a corrupt install, not as a truncated upload. The
  * decline names the largest contributors so the offending `hubinclude` line is
  * obvious.
+ *
+ * This is the FALLBACK for a caller that passes no budget. The real one comes
+ * from `hub.carryMaxMb` and reaches here through `captureCarry`'s `maxBytes` —
+ * which matters because the decline is not retryable on demand (the carry rides
+ * a bundle, and an immediate re-push answers `upToDate`), and because the
+ * SessionEnd auto-push takes no flags, so config is the only lever there.
+ *
+ * It was 5 MB, on the reasoning that a carry is a *diff* of uncommitted work
+ * where 5 MB already means generated artifacts. Measured against reality that
+ * was simply wrong: this repository's own `.superpowers/` working notes are
+ * ~12.6 MB of untracked, non-gitignored files the owner deliberately wants
+ * carried, so the carry declined on the very repository that produced the tool.
  */
-export const CARRY_MAX_BYTES = 5 * 1024 * 1024;
+export const CARRY_MAX_BYTES = DEFAULT_CARRY_MAX_MB * 1024 * 1024;
 /**
  * What one carried FILE costs against the budget, on top of its bytes.
  *
@@ -23,6 +36,14 @@ export const CARRY_MAX_BYTES = 5 * 1024 * 1024;
  * tiny generated files is exactly that shape. 512 bytes is one tar header —
  * small enough to be invisible for ordinary files (a 20 KB source file moves
  * the needle by 2.5%), decisive for a payload made of nothing but entries.
+ *
+ * It stays a FIXED per-file cost now that the byte budget is configurable, and
+ * that is the point: the charge is the real per-entry cost of a file (a tar
+ * header, a syscall, a write on the peer), which does not change because a user
+ * raised the ceiling. Scaling it with the budget would defeat it exactly where
+ * it is needed — the file-count ceiling it implies rises WITH the budget
+ * (10,240 empty files at 5 MB, 102,400 at 50 MB, ~2.1M at the 1 GB clamp), so
+ * a raised budget buys proportionally more files, never unbounded ones.
  */
 const CARRY_PER_FILE_BYTES = 512;
 /**
@@ -76,8 +97,8 @@ const PATCH_HARDENING = [
  *
  * `isCarriedPath` filters the UNTRACKED enumeration; nothing filtered the patch,
  * and `git diff HEAD` happily describes changes to a TRACKED
- * `.claude-sesh-mover/config.json` (which can redirect `hub.path`) or
- * `.claude-sesh-mover/hubinclude` (which decides what the next push ships).
+ * `.sesh-mover/config.json` (which can redirect `hub.path`) or
+ * `.sesh-mover-hubinclude` (which decides what the next push ships).
  * Committing that directory is what this project's own docs RECOMMEND, so the
  * shape is ordinary rather than exotic — and while today's pull ignores the
  * carry payload entirely, §6.2's `git apply` will not, and a patch is not
@@ -93,14 +114,14 @@ const PATCH_HARDENING = [
  * It does NOT mirror that function's other folding: `isNeverSegment` also
  * strips trailing dots and whitespace (Win32 resolves `.git.` and `.git ` to
  * `.git`), and no pathspec spelling expresses that without also swallowing
- * `.claude-sesh-moverX`. So `.claude-sesh-mover./config.json` rides this patch.
+ * `.sesh-moverX`. So `.sesh-mover./config.json` rides this patch.
  * The receiving side closes that: §6.2's `git apply` runs every path in the
  * patch through `isNeverIncludable`, which does fold, and refuses the payload
  * whole before writing anything. Do not treat this pathspec as the boundary.
  *
  * BE PRECISE ABOUT WHICH HALF IS CLOSED. The receiver's floor stops such a path
  * being WRITTEN; it does not stop it TRAVELLING. The bytes of a
- * `.claude-sesh-mover./config.json` still leave this machine, ride the bundle,
+ * `.sesh-mover./config.json` still leave this machine, ride the bundle,
  * and sit on the hub in plaintext — a disclosure gap, not a planting one, and
  * exactly the shape of the tracked-vs-untracked split documented at
  * `trackedIgnored`. It costs nothing on POSIX, where such a name is an ordinary
@@ -146,7 +167,7 @@ const FLOOR_PATHSPEC = [
  * - `GIT_LITERAL_PATHSPECS` / `GIT_GLOB_PATHSPECS` / `GIT_NOGLOB_PATHSPECS` /
  *   `GIT_ICASE_PATHSPECS` — these reinterpret `FLOOR_PATHSPEC`.
  *   `GIT_LITERAL_PATHSPECS=1` turns off pathspec magic entirely, so
- *   `:(exclude,icase,glob)**\/.claude-sesh-mover` reads as a literal filename and
+ *   `:(exclude,icase,glob)**\/.sesh-mover` reads as a literal filename and
  *   the floor SILENTLY stops excluding anything (verified).
  * - `GIT_DIR` / `GIT_WORK_TREE` / `GIT_COMMON_DIR` / `GIT_INDEX_FILE` /
  *   `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` /
@@ -284,8 +305,8 @@ function detectInProgress(gitDir) {
  *
  * Everything is filtered through `isCarriedPath`, which is the same rule the
  * workspace walk applies — including the `NEVER_INCLUDABLE` floor, which is
- * what stops `.claude-sesh-mover/config.json` (a file that can redirect
- * `hub.path`) and `.claude-sesh-mover/hubinclude` (the file deciding what the
+ * what stops `.sesh-mover/config.json` (a file that can redirect
+ * `hub.path`) and `.sesh-mover-hubinclude` (the file deciding what the
  * NEXT push ships) from riding along as ordinary untracked files. They are
  * untracked and usually NOT gitignored, so nothing else would have stopped them.
  *
@@ -405,7 +426,7 @@ function findTrackedIgnored(projectPath, diagnostics) {
  * uncommitted changes in full. `trackedIgnored` reports exactly that set rather
  * than leaving it to be inferred. The one filter that DOES apply to the patch is
  * `FLOOR_PATHSPEC`, the `NEVER_INCLUDABLE` floor, because a tracked
- * `.claude-sesh-mover/config.json` can redirect `hub.path` on the machine that
+ * `.sesh-mover/config.json` can redirect `hub.path` on the machine that
  * applies it.
  *
  * The patch is handled as BYTES from end to end. `git diff` writes a text
@@ -422,7 +443,20 @@ function findTrackedIgnored(projectPath, diagnostics) {
  */
 export async function captureCarry(projectPath, destDir, opts) {
     const diagnostics = opts?.diagnostics ?? [];
-    const maxBytes = Math.max(1, opts?.maxBytes ?? CARRY_MAX_BYTES);
+    // `Math.max(0, …)`, not `Math.max(1, …)`: a configured budget of 0 means
+    // "carry nothing" and has to stay exactly 0, or the early return below never
+    // fires and a 1-byte budget declines with a message about sizes instead.
+    const maxBytes = Math.max(0, opts?.maxBytes ?? CARRY_MAX_BYTES);
+    if (maxBytes === 0) {
+        // Answered before `git` is spawned at all: a disabled budget should cost
+        // nothing, and `git diff` with a 1-byte maxBuffer would otherwise decline
+        // through ENOBUFS with a size complaint that explains the wrong thing.
+        return {
+            captured: false,
+            reason: "budget-disabled",
+            detail: "the carry budget is set to 0, so no uncommitted work is carried (hub.carryMaxMb)",
+        };
+    }
     // `--verify` so a failure is unambiguous: plain `rev-parse HEAD` prints
     // "HEAD" on stdout AND exits 128 when HEAD is unborn.
     const head = git(projectPath, ["rev-parse", "--verify", "HEAD"], 4096);
@@ -513,7 +547,7 @@ export async function captureCarry(projectPath, destDir, opts) {
     if (cost > maxBytes) {
         // Reports the REAL size AND the file count, because either one alone can be
         // the cause: without the count a payload of empty files reads as "0 bytes
-        // exceeds 5 MB". `largest:` is omitted when every contributor measures zero
+        // exceeds 50 MB". `largest:` is omitted when every contributor measures zero
         // — three arbitrary empty filenames explain nothing.
         const largest = describeLargest(files, patch.length);
         return {
@@ -637,9 +671,9 @@ const APPLY_CONFIG = ["-c", "apply.ignoreWhitespace=no"];
  *   nothing written — measured). Applied to `--numstat` that means a
  *   subdirectory project reports NO entries at all, so a floor check reading
  *   its output passes vacuously: measured, a `GIT binary patch` creating
- *   `.claude-sesh-mover/hubinclude` was refused at a repo-root project and
+ *   `.sesh-mover-hubinclude` was refused at a repo-root project and
  *   APPLIED at a subdirectory one, as were an empty-file creation of
- *   `.claude-sesh-mover/config.json` and an `old mode`/`new mode` chmod. The
+ *   `.sesh-mover/config.json` and an `old mode`/`new mode` chmod. The
  *   same omission zeroed `filesChanged` on every subdirectory project.
  * - **`APPLY_CONFIG`/`APPLY_FLAGS` on some but not all.** `git apply --numstat`
  *   honours `apply.whitespace=error` and exits 128 on a patch that adds
@@ -667,10 +701,19 @@ function applyInvocation(applyPrefix, mode, patchPath) {
  * Cap on a patch this module will INSPECT. Over it the payload is declined
  * rather than applied unchecked: the floor and symlink guards below both read
  * the whole patch, and a guard that silently gives up on large input is not a
- * guard. The sender's own budget is `CARRY_MAX_BYTES` (5 MB), so this only ever
- * bites a hand-made or damaged bundle.
+ * guard.
+ *
+ * It has to sit ABOVE the sender's default budget, and that is why it moved
+ * with it. At 32 MB against a 5 MB sender it only ever bit a hand-made or
+ * damaged bundle; against a 50 MB sender it would have started refusing
+ * ordinary payloads on the receiving side, where the remedy (`hub.carryMaxMb`)
+ * lives on the OTHER machine. This is a receiver-side constant and cannot know
+ * what the sender configured, so the relationship is stated rather than
+ * enforced: a machine that raises `hub.carryMaxMb` above this produces payloads
+ * its peers save but do not apply — the fail-closed direction, with the saved
+ * copy and its README as the remedy.
  */
-const PATCH_SCAN_MAX_BYTES = 32 * 1024 * 1024;
+const PATCH_SCAN_MAX_BYTES = 128 * 1024 * 1024;
 /**
  * How many saved carry payloads a project keeps. A carry rides every push that
  * has session content and `hub.carryDiff` is on by default, so an unapplied
@@ -693,19 +736,19 @@ const C_QUOTE_ESCAPES = {
  *
  * `core.quotePath` is on by default and it quotes at the SENDER, inside the
  * patch bytes — so no flag on this side changes it. Left encoded, a quoted
- * `".claude-sesh-mover/x"` reads as a single segment starting with `"` and
+ * `".sesh-mover/x"` reads as a single segment starting with `"` and
  * walks straight past the floor check.
  *
  * Three details are git's, not conveniences, and each one was a hole:
  *
  * - **It stops at the first UNESCAPED closing quote and ignores everything
  *   after it.** Requiring the token to END with the quote (what this function
- *   did) means one appended junk byte — `".claude-sesh-mover/hubinclude"X` —
+ *   did) means one appended junk byte — `".sesh-mover-hubinclude"X` —
  *   leaves the literal token as the only reading, whose leading `"` fuses into
  *   the first segment so `isNeverSegment` no longer matches, while git decodes
  *   the real path and applies it. Measured on a healthy-git receiver at both
  *   layouts: that spelling on a `rename from` line DELETED the receiver's
- *   `.claude-sesh-mover/hubinclude`, and on a `copy from` line reproduced it at
+ *   `.sesh-mover-hubinclude`, and on a `copy from` line reproduced it at
  *   an ordinary path from where the next auto-push would upload it.
  * - **An octal escape is exactly three digits with the first in 0–3**; two
  *   digits (`\56`) or a leading `4`–`7` is an ERROR, not a shorter escape.
@@ -760,7 +803,7 @@ function unquoteGitPath(raw) {
  * the same space-separated, second- and fraction-less variants, and a bare
  * `\t12345`) is a run of digits, `-`, `+`, `:`, `.` and blanks, so requiring
  * that shape is wide enough; requiring the run to hold no LETTERS is what keeps
- * `docs/.claude-sesh-mover notes.md` — a real tracked name in the harness's
+ * `docs/.sesh-mover notes.md` — a real tracked name in the harness's
  * negative corpus — from being trimmed back to a forbidden segment.
  */
 const TRAILING_TIMESTAMP = /[ \t][-+0-9:.][-+0-9:.\t ]*$/;
@@ -872,7 +915,7 @@ function stripOneComponent(path) {
  *
  * **The standard here is what `git apply` ACCEPTS, not what `git diff` emits.**
  * The threat model for this line is a hand-crafted payload — that is the only
- * way `copy from .claude-sesh-mover/hubinclude` arises either — so covering
+ * way `copy from .sesh-mover-hubinclude` arises either — so covering
  * git's own output is not enough. Two spellings real git accepts walked past an
  * earlier "split at the midpoint, require the halves to match after stripping
  * `a/`/`b/`" reading of this header, both measured end to end (`--numstat`
@@ -918,7 +961,7 @@ function stripOneComponent(path) {
  *
  * The agreement requirement is what keeps this honest rather than a
  * false-refusal machine: no split of `a/tracked.txt b/renamed.txt` agrees, and
- * neither does any mis-split of a path containing spaces (`a/docs/.claude-sesh-mover
+ * neither does any mis-split of a path containing spaces (`a/docs/.sesh-mover
  * notes.md b/…` agrees only at the real separator). Everything a split can
  * still get wrong ends in a REFUSAL, never a pass.
  *
@@ -970,11 +1013,11 @@ function diffGitHeaderPaths(rest, budget) {
  *
  * 1. **The `NEVER_INCLUDABLE` floor.** `git apply` refuses `.git/…` and `..`
  *    traversal itself (measured: exit 128, "invalid path"), but it writes
- *    `.claude-sesh-mover/config.json` — and `.claude-sesh-mover./config.json` —
+ *    `.sesh-mover/config.json` — and `.sesh-mover./config.json` —
  *    without a murmur. The capture side's `FLOOR_PATHSPEC` closes the ordinary
  *    case, but its `icase` mirrors only the CASE half of `isNeverSegment`: no
  *    pathspec spelling folds trailing dots and whitespace without also
- *    swallowing `.claude-sesh-moverX`. An older sesh-mover, a hand-made bundle
+ *    swallowing `.sesh-moverX`. An older sesh-mover, a hand-made bundle
  *    and that trailing-dot spelling all arrive here, and the prize is the file
  *    deciding what this machine's NEXT push ships plus the project-scope
  *    `config.json` that redirects `hub.path`.
@@ -992,7 +1035,7 @@ function diffGitHeaderPaths(rest, budget) {
  * - `git apply --numstat -z` is git's own parse — authoritative and unquoted.
  *   But for a RENAME **or a COPY** it prints only the DESTINATION (measured
  *   both), so the source path is invisible to it: `copy from
- *   .claude-sesh-mover/hubinclude` / `copy to stolen.txt` materialises the
+ *   .sesh-mover-hubinclude` / `copy to stolen.txt` materialises the
  *   RECEIVER's own plugin internals at an ordinary path, from where the next
  *   auto-push carries them to the hub. It also cannot run at all on a machine
  *   with no `git`, or on one whose `git` cannot read this repository.
@@ -1010,7 +1053,7 @@ function diffGitHeaderPaths(rest, budget) {
  * nine above. `similarity index`, `dissimilarity index`, `index` and the four
  * mode lines carry no path. **`rename old `/`rename new ` are git's legacy
  * spelling of `rename from`/`to`, and it still accepts them** — measured: an
- * otherwise identical payload deleted `.claude-sesh-mover/hubinclude` and
+ * otherwise identical payload deleted `.sesh-mover-hubinclude` and
  * created `moved.txt`, `applied: true`, at BOTH layouts, on a receiver with a
  * perfectly healthy `git`, because `--numstat` prints only a rename's
  * destination and the scan did not read the source line.
@@ -1144,7 +1187,7 @@ function listPayloadFiles(root) {
  * saved directory is not an archive, it is a set of instructions: the README it
  * ships alongside tells the user to run `cp -R '<saved>/untracked/.' .`, and
  * that command copies dot-entries. So an `untracked/.git/hooks/pre-commit` or
- * `untracked/.claude-sesh-mover/hubinclude` that `applyCarry` refuses outright
+ * `untracked/.sesh-mover-hubinclude` that `applyCarry` refuses outright
  * (`refused[]`, nothing written) was planted by the routine `not-requested`
  * path the moment the user followed our own instructions — the one path whose
  * sibling has the defence. Only a hand-made, damaged or pre-floor bundle can
@@ -1176,7 +1219,7 @@ function copyPayloadTree(src, dest) {
 }
 /**
  * First line of the `.gitignore` every saved payload carries — and the marker
- * that makes a `carry-*` directory OURS to delete. `.claude-sesh-mover/` is also
+ * that makes a `carry-*` directory OURS to delete. `.sesh-mover/` is also
  * where `export --scope project` puts a bundle the user named, so a name match
  * alone would let retention delete a user's own `carry-…` export.
  */
@@ -1205,7 +1248,7 @@ function isSavedCarryDir(dir) {
  *   `savedTo` naming nothing at all while the result claims the payload was
  *   saved. `keepName` is excluded from the candidates outright (it still counts
  *   against the budget, so the total stays bounded).
- * - **Delete something that is not ours.** `.claude-sesh-mover/` is also where a
+ * - **Delete something that is not ours.** `.sesh-mover/` is also where a
  *   project-scope `sesh-mover export` lands, so a user export named `carry-…`
  *   matched the name filter. Ownership is now proven by the marker inside the
  *   directory, not by its name.
@@ -1235,17 +1278,17 @@ function pruneSavedCarries(pluginDir, keepName) {
  * the pull finishes. Everything needed to finish the job by hand is therefore
  * copied out now.
  *
- * It lands under `.claude-sesh-mover/`, which is on the `NEVER_INCLUDABLE`
+ * It lands under `.sesh-mover/`, which is on the `NEVER_INCLUDABLE`
  * floor — so a saved payload can never be swept up by the next push's own
  * carry — and it carries a `.gitignore` of `*` so that a project which COMMITS
- * its `.claude-sesh-mover` directory (which this project's own docs recommend)
+ * its `.sesh-mover` directory (which this project's own docs recommend)
  * cannot commit a peer's uncommitted work, secrets included, with a `git add
  * -A`. That `.gitignore` is also what keeps the saved copy out of the
  * dirty-tree check on the NEXT attempt, whichever way that check is spelled.
  */
 function saveCarryPayload(opts) {
     const stamp = opts.stamp;
-    const roots = [join(opts.targetPath, ".claude-sesh-mover"), join(homedir(), ".claude-sesh-mover")];
+    const roots = [projectSeshMoverDir(opts.targetPath), userSeshMoverDir()];
     for (const [index, root] of roots.entries()) {
         if (index === 0) {
             // Two reasons to skip the in-project destination. A symlink where the
@@ -1256,7 +1299,7 @@ function saveCarryPayload(opts) {
             // payload.
             if (!existsSync(opts.targetPath))
                 continue;
-            const dest = classifyDestination(opts.targetPath, ".claude-sesh-mover", "dir");
+            const dest = classifyDestination(opts.targetPath, PROJECT_DIR_NAME, "dir");
             if (!dest.ok)
                 continue;
         }
@@ -1390,10 +1433,10 @@ function renderSavedReadme(opts) {
         // Said HERE and not only in the pull's warnings, because this file is what
         // the user reads while running the copy command below — and that command
         // would have planted these paths verbatim.
-        lines.push(`**${opts.refused.length} path(s) in this payload were left out of this directory on purpose** — they name plugin or VCS internals that sesh-mover never writes (\`.git\` or \`.claude-sesh-mover\` at some depth, in some casing): ${opts.refused.slice(0, 5).map((p) => `\`${p}\``).join(", ")}. They are not below, so the commands in this file cannot plant them. A current sesh-mover never puts such a path in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all — nothing needs re-running, but read the rest of it before you use it.`, "");
+        lines.push(`**${opts.refused.length} path(s) in this payload were left out of this directory on purpose** — they name plugin or VCS internals that sesh-mover never writes (\`.git\` or \`.sesh-mover\` at some depth, in some casing): ${opts.refused.slice(0, 5).map((p) => `\`${p}\``).join(", ")}. They are not below, so the commands in this file cannot plant them. A current sesh-mover never puts such a path in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all — nothing needs re-running, but read the rest of it before you use it.`, "");
     }
     if (opts.advice === "unsafe") {
-        lines.push("**This payload was refused, not merely deferred.** It names paths that can never be written by sesh-mover (`.git` or `.claude-sesh-mover` at some depth) or it carries symbolic links. Read it before you do anything with it — `.claude-sesh-mover/hubinclude` decides what this machine's next push uploads, and the project-scope `config.json` decides where the hub is. No apply command is given here on purpose.", "");
+        lines.push("**This payload was refused, not merely deferred.** It names paths that can never be written by sesh-mover (`.git` or `.sesh-mover` at some depth) or it carries symbolic links. Read it before you do anything with it — `.sesh-mover-hubinclude` decides what this machine's next push uploads, and the project-scope `config.json` decides where the hub is. No apply command is given here on purpose.", "");
         return lines.join("\n") + "\n";
     }
     if (opts.advice === "unparseable") {
@@ -1442,7 +1485,7 @@ function renderSavedReadme(opts) {
  * Weaken either guard and that stops being true.
  *
  * What is deliberately NOT a guard: untracked files. `git status --porcelain`
- * lists them by default, and `pull` plants `.claude-sesh-mover/project.json`
+ * lists them by default, and `pull` plants `.sesh-mover-project.json`
  * into the project earlier in the same run, so counting them as dirt would
  * refuse every hub-linked git project that has not committed the plugin
  * directory — permanently, since the payload is never offered twice. They are

@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolveConfigDir } from "./platform.js";
-import { readConfig, readConfigOverrides, writeConfigOverrides, setConfigOverride, computeEffectiveConfig, } from "./config.js";
+import { readConfig, readConfigOverrides, writeConfigOverrides, setConfigOverride, computeEffectiveConfig, resolveHubBudgets, configValueKind, } from "./config.js";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
@@ -19,11 +19,12 @@ import { discoverSessionById } from "./discovery.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
 import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
+import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "./paths.js";
 const program = new Command();
 program
     .name("sesh-mover")
     .description("Export, import, and migrate Claude Code sessions")
-    .version("0.6.0");
+    .version("0.7.0");
 // --- Export ---
 program
     .command("export")
@@ -75,10 +76,10 @@ program
             outputDir = opts.output;
         }
         else if (storage === "project") {
-            outputDir = join(process.cwd(), ".claude-sesh-mover");
+            outputDir = projectSeshMoverDir(process.cwd());
         }
         else {
-            outputDir = join(homedir(), ".claude-sesh-mover");
+            outputDir = userSeshMoverDir();
         }
         mkdirSync(outputDir, { recursive: true });
         // Generate name
@@ -303,13 +304,13 @@ program
         const exports = [];
         const searchDirs = [];
         if (opts.storage === "user" || opts.storage === "all") {
-            const userDir = join(homedir(), ".claude-sesh-mover");
+            const userDir = userSeshMoverDir();
             if (existsSync(userDir)) {
                 searchDirs.push({ dir: userDir, storage: "user" });
             }
         }
         if (opts.storage === "project" || opts.storage === "all") {
-            const projectDir = join(process.cwd(), ".claude-sesh-mover");
+            const projectDir = projectSeshMoverDir(process.cwd());
             if (existsSync(projectDir)) {
                 searchDirs.push({ dir: projectDir, storage: "project" });
             }
@@ -355,13 +356,13 @@ program
                 }
             }
         }
-        // Also scan cwd for export bundles and archives that aren't inside .claude-sesh-mover/
+        // Also scan cwd for export bundles and archives that aren't inside .sesh-mover/
         // This catches exports dropped directly in the project root (e.g., received via file transfer)
         if (opts.storage === "project" || opts.storage === "all") {
             const cwd = process.cwd();
             const cwdEntries = readdirSync(cwd);
             for (const entry of cwdEntries) {
-                if (entry === ".claude-sesh-mover")
+                if (entry === PROJECT_DIR_NAME)
                     continue; // already scanned above
                 const entryPath = join(cwd, entry);
                 // Check for export directories with manifest.json
@@ -427,8 +428,8 @@ program
     .action(async (opts) => {
     try {
         const configDir = opts.scope === "project"
-            ? join(process.cwd(), ".claude-sesh-mover")
-            : join(homedir(), ".claude-sesh-mover");
+            ? projectSeshMoverDir(process.cwd())
+            : userSeshMoverDir();
         if (opts.reset) {
             // Clear this scope's overrides rather than writing a snapshot of every
             // default: a defaults-filled file is indistinguishable from one whose
@@ -483,7 +484,19 @@ program
             let overrides = readConfigOverrides(configDir);
             // Parse value
             let parsedValue = value;
-            if (value === "true")
+            if (configValueKind(key) === "number") {
+                // Refused at write time rather than coerced or stored as a string.
+                // A numeric key holding `"100"` reads back as "not a size" on every
+                // push afterwards, and the user has no way to tell that from the
+                // setting working — see `configValueKind`.
+                const n = Number(value);
+                if (value.trim() === "" || !Number.isFinite(n)) {
+                    outputError("configure", new Error(`${key} expects a number (megabytes); got "${value}"`));
+                    return;
+                }
+                parsedValue = n;
+            }
+            else if (value === "true")
                 parsedValue = true;
             else if (value === "false")
                 parsedValue = false;
@@ -630,6 +643,7 @@ hub
             hubPath: gate.hubPath,
             noWorkspace: config.hub.noWorkspace,
             noCarry: !config.hub.carryDiff,
+            budgets: resolveHubBudgets(config),
             // Nothing this push produces is read by a human: stdout is closed to it
             // and stderr only carries failures. `quiet` keeps it from computing the
             // ignored-path discovery aid nobody will see (and from walking the
@@ -760,6 +774,13 @@ program
             sessionIds: opts.sessionId,
             noWorkspace: opts.workspace === false || config.hub.noWorkspace,
             noCarry: opts.carry === false || !config.hub.carryDiff,
+            // Deliberately NO `--carry-max-mb` flag to override this. The decline
+            // is not retryable on demand — the carry rides a bundle, so an
+            // immediate re-push answers `upToDate` and a flag on the retry would be
+            // inert in the one situation you would reach for it. And the push that
+            // matters most is the unattended SessionEnd one, which takes no flags
+            // at all. Config is the lever that actually works in both cases.
+            budgets: resolveHubBudgets(config),
             projectIdOverride: opts.projectId,
             createProject: !!opts.createProject,
             claudeVersion: getClaudeVersion(),
@@ -1041,8 +1062,8 @@ function parseFormat(value) {
     }
 }
 function loadEffectiveConfig(_configDir, projectDir) {
-    const userConfigDir = join(homedir(), ".claude-sesh-mover");
-    const projectConfigDir = join(projectDir, ".claude-sesh-mover");
+    const userConfigDir = userSeshMoverDir();
+    const projectConfigDir = projectSeshMoverDir(projectDir);
     return computeEffectiveConfig(userConfigDir, projectConfigDir);
 }
 function generateExportName(configDir, sessionId) {

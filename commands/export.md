@@ -16,8 +16,8 @@ You are running the sesh-mover export command. Follow these steps:
 
    **Question 2 — Storage:**
    Use AskUserQuestion with options:
-   - "User level (~/.claude-sesh-mover/)" (recommended) → `--storage user`
-   - "Project level (.claude-sesh-mover/)" → `--storage project`
+   - "User level (~/.sesh-mover/)" (recommended) → `--storage user`
+   - "Project level (.sesh-mover/)" → `--storage project`
 
    **Question 3 — Format:**
    Use AskUserQuestion with options:
@@ -33,7 +33,7 @@ You are running the sesh-mover export command. Follow these steps:
    - "Exclude memory/plans/subagents" → add `memory plans subagents` to `--exclude`
 
    **Question 5 — Mode (only if prior peers exist for this project):**
-   Read `~/.claude-sesh-mover/sync-state/<encoded-project-path>.json` if present. If the file is missing or `peers` is empty, skip this question entirely.
+   Read `~/.sesh-mover/sync-state/<encoded-project-path>.json` if present. If the file is missing or `peers` is empty, skip this question entirely.
 
    If peers exist, ask with AskUserQuestion (≤4 options):
    - Slot 1: "Full export (every session)" → omit `--incremental`

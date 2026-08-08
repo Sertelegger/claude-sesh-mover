@@ -163,6 +163,12 @@ const REGISTRY: FlagUse[] = [
     klass: "future-only",
     why: "The snapshot was empty, not skipped; --no-workspace is about how the user pushes from now on.",
   },
+  {
+    file: "workspace.ts",
+    match: "or pass --no-workspace on later pushes",
+    klass: "future-only",
+    why: "hub.workspaceMaxMb is 0, so this push already carried no files and recorded its bundle. Both remedies — raising the setting and the flag — apply to a LATER push. Worded distinctly from the empty-snapshot line above so each keeps its own registry entry.",
+  },
 ];
 
 const HUB_DIR = join(import.meta.dirname, "..", "src", "hub");

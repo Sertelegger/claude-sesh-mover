@@ -13,6 +13,21 @@ export interface HubPushOptions {
      * its changes and no carry rule filters the patch — see `trackedIgnored`.)
      */
     noCarry?: boolean;
+    /**
+     * Byte budgets for the two optional payloads, resolved from `hub.carryMaxMb`
+     * and `hub.workspaceMaxMb`, plus whatever resolving them had to say.
+     *
+     * Resolved by the CALLER rather than read here, for the same reason
+     * `noWorkspace`/`noCarry` are: this module is handed a decision, not a config
+     * directory, and there is exactly one resolver (`resolveHubBudgets`) so the
+     * SessionEnd auto-push and the manual push cannot drift. Absent means "use
+     * the module defaults", which is what a programmatic caller gets.
+     */
+    budgets?: {
+        carryMaxBytes: number;
+        workspaceMaxBytes: number;
+        warnings: string[];
+    };
     projectIdOverride?: string;
     createProject?: boolean;
     claudeVersion: string;

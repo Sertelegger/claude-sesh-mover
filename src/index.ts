@@ -3,6 +3,7 @@
 // Use readProjectPathFromJsonl in discovery.ts or read cwd from JSONL entries instead.
 export * from "./types.js";
 export * from "./platform.js";
+export * from "./paths.js";
 export * from "./config.js";
 export * from "./manifest.js";
 export * from "./discovery.js";

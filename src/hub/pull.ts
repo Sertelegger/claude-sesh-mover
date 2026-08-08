@@ -55,6 +55,7 @@ import type {
   UnfetchableBundleGroup,
   WorkspaceGenerationRef,
 } from "../types.js";
+import { isPluginStateName } from "../paths.js";
 
 export interface HubPullOptions {
   configDir: string;
@@ -640,7 +641,7 @@ function describeCarryApply(
       // not accuse the sender. An older sesh-mover, on a case-insensitive
       // filesystem, legitimately produced payloads this guard now refuses.
       out.push(
-        "That payload tried to write paths that never travel (plugin or VCS internals such as .claude-sesh-mover/hubinclude, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it."
+        "That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-hubinclude, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it."
       );
     }
     return out;
@@ -792,7 +793,7 @@ export async function hubPull(
     // project doesn't exist locally yet and --target-path names a fresh
     // destination for the workspace) that destination must stay genuinely
     // nonexistent until the workspace-unpack step runs; if linking wrote
-    // .claude-sesh-mover under it first, the "project path doesn't exist
+    // .sesh-mover under it first, the "project path doesn't exist
     // locally" gate on the workspace flow (step 8) would never fire.
     let local: LocalProjectId;
     if (opts.projectIdOverride) {
@@ -1416,12 +1417,16 @@ export async function hubPull(
       //                                   pulls of non-git projects must not
       //                                   start erroring)
       //
-      // ".claude-sesh-mover" counts as non-content on BOTH sides: identity
-      // linking above may have just planted project.json into an otherwise
-      // fresh directory (the in-place bootstrap flow, --project-id with no
-      // --target-path), and that metadata alone must neither trigger the
-      // routine-skip branch nor trip unpackWorkspace's own emptiness check —
-      // hence force is also set when the dir holds nothing but our metadata.
+      // Plugin state counts as non-content on BOTH sides: identity linking
+      // above may have just planted `.sesh-mover-project.json` into an
+      // otherwise fresh directory (the in-place bootstrap flow, --project-id
+      // with no --target-path), and that metadata alone must neither trigger
+      // the routine-skip branch nor trip unpackWorkspace's own emptiness check
+      // — hence force is also set when the dir holds nothing but our metadata.
+      // `isPluginStateName` rather than one literal name: since 0.7.0 the
+      // metadata is a directory AND three root dotfiles, and the pre-0.7.0
+      // directory is still recognized, so a single `!==` would read a freshly
+      // linked project as having real content and skip the merge.
       const incomingDir = join(extractDir, "workspace");
       const workspaceDeclared = i === workspaceBundleIndex && !!bundleManifest.workspace;
 
@@ -1448,7 +1453,7 @@ export async function hubPull(
         );
       } else if (workspaceDeclared) {
         const entries = existsSync(effectiveProjectPath) ? readdirSync(effectiveProjectPath) : [];
-        const hasRealContent = entries.some((n) => n !== ".claude-sesh-mover");
+        const hasRealContent = entries.some((n) => !isPluginStateName(n));
 
         // Ancestor lookup is keyed off the EFFECTIVE project path, like every
         // other piece of local bookkeeping here — a pull into a fresh

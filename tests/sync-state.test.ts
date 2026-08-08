@@ -18,11 +18,11 @@ describe("sync-state", () => {
     rmSync(tempHome, { recursive: true, force: true });
   });
 
-  it("syncStatePath uses encoded project path under ~/.claude-sesh-mover/sync-state/", async () => {
+  it("syncStatePath uses encoded project path under ~/.sesh-mover/sync-state/", async () => {
     const { syncStatePath } = await import("../src/sync-state.js");
     const p = syncStatePath("/Users/sascha/Projects/foo");
     expect(p).toBe(
-      join(tempHome, ".claude-sesh-mover", "sync-state", "-Users-sascha-Projects-foo.json")
+      join(tempHome, ".sesh-mover", "sync-state", "-Users-sascha-Projects-foo.json")
     );
   });
 
@@ -39,7 +39,7 @@ describe("sync-state", () => {
     const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
     const { mkdirSync, writeFileSync } = await import("node:fs");
     const p = syncStatePath("/Users/sascha/Projects/foo");
-    mkdirSync(join(tempHome, ".claude-sesh-mover", "sync-state"), { recursive: true });
+    mkdirSync(join(tempHome, ".sesh-mover", "sync-state"), { recursive: true });
     writeFileSync(
       p,
       JSON.stringify({ projectPath: "/Users/sascha/Projects/foo", schemaVersion: 1, peers: {}, lineage: {} }),
@@ -53,7 +53,7 @@ describe("sync-state", () => {
     const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
     const { mkdirSync, writeFileSync } = await import("node:fs");
     const p = syncStatePath("/Users/sascha/Projects/foo");
-    mkdirSync(join(tempHome, ".claude-sesh-mover", "sync-state"), { recursive: true });
+    mkdirSync(join(tempHome, ".sesh-mover", "sync-state"), { recursive: true });
     writeFileSync(
       p,
       JSON.stringify({
@@ -104,7 +104,7 @@ describe("sync-state", () => {
     const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
     const p = syncStatePath("/Users/sascha/Projects/foo");
     const { mkdirSync, writeFileSync } = await import("node:fs");
-    mkdirSync(join(tempHome, ".claude-sesh-mover", "sync-state"), { recursive: true });
+    mkdirSync(join(tempHome, ".sesh-mover", "sync-state"), { recursive: true });
     writeFileSync(
       p,
       JSON.stringify({ projectPath: "/Users/sascha/Projects/foo", schemaVersion: 1, peers: null, lineage: {} }),
@@ -119,7 +119,7 @@ describe("sync-state", () => {
     const { readSyncState, syncStatePath } = await import("../src/sync-state.js");
     const p = syncStatePath("/Users/sascha/Projects/foo");
     const { mkdirSync } = await import("node:fs");
-    mkdirSync(join(tempHome, ".claude-sesh-mover", "sync-state"), { recursive: true });
+    mkdirSync(join(tempHome, ".sesh-mover", "sync-state"), { recursive: true });
     writeFileSync(p, "{not json", "utf-8");
     const state = readSyncState("/Users/sascha/Projects/foo");
     expect(state.peers).toEqual({});

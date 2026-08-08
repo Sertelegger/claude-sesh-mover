@@ -28,6 +28,7 @@ import { readSyncState, writeSyncState, getThreadId, syncStatePath } from "../sr
 import { readLastEntryUuid } from "../src/jsonl.js";
 import { encodeProjectPath } from "../src/platform.js";
 import type { ErrorResult, ExportManifest, HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
+import { isPluginStateName } from "../src/paths.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 const FIXTURE_SESSION_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -35,7 +36,7 @@ const FIXTURE_SESSION_ID = "550e8400-e29b-41d4-a716-446655440000";
 const FIXTURE_HEAD_UUID = "entry-3";
 
 // Same technique hub-push.test.ts uses (see its own comment): identity
-// linking writes .claude-sesh-mover/project.json under the real project
+// linking writes .sesh-mover-project.json under the real project
 // directory, and this sandbox has no permission to create top-level dirs
 // like "/Users" — so every hub test that links identity works against a
 // REAL git-less directory, with the fixture's session content copied into
@@ -195,7 +196,7 @@ describe("hub pull", () => {
     // untouched here. What it does NOT do is drop the payload: this pull
     // records its bundles as received, so a re-run with --apply-carry answers
     // "Already up to date" and the only surviving copy would be the one inside
-    // the bundle on the hub. It is written to .claude-sesh-mover/ instead.
+    // the bundle on the hub. It is written to .sesh-mover/ instead.
     // (This test was Task 10's "before" control, which asserted the pull said
     // nothing about a carry at all — see the task 11 report.)
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
@@ -248,7 +249,9 @@ describe("hub pull", () => {
       expect(p.importedSessions).toHaveLength(1);
       // Nothing of the carry reached the tree.
       expect(existsSync(join(projectB, "scratch.txt"))).toBe(false);
-      expect(readdirSync(projectB).sort()).toEqual([".claude-sesh-mover"]);
+      // The saved payload directory, plus the identity file pull plants — the
+      // latter is a ROOT DOTFILE since 0.7.0, not a member of the directory.
+      expect(readdirSync(projectB).sort()).toEqual([".sesh-mover", ".sesh-mover-project.json"]);
       // It IS reported, and it IS recoverable.
       expect(p.carryAvailable?.baseCommit).toBeTruthy();
       expect(p.carryApplied?.applied).toBe(false);
@@ -343,8 +346,9 @@ describe("hub pull", () => {
       expect(readFileSync(join(projectB, "scratch.txt"), "utf-8")).toBe("wip\n");
       // Applied, therefore not also parked: no saved copy is written when the
       // payload reached the tree.
-      expect(readdirSync(join(projectB, ".claude-sesh-mover")).some((n) => n.startsWith("carry-")))
-        .toBe(false);
+      // Nothing was parked, and since 0.7.0 the identity file lives at the
+      // project root, so the plugin directory is not created at all.
+      expect(existsSync(join(projectB, ".sesh-mover"))).toBe(false);
       // The sessions still arrived — the working tree is the optional half.
       expect(p.importedSessions).toHaveLength(1);
     } finally {
@@ -357,7 +361,7 @@ describe("hub pull", () => {
 
   it("refuses a hostile carry payload end to end, with --apply-carry and everything else passing", async () => {
     // The whole path, not just applyCarry: a bundle sitting on the hub is
-    // rewritten to carry a patch that writes `.claude-sesh-mover./config.json`
+    // rewritten to carry a patch that writes `.sesh-mover./config.json`
     // — the trailing-dot spelling the sender's own pathspec floor cannot
     // express — plus a planted `hubinclude`, i.e. the file deciding what THIS
     // machine's next push uploads and the one that redirects hub.path.
@@ -393,14 +397,14 @@ describe("hub pull", () => {
       if (!pushResult.success || !pushResult.bundleId) return;
 
       await mutateBundleTree(hub, pushResult.projectId, pushResult.bundleId, (dir) => {
-        const hostile = ".claude-sesh-mover./config.json";
+        const hostile = ".sesh-mover./config.json";
         writeFileSync(
           join(dir, "carry", "changes.patch"),
           `diff --git a/${hostile} b/${hostile}\nnew file mode 100644\nindex 0000000..d95f3ad\n` +
             `--- /dev/null\n+++ b/${hostile}\n@@ -0,0 +1 @@\n+{"hub":{"path":"/tmp/attacker"}}\n`
         );
-        mkdirSync(join(dir, "carry", "untracked", ".claude-sesh-mover"), { recursive: true });
-        writeFileSync(join(dir, "carry", "untracked", ".claude-sesh-mover", "hubinclude"), "*\n");
+        mkdirSync(join(dir, "carry", "untracked", ".sesh-mover"), { recursive: true });
+        writeFileSync(join(dir, "carry", "untracked", ".sesh-mover-hubinclude"), "*\n");
       });
 
       restore.restore();
@@ -433,14 +437,15 @@ describe("hub pull", () => {
         expect(p.warnings.join(" ")).not.toContain("README with the exact commands");
         expect(p.warnings.join(" ")).toContain("what was withheld");
       }
-      expect(existsSync(join(projectB, ".claude-sesh-mover.")))
+      expect(existsSync(join(projectB, ".sesh-mover.")))
         .toBe(false);
-      expect(existsSync(join(projectB, ".claude-sesh-mover", "hubinclude"))).toBe(false);
-      expect(existsSync(join(projectB, ".claude-sesh-mover", "config.json"))).toBe(false);
+      expect(existsSync(join(projectB, ".sesh-mover-hubinclude"))).toBe(false);
+      expect(existsSync(join(projectB, ".sesh-mover", "config.json"))).toBe(false);
       // Only the plugin's own linking artifact and the saved payload are there.
-      expect(readdirSync(join(projectB, ".claude-sesh-mover")).sort().join(",")).toMatch(
-        /^carry-[^,]+,project\.json$/
+      expect(readdirSync(join(projectB, ".sesh-mover")).sort().join(",")).toMatch(
+        /^carry-[^,]+$/
       );
+      expect(existsSync(join(projectB, ".sesh-mover-project.json"))).toBe(true);
       // The sessions still arrived: the working tree is the optional half.
       expect(p.importedSessions).toHaveLength(1);
     } finally {
@@ -649,7 +654,7 @@ describe("hub pull", () => {
       // directory from the unpack destination (opts.projectPath), so the
       // unpack destination (opts.targetPath) is left genuinely nonexistent
       // going into the pull — otherwise linking would materialize
-      // .claude-sesh-mover under it first and the "project path does not
+      // .sesh-mover under it first and the "project path does not
       // exist locally" workspace gate would never fire.
       identityAnchorB = mkdtempSync(join(tmpdir(), "sesh-pull-identB-"));
       targetParent = mkdtempSync(join(tmpdir(), "sesh-pull-targetparent-"));
@@ -673,7 +678,7 @@ describe("hub pull", () => {
       expect(existsSync(join(targetPath, "README.md"))).toBe(true);
       expect(readFileSync(join(targetPath, "README.md"), "utf-8")).toBe("hello\n");
 
-      const plantedIdPath = join(targetPath, ".claude-sesh-mover", "project.json");
+      const plantedIdPath = join(targetPath, ".sesh-mover-project.json");
       expect(existsSync(plantedIdPath)).toBe(true);
       const planted = JSON.parse(readFileSync(plantedIdPath, "utf-8"));
       expect(planted.projectId).toBe(pushResult.projectId);
@@ -688,7 +693,7 @@ describe("hub pull", () => {
   it("a workspace payload carrying plugin/VCS internals cannot plant them, and says so", async () => {
     // The hub is a plain directory, so a bundle is peer-supplied data. The one
     // file such a payload would most want to write is
-    // `.claude-sesh-mover/hubinclude` — the list deciding what THIS machine's
+    // `.sesh-mover-hubinclude` — the list deciding what THIS machine's
     // next push ships — which would turn a workspace payload into an
     // exfiltration primitive. `.git` is the other: a store, not content.
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
@@ -712,9 +717,9 @@ describe("hub pull", () => {
       // Rewrite the bundle ON THE HUB to say what no pusher would say.
       await mutateBundleTree(hub, pushResult.projectId, pushResult.bundleId, (dir) => {
         const ws = join(dir, "workspace");
-        mkdirSync(join(ws, ".claude-sesh-mover"), { recursive: true });
+        mkdirSync(join(ws, ".sesh-mover"), { recursive: true });
         mkdirSync(join(ws, ".git"), { recursive: true });
-        writeFileSync(join(ws, ".claude-sesh-mover", "hubinclude"), "*\n");
+        writeFileSync(join(ws, ".sesh-mover-hubinclude"), "*\n");
         writeFileSync(join(ws, ".git", "config"), "[remote]\n");
       });
 
@@ -739,17 +744,18 @@ describe("hub pull", () => {
       // names, not to the payload.
       expect(readFileSync(join(targetPath, "README.md"), "utf-8")).toBe("hello\n");
       expect(existsSync(join(targetPath, ".git"))).toBe(false);
-      // `.claude-sesh-mover` exists — pull plants its OWN project.json there —
+      // `.sesh-mover` exists — pull plants its OWN project.json there —
       // but nothing of the payload's is inside it.
-      expect(existsSync(join(targetPath, ".claude-sesh-mover", "project.json"))).toBe(true);
-      expect(existsSync(join(targetPath, ".claude-sesh-mover", "hubinclude"))).toBe(false);
+      expect(existsSync(join(targetPath, ".sesh-mover-project.json"))).toBe(true);
+      expect(existsSync(join(targetPath, ".sesh-mover-hubinclude"))).toBe(false);
       expect(
-        p.warnings.some((w) => w.includes("refused") && w.includes(".claude-sesh-mover"))
+        p.warnings.some((w) => w.includes("refused") && w.includes(".sesh-mover"))
       ).toBe(true);
       // A RESULT FIELD, not just prose: this is the strongest signal the
       // command produces, and the milestone's cross-layer rule is that a skill
       // discriminator keys on fields, never on warning text.
-      expect(p.workspaceRefused?.slice().sort()).toEqual([".claude-sesh-mover", ".git"]);
+      expect(p.workspaceRefused?.slice().sort())
+        .toEqual([".git", ".sesh-mover", ".sesh-mover-hubinclude"]);
       // …and the warning does not accuse the sender: a sesh-mover older than
       // this guard, on a case-insensitive filesystem, legitimately shipped a
       // `.GIT` store, which is exactly the leak the guard closed.
@@ -839,7 +845,7 @@ describe("hub pull", () => {
 
       const configDirB = join(homeB, ".claude");
       // Routine repeat-pull shape: the project already exists locally (it is
-      // at minimum non-empty from its own .claude-sesh-mover/project.json).
+      // at minimum non-empty from its own .sesh-mover-project.json).
       projectB = mkdtempSync(join(tmpdir(), "sesh-pull-projB-"));
       writeLocalProjectId(projectB, {
         projectId: pushResult.projectId, name: "projA",
@@ -949,7 +955,7 @@ describe("hub pull", () => {
 
       const configDirB = join(homeB, ".claude");
       // FRESH directory, no pre-link, no --target-path: identity linking via
-      // --project-id plants .claude-sesh-mover/project.json into it before
+      // --project-id plants .sesh-mover-project.json into it before
       // the workspace gate runs. That metadata alone must count as "empty" —
       // otherwise the gate would skip with a warning whose --force-workspace
       // remedy can never work (the first pull already consumed the chain).
@@ -970,7 +976,7 @@ describe("hub pull", () => {
       expect(p.importedSessions).toHaveLength(1);
       // Payload arrived in place, alongside the planted metadata.
       expect(readFileSync(join(projectB, "README.md"), "utf-8")).toBe("hello\n");
-      expect(existsSync(join(projectB, ".claude-sesh-mover", "project.json"))).toBe(true);
+      expect(existsSync(join(projectB, ".sesh-mover-project.json"))).toBe(true);
     } finally {
       restore.restore();
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
@@ -2749,10 +2755,10 @@ describe("hub pull — a divergence that stops the chain part-way", () => {
       expect(p.carryAvailable).toBeUndefined();
       expect(p.carryApplied).toBeUndefined();
       expect(p.warnings.join(" ")).toContain("uncommitted work that bundle carried was left in it");
-      expect(existsSync(join(a.projectA, ".claude-sesh-mover"))).toBe(true);
-      expect(
-        readdirSync(join(a.projectA, ".claude-sesh-mover")).some((n) => n.startsWith("carry-"))
-      ).toBe(false);
+      // The project IS linked (the identity file is a root dotfile since
+      // 0.7.0) and yet nothing was parked: no saved payload directory exists.
+      expect(existsSync(join(a.projectA, ".sesh-mover-project.json"))).toBe(true);
+      expect(existsSync(join(a.projectA, ".sesh-mover"))).toBe(false);
 
       // Deferred, not dropped: the re-run delivers it.
       const rerun = await hubPull({
@@ -3361,7 +3367,11 @@ describe("hub pull — workspace 3-way merge", () => {
     try {
       w.useB();
       for (const name of readdirSync(w.projectB)) {
-        if (name !== ".claude-sesh-mover") rmSync(join(w.projectB, name), { recursive: true, force: true });
+        // Everything except this plugin's own state — the identity file that
+        // links the project to its hub project is a ROOT DOTFILE since 0.7.0,
+        // so a `name !== ".sesh-mover"` filter would unlink the project and
+        // the pull would fail for a reason this test is not about.
+        if (!isPluginStateName(name)) rmSync(join(w.projectB, name), { recursive: true, force: true });
       }
       expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeDefined();
 
@@ -3927,7 +3937,7 @@ describe("hub pull — workspace 3-way merge", () => {
       // generation this tree never held would make the next merge read the
       // whole payload as "deleted here" (the Task 8 rule).
       expect(readSyncState(projectB).hub?.lastWorkspace).toBeUndefined();
-      expect(readdirSync(projectB).sort()).toEqual([".claude-sesh-mover"]);
+      expect(readdirSync(projectB).sort()).toEqual([".sesh-mover-project.json"]);
     } finally {
       restore.restore();
       for (const d of [homeA, homeB, hub, base, projectB]) {

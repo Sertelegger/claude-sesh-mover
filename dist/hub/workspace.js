@@ -1,8 +1,10 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, } from "node:fs";
 import { dirname, join } from "node:path";
+import { HUBIGNORE_FILE_NAME, HUBINCLUDE_FILE_NAME, PLUGIN_STATE_NAMES, PROJECT_DIR_NAME, hubignoreFilePath, hubincludeFilePath, isPluginStateName, } from "../paths.js";
+import { DEFAULT_WORKSPACE_MAX_MB } from "../config.js";
 /**
  * The convenience excludes every carry path starts from. Each of these is a
- * DEFAULT, not a floor: `.claude-sesh-mover/hubinclude` names any of them back
+ * DEFAULT, not a floor: `.sesh-mover-hubinclude` names any of them back
  * (the floor that nothing names back is `NEVER_INCLUDABLE`, below).
  *
  * `.claude` is the one entry here that is not about size or noise. It is the
@@ -19,7 +21,7 @@ import { dirname, join } from "node:path";
  * than something a user chose per push.
  */
 export const DEFAULT_WORKSPACE_EXCLUDES = [
-    ".git", "node_modules", ".claude", ".claude-sesh-mover", ".venv", "__pycache__", ".DS_Store",
+    ".git", "node_modules", ".claude", PROJECT_DIR_NAME, ".venv", "__pycache__", ".DS_Store",
 ];
 /**
  * Names that can never be carried, re-included, or applied — at ANY depth, on
@@ -33,12 +35,26 @@ export const DEFAULT_WORKSPACE_EXCLUDES = [
  *   one corrupts the repository rather than merging it. A *nested* `.git` (a
  *   vendored submodule, a worktree) is the same store one level down, which is
  *   why the check is per segment and not just on the first one.
- * - `.claude-sesh-mover` holds this plugin's own project state — `project.json`
- *   (planted by pull independently), the project-scope `config.json` (which can
- *   redirect `hub.path`), and `hubinclude` ITSELF. A payload able to write that
- *   directory could rewrite the list deciding what the next push ships, turning
- *   a workspace payload into an exfiltration primitive. So it is refused on the
- *   apply side too, not only on the carry side.
+ * - Everything in `PLUGIN_STATE_NAMES` holds this plugin's own project state —
+ *   `.sesh-mover-project.json` (planted by pull independently), the
+ *   project-scope `config.json` under `.sesh-mover/` (which can redirect
+ *   `hub.path`), and `.sesh-mover-hubinclude` ITSELF. A payload able to write
+ *   any of those could rewrite the list deciding what the next push ships,
+ *   turning a workspace payload into an exfiltration primitive. So they are
+ *   refused on the apply side too, not only on the carry side.
+ *
+ * TWO THINGS ABOUT THIS LIST ARE PERMANENT, not incidental to the 0.7.0 rename:
+ *
+ * 1. **`.claude-sesh-mover` stays here forever.** Bundles carrying that path are
+ *    already sitting on hubs, written by every version before 0.7.0. Dropping
+ *    the old name would un-protect every one of them and reopen the exact
+ *    exfiltration primitive above in a new shape — a payload writing a legacy
+ *    `hubinclude` that an older peer still reads.
+ * 2. **The three root dotfiles need the floor MORE than the directory did.**
+ *    They are ordinary files at the project root, so there is no directory name
+ *    between a payload and them: `.sesh-mover-hubinclude` can be named directly.
+ *    The check is per SEGMENT and fold-tolerant (`isNeverSegment`), so it holds
+ *    at any depth and in every spelling the directory names already survive.
  *
  * Everything else in `DEFAULT_WORKSPACE_EXCLUDES` (`.claude`, `node_modules`,
  * `.venv`, `__pycache__`, `.DS_Store`) is a convenience default and stays
@@ -48,16 +64,19 @@ export const DEFAULT_WORKSPACE_EXCLUDES = [
  * is excluded for a disclosure reason rather than a size one (see
  * `DEFAULT_WORKSPACE_EXCLUDES`) and the two lists are one line apart. It is
  * deliberately NOT here, and the dividing line is what a name can do rather
- * than what it contains: this floor holds the two directories that decide where
- * the hub is, what the next push ships, and whether a VCS store survives being
- * written over — a payload that reaches either of those subverts sesh-mover
- * itself. `.claude` does none of that. Its risk is that its contents leave the
+ * than what it contains: this floor holds the names that decide where the hub
+ * is, what the next push ships, and whether a VCS store survives being written
+ * over — a payload that reaches any of those subverts sesh-mover itself.
+ * `.claude` does none of that. Its risk is that its contents leave the
  * machine, which is the user's own call to make: a project-level
  * `.claude/settings.json` or a set of shared agents is ordinary project content
  * someone may well want carried between their own machines, and writing
  * `.claude` in `hubinclude` is exactly how they say so.
  */
-export const NEVER_INCLUDABLE = Object.freeze([".git", ".claude-sesh-mover"]);
+export const NEVER_INCLUDABLE = Object.freeze([
+    ".git",
+    ...PLUGIN_STATE_NAMES,
+]);
 /** Byte cap on `hubinclude`; a bigger file is ignored outright (fail closed). */
 const MAX_HUBINCLUDE_BYTES = 64 * 1024;
 /** Pattern cap: every pattern is tested against every candidate path. */
@@ -94,7 +113,7 @@ export class WorkspaceTargetNotEmptyError extends Error {
 // file excludes a `docs` anywhere; `docs/` in hubinclude names back only the top
 // -level one. Do not "harmonize" them by making one follow the other.
 export function readHubignore(projectPath) {
-    const p = join(projectPath, ".claude-sesh-mover", "hubignore");
+    const p = hubignoreFilePath(projectPath);
     if (!existsSync(p))
         return [];
     return readFileSync(p, "utf-8")
@@ -104,7 +123,7 @@ export function readHubignore(projectPath) {
 }
 /** Where a project's `hubinclude` lives. */
 export function hubincludePath(projectPath) {
-    return join(projectPath, ".claude-sesh-mover", "hubinclude");
+    return hubincludeFilePath(projectPath);
 }
 /**
  * hubinclude: the opt-in re-include list (design §6.0). Sibling to `hubignore`,
@@ -141,12 +160,12 @@ export function readHubinclude(projectPath, diagnostics) {
     // /dev/zero` symlink would otherwise be read forever).
     if (!st.isFile()) {
         if (st.isDirectory()) {
-            diagnostics?.push(".claude-sesh-mover/hubinclude is a directory, not a file — it was ignored entirely, so no re-includes are in effect.");
+            diagnostics?.push(`${HUBINCLUDE_FILE_NAME} is a directory, not a file — it was ignored entirely, so no re-includes are in effect.`);
         }
         return [];
     }
     if (st.size > MAX_HUBINCLUDE_BYTES) {
-        diagnostics?.push(`.claude-sesh-mover/hubinclude is ${st.size} bytes, over the ${MAX_HUBINCLUDE_BYTES}-byte cap — it was ignored ENTIRELY, so none of its re-includes are in effect and every path it names was left out of this snapshot.`);
+        diagnostics?.push(`${HUBINCLUDE_FILE_NAME} is ${st.size} bytes, over the ${MAX_HUBINCLUDE_BYTES}-byte cap — it was ignored ENTIRELY, so none of its re-includes are in effect and every path it names was left out of this snapshot.`);
         return [];
     }
     const all = readFileSync(p, "utf-8")
@@ -154,7 +173,7 @@ export function readHubinclude(projectPath, diagnostics) {
         .map((l) => l.trim())
         .filter((l) => l.length > 0 && !l.startsWith("#"));
     if (all.length > MAX_HUBINCLUDE_PATTERNS) {
-        diagnostics?.push(`.claude-sesh-mover/hubinclude has ${all.length} patterns, over the ${MAX_HUBINCLUDE_PATTERNS}-pattern cap — only the first ${MAX_HUBINCLUDE_PATTERNS} are in effect and the rest were dropped.`);
+        diagnostics?.push(`${HUBINCLUDE_FILE_NAME} has ${all.length} patterns, over the ${MAX_HUBINCLUDE_PATTERNS}-pattern cap — only the first ${MAX_HUBINCLUDE_PATTERNS} are in effect and the rest were dropped.`);
     }
     return all.slice(0, MAX_HUBINCLUDE_PATTERNS);
 }
@@ -576,24 +595,33 @@ function listDirSafely(dir) {
 }
 /**
  * Byte budget for one workspace snapshot — the whole payload, measured before
- * anything is copied.
- *
- * Deliberately NOT `CARRY_MAX_BYTES` (5 MB), and the two must not be
- * "harmonized":
- *
- * - a git carry is a *diff* of uncommitted work, where 5 MB already means
- *   generated artifacts (design §6.1);
- * - a workspace snapshot is the *entire project* for a project git cannot
- *   reconstruct, where 5 MB is an ordinary size. Reusing the smaller number
- *   would silently stop syncing projects that sync today.
+ * anything is copied. The FALLBACK, like `CARRY_MAX_BYTES`: the real one comes
+ * from `hub.workspaceMaxMb` via `snapshotWorkspace`'s `maxBytes`.
  *
  * The guard exists because `hubinclude` made an unbounded payload reachable: a
  * single `*` line re-admits every built-in exclude, and a measured
  * `node_modules` alone is 6,021 files. Before that the built-in excludes made
  * an over-budget payload nearly impossible, so there was nothing to bound.
+ *
+ * **WHY THIS AND `CARRY_MAX_BYTES` NOW SHARE A DEFAULT, having deliberately
+ * disagreed.** The original split was 50 MB here and 5 MB there, reasoning that
+ * a snapshot is a whole project while a carry is a diff, so 5 MB in a diff
+ * already means generated artifacts. The second half of that did not survive
+ * contact: measured on this repository, its own untracked `.superpowers/`
+ * working notes are ~12.6 MB of content the owner deliberately wants carried.
+ * A diff of uncommitted work is not inherently small — it is exactly as large
+ * as the work you have not committed yet. So the numbers agree now because the
+ * distinction they encoded turned out not to exist, NOT because the two
+ * payloads became the same thing. They still differ in every other way, and
+ * they are separately configurable precisely so a user who does find the split
+ * real can restore it.
  */
-export const WORKSPACE_MAX_BYTES = 50 * 1024 * 1024;
-/** What one carried FILE costs against a budget on top of its bytes (one tar header). */
+export const WORKSPACE_MAX_BYTES = DEFAULT_WORKSPACE_MAX_MB * 1024 * 1024;
+/**
+ * What one carried FILE costs against a budget on top of its bytes (one tar
+ * header). Fixed, not a fraction of the budget — see `CARRY_PER_FILE_BYTES` in
+ * carry.ts, which is the same charge for the same reason.
+ */
 const PER_FILE_BYTES = 512;
 /**
  * Copy a project's working tree into `destDir`, minus the excluded paths and
@@ -615,7 +643,24 @@ const PER_FILE_BYTES = 512;
  */
 export async function snapshotWorkspace(projectPath, destDir, opts) {
     const warnings = [];
-    const maxBytes = opts?.maxBytes ?? WORKSPACE_MAX_BYTES;
+    const maxBytes = Math.max(0, opts?.maxBytes ?? WORKSPACE_MAX_BYTES);
+    if (maxBytes === 0) {
+        // A budget of 0 is an explicit "snapshot nothing" (see `resolveBudgetMb`),
+        // answered before the measuring walk so that it costs nothing. Handled
+        // separately from the over-budget branch below rather than falling into it:
+        // on an EMPTY project the measured cost is also 0, and `0 > 0` is false, so
+        // that branch would quietly build an empty payload for a setting that said
+        // not to.
+        return {
+            fileCount: 0,
+            byteSize: 0,
+            symlinksSkipped: 0,
+            skipped: true,
+            warnings: [
+                "The workspace snapshot budget is set to 0, so this push carries no project files (hub.workspaceMaxMb). Raise that setting, or pass --no-workspace on later pushes, if that is not what you meant.",
+            ],
+        };
+    }
     const rules = readCarryRules(projectPath, warnings);
     let fileCount = 0;
     let byteSize = 0;
@@ -648,7 +693,7 @@ export async function snapshotWorkspace(projectPath, destDir, opts) {
             largest.pop();
     });
     if (cost > maxBytes) {
-        warnings.push(`The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so this push carries no project files (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with .claude-sesh-mover/hubignore — and check .claude-sesh-mover/hubinclude for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`);
+        warnings.push(`The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so this push carries no project files (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with ${HUBIGNORE_FILE_NAME} — and check ${HUBINCLUDE_FILE_NAME} for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`);
         return { fileCount: 0, byteSize: measured, symlinksSkipped: 0, skipped: true, warnings };
     }
     // Created up front, not lazily per file: a payload this function returns
@@ -670,8 +715,8 @@ export async function snapshotWorkspace(projectPath, destDir, opts) {
     // what one over-broad line produces: `*/` in hubignore excludes every
     // top-level directory, so the snapshot silently carried nothing. Say so
     // whenever there WAS something to carry.
-    if (fileCount === 0 && listDirSafely(projectPath).some((n) => n !== ".claude-sesh-mover")) {
-        warnings.push("The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by .claude-sesh-mover/hubignore, so this push carries no project files. Check hubignore for an over-broad pattern (`*` and `*/` match everything at a level), or pass --no-workspace on future pushes if that is what you meant.");
+    if (fileCount === 0 && listDirSafely(projectPath).some((n) => !isPluginStateName(n))) {
+        warnings.push(`The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by ${HUBIGNORE_FILE_NAME}, so this push carries no project files. Check it for an over-broad pattern (\`*\` and \`*/\` match everything at a level), or pass --no-workspace on future pushes if that is what you meant.`);
     }
     return { fileCount, byteSize, symlinksSkipped, skipped: false, warnings };
 }
@@ -700,7 +745,7 @@ export function formatBytes(bytes) {
  * attack: a hand-made or damaged bundle; a bundle written by a version older
  * than this guard, on a case-insensitive filesystem where a store spelled
  * `.GIT` slipped past the case-sensitive exclude list; and a deliberately
- * planted payload, whose prize is `.claude-sesh-mover/hubinclude` — the file
+ * planted payload, whose prize is `.sesh-mover-hubinclude` — the file
  * deciding what the NEXT push ships. Callers must not name a culprit. Refusing
  * here is what keeps the two apply paths (merge and unpack) saying the same
  * thing, the same argument that moved `classifyDestination` into this module.

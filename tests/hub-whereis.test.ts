@@ -104,7 +104,7 @@ describe("hub whereis", () => {
   it("unlinked project -> linked false, candidates listed, threads empty", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-whereis-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-whereis-hub-"));
-    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-proj-")); // no .claude-sesh-mover/project.json, no .git
+    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-proj-")); // no .sesh-mover-project.json, no .git
     const restore = overrideHome(home);
     try {
       const backend = createFsBackend(hub);

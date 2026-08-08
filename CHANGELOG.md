@@ -2,6 +2,97 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.7.0] — 2026-08-07
+
+### Changed
+
+- **Every path the plugin owns on disk is renamed, and split by lifecycle.** A dotfile now
+  spells the *plugin* name (`sesh-mover`) rather than the npm package name
+  (`claude-sesh-mover`): the short name is the one a user types, and it stops a directory
+  asserting "Claude" about a project that may have none in it — the hub index schema has
+  carried an `agent` discriminator from day one, and other agentic CLIs are on the roadmap.
+
+  | before | after |
+  |---|---|
+  | `~/.claude-sesh-mover/` | `~/.sesh-mover/` |
+  | `<project>/.claude-sesh-mover/` (exports) | `<project>/.sesh-mover/` |
+  | `<project>/.claude-sesh-mover/config.json` | `<project>/.sesh-mover/config.json` |
+  | `<project>/.claude-sesh-mover/carry-<ts>/` | `<project>/.sesh-mover/carry-<ts>/` |
+  | `<project>/.claude-sesh-mover/hubinclude` | `<project>/.sesh-mover-hubinclude` |
+  | `<project>/.claude-sesh-mover/hubignore` | `<project>/.sesh-mover-hubignore` |
+  | `<project>/.claude-sesh-mover/project.json` | `<project>/.sesh-mover-project.json` |
+
+  The split is the point, not the spelling. One directory held two things with **opposite
+  lifecycles** — generated exports, which must never be committed, and config plus hub
+  identity, which must be or they do not work at all — so the only way to have both was a
+  `.gitignore` negation (`.claude-sesh-mover/*` plus three `!` lines), and getting it wrong
+  silently stopped `hubinclude` and `project.json` being committed. Ignoring exports is now
+  a plain `.sesh-mover/` line with no negation, because the three committed files are
+  ordinary root dotfiles that no ignore rule touches.
+- **The user-scope directory migrates itself; project-level files do not.** On its first run
+  this version renames `~/.claude-sesh-mover/` to `~/.sesh-mover/` with a single move. That
+  it is a *move* is load-bearing: the directory holds `machine-id.json`, so reading the new
+  path without moving the old one would mint a new machine identity — every peer ledger
+  reset, every session re-uploaded as a full bundle instead of a continuation, and the old
+  machine left on the hub as a ghost that `whereis` lists and every pull resolves across.
+  Three cases do something other than move, each reported in the command's `warnings`:
+  **both directories exist** — neither is touched, the new name is used, and the warning
+  says so and repeats, since only the user can tell which sync state is live; **the rename
+  fails** (EACCES, a cross-device mount) — the *legacy* directory keeps being used, so
+  nothing is lost, and the move is retried on the next command; **neither exists** — a
+  normal first run, which creates nothing and says nothing. **Project-level files are not
+  migrated at all.** A project holding a `.claude-sesh-mover/` directory keeps it, but
+  `hubinclude`, `hubignore` and `project.json` are no longer read from there — recreate them
+  by hand as the three root dotfiles. Copying `project.json` across verbatim preserves that
+  project's link to its hub project; leaving it behind means the next `push` re-links by git
+  remote or offers to mint a fresh hub project.
+- **`.claude-sesh-mover` stays on the `NEVER_INCLUDABLE` floor permanently**, alongside
+  `.git`, `.sesh-mover`, and the three `.sesh-mover-*` root dotfiles — at any depth, in any
+  casing, with trailing dots and spaces folded, and re-includable by no `hubinclude` pattern
+  or spelling. Bundles carrying the old path are already sitting on hubs, written by every
+  version before this one, so dropping the name would un-protect all of them and reopen the
+  exfiltration primitive the floor exists for, in a new shape: a payload that writes a
+  legacy `hubinclude` an older peer still reads. The three dotfiles need the floor *more*
+  than the directory did — they sit at the project root, so a payload can name one directly
+  with no directory segment in the way.
+- **The git-diff carry budget is 50 MB, up from 5 MB, and both payload budgets are now
+  configurable** — `hub.carryMaxMb` and `hub.workspaceMaxMb`, in megabytes, both defaulting
+  to 50. The old 5 MB rested on the reasoning that a carry is a *diff* of uncommitted work,
+  where 5 MB already means generated artifacts. Measured, that is not how people work: this
+  repository's own untracked `.superpowers/` working notes are ~12.6 MB of content its owner
+  deliberately wants carried, so the carry declined on the very repo that produced the tool.
+  A hub is a directory with a disk behind it; the budget exists to stop a runaway payload,
+  not to ration ordinary work. The two numbers agree now because the distinction they
+  encoded turned out not to exist — the payloads are still separately configurable, so a
+  user who does find the split real can restore it.
+
+  Both budgets still fail **closed**: over budget the whole payload is declined with a
+  warning, never partially sent. `0` means carry nothing — an explicit off switch, never
+  "unlimited", which is the reading that would turn a typo into an unbounded upload on an
+  unattended session-end push. A negative, non-finite or non-numeric value falls back to the
+  default *and warns*, because silently substituting it is indistinguishable from the
+  setting working. Values over 1024 MB are clamped, with a warning: that ceiling is a memory
+  limit rather than a policy one, since both payloads are held whole in memory to build and
+  again to check on the receiving machine. `configure --set` now stores a numeric key as a
+  number and refuses a non-numeric value outright, instead of persisting `"100"` as a string
+  that every later push would read as "not a size". The 512-bytes-per-file charge is
+  unchanged and stays a fixed cost rather than a fraction of the budget, so a raised budget
+  buys proportionally more files and never unbounded ones.
+
+  **There is deliberately no CLI flag for either.** A declined carry is not retryable on
+  demand — it rides a bundle, so an immediate re-push answers `upToDate` and a flag on the
+  retry would be inert in the one situation you would reach for it — and the push that
+  matters most is the unattended SessionEnd one, which takes no flags at all. Worth knowing
+  before raising it: that push happens on **every** session end and the hub keeps **every**
+  bundle, so a 50 MB carry on a synced folder is 50 MB of sync traffic per session end.
+
+  The receiver-side cap on a patch this version will *inspect* moved with the default, from
+  32 MB to 128 MB. At 32 MB against a 5 MB sender it only ever met a hand-made or damaged
+  bundle; against a 50 MB sender it would have begun refusing ordinary payloads on the
+  receiving machine, where the remedy lives on the *other* one. A machine that raises
+  `hub.carryMaxMb` past 128 MB produces payloads its peers save but do not apply — the
+  fail-closed direction, with the saved copy and its README as the remedy.
+
 ## [0.6.0] — 2026-08-06
 
 The Hub, Slice 2: the hub keeps itself current, and a pulled continuation lands *in* the
