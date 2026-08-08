@@ -177,6 +177,10 @@ export async function hubPush(opts) {
         const warnings = [];
         // See hub/status.ts: the user-directory migration notice, if there is one.
         warnings.push(...userDirWarnings());
+        // A budget that could not be read as written. Said once, up front, rather
+        // than folded into the decline it causes — the two are different facts, and
+        // on an unattended session-end push this is the only trace of the typo.
+        warnings.push(...(opts.budgets?.warnings ?? []));
         if (lock.stoleStale) {
             warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress.");
         }
@@ -321,7 +325,9 @@ export async function hubPush(opts) {
         // the working tree from otherwise.
         let hasWorkspace = false;
         if (!opts.noWorkspace && gitScan().kind === "none" && existsSync(opts.projectPath)) {
-            const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));
+            const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"), {
+                maxBytes: opts.budgets?.workspaceMaxBytes,
+            });
             if (ws.symlinksSkipped > 0)
                 warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
             // Rule-level diagnostics (a hubinclude past a cap, an exclude set that
@@ -379,7 +385,9 @@ export async function hubPush(opts) {
             // unbounded (mid-rebase, submodules, 200k untracked files, a filesystem
             // that refuses a read), and no failure of the OPTIONAL half of a push may
             // cost the user the session bundle that is the point of the operation.
-            const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), { diagnostics })
+            const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), {
+                diagnostics, maxBytes: opts.budgets?.carryMaxBytes,
+            })
                 .catch((e) => ({ captured: false, reason: "git-failed", detail: e.message }));
             warnings.push(...diagnostics);
             if (cap.captured) {

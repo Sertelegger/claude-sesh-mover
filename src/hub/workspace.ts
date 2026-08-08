@@ -6,6 +6,7 @@ import {
   HUBIGNORE_FILE_NAME, HUBINCLUDE_FILE_NAME, PLUGIN_STATE_NAMES, PROJECT_DIR_NAME,
   hubignoreFilePath, hubincludeFilePath, isPluginStateName,
 } from "../paths.js";
+import { DEFAULT_WORKSPACE_MAX_MB } from "../config.js";
 
 /**
  * The convenience excludes every carry path starts from. Each of these is a
@@ -661,25 +662,34 @@ function listDirSafely(dir: string): string[] {
 
 /**
  * Byte budget for one workspace snapshot — the whole payload, measured before
- * anything is copied.
- *
- * Deliberately NOT `CARRY_MAX_BYTES` (5 MB), and the two must not be
- * "harmonized":
- *
- * - a git carry is a *diff* of uncommitted work, where 5 MB already means
- *   generated artifacts (design §6.1);
- * - a workspace snapshot is the *entire project* for a project git cannot
- *   reconstruct, where 5 MB is an ordinary size. Reusing the smaller number
- *   would silently stop syncing projects that sync today.
+ * anything is copied. The FALLBACK, like `CARRY_MAX_BYTES`: the real one comes
+ * from `hub.workspaceMaxMb` via `snapshotWorkspace`'s `maxBytes`.
  *
  * The guard exists because `hubinclude` made an unbounded payload reachable: a
  * single `*` line re-admits every built-in exclude, and a measured
  * `node_modules` alone is 6,021 files. Before that the built-in excludes made
  * an over-budget payload nearly impossible, so there was nothing to bound.
+ *
+ * **WHY THIS AND `CARRY_MAX_BYTES` NOW SHARE A DEFAULT, having deliberately
+ * disagreed.** The original split was 50 MB here and 5 MB there, reasoning that
+ * a snapshot is a whole project while a carry is a diff, so 5 MB in a diff
+ * already means generated artifacts. The second half of that did not survive
+ * contact: measured on this repository, its own untracked `.superpowers/`
+ * working notes are ~12.6 MB of content the owner deliberately wants carried.
+ * A diff of uncommitted work is not inherently small — it is exactly as large
+ * as the work you have not committed yet. So the numbers agree now because the
+ * distinction they encoded turned out not to exist, NOT because the two
+ * payloads became the same thing. They still differ in every other way, and
+ * they are separately configurable precisely so a user who does find the split
+ * real can restore it.
  */
-export const WORKSPACE_MAX_BYTES = 50 * 1024 * 1024;
+export const WORKSPACE_MAX_BYTES = DEFAULT_WORKSPACE_MAX_MB * 1024 * 1024;
 
-/** What one carried FILE costs against a budget on top of its bytes (one tar header). */
+/**
+ * What one carried FILE costs against a budget on top of its bytes (one tar
+ * header). Fixed, not a fraction of the budget — see `CARRY_PER_FILE_BYTES` in
+ * carry.ts, which is the same charge for the same reason.
+ */
 const PER_FILE_BYTES = 512;
 
 /**
@@ -712,7 +722,24 @@ export async function snapshotWorkspace(
   warnings: string[];
 }> {
   const warnings: string[] = [];
-  const maxBytes = opts?.maxBytes ?? WORKSPACE_MAX_BYTES;
+  const maxBytes = Math.max(0, opts?.maxBytes ?? WORKSPACE_MAX_BYTES);
+  if (maxBytes === 0) {
+    // A budget of 0 is an explicit "snapshot nothing" (see `resolveBudgetMb`),
+    // answered before the measuring walk so that it costs nothing. Handled
+    // separately from the over-budget branch below rather than falling into it:
+    // on an EMPTY project the measured cost is also 0, and `0 > 0` is false, so
+    // that branch would quietly build an empty payload for a setting that said
+    // not to.
+    return {
+      fileCount: 0,
+      byteSize: 0,
+      symlinksSkipped: 0,
+      skipped: true,
+      warnings: [
+        "The workspace snapshot budget is set to 0, so this push carries no project files (hub.workspaceMaxMb). Raise that setting, or pass --no-workspace on later pushes, if that is not what you meant.",
+      ],
+    };
+  }
   const rules = readCarryRules(projectPath, warnings);
   let fileCount = 0;
   let byteSize = 0;

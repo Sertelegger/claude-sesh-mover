@@ -157,12 +157,73 @@ describe("captureCarry", () => {
     }
   });
 
+  it("the default budget is 50 MB, and it carries what the old 5 MB one declined", async () => {
+    // The number that motivated the change: this repository's own untracked
+    // `.superpowers/` notes are ~12.6 MB, so the old 5 MB budget declined the
+    // carry on the very repo that produced the tool. 6 MB stands in for that
+    // shape here — over the old default, comfortably under the new one.
+    expect(CARRY_MAX_BYTES).toBe(50 * 1024 * 1024);
+    const repo = gitRepo("carrybigdefault");
+    const dest = tempDest();
+    try {
+      writeFileSync(join(repo, "notes.md"), "n".repeat(6 * 1024 * 1024));
+      const r = await captureCarry(repo, dest);
+      expect(r.captured).toBe(true);
+      expect(existsSync(join(dest, "untracked", "notes.md"))).toBe(true);
+    } finally {
+      cleanup(repo, dest);
+    }
+  });
+
+  it("a budget of 0 declines everything, with its own reason and no `git` spawned", async () => {
+    // `0` is an explicit off switch, never "unlimited". It is answered before
+    // `git` runs, so the reason names the setting rather than a size.
+    const repo = gitRepo("carryzero");
+    const dest = tempDest();
+    try {
+      writeFileSync(join(repo, "scratch.txt"), "work\n");
+      const r = await captureCarry(repo, dest, { maxBytes: 0 });
+      expect(r.captured).toBe(false);
+      if (!r.captured) {
+        expect(r.reason).toBe("budget-disabled");
+        expect(r.detail).toContain("hub.carryMaxMb");
+      }
+      // Fails CLOSED: nothing partial is left behind either.
+      expect(existsSync(dest)).toBe(false);
+    } finally {
+      cleanup(repo, dest);
+    }
+  });
+
+  it("the per-file charge still bites at a RAISED budget — it is a cost, not a fraction", async () => {
+    // 512 B/file exists so 200k empty files cannot defeat a byte-only budget.
+    // Raising the byte budget must raise the implied file ceiling
+    // proportionally and no more: 40 empty files cost 20,480 B, which passes at
+    // 32 KB and fails at 16 KB regardless of measuring ~0 bytes of content.
+    const repo = gitRepo("carryperfile");
+    const dest = tempDest();
+    try {
+      mkdirSync(join(repo, "generated"), { recursive: true });
+      for (let i = 0; i < 40; i++) writeFileSync(join(repo, "generated", `f${i}.txt`), "");
+      const tight = await captureCarry(repo, dest, { maxBytes: 16 * 1024 });
+      expect(tight.captured).toBe(false);
+      if (!tight.captured) expect(tight.reason).toBe("too-large");
+      const roomy = await captureCarry(repo, dest, { maxBytes: 32 * 1024 });
+      expect(roomy.captured).toBe(true);
+    } finally {
+      cleanup(repo, dest);
+    }
+  });
+
   it("declines with too-large when the payload exceeds the budget", async () => {
     const repo = gitRepo();
     const dest = tempDest();
     try {
-      writeFileSync(join(repo, "big.txt"), "x".repeat(CARRY_MAX_BYTES + 1024));
-      const r = await captureCarry(repo, dest);
+      // A small explicit budget rather than the 50 MB default: the branch under
+      // test is `cost > maxBytes`, and materializing 50 MB of "x" to reach it
+      // would cost every run of this suite the same 50 MB.
+      writeFileSync(join(repo, "big.txt"), "x".repeat(64 * 1024));
+      const r = await captureCarry(repo, dest, { maxBytes: 32 * 1024 });
       expect(r.captured).toBe(false);
       if (!r.captured) {
         expect(r.reason).toBe("too-large");

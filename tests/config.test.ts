@@ -123,6 +123,7 @@ describe("config", () => {
       expect(cfg.hub).toEqual({
         path: "", noWorkspace: false, autoPush: true, startupNotice: true,
         pullAppend: true, onDivergence: "fragment", carryDiff: true,
+        carryMaxMb: 50, workspaceMaxMb: 50,
       });
       const updated = setConfigValue(cfg, "hub.path", "/mnt/share/hub");
       expect(updated.hub.path).toBe("/mnt/share/hub");
@@ -138,6 +139,10 @@ describe("config", () => {
       expect(setConfigValue(cfg, "hub.onDivergence", "adopt-hub").hub.onDivergence).toBe(
         "adopt-hub"
       );
+      // Same argument for the two budgets: reachable from the auto-push, which
+      // takes no flags, so a key missing from the defaults is unsettable.
+      expect(setConfigValue(cfg, "hub.carryMaxMb", 200).hub.carryMaxMb).toBe(200);
+      expect(setConfigValue(cfg, "hub.workspaceMaxMb", 0).hub.workspaceMaxMb).toBe(0);
       // hub.carryDiff is the only way to opt the SessionEnd auto-push out of
       // uploading uncommitted work: the hook takes no flags.
       expect(setConfigValue(cfg, "hub.carryDiff", false).hub.carryDiff).toBe(false);
@@ -270,6 +275,83 @@ describe("config", () => {
       writeConfig(projectDir, setConfigValue(readConfig(projectDir), "hub.path", "/other/hub"));
       expect(readConfigOverrides(projectDir).hub?.path).toBe("/other/hub");
       expect(computeEffectiveConfig(userDir, projectDir).hub.path).toBe("/other/hub");
+    });
+  });
+  describe("hub payload budgets", () => {
+    // The budgets are reachable from the SessionEnd auto-push, which takes no
+    // flags — so config is the only lever there, and a value nobody validated
+    // would silently disable a payload on every session end. Each case below is
+    // a value a human plausibly types into a JSON file by hand.
+    it("defaults to 50 MB for BOTH payloads, and both keys exist in the defaults", async () => {
+      const { getDefaultConfig, resolveHubBudgets } = await import("../src/config.js");
+      const d = getDefaultConfig();
+      // Present in the DEFAULTS, not merely in the type: `configure --set`
+      // rejects any dot-path absent from them, so a missing key here makes the
+      // setting unreachable from the CLI entirely.
+      expect(d.hub.carryMaxMb).toBe(50);
+      expect(d.hub.workspaceMaxMb).toBe(50);
+      const b = resolveHubBudgets(d);
+      expect(b).toEqual({
+        carryMaxBytes: 50 * 1024 * 1024,
+        workspaceMaxBytes: 50 * 1024 * 1024,
+        warnings: [],
+      });
+    });
+
+    it("0 means CARRY NOTHING — not unlimited — and says nothing about it", async () => {
+      const { resolveBudgetMb } = await import("../src/config.js");
+      // The dangerous reading is "0 = no limit", which turns a typo into an
+      // unbounded upload on an unattended push. It is an off switch.
+      expect(resolveBudgetMb(0, "hub.carryMaxMb", 50)).toEqual({ bytes: 0, warning: null });
+    });
+
+    it("a value that is not a size falls back to the default AND warns", async () => {
+      const { resolveBudgetMb, MAX_BUDGET_MB } = await import("../src/config.js");
+      for (const bad of [-1, -0.5, Number.NaN, Number.POSITIVE_INFINITY, "50", "abc", null, {}, []]) {
+        const r = resolveBudgetMb(bad, "hub.carryMaxMb", 50);
+        expect([bad, r.bytes]).toEqual([bad, 50 * 1024 * 1024]);
+        // Silently substituting the default is indistinguishable from the
+        // setting working, and the direction of the mistake is unknowable.
+        expect(r.warning, String(bad)).toContain("hub.carryMaxMb");
+      }
+      // Absurdly large is clamped rather than refused: the ceiling is about
+      // buffering the payload in memory, so the useful answer is the largest
+      // budget that still declines instead of failing to allocate.
+      const huge = resolveBudgetMb(1e9, "hub.carryMaxMb", 50);
+      expect(huge.bytes).toBe(MAX_BUDGET_MB * 1024 * 1024);
+      expect(huge.warning).toContain("ceiling");
+      // The boundary itself is allowed through untouched.
+      expect(resolveBudgetMb(MAX_BUDGET_MB, "hub.carryMaxMb", 50))
+        .toEqual({ bytes: MAX_BUDGET_MB * 1024 * 1024, warning: null });
+    });
+
+    it("a fraction is honored, floored to whole bytes", async () => {
+      const { resolveBudgetMb } = await import("../src/config.js");
+      expect(resolveBudgetMb(0.5, "hub.carryMaxMb", 50).bytes).toBe(512 * 1024);
+    });
+
+    it("resolveHubBudgets reports BOTH keys' complaints, not just the first", async () => {
+      const { getDefaultConfig, resolveHubBudgets } = await import("../src/config.js");
+      const config = getDefaultConfig();
+      (config.hub as unknown as Record<string, unknown>).carryMaxMb = -5;
+      (config.hub as unknown as Record<string, unknown>).workspaceMaxMb = "big";
+      const b = resolveHubBudgets(config);
+      expect(b.warnings).toHaveLength(2);
+      expect(b.warnings.join(" ")).toContain("hub.carryMaxMb");
+      expect(b.warnings.join(" ")).toContain("hub.workspaceMaxMb");
+      expect(b.carryMaxBytes).toBe(50 * 1024 * 1024);
+      expect(b.workspaceMaxBytes).toBe(50 * 1024 * 1024);
+    });
+
+    it("configValueKind tells a numeric key from every other kind", async () => {
+      const { configValueKind } = await import("../src/config.js");
+      expect(configValueKind("hub.carryMaxMb")).toBe("number");
+      expect(configValueKind("hub.workspaceMaxMb")).toBe("number");
+      expect(configValueKind("hub.path")).toBe("string");
+      expect(configValueKind("hub.autoPush")).toBe("boolean");
+      expect(configValueKind("export.exclude")).toBe("array");
+      expect(configValueKind("hub.nope")).toBe(null);
+      expect(configValueKind("__proto__.polluted")).toBe(null);
     });
   });
 });

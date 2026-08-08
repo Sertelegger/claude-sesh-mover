@@ -10,6 +10,7 @@ import {
   NEVER_INCLUDABLE, readCarryRules, type CarryRules, type DestinationBlock,
 } from "./workspace.js";
 import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
+import { DEFAULT_CARRY_MAX_MB } from "../config.js";
 
 /**
  * Byte budget for one carry payload: the diff plus every file copied beside it.
@@ -20,8 +21,20 @@ import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "../path
  * directory reads there as a corrupt install, not as a truncated upload. The
  * decline names the largest contributors so the offending `hubinclude` line is
  * obvious.
+ *
+ * This is the FALLBACK for a caller that passes no budget. The real one comes
+ * from `hub.carryMaxMb` and reaches here through `captureCarry`'s `maxBytes` —
+ * which matters because the decline is not retryable on demand (the carry rides
+ * a bundle, and an immediate re-push answers `upToDate`), and because the
+ * SessionEnd auto-push takes no flags, so config is the only lever there.
+ *
+ * It was 5 MB, on the reasoning that a carry is a *diff* of uncommitted work
+ * where 5 MB already means generated artifacts. Measured against reality that
+ * was simply wrong: this repository's own `.superpowers/` working notes are
+ * ~12.6 MB of untracked, non-gitignored files the owner deliberately wants
+ * carried, so the carry declined on the very repository that produced the tool.
  */
-export const CARRY_MAX_BYTES = 5 * 1024 * 1024;
+export const CARRY_MAX_BYTES = DEFAULT_CARRY_MAX_MB * 1024 * 1024;
 
 /**
  * What one carried FILE costs against the budget, on top of its bytes.
@@ -32,6 +45,14 @@ export const CARRY_MAX_BYTES = 5 * 1024 * 1024;
  * tiny generated files is exactly that shape. 512 bytes is one tar header —
  * small enough to be invisible for ordinary files (a 20 KB source file moves
  * the needle by 2.5%), decisive for a payload made of nothing but entries.
+ *
+ * It stays a FIXED per-file cost now that the byte budget is configurable, and
+ * that is the point: the charge is the real per-entry cost of a file (a tar
+ * header, a syscall, a write on the peer), which does not change because a user
+ * raised the ceiling. Scaling it with the budget would defeat it exactly where
+ * it is needed — the file-count ceiling it implies rises WITH the budget
+ * (10,240 empty files at 5 MB, 102,400 at 50 MB, ~2.1M at the 1 GB clamp), so
+ * a raised budget buys proportionally more files, never unbounded ones.
  */
 const CARRY_PER_FILE_BYTES = 512;
 
@@ -242,8 +263,10 @@ export type CarryDeclineReason =
   | "no-commits"
   /** Nothing to carry once the carry rules have had their say. */
   | "clean"
-  /** Payload over `CARRY_MAX_BYTES`; nothing was written. */
+  /** Payload over the carry budget; nothing was written. */
   | "too-large"
+  /** The carry budget is `0` — an explicit "carry nothing". Nothing was attempted. */
+  | "budget-disabled"
   /** A `git` invocation failed after HEAD had already resolved. */
   | "git-failed"
   /** The payload could not be written to the bundle; nothing was left behind. */
@@ -320,7 +343,14 @@ export interface CaptureCarryOptions {
    * `readHubinclude`'s `diagnostics`).
    */
   diagnostics?: string[];
-  /** Override `CARRY_MAX_BYTES` (tests; keeps the budget assertions cheap). */
+  /**
+   * The byte budget for this capture, overriding `CARRY_MAX_BYTES`.
+   *
+   * `hub/push.ts` passes the user's resolved `hub.carryMaxMb` through here, so
+   * this is the production path, not only a test seam. `0` declines everything
+   * (see `captureCarry`); tests use small values to keep budget assertions
+   * cheap.
+   */
   maxBytes?: number;
 }
 
@@ -577,7 +607,20 @@ export async function captureCarry(
   opts?: CaptureCarryOptions
 ): Promise<CaptureResult> {
   const diagnostics = opts?.diagnostics ?? [];
-  const maxBytes = Math.max(1, opts?.maxBytes ?? CARRY_MAX_BYTES);
+  // `Math.max(0, …)`, not `Math.max(1, …)`: a configured budget of 0 means
+  // "carry nothing" and has to stay exactly 0, or the early return below never
+  // fires and a 1-byte budget declines with a message about sizes instead.
+  const maxBytes = Math.max(0, opts?.maxBytes ?? CARRY_MAX_BYTES);
+  if (maxBytes === 0) {
+    // Answered before `git` is spawned at all: a disabled budget should cost
+    // nothing, and `git diff` with a 1-byte maxBuffer would otherwise decline
+    // through ENOBUFS with a size complaint that explains the wrong thing.
+    return {
+      captured: false,
+      reason: "budget-disabled",
+      detail: "the carry budget is set to 0, so no uncommitted work is carried (hub.carryMaxMb)",
+    };
+  }
 
   // `--verify` so a failure is unambiguous: plain `rev-parse HEAD` prints
   // "HEAD" on stdout AND exits 128 when HEAD is unborn.
@@ -687,7 +730,7 @@ export async function captureCarry(
   if (cost > maxBytes) {
     // Reports the REAL size AND the file count, because either one alone can be
     // the cause: without the count a payload of empty files reads as "0 bytes
-    // exceeds 5 MB". `largest:` is omitted when every contributor measures zero
+    // exceeds 50 MB". `largest:` is omitted when every contributor measures zero
     // — three arbitrary empty filenames explain nothing.
     const largest = describeLargest(files, patch.length);
     return {
@@ -847,10 +890,19 @@ function applyInvocation(applyPrefix: string, mode: string[], patchPath: string)
  * Cap on a patch this module will INSPECT. Over it the payload is declined
  * rather than applied unchecked: the floor and symlink guards below both read
  * the whole patch, and a guard that silently gives up on large input is not a
- * guard. The sender's own budget is `CARRY_MAX_BYTES` (5 MB), so this only ever
- * bites a hand-made or damaged bundle.
+ * guard.
+ *
+ * It has to sit ABOVE the sender's default budget, and that is why it moved
+ * with it. At 32 MB against a 5 MB sender it only ever bit a hand-made or
+ * damaged bundle; against a 50 MB sender it would have started refusing
+ * ordinary payloads on the receiving side, where the remedy (`hub.carryMaxMb`)
+ * lives on the OTHER machine. This is a receiver-side constant and cannot know
+ * what the sender configured, so the relationship is stated rather than
+ * enforced: a machine that raises `hub.carryMaxMb` above this produces payloads
+ * its peers save but do not apply — the fail-closed direction, with the saved
+ * copy and its README as the remedy.
  */
-const PATCH_SCAN_MAX_BYTES = 32 * 1024 * 1024;
+const PATCH_SCAN_MAX_BYTES = 128 * 1024 * 1024;
 
 /**
  * How many saved carry payloads a project keeps. A carry rides every push that

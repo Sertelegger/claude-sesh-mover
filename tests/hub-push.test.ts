@@ -474,9 +474,16 @@ describe("hub push — git-diff carry", () => {
   });
 
   it("warns, without failing the push, when the carry busts the budget", async () => {
-    const { result, extractDir, cleanup } = await pushAndExtract((p) => {
-      writeFileSync(join(p, "huge.bin"), "x".repeat(6 * 1024 * 1024));
-    });
+    // An explicit small budget rather than 6 MB against the default: since the
+    // default is 50 MB, materializing enough bytes to bust it would cost every
+    // run of this suite 50 MB of I/O to exercise one comparison. This is also
+    // the path a user's `hub.carryMaxMb` takes to get here.
+    const { result, extractDir, cleanup } = await pushAndExtract(
+      (p) => {
+        writeFileSync(join(p, "huge.bin"), "x".repeat(256 * 1024));
+      },
+      { budgets: { carryMaxBytes: 64 * 1024, workspaceMaxBytes: 50 * 1024 * 1024, warnings: [] } }
+    );
     try {
       expect(result.success).toBe(true);
       if (!result.success) return;

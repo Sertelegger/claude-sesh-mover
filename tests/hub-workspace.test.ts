@@ -611,8 +611,50 @@ describe("hubinclude", () => {
     } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
   });
 
-  it("WORKSPACE_MAX_BYTES is its own budget, deliberately larger than a carry's", () => {
+  it("WORKSPACE_MAX_BYTES is the 50 MB default, and the carry's now matches it", async () => {
+    const { CARRY_MAX_BYTES } = await import("../src/hub/carry.js");
     expect(WORKSPACE_MAX_BYTES).toBe(50 * 1024 * 1024);
+    // They disagreed (50 MB vs 5 MB) on the reasoning that a carry is a diff
+    // and therefore small. Measured, that was false — this repo's own untracked
+    // working notes are ~12.6 MB — so the numbers agree now because the
+    // distinction they encoded did not exist, not because the payloads did.
+    // They stay SEPARATELY configurable so a user who does find the split real
+    // can restore it.
+    expect(CARRY_MAX_BYTES).toBe(WORKSPACE_MAX_BYTES);
+  });
+
+  it("a budget of 0 skips the snapshot outright, even for an EMPTY project", async () => {
+    // The over-budget branch compares `cost > maxBytes`, and an empty project
+    // measures 0 — so `0 > 0` is false and a plain reuse of that branch would
+    // build an empty payload for a setting that said not to. It is answered
+    // before the measuring walk instead.
+    for (const seed of [true, false]) {
+      const src = tmp("sesh-zero-src-");
+      const dest = tmp("sesh-zero-dest-");
+      try {
+        if (seed) writeFileSync(join(src, "app.ts"), "code\n");
+        const r = await snapshotWorkspace(src, dest, { maxBytes: 0 });
+        expect(r.skipped).toBe(true);
+        expect(r.fileCount).toBe(0);
+        expect(r.warnings.join(" ")).toContain("hub.workspaceMaxMb");
+        expect(listAll(dest)).toEqual([]);
+      } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+    }
+  });
+
+  it("a raised budget carries what the old 50 MB default would have declined", async () => {
+    const src = tmp("sesh-raise-src-");
+    const dest = tmp("sesh-raise-dest-");
+    try {
+      writeFileSync(join(src, "big.bin"), Buffer.alloc(64 * 1024, 7));
+      // Just under, then just over: the budget is the thing being tested, not
+      // the tree.
+      expect((await snapshotWorkspace(src, dest, { maxBytes: 32 * 1024 })).skipped).toBe(true);
+      rmSync(dest, { recursive: true, force: true });
+      const ok = await snapshotWorkspace(src, dest, { maxBytes: 128 * 1024 });
+      expect(ok.skipped).toBe(false);
+      expect(ok.fileCount).toBe(1);
+    } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
   });
 
   it("counts files as well as bytes, so a tree of empty files cannot slip the budget", async () => {

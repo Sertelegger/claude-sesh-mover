@@ -265,6 +265,19 @@ export interface SeshMoverConfig {
     // regardless, since no carry rule filters the patch (reported back as
     // `carry.trackedIgnored`).
     carryDiff: boolean;
+    // Byte budget for the git-diff carry, in MB (default 50). Over it the WHOLE
+    // payload is declined with a warning, never partially sent. `0` means carry
+    // nothing; a negative, non-finite or non-numeric value falls back to the
+    // default with a warning; anything over 1024 MB is clamped. See
+    // `resolveBudgetMb` in config.ts for why each of those is what it is.
+    //
+    // Worth knowing before raising it: the carry rides a bundle pushed on EVERY
+    // session end, unattended, and the hub keeps every bundle — so a 50 MB
+    // carry on a synced folder is 50 MB of sync traffic per session end.
+    carryMaxMb: number;
+    // The same, for the whole-project workspace snapshot a project with no git
+    // remotes pushes instead of a carry (default 50).
+    workspaceMaxMb: number;
   };
 }
 

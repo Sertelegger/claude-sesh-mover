@@ -260,21 +260,26 @@ export declare function isCarriedPath(relPath: string, rules: CarryRules): boole
 export declare function readCarryRules(projectPath: string, diagnostics?: string[]): CarryRules;
 /**
  * Byte budget for one workspace snapshot — the whole payload, measured before
- * anything is copied.
- *
- * Deliberately NOT `CARRY_MAX_BYTES` (5 MB), and the two must not be
- * "harmonized":
- *
- * - a git carry is a *diff* of uncommitted work, where 5 MB already means
- *   generated artifacts (design §6.1);
- * - a workspace snapshot is the *entire project* for a project git cannot
- *   reconstruct, where 5 MB is an ordinary size. Reusing the smaller number
- *   would silently stop syncing projects that sync today.
+ * anything is copied. The FALLBACK, like `CARRY_MAX_BYTES`: the real one comes
+ * from `hub.workspaceMaxMb` via `snapshotWorkspace`'s `maxBytes`.
  *
  * The guard exists because `hubinclude` made an unbounded payload reachable: a
  * single `*` line re-admits every built-in exclude, and a measured
  * `node_modules` alone is 6,021 files. Before that the built-in excludes made
  * an over-budget payload nearly impossible, so there was nothing to bound.
+ *
+ * **WHY THIS AND `CARRY_MAX_BYTES` NOW SHARE A DEFAULT, having deliberately
+ * disagreed.** The original split was 50 MB here and 5 MB there, reasoning that
+ * a snapshot is a whole project while a carry is a diff, so 5 MB in a diff
+ * already means generated artifacts. The second half of that did not survive
+ * contact: measured on this repository, its own untracked `.superpowers/`
+ * working notes are ~12.6 MB of content the owner deliberately wants carried.
+ * A diff of uncommitted work is not inherently small — it is exactly as large
+ * as the work you have not committed yet. So the numbers agree now because the
+ * distinction they encoded turned out not to exist, NOT because the two
+ * payloads became the same thing. They still differ in every other way, and
+ * they are separately configurable precisely so a user who does find the split
+ * real can restore it.
  */
 export declare const WORKSPACE_MAX_BYTES: number;
 /**

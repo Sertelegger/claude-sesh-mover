@@ -201,6 +201,8 @@ export interface SeshMoverConfig {
         pullAppend: boolean;
         onDivergence: OnDivergenceMode;
         carryDiff: boolean;
+        carryMaxMb: number;
+        workspaceMaxMb: number;
     };
 }
 /**

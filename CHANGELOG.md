@@ -55,6 +55,43 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   legacy `hubinclude` an older peer still reads. The three dotfiles need the floor *more*
   than the directory did — they sit at the project root, so a payload can name one directly
   with no directory segment in the way.
+- **The git-diff carry budget is 50 MB, up from 5 MB, and both payload budgets are now
+  configurable** — `hub.carryMaxMb` and `hub.workspaceMaxMb`, in megabytes, both defaulting
+  to 50. The old 5 MB rested on the reasoning that a carry is a *diff* of uncommitted work,
+  where 5 MB already means generated artifacts. Measured, that is not how people work: this
+  repository's own untracked `.superpowers/` working notes are ~12.6 MB of content its owner
+  deliberately wants carried, so the carry declined on the very repo that produced the tool.
+  A hub is a directory with a disk behind it; the budget exists to stop a runaway payload,
+  not to ration ordinary work. The two numbers agree now because the distinction they
+  encoded turned out not to exist — the payloads are still separately configurable, so a
+  user who does find the split real can restore it.
+
+  Both budgets still fail **closed**: over budget the whole payload is declined with a
+  warning, never partially sent. `0` means carry nothing — an explicit off switch, never
+  "unlimited", which is the reading that would turn a typo into an unbounded upload on an
+  unattended session-end push. A negative, non-finite or non-numeric value falls back to the
+  default *and warns*, because silently substituting it is indistinguishable from the
+  setting working. Values over 1024 MB are clamped, with a warning: that ceiling is a memory
+  limit rather than a policy one, since both payloads are held whole in memory to build and
+  again to check on the receiving machine. `configure --set` now stores a numeric key as a
+  number and refuses a non-numeric value outright, instead of persisting `"100"` as a string
+  that every later push would read as "not a size". The 512-bytes-per-file charge is
+  unchanged and stays a fixed cost rather than a fraction of the budget, so a raised budget
+  buys proportionally more files and never unbounded ones.
+
+  **There is deliberately no CLI flag for either.** A declined carry is not retryable on
+  demand — it rides a bundle, so an immediate re-push answers `upToDate` and a flag on the
+  retry would be inert in the one situation you would reach for it — and the push that
+  matters most is the unattended SessionEnd one, which takes no flags at all. Worth knowing
+  before raising it: that push happens on **every** session end and the hub keeps **every**
+  bundle, so a 50 MB carry on a synced folder is 50 MB of sync traffic per session end.
+
+  The receiver-side cap on a patch this version will *inspect* moved with the default, from
+  32 MB to 128 MB. At 32 MB against a 5 MB sender it only ever met a hand-made or damaged
+  bundle; against a 50 MB sender it would have begun refusing ordinary payloads on the
+  receiving machine, where the remedy lives on the *other* one. A machine that raises
+  `hub.carryMaxMb` past 128 MB produces payloads its peers save but do not apply — the
+  fail-closed direction, with the saved copy and its README as the remedy.
 
 ## [0.6.0] — 2026-08-06
 

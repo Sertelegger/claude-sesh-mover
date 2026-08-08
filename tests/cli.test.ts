@@ -779,6 +779,51 @@ describe("cli", () => {
       }
     });
 
+    it("--set stores a NUMERIC config key as a number, not as a string", () => {
+      // `--set` used to parse only `true`/`false` and a leading `[`, leaving
+      // everything else a string. `hub.carryMaxMb=100` would then persist
+      // `"100"`, which `resolveBudgetMb` reads as "not a size" — so every push
+      // afterwards silently fell back to the default while warning about a
+      // value the user typed correctly.
+      const homeOverride = overrideHome(tempDir);
+      try {
+        expect(JSON.parse(runCli(`configure --scope user --set hub.carryMaxMb=100 --json`)).success)
+          .toBe(true);
+        const shown = JSON.parse(runCli("configure --show --json"));
+        expect(shown.config.hub.carryMaxMb).toBe(100);
+        // …and it is on disk as a number, not as a quoted string.
+        const raw = JSON.parse(
+          readFileSync(join(tempDir, ".sesh-mover", "config.json"), "utf-8")
+        );
+        expect(raw.hub.carryMaxMb).toBe(100);
+        // 0 is a legitimate setting (carry nothing), so it must not be
+        // mistaken for "unset" anywhere on the way in.
+        expect(JSON.parse(runCli(`configure --scope user --set hub.workspaceMaxMb=0 --json`)).success)
+          .toBe(true);
+        expect(JSON.parse(runCli("configure --show --json")).config.hub.workspaceMaxMb).toBe(0);
+      } finally {
+        homeOverride.restore();
+      }
+    });
+
+    it("--set refuses a non-numeric value for a numeric key instead of storing it", () => {
+      const homeOverride = overrideHome(tempDir);
+      let caught: { stdout: string; status: number } | null = null;
+      try {
+        runCli(`configure --scope user --set hub.carryMaxMb=lots --json`);
+      } catch (e) {
+        const err = e as { stdout?: Buffer; status?: number };
+        caught = { stdout: err.stdout ? err.stdout.toString() : "", status: err.status ?? 0 };
+      } finally {
+        homeOverride.restore();
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.status).not.toBe(0);
+      const result = JSON.parse(caught!.stdout);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("hub.carryMaxMb");
+    });
+
     it("returns clean ErrorResult JSON for malformed --set JSON values", () => {
       let caught: { stdout: string; status: number } | null = null;
       try {
@@ -1156,6 +1201,84 @@ describe("cli", () => {
         expect(second.success).toBe(true);
         expect(second.upToDate).toBe(false); // a real bundle, just no carry in it
         expect(second.carry).toBeUndefined();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+
+    it("hub.carryMaxMb reaches the payload builder — 0 declines, a bad value warns", () => {
+      // The wiring test for the budgets, not the arithmetic (config.test.ts has
+      // that): a budget nothing threads through the CLI is a setting that does
+      // not exist, and the push that matters most is the unattended SessionEnd
+      // one, which takes no flags at all.
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-budget-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-budget-hub-"));
+      const projectPath = join(tempDir, "budgetproj");
+      mkdirSync(projectPath, { recursive: true });
+      const realEncoded = encodeProjectPath(projectPath);
+      const sessionPath = join(configDir, "projects", realEncoded, `${sessionId}.jsonl`);
+      try {
+        runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", realEncoded),
+          { recursive: true }
+        );
+        const g = (args: string[]): void => {
+          execFileSync("git", args, { cwd: projectPath, stdio: "ignore" });
+        };
+        g(["init", "-q"]);
+        g(["config", "user.email", "t@example.com"]);
+        g(["config", "user.name", "Test"]);
+        g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v1\n");
+        g(["add", "-A"]);
+        g(["commit", "-q", "-m", "init"]);
+        writeFileSync(join(projectPath, "tracked.txt"), "v2 uncommitted\n");
+
+        const homeOverride = overrideHome(home);
+        try {
+          runCli(`configure --scope user --set hub.carryMaxMb=0 --json`, homeEnv(home));
+        } finally {
+          homeOverride.restore();
+        }
+        const zero = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(zero.success).toBe(true);
+        // Fails CLOSED and says so: no carry in the bundle, and a warning that
+        // names the setting rather than a size.
+        expect(zero.carry).toBeUndefined();
+        expect(zero.warnings.join(" ")).toContain("hub.carryMaxMb");
+
+        // A value that is not a size: the default applies and the push says so
+        // — silence here is indistinguishable from the setting working.
+        writeFileSync(
+          join(home, ".sesh-mover", "config.json"),
+          JSON.stringify({ hub: { path: hubDir, carryMaxMb: "lots" } }, null, 2) + "\n"
+        );
+        writeFileSync(join(projectPath, "tracked.txt"), "v3 uncommitted\n");
+        appendFileSync(
+          sessionPath,
+          JSON.stringify({
+            type: "user", uuid: "budget-cfg-1", parentUuid: null, timestamp: new Date().toISOString(),
+            cwd: projectPath, sessionId, version: "2.1.81",
+            message: { role: "user", content: "more" },
+          }) + "\n"
+        );
+        const bad = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(bad.success).toBe(true);
+        expect(bad.warnings.join(" ")).toContain("hub.carryMaxMb");
+        expect(bad.carry.baseCommit).toMatch(/^[0-9a-f]{40}$/); // the default applied
       } finally {
         rmSync(home, { recursive: true, force: true });
         rmSync(hubDir, { recursive: true, force: true });

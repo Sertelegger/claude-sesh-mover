@@ -8,6 +8,18 @@ import { type DestinationBlock } from "./workspace.js";
  * directory reads there as a corrupt install, not as a truncated upload. The
  * decline names the largest contributors so the offending `hubinclude` line is
  * obvious.
+ *
+ * This is the FALLBACK for a caller that passes no budget. The real one comes
+ * from `hub.carryMaxMb` and reaches here through `captureCarry`'s `maxBytes` —
+ * which matters because the decline is not retryable on demand (the carry rides
+ * a bundle, and an immediate re-push answers `upToDate`), and because the
+ * SessionEnd auto-push takes no flags, so config is the only lever there.
+ *
+ * It was 5 MB, on the reasoning that a carry is a *diff* of uncommitted work
+ * where 5 MB already means generated artifacts. Measured against reality that
+ * was simply wrong: this repository's own `.superpowers/` working notes are
+ * ~12.6 MB of untracked, non-gitignored files the owner deliberately wants
+ * carried, so the carry declined on the very repository that produced the tool.
  */
 export declare const CARRY_MAX_BYTES: number;
 /**
@@ -41,8 +53,10 @@ export type CarryDeclineReason =
  | "no-commits"
 /** Nothing to carry once the carry rules have had their say. */
  | "clean"
-/** Payload over `CARRY_MAX_BYTES`; nothing was written. */
+/** Payload over the carry budget; nothing was written. */
  | "too-large"
+/** The carry budget is `0` — an explicit "carry nothing". Nothing was attempted. */
+ | "budget-disabled"
 /** A `git` invocation failed after HEAD had already resolved. */
  | "git-failed"
 /** The payload could not be written to the bundle; nothing was left behind. */
@@ -121,7 +135,14 @@ export interface CaptureCarryOptions {
      * `readHubinclude`'s `diagnostics`).
      */
     diagnostics?: string[];
-    /** Override `CARRY_MAX_BYTES` (tests; keeps the budget assertions cheap). */
+    /**
+     * The byte budget for this capture, overriding `CARRY_MAX_BYTES`.
+     *
+     * `hub/push.ts` passes the user's resolved `hub.carryMaxMb` through here, so
+     * this is the production path, not only a test seam. `0` declines everything
+     * (see `captureCarry`); tests use small values to keep budget assertions
+     * cheap.
+     */
     maxBytes?: number;
 }
 /**

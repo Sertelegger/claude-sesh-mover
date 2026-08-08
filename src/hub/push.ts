@@ -43,6 +43,17 @@ export interface HubPushOptions {
    * its changes and no carry rule filters the patch — see `trackedIgnored`.)
    */
   noCarry?: boolean;
+  /**
+   * Byte budgets for the two optional payloads, resolved from `hub.carryMaxMb`
+   * and `hub.workspaceMaxMb`, plus whatever resolving them had to say.
+   *
+   * Resolved by the CALLER rather than read here, for the same reason
+   * `noWorkspace`/`noCarry` are: this module is handed a decision, not a config
+   * directory, and there is exactly one resolver (`resolveHubBudgets`) so the
+   * SessionEnd auto-push and the manual push cannot drift. Absent means "use
+   * the module defaults", which is what a programmatic caller gets.
+   */
+  budgets?: { carryMaxBytes: number; workspaceMaxBytes: number; warnings: string[] };
   projectIdOverride?: string;
   createProject?: boolean;
   claudeVersion: string;
@@ -244,6 +255,10 @@ export async function hubPush(
     const warnings: string[] = [];
     // See hub/status.ts: the user-directory migration notice, if there is one.
     warnings.push(...userDirWarnings());
+    // A budget that could not be read as written. Said once, up front, rather
+    // than folded into the decline it causes — the two are different facts, and
+    // on an unattended session-end push this is the only trace of the typo.
+    warnings.push(...(opts.budgets?.warnings ?? []));
     if (lock.stoleStale) {
       warnings.push(
         "Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress."
@@ -414,7 +429,9 @@ export async function hubPush(
     // the working tree from otherwise.
     let hasWorkspace = false;
     if (!opts.noWorkspace && gitScan().kind === "none" && existsSync(opts.projectPath)) {
-      const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"));
+      const ws = await snapshotWorkspace(opts.projectPath, join(bundleStaging, "workspace"), {
+        maxBytes: opts.budgets?.workspaceMaxBytes,
+      });
       if (ws.symlinksSkipped > 0) warnings.push(`${ws.symlinksSkipped} symlink(s) skipped in workspace snapshot.`);
       // Rule-level diagnostics (a hubinclude past a cap, an exclude set that
       // swallowed the whole tree, a payload over the snapshot budget). Every
@@ -472,7 +489,9 @@ export async function hubPush(
       // unbounded (mid-rebase, submodules, 200k untracked files, a filesystem
       // that refuses a read), and no failure of the OPTIONAL half of a push may
       // cost the user the session bundle that is the point of the operation.
-      const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), { diagnostics })
+      const cap = await captureCarry(opts.projectPath, join(bundleStaging, "carry"), {
+        diagnostics, maxBytes: opts.budgets?.carryMaxBytes,
+      })
         .catch((e: Error) => ({ captured: false, reason: "git-failed", detail: e.message } as const));
       warnings.push(...diagnostics);
       if (cap.captured) {
