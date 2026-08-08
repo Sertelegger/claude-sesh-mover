@@ -4,6 +4,25 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
 
 ## [0.8.0] — 2026-08-08
 
+> [!WARNING]
+> **Breaking, and there is no migration — this release is a clean break.**
+>
+> 0.8.0 does not read, move, or warn about anything a previous version wrote. Two
+> per-project files are renamed, and every pre-0.8.0 path is simply ignored.
+>
+> **What you do, per project:** recreate `.sesh-mover-include` and
+> `.sesh-mover-ignore` (renamed from `.sesh-mover-hubinclude` /
+> `.sesh-mover-hubignore`). Copy `.sesh-mover-project.json` across verbatim to keep
+> that project's hub link, or let the next push re-link by git remote.
+>
+> **What you do, per machine:** nothing is required. `~/.claude-sesh-mover/` and any
+> `<project>/.claude-sesh-mover/` are no longer read and can be deleted. A machine
+> coming from 0.6.x gets a fresh identity and re-uploads sessions as full bundles
+> on its first push — expected, not an error.
+>
+> **Coming from 0.6.x?** 0.7.0 and 0.8.0 are one break, not two. Follow this note
+> only; the 0.7.0 instructions are superseded.
+
 ### Changed
 
 - **The two per-project list files drop `hub` from their names.** `.sesh-mover-hubinclude`
