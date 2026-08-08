@@ -20,7 +20,7 @@ import { WORKSPACE_MAX_BYTES } from "../src/hub/workspace.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
-// Identity linking writes `.claude-sesh-mover/project.json` under the real
+// Identity linking writes `.sesh-mover-project.json` under the real
 // project directory (src/hub/identity.ts's writeLocalProjectId). The
 // exporter/importer/migrator fixtures elsewhere in this suite get away with
 // a purely virtual "/Users/testuser/Projects/testproject" projectPath
@@ -90,7 +90,7 @@ describe("hub push", () => {
 
   /**
    * Linking IS the consent gate for the default-on automation: once
-   * `.claude-sesh-mover/project.json` exists, `evaluateHookGate` lets the
+   * `.sesh-mover-project.json` exists, `evaluateHookGate` lets the
    * SessionEnd auto-push run, and for a git-less project that push uploads the
    * WHOLE working tree without reading .gitignore. So a push that FAILED must
    * not leave the project linked.
@@ -128,7 +128,7 @@ describe("hub push", () => {
       expect("error" in r && r.error).toContain("No sessions found");
 
       // Nothing local was linked...
-      expect(existsSync(join(sessionless, ".claude-sesh-mover", "project.json"))).toBe(false);
+      expect(existsSync(join(sessionless, ".sesh-mover-project.json"))).toBe(false);
       // ...and no hub project was minted for it either.
       expect(existsSync(join(hub, "projects"))).toBe(false);
     } finally {
@@ -381,12 +381,12 @@ describe("hub push — git-diff carry", () => {
       expect(manifest.carry.baseCommit).toMatch(/^[0-9a-f]{40}$/);
       expect(readFileSync(join(extractDir, "carry", "changes.patch"), "utf-8")).toContain("README.md");
       expect(readFileSync(join(extractDir, "carry", "untracked", "scratch.txt"), "utf-8")).toBe("new work\n");
-      // Every hub-linked project has an untracked .claude-sesh-mover/project.json
+      // Every hub-linked project has an untracked .sesh-mover-project.json
       // by the time carry runs — identity linking writes it earlier in this very
       // push. Nothing about it is gitignored, so only the NEVER floor keeps the
       // plugin's own state (and the file that decides what the NEXT push ships)
       // out of the bundle.
-      expect(existsSync(join(extractDir, "carry", "untracked", ".claude-sesh-mover"))).toBe(false);
+      expect(existsSync(join(extractDir, "carry", "untracked", ".sesh-mover"))).toBe(false);
       expect(result.carry.untrackedCount).toBe(2);
       expect(readFileSync(join(extractDir, "carry", "untracked", "café note.txt"), "utf-8")).toBe("unicode\n");
     } finally {
@@ -428,8 +428,8 @@ describe("hub push — git-diff carry", () => {
       mkdirSync(join(p, "docs"), { recursive: true });
       writeFileSync(join(p, "docs", "spec.md"), "# spec\n");
       writeFileSync(join(p, "secret.env"), "TOKEN=1\n");
-      mkdirSync(join(p, ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(p, ".claude-sesh-mover", "hubinclude"), "docs/\n");
+      mkdirSync(join(p, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(p, ".sesh-mover-hubinclude"), "docs/\n");
     });
     try {
       expect(result.success).toBe(true);
@@ -671,8 +671,8 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
       writeFileSync(join(p, "docs", "design.md"), "spec\n");
       // Present but empty of patterns: the user has already met the mechanism,
       // so the discovery aid has done its job and must stop nagging.
-      mkdirSync(join(p, ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(p, ".claude-sesh-mover", "hubinclude"), "# nothing yet\n");
+      mkdirSync(join(p, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(p, ".sesh-mover-hubinclude"), "# nothing yet\n");
     });
     expect(reported).toBeUndefined();
   });
@@ -687,7 +687,7 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
 
   it("caps the report at 10 paths and never names plugin or VCS internals", async () => {
     const reported = await pushIgnoreFixture(
-      Array.from({ length: 14 }, (_, i) => `ig${i}/`).join("\n") + "\n.claude-sesh-mover/\n",
+      Array.from({ length: 14 }, (_, i) => `ig${i}/`).join("\n") + "\n.sesh-mover/\n",
       (p) => {
         for (let i = 0; i < 14; i++) {
           mkdirSync(join(p, `ig${i}`), { recursive: true });
@@ -696,7 +696,7 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
       }
     );
     expect(reported).toHaveLength(10);
-    expect(reported!.some((p) => p.startsWith(".claude-sesh-mover"))).toBe(false);
+    expect(reported!.some((p) => p.startsWith(".sesh-mover"))).toBe(false);
   });
 
   it("an over-budget workspace pushes the sessions, declares no payload, and records NO generation", async () => {
@@ -778,7 +778,7 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
  * above) only covers failures UP TO that point. Everything after
  * `commitIdentity()` — the archive, the bundle upload, the index write, an
  * unreadable file the workspace snapshot trips over — used to surface as a bare
- * thrown Error with `.claude-sesh-mover/project.json` sitting in the project
+ * thrown Error with `.sesh-mover-project.json` sitting in the project
  * directory, which is precisely what arms the default-on SessionEnd auto-push:
  * the next session end then uploads the whole working tree of a push the user
  * watched fail.
@@ -820,7 +820,7 @@ describe("hub push — a failure after the link is committed", () => {
   }
 
   const linkPath = (projectPath: string): string =>
-    join(projectPath, ".claude-sesh-mover", "project.json");
+    join(projectPath, ".sesh-mover-project.json");
 
   it("rolls the link back and reports the project as NOT linked", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-push-rb-home-"));
@@ -853,7 +853,7 @@ describe("hub push — a failure after the link is committed", () => {
       expect(existsSync(linkPath(projectPath))).toBe(false);
       // ...and the directory the link write created goes with it, since
       // nothing else of the user's lives in it.
-      expect(existsSync(join(projectPath, ".claude-sesh-mover"))).toBe(false);
+      expect(existsSync(join(projectPath, ".sesh-mover"))).toBe(false);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
@@ -869,8 +869,8 @@ describe("hub push — a failure after the link is committed", () => {
       const { configDir } = createFixtureTree(base);
       const projectPath = createRealProject(base, configDir);
       // The user's own rules file, written long before this push.
-      mkdirSync(join(projectPath, ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(projectPath, ".claude-sesh-mover", "hubignore"), "build/\n");
+      mkdirSync(join(projectPath, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(projectPath, ".sesh-mover-hubignore"), "build/\n");
       await hubInit({ hubPath: hub, configScope: "user", cwd: home });
       seedHubProject(hub);
       blockBundleDir(hub);
@@ -881,7 +881,7 @@ describe("hub push — a failure after the link is committed", () => {
       });
       expect(r.success).toBe(false);
       expect(existsSync(linkPath(projectPath))).toBe(false);
-      expect(readFileSync(join(projectPath, ".claude-sesh-mover", "hubignore"), "utf-8")).toBe("build/\n");
+      expect(readFileSync(join(projectPath, ".sesh-mover-hubignore"), "utf-8")).toBe("build/\n");
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
@@ -900,7 +900,7 @@ describe("hub push — a failure after the link is committed", () => {
       seedHubProject(hub);
       // Linked before this push ever ran — committed to the repo, in the real
       // flow. A failure of OURS is not licence to delete it.
-      mkdirSync(join(projectPath, ".claude-sesh-mover"), { recursive: true });
+      mkdirSync(join(projectPath, ".sesh-mover"), { recursive: true });
       const preExisting = JSON.stringify({
         projectId: PROJECT_ID, name: "seeded",
         createdAt: "2026-07-01T00:00:00.000Z", createdByMachine: "some-other-machine",

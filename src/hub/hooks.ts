@@ -1,8 +1,8 @@
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { computeEffectiveConfig } from "../config.js";
 import { resolveHubPath } from "./init.js";
 import { readLocalProjectId } from "./identity.js";
+import { projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 
 /**
  * Shared gating primitive for the Claude Code hook endpoints
@@ -72,8 +72,8 @@ export function evaluateHookGate(payload: HookPayload, key: HookGateKey): HookGa
   // Same call shape hub/status.ts uses: computeEffectiveConfig reads the raw
   // override files itself, so an absent layer contributes nothing.
   const config = computeEffectiveConfig(
-    join(homedir(), ".claude-sesh-mover"),
-    join(projectPath, ".claude-sesh-mover")
+    userSeshMoverDir(),
+    projectSeshMoverDir(projectPath)
   );
   const hubPath = resolveHubPath(config);
   if (!hubPath) return { ok: false, reason: "no-hub" };

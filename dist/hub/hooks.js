@@ -1,8 +1,7 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { computeEffectiveConfig } from "../config.js";
 import { resolveHubPath } from "./init.js";
 import { readLocalProjectId } from "./identity.js";
+import { projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 // Hook payloads arrive on stdin as JSON. A malformed payload must never crash
 // the hook — the endpoints exit 0 no matter what, so parsing failures degrade
 // to "no context" and the gate declines. The shape check is load-bearing:
@@ -34,7 +33,7 @@ export function evaluateHookGate(payload, key) {
         return { ok: false, reason: "no-cwd" };
     // Same call shape hub/status.ts uses: computeEffectiveConfig reads the raw
     // override files itself, so an absent layer contributes nothing.
-    const config = computeEffectiveConfig(join(homedir(), ".claude-sesh-mover"), join(projectPath, ".claude-sesh-mover"));
+    const config = computeEffectiveConfig(userSeshMoverDir(), projectSeshMoverDir(projectPath));
     const hubPath = resolveHubPath(config);
     if (!hubPath)
         return { ok: false, reason: "no-hub" };

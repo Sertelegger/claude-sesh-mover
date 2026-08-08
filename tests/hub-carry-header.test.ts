@@ -43,7 +43,7 @@ import { copyTreeSync } from "./helpers/copy-tree.js";
  *    quietly working around it — that blindness is the whole reason the byte
  *    scan exists beside git's own parse.
  * 3. **`-p1` can strip the forbidden component away.** `diff --git
- *    .claude-sesh-mover/x .claude-sesh-mover/x` resolves to `x` for git, while
+ *    .sesh-mover/x .sesh-mover/x` resolves to `x` for git, while
  *    the scan still sees the spelling and refuses. Counted as an over-refusal,
  *    which is the safe direction, and excluded from the false-refusal rule.
  *
@@ -73,17 +73,33 @@ import { copyTreeSync } from "./helpers/copy-tree.js";
  * names, what ends one) swept over their whole plausible domain.
  */
 
-/** The receiver-side file every hostile spelling is aiming at. */
-const FLOOR = ".claude-sesh-mover/hubinclude";
+/**
+ * The receiver-side file every hostile spelling is aiming at.
+ *
+ * Deliberately the DIRECTORY-shaped prize (`.sesh-mover/config.json` redirects
+ * `hub.path`) rather than the root dotfile: two path components is what makes
+ * the `-p1` strip axis and the middle-component axis mean anything, and the
+ * measured baselines below were taken against a two-component floor. The root
+ * dotfiles are covered where their shape actually differs — see
+ * `ROOT_DOTFILE_FLOOR` at the end of this file.
+ */
+const FLOOR = ".sesh-mover/config.json";
+/**
+ * The 0.7.0 addition: the committed rule file is now a ROOT DOTFILE, so a
+ * payload can name it with no directory component in the way. One segment, so
+ * it adds no new axis to the corpus above — but it is the file that decides
+ * what this machine's next push uploads, so the scan has to meet it too.
+ */
+const ROOT_DOTFILE_FLOOR = ".sesh-mover-hubinclude";
 /**
  * The same floor, reached at the LEAF instead of a middle component.
  *
  * A trailing timestamp is appended to the last component, so it is the only
  * position where git stripping one can uncover a forbidden segment that the
  * un-stripped reading of the line does not already show. Measured applying for
- * real: `+++ b/sub/.claude-sesh-mover <timestamp>` creates that file.
+ * real: `+++ b/sub/.sesh-mover <timestamp>` creates that file.
  */
-const FLOOR_TAIL = "sub/.claude-sesh-mover";
+const FLOOR_TAIL = "sub/.sesh-mover";
 /** Their innocent twin: same shape, nothing the floor forbids. */
 const SAFE = "docs/notes.txt";
 /** `\t2024-01-02 …` — the trailing timestamp GNU diff writes after a name. */
@@ -221,8 +237,10 @@ function oracleRepo(name: string): string {
   git(dir, ["init", "-q"]);
   git(dir, ["config", "user.email", "t@example.com"]);
   git(dir, ["config", "user.name", "Test"]);
-  mkdirSync(join(dir, ".claude-sesh-mover"), { recursive: true });
-  writeFileSync(join(dir, ".claude-sesh-mover", "hubinclude"), "v1\n");
+  mkdirSync(join(dir, ".sesh-mover"), { recursive: true });
+  writeFileSync(join(dir, FLOOR), "v1\n");
+  // The root dotfile floor lives beside it, so a case can name either shape.
+  writeFileSync(join(dir, ROOT_DOTFILE_FLOOR), "docs/\n");
   mkdirSync(join(dir, "docs"), { recursive: true });
   writeFileSync(join(dir, "docs", "notes.txt"), "v1\n");
   writeFileSync(join(dir, "decoy.txt"), "v1\n");
@@ -475,10 +493,10 @@ interface Oracle {
  * compacts only a common PREFIX (never a suffix) and it never C-quotes, so
  * every byte of both paths is present raw. What it does not do is escape `{`,
  * `}` or ` => `, which makes the line ambiguous on its face: a rename of
- * `d/.claude-sesh-mover/{f.txt` to `d/out.txt` prints
- * ` rename d/{.claude-sesh-mover/{f.txt => out.txt} (100%)`, and reading that
- * with a `(.*)\{(.*) => (.*)\}(.*)` regex yields `d/{.claude-sesh-mover/f.txt`
- * — whose first segment is `{.claude-sesh-mover`, so a genuine floor resolution
+ * `d/.sesh-mover/{f.txt` to `d/out.txt` prints
+ * ` rename d/{.sesh-mover/{f.txt => out.txt} (100%)`, and reading that
+ * with a `(.*)\{(.*) => (.*)\}(.*)` regex yields `d/{.sesh-mover/f.txt`
+ * — whose first segment is `{.sesh-mover`, so a genuine floor resolution
  * scores as an ordinary one and the case drains into rule 3 unnoticed.
  *
  * It is not ambiguous once the DESTINATION is known, and `--numstat` reports
@@ -670,7 +688,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
     // rests on them meaning what they say. These spellings — at least one per
     // way the oracle learns a path, and one per termination rule — are applied
     // for real by a bare `git apply` with none of this module's guards, and the
-    // receiver's own `.claude-sesh-mover` tree is inspected afterwards.
+    // receiver's own `.sesh-mover` tree is inspected afterwards.
     //
     // Two of the eight state an OUTCOME Win32 cannot represent — an executable
     // bit, and a filename holding a TAB. `noApplyOnWin32` names the reason and
@@ -719,7 +737,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
         id: "copy to, TAB inside the name (rename/copy read with terminate = 0)",
         patch: `diff --git a/decoy.txt b/stolen.txt\nsimilarity index 100%\n` +
           `copy from decoy.txt\ncopy to X\tsub/${FLOOR}\n`,
-        check: (d) => readTextLf(join(d, "X\tsub", ".claude-sesh-mover", "hubinclude")) === "v1\n",
+        check: (d) => readTextLf(join(d, "X\tsub", ".sesh-mover", "config.json")) === "v1\n",
         noApplyOnWin32: "TAB is a reserved character in a Win32 filename, so the " +
           "directory this case creates cannot exist there",
       },
@@ -732,13 +750,14 @@ describe("carry patch header scan — differential against real `git apply`", ()
       },
       {
         id: "+++ traditional, TAB inside the name + timestamp (terminate = 0)",
-        patch: `--- /dev/null\n+++ b\tQ/.claude-sesh-mover/config.json\t${TIMESTAMP}\n@@ -0,0 +1 @@\n+{}\n`,
-        check: (d) => readTextLf(join(d, ".claude-sesh-mover", "config.json")) === "{}\n",
+        // A CREATION, so it must name a floor path the seed does NOT hold.
+        patch: `--- /dev/null\n+++ b\tQ/.sesh-mover/planted.json\t${TIMESTAMP}\n@@ -0,0 +1 @@\n+{}\n`,
+        check: (d) => readTextLf(join(d, ".sesh-mover", "planted.json")) === "{}\n",
       },
       {
         id: "+++ traditional, SPACE-separated timestamp, forbidden segment LAST",
         patch: `--- /dev/null\n+++ b/${FLOOR_TAIL} ${TIMESTAMP}\n@@ -0,0 +1 @@\n+pwned\n`,
-        check: (d) => existsSync(join(d, "sub", ".claude-sesh-mover")),
+        check: (d) => existsSync(join(d, "sub", ".sesh-mover")),
       },
     ];
     const seed = oracleRepo("hdrreal");
@@ -799,13 +818,13 @@ describe("carry patch header scan — differential against real `git apply`", ()
         "docs/café.txt",
         "docs/naïve — dash.txt",
         "docs/dollar$sign.txt",
-        "docs/.claude-sesh-mover notes.md",
+        "docs/.sesh-mover notes.md",
         // Digits after the space: the shape the trailing-timestamp strip must
         // NOT trim back to a forbidden segment (it refuses to strip a run
         // holding letters, and `2024.md` holds two).
-        "docs/.claude-sesh-mover 2024.md",
-        "docs/.claude-sesh-moverX/notes.md",
-        "docs/not.claude-sesh-mover/notes.md",
+        "docs/.sesh-mover 2024.md",
+        "docs/.sesh-moverX/notes.md",
+        "docs/not.sesh-mover/notes.md",
         "docs/a b/c d/e f.txt",
         "docs/percent%20.txt",
         "docs/新しい.txt",
@@ -875,7 +894,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
     // present: the `{…}` prefix compaction, a name holding ` => `, names holding
     // `{` and `}`, a name git C-quotes in `git diff` but NOT in `--summary`, and
     // — the one that matters — a floor path whose spelling makes the naive
-    // `(.*)\{(.*) => (.*)\}(.*)` reading come out as `{.claude-sesh-mover`,
+    // `(.*)\{(.*) => (.*)\}(.*)` reading come out as `{.sesh-mover`,
     // i.e. innocent.
     //
     // `docs/a => b.txt` is the one Win32 cannot hold (`>` is reserved), and it
@@ -904,7 +923,7 @@ describe("carry patch header scan — differential against real `git apply`", ()
       ...(win32 ? [] : [[ARROW_RENAME.from, ARROW_RENAME.to] as [string, string]]),
       ["docs/{brace.txt", "docs/out.txt"],
       ["docs/}close.txt", "docs/out2.txt"],
-      ["d/.claude-sesh-mover/{f.txt", "d/out.txt"],
+      ["d/.sesh-mover/{f.txt", "d/out.txt"],
     ];
     const repo = oracleRepo("hdrsummary");
     const slot = patchSlot("hdrsummary");
@@ -937,10 +956,10 @@ describe("carry patch header scan — differential against real `git apply`", ()
       // failure names the path.
       for (const [from] of [...renames, [ARROW_RENAME.from]]) expect(o.paths, from).toContain(from);
       // …and the floor one is scored as a floor resolution, which is the whole
-      // point: the naive expansion returned `d/{.claude-sesh-mover/f.txt` here,
+      // point: the naive expansion returned `d/{.sesh-mover/f.txt` here,
       // whose first segment is not forbidden.
       expect(o.paths.filter((p) => isNeverIncludable(p)))
-        .toEqual(["d/.claude-sesh-mover/{f.txt"]);
+        .toEqual(["d/.sesh-mover/{f.txt"]);
       // The corpus really did exercise the compaction rather than nine plain
       // `<src> => <dst>` lines.
       expect(diff.stdout).toContain("rename from ");

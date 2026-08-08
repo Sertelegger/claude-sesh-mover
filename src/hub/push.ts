@@ -27,6 +27,7 @@ import {
   readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace,
 } from "../sync-state.js";
 import type { ErrorResult, HubLockBusyResult, HubPushResult, HubUnlinkedResult, ProgressEvent } from "../types.js";
+import { userDirWarnings } from "../paths.js";
 
 export interface HubPushOptions {
   configDir: string;
@@ -199,7 +200,7 @@ function failedAfterLink(
         `and the SessionEnd auto-push stays off for it.${orphanBundle}`
       : `The link this push created could NOT be removed (${rollback.detail}), so this project IS ` +
         `linked to hub project ${link.local.projectId} and the SessionEnd auto-push is armed for it — ` +
-        `delete .claude-sesh-mover/project.json to unlink it.${orphanBundle}`,
+        `delete .sesh-mover-project.json to unlink it.${orphanBundle}`,
     suggestion: link.mintedHubProject
       ? `Hub project ${link.local.projectId} was created before the failure and nothing removes a hub project, so pass --project-id ${link.local.projectId} on a later push to link to that one instead of minting a second.`
       : "Fix the cause above and push again; the project links again once a push gets past this point.",
@@ -241,6 +242,8 @@ export async function hubPush(
     staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
     const backend = createFsBackend(opts.hubPath);
     const warnings: string[] = [];
+    // See hub/status.ts: the user-directory migration notice, if there is one.
+    warnings.push(...userDirWarnings());
     if (lock.stoleStale) {
       warnings.push(
         "Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress."
@@ -250,7 +253,7 @@ export async function hubPush(
 
     // Identity — DECIDED here, COMMITTED after the export.
     //
-    // Linking is the hub's consent gate: `.claude-sesh-mover/project.json`
+    // Linking is the hub's consent gate: `.sesh-mover-project.json`
     // existing is what makes `evaluateHookGate` let the default-on SessionEnd
     // auto-push run, and for a git-less project that push uploads the WHOLE
     // project directory. So a link must not be a side effect of a push that
@@ -485,7 +488,7 @@ export async function hubPush(
           const shown = cap.meta.reIncluded.join(", ");
           const more = cap.meta.reIncludedCount - cap.meta.reIncluded.length;
           warnings.push(
-            `Carried ${cap.meta.reIncludedCount} gitignored file(s) because .claude-sesh-mover/hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`
+            `Carried ${cap.meta.reIncludedCount} gitignored file(s) because .sesh-mover-hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`
           );
         }
         if (cap.meta.trackedIgnoredCount > 0) {

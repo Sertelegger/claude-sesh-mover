@@ -39,7 +39,7 @@ describe("config", () => {
 
     it("reads and merges partial config file", async () => {
       const { readConfig } = await import("../src/config.js");
-      const configDir = join(tempDir, ".claude-sesh-mover");
+      const configDir = join(tempDir, ".sesh-mover");
       mkdirSync(configDir, { recursive: true });
       writeFileSync(
         join(configDir, "config.json"),
@@ -56,7 +56,7 @@ describe("config", () => {
       const { writeConfig, readConfig, getDefaultConfig } = await import(
         "../src/config.js"
       );
-      const configDir = join(tempDir, ".claude-sesh-mover");
+      const configDir = join(tempDir, ".sesh-mover");
       mkdirSync(configDir, { recursive: true });
       const config = getDefaultConfig();
       config.export.storage = "project";

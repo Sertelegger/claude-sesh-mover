@@ -19,6 +19,7 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, } from "../sync-state.js";
+import { userDirWarnings } from "../paths.js";
 /** Cap on `ignoredNotCarried`: a sample the user can recognize, not an inventory. */
 const MAX_IGNORED_REPORTED = 10;
 /**
@@ -135,7 +136,7 @@ function failedAfterLink(projectPath, link, bundleCommitted, error) {
                 `and the SessionEnd auto-push stays off for it.${orphanBundle}`
             : `The link this push created could NOT be removed (${rollback.detail}), so this project IS ` +
                 `linked to hub project ${link.local.projectId} and the SessionEnd auto-push is armed for it — ` +
-                `delete .claude-sesh-mover/project.json to unlink it.${orphanBundle}`,
+                `delete .sesh-mover-project.json to unlink it.${orphanBundle}`,
         suggestion: link.mintedHubProject
             ? `Hub project ${link.local.projectId} was created before the failure and nothing removes a hub project, so pass --project-id ${link.local.projectId} on a later push to link to that one instead of minting a second.`
             : "Fix the cause above and push again; the project links again once a push gets past this point.",
@@ -174,6 +175,8 @@ export async function hubPush(opts) {
         staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
         const backend = createFsBackend(opts.hubPath);
         const warnings = [];
+        // See hub/status.ts: the user-directory migration notice, if there is one.
+        warnings.push(...userDirWarnings());
         if (lock.stoleStale) {
             warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress.");
         }
@@ -391,7 +394,7 @@ export async function hubPush(opts) {
                     // the opt-in as a silent success would undercut it.
                     const shown = cap.meta.reIncluded.join(", ");
                     const more = cap.meta.reIncludedCount - cap.meta.reIncluded.length;
-                    warnings.push(`Carried ${cap.meta.reIncludedCount} gitignored file(s) because .claude-sesh-mover/hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`);
+                    warnings.push(`Carried ${cap.meta.reIncludedCount} gitignored file(s) because .sesh-mover-hubinclude names them: ${shown}${more > 0 ? `, and ${more} more` : ""}. They are on the hub now.`);
                 }
                 if (cap.meta.trackedIgnoredCount > 0) {
                     // A different disclosure with a different remedy, which is why it is

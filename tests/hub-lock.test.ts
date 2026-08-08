@@ -29,7 +29,7 @@ describe("project lock", () => {
       // Recreate a lock file with an ancient timestamp. Path computed via
       // encodeProjectPath (not hardcoded) so this stays correct if the
       // encoding scheme ever changes.
-      const dir = join(homedir(), ".claude-sesh-mover", "locks");
+      const dir = join(homedir(), ".sesh-mover", "locks");
       mkdirSync(dir, { recursive: true });
       const lockFile = join(dir, `${encodeProjectPath("/some/project")}.lock`);
       writeFileSync(lockFile, JSON.stringify({ pid: 99999, acquiredAt: new Date(Date.now() - LOCK_STALE_MS - 1000).toISOString() }));
@@ -50,7 +50,7 @@ describe("project lock", () => {
     const restore = overrideHome(home);
     try {
       const lockFile = join(
-        homedir(), ".claude-sesh-mover", "locks", `${encodeProjectPath("/some/project")}.lock`
+        homedir(), ".sesh-mover", "locks", `${encodeProjectPath("/some/project")}.lock`
       );
 
       const a = acquireProjectLock("/some/project");
@@ -93,10 +93,10 @@ describe("project lock", () => {
     const restore = overrideHome(home);
     try {
       const lockFile = join(
-        homedir(), ".claude-sesh-mover", "locks", `${encodeProjectPath("/some/project")}.lock`
+        homedir(), ".sesh-mover", "locks", `${encodeProjectPath("/some/project")}.lock`
       );
 
-      // Vanished under us (a `rm -rf ~/.claude-sesh-mover`, or another tool).
+      // Vanished under us (a `rm -rf ~/.sesh-mover`, or another tool).
       const gone = acquireProjectLock("/some/project");
       rmSync(lockFile, { force: true });
       expect(() => gone.release()).not.toThrow();

@@ -26,7 +26,7 @@ export interface RunCliOptions {
   input?: string;
   /**
    * Working directory for the child. Needed for anything project-scoped:
-   * `--scope project` resolves to `<cwd>/.claude-sesh-mover`, and the effective
+   * `--scope project` resolves to `<cwd>/.sesh-mover`, and the effective
    * config is always read from the cwd's project layer.
    */
   cwd?: string;

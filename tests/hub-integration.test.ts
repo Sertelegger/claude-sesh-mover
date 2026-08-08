@@ -25,7 +25,7 @@ import type { HubPullResult, HubPushResult, NotYetSyncedResult } from "../src/ty
 
 // Keystone integration suite (spec §9): a full A -> B -> A round trip through
 // REAL temp dirs, simulating two machines via distinct HOME overrides (each
-// with its own ~/.claude-sesh-mover/machine-id.json) sharing ONE hub
+// with its own ~/.sesh-mover/machine-id.json) sharing ONE hub
 // directory. This proves the Slice-1 flow end-to-end; branch/edge coverage
 // for each orchestrator already lives in its own per-task test file — this
 // file asserts through public results and filesystem counts only.
@@ -34,7 +34,7 @@ const CLAUDE_VERSION = "2.1.81";
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
 // Same technique every other hub test uses: hub identity linking writes a
-// real `.claude-sesh-mover/project.json` under the project directory, and
+// real `.sesh-mover-project.json` under the project directory, and
 // this sandbox has no permission to create top-level dirs like "/Users" — so
 // every hub test operates against a REAL git-less directory, with the
 // fixture's session content copied into its encoded config-dir slot.
@@ -956,9 +956,9 @@ describe("hub keystone: multi-machine round trip", () => {
       expect(lastUuid(pathB)).toBe("b-append-2");
       // The applied payload is not also parked, so nothing invites the user to
       // apply it a second time.
-      expect(existsSync(join(projectB, ".claude-sesh-mover"))).toBe(true);
+      expect(existsSync(join(projectB, ".sesh-mover"))).toBe(true);
       expect(
-        readdirSync(join(projectB, ".claude-sesh-mover")).filter((n) => n.startsWith("carry-"))
+        readdirSync(join(projectB, ".sesh-mover")).filter((n) => n.startsWith("carry-"))
       ).toHaveLength(1); // the FIRST pull's save, and only that one
     } finally {
       restore.restore();

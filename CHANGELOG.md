@@ -2,6 +2,60 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [Unreleased]
+
+### Changed
+
+- **Every path the plugin owns on disk is renamed, and split by lifecycle.** A dotfile now
+  spells the *plugin* name (`sesh-mover`) rather than the npm package name
+  (`claude-sesh-mover`): the short name is the one a user types, and it stops a directory
+  asserting "Claude" about a project that may have none in it — the hub index schema has
+  carried an `agent` discriminator from day one, and other agentic CLIs are on the roadmap.
+
+  | before | after |
+  |---|---|
+  | `~/.claude-sesh-mover/` | `~/.sesh-mover/` |
+  | `<project>/.claude-sesh-mover/` (exports) | `<project>/.sesh-mover/` |
+  | `<project>/.claude-sesh-mover/config.json` | `<project>/.sesh-mover/config.json` |
+  | `<project>/.claude-sesh-mover/carry-<ts>/` | `<project>/.sesh-mover/carry-<ts>/` |
+  | `<project>/.claude-sesh-mover/hubinclude` | `<project>/.sesh-mover-hubinclude` |
+  | `<project>/.claude-sesh-mover/hubignore` | `<project>/.sesh-mover-hubignore` |
+  | `<project>/.claude-sesh-mover/project.json` | `<project>/.sesh-mover-project.json` |
+
+  The split is the point, not the spelling. One directory held two things with **opposite
+  lifecycles** — generated exports, which must never be committed, and config plus hub
+  identity, which must be or they do not work at all — so the only way to have both was a
+  `.gitignore` negation (`.claude-sesh-mover/*` plus three `!` lines), and getting it wrong
+  silently stopped `hubinclude` and `project.json` being committed. Ignoring exports is now
+  a plain `.sesh-mover/` line with no negation, because the three committed files are
+  ordinary root dotfiles that no ignore rule touches.
+- **The user-scope directory migrates itself; project-level files do not.** On its first run
+  this version renames `~/.claude-sesh-mover/` to `~/.sesh-mover/` with a single move. That
+  it is a *move* is load-bearing: the directory holds `machine-id.json`, so reading the new
+  path without moving the old one would mint a new machine identity — every peer ledger
+  reset, every session re-uploaded as a full bundle instead of a continuation, and the old
+  machine left on the hub as a ghost that `whereis` lists and every pull resolves across.
+  Three cases do something other than move, each reported in the command's `warnings`:
+  **both directories exist** — neither is touched, the new name is used, and the warning
+  says so and repeats, since only the user can tell which sync state is live; **the rename
+  fails** (EACCES, a cross-device mount) — the *legacy* directory keeps being used, so
+  nothing is lost, and the move is retried on the next command; **neither exists** — a
+  normal first run, which creates nothing and says nothing. **Project-level files are not
+  migrated at all.** A project holding a `.claude-sesh-mover/` directory keeps it, but
+  `hubinclude`, `hubignore` and `project.json` are no longer read from there — recreate them
+  by hand as the three root dotfiles. Copying `project.json` across verbatim preserves that
+  project's link to its hub project; leaving it behind means the next `push` re-links by git
+  remote or offers to mint a fresh hub project.
+- **`.claude-sesh-mover` stays on the `NEVER_INCLUDABLE` floor permanently**, alongside
+  `.git`, `.sesh-mover`, and the three `.sesh-mover-*` root dotfiles — at any depth, in any
+  casing, with trailing dots and spaces folded, and re-includable by no `hubinclude` pattern
+  or spelling. Bundles carrying the old path are already sitting on hubs, written by every
+  version before this one, so dropping the name would un-protect all of them and reopen the
+  exfiltration primitive the floor exists for, in a new shape: a payload that writes a
+  legacy `hubinclude` an older peer still reads. The three dotfiles need the floor *more*
+  than the directory did — they sit at the project root, so a payload can name one directly
+  with no directory segment in the way.
+
 ## [0.6.0] — 2026-08-06
 
 The Hub, Slice 2: the hub keeps itself current, and a pulled continuation lands *in* the

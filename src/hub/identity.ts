@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import type { HubBackend } from "./backend.js";
 import { projectJsonPath, assertSafeHubId, type HubProjectJson } from "./layout.js";
 import { gitChildEnv } from "./carry.js";
+import { projectJsonFilePath } from "../paths.js";
 
 export interface LocalProjectId {
   projectId: string;
@@ -14,7 +15,7 @@ export interface LocalProjectId {
 }
 
 export function localProjectIdPath(projectPath: string): string {
-  return join(projectPath, ".claude-sesh-mover", "project.json");
+  return projectJsonFilePath(projectPath);
 }
 
 export function readLocalProjectId(projectPath: string): LocalProjectId | null {

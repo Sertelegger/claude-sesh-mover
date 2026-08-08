@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, symlinkSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, symlinkSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,17 @@ import {
 function tmp(p: string): string { return mkdtempSync(join(tmpdir(), p)); }
 const isWindows = platform() === "win32";
 
+/** Every file under `root`, as sorted "/"-joined relative paths. */
+function listAll(root: string, rel = ""): string[] {
+  const out: string[] = [];
+  for (const e of readdirSync(join(root, rel), { withFileTypes: true })) {
+    const childRel = rel ? `${rel}/${e.name}` : e.name;
+    if (e.isDirectory()) out.push(...listAll(root, childRel));
+    else out.push(childRel);
+  }
+  return out.sort();
+}
+
 describe("workspace snapshot", () => {
   it("isExcluded matches literals and single-star globs per segment", () => {
     expect(isExcluded("node_modules", DEFAULT_WORKSPACE_EXCLUDES)).toBe(true);
@@ -23,8 +34,8 @@ describe("workspace snapshot", () => {
   it("hubignore lines add to excludes; comments and blanks skipped", () => {
     const dir = tmp("sesh-ws-");
     try {
-      mkdirSync(join(dir, ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(dir, ".claude-sesh-mover", "hubignore"), "# comment\n\n*.log\nbig-data\n");
+      mkdirSync(join(dir, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(dir, ".sesh-mover-hubignore"), "# comment\n\n*.log\nbig-data\n");
       expect(readHubignore(dir)).toEqual(["*.log", "big-data"]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -34,18 +45,18 @@ describe("workspace snapshot", () => {
     const dest = tmp("sesh-ws-dest-");
     try {
       mkdirSync(join(src, "src", "node_modules", "x"), { recursive: true });
-      mkdirSync(join(src, ".claude-sesh-mover"), { recursive: true });
+      mkdirSync(join(src, ".sesh-mover"), { recursive: true });
       writeFileSync(join(src, "a.md"), "hello");
       writeFileSync(join(src, "src", "b.ts"), "world!");
       writeFileSync(join(src, "src", "node_modules", "x", "junk.js"), "junk");
-      writeFileSync(join(src, ".claude-sesh-mover", "config.json"), "{}");
+      writeFileSync(join(src, ".sesh-mover", "config.json"), "{}");
       const r = await snapshotWorkspace(src, dest);
       expect(r.fileCount).toBe(2);
       expect(r.byteSize).toBe(5 + 6);
       expect(existsSync(join(dest, "a.md"))).toBe(true);
       expect(existsSync(join(dest, "src", "b.ts"))).toBe(true);
       expect(existsSync(join(dest, "src", "node_modules"))).toBe(false);
-      expect(existsSync(join(dest, ".claude-sesh-mover"))).toBe(false);
+      expect(existsSync(join(dest, ".sesh-mover"))).toBe(false);
     } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
   });
 
@@ -284,8 +295,8 @@ describe("workspace snapshot", () => {
     const src = tmp("sesh-ws-src-");
     const dest = tmp("sesh-ws-dest-");
     try {
-      mkdirSync(join(src, ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(src, ".claude-sesh-mover", "hubignore"), "# ignore logs\n*.log\n");
+      mkdirSync(join(src, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(src, ".sesh-mover-hubignore"), "# ignore logs\n*.log\n");
       writeFileSync(join(src, "app.log"), "log line");
       writeFileSync(join(src, "keep.ts"), "ok");
       const r = await snapshotWorkspace(src, dest);
@@ -303,8 +314,8 @@ describe("workspace snapshot", () => {
     const src = tmp("sesh-ws-src-");
     const dest = tmp("sesh-ws-dest-");
     try {
-      mkdirSync(join(src, ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(src, ".claude-sesh-mover", "hubignore"), "build/\n");
+      mkdirSync(join(src, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(src, ".sesh-mover-hubignore"), "build/\n");
       expect(readHubignore(src)).toEqual(["build"]);
       mkdirSync(join(src, "build"), { recursive: true });
       writeFileSync(join(src, "build", "out.js"), "generated");
@@ -318,12 +329,12 @@ describe("workspace snapshot", () => {
 
 describe("hubinclude", () => {
   const writeInclude = (dir: string, body: string): void => {
-    mkdirSync(join(dir, ".claude-sesh-mover"), { recursive: true });
-    writeFileSync(join(dir, ".claude-sesh-mover", "hubinclude"), body);
+    mkdirSync(join(dir, ".sesh-mover"), { recursive: true });
+    writeFileSync(join(dir, ".sesh-mover-hubinclude"), body);
   };
   const writeIgnore = (dir: string, body: string): void => {
-    mkdirSync(join(dir, ".claude-sesh-mover"), { recursive: true });
-    writeFileSync(join(dir, ".claude-sesh-mover", "hubignore"), body);
+    mkdirSync(join(dir, ".sesh-mover"), { recursive: true });
+    writeFileSync(join(dir, ".sesh-mover-hubignore"), body);
   };
 
   it("parses patterns, skipping comments and blanks", () => {
@@ -338,18 +349,18 @@ describe("hubinclude", () => {
     const dir = tmp("sesh-inc-");
     try {
       expect(readHubinclude(dir)).toEqual([]);
-      mkdirSync(join(dir, ".claude-sesh-mover", "hubinclude"), { recursive: true });
+      mkdirSync(join(dir, ".sesh-mover-hubinclude"), { recursive: true });
       expect(readHubinclude(dir)).toEqual([]); // a DIRECTORY named hubinclude
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it("matches subtrees and globs but never .git or .claude-sesh-mover", () => {
-    const pats = ["docs/superpowers/", "*.keepme", ".git", ".claude-sesh-mover"];
+  it("matches subtrees and globs but never .git or .sesh-mover", () => {
+    const pats = ["docs/superpowers/", "*.keepme", ".git", ".sesh-mover"];
     expect(isReIncluded("docs/superpowers/specs/a.md", pats)).toBe(true);
     expect(isReIncluded("docs/other/a.md", pats)).toBe(false);
     expect(isReIncluded("notes.keepme", pats)).toBe(true);
     expect(isReIncluded(".git/config", pats)).toBe(false);              // hard-excluded
-    expect(isReIncluded(".claude-sesh-mover/config.json", pats)).toBe(false);
+    expect(isReIncluded(".sesh-mover/config.json", pats)).toBe(false);
   });
 
   it("a rooted pattern carries its subtree and nothing beside it", () => {
@@ -403,12 +414,12 @@ describe("hubinclude", () => {
 
   // --- Attacks: every way a pattern might smuggle back a hard-excluded path ---
 
-  it("blocks .git and .claude-sesh-mover at ANY depth, not just the first segment", () => {
+  it("blocks .git and .sesh-mover at ANY depth, not just the first segment", () => {
     // The obvious implementation checks relPath.split("/")[0]; a vendored
     // submodule then carries a whole .git store through a `vendor/` pattern.
     expect(isReIncluded("vendor/lib/.git/config", ["vendor/"])).toBe(false);
     expect(isReIncluded("vendor/lib/.git", ["vendor/"])).toBe(false);
-    expect(isReIncluded("sub/.claude-sesh-mover/config.json", ["sub"])).toBe(false);
+    expect(isReIncluded("sub/.sesh-mover/config.json", ["sub"])).toBe(false);
     expect(isReIncluded("vendor/lib/.git/config", ["*"])).toBe(false);
     // …and the ordinary file beside it still travels.
     expect(isReIncluded("vendor/lib/index.js", ["vendor/"])).toBe(true);
@@ -418,8 +429,8 @@ describe("hubinclude", () => {
     for (const pattern of [".git", ".git/", "./.git", ".git/config", "x/../.git", "/.git", ".git\\config"]) {
       expect(isReIncluded(".git/config", [pattern])).toBe(false);
     }
-    for (const pattern of [".claude-sesh-mover", ".claude-sesh-mover/", "./.claude-sesh-mover/hubinclude"]) {
-      expect(isReIncluded(".claude-sesh-mover/hubinclude", [pattern])).toBe(false);
+    for (const pattern of [".sesh-mover", ".sesh-mover/", "./.sesh-mover-hubinclude"]) {
+      expect(isReIncluded(".sesh-mover-hubinclude", [pattern])).toBe(false);
     }
   });
 
@@ -544,7 +555,7 @@ describe("hubinclude", () => {
     const dest = tmp("sesh-inc-dest-");
     try {
       expect((await snapshotWorkspace(empty, dest)).warnings).toEqual([]);
-      writeInclude(empty, "x".repeat(200_000)); // only .claude-sesh-mover exists
+      writeInclude(empty, "x".repeat(200_000)); // only .sesh-mover exists
       const r = await snapshotWorkspace(empty, dest);
       expect(r.warnings).toHaveLength(1);       // the cap, not the emptiness
       expect(r.warnings[0]).toContain("hubinclude");
@@ -654,7 +665,7 @@ describe("hubinclude", () => {
     const rules = { excludePatterns: [...DEFAULT_WORKSPACE_EXCLUDES], includePatterns: ["*"] };
     for (const hostile of [
       "../escape.txt", "../../escape.txt", "/etc/hosts", "C:/Windows/system32",
-      ".git/config", "vendor/.git/config", ".claude-sesh-mover/config.json",
+      ".git/config", "vendor/.git/config", ".sesh-mover/config.json",
       ".GIT/config", ".git./config", "..",
     ]) {
       expect(isCarriedPath(hostile, rules)).toBe(false);
@@ -665,7 +676,19 @@ describe("hubinclude", () => {
   it("NEVER_INCLUDABLE is frozen, not just readonly at compile time", () => {
     expect(Object.isFrozen(NEVER_INCLUDABLE)).toBe(true);
     expect(() => (NEVER_INCLUDABLE as string[]).push(".env")).toThrow();
-    expect(NEVER_INCLUDABLE).toEqual([".git", ".claude-sesh-mover"]);
+    // The pre-0.7.0 directory name is on this list PERMANENTLY: bundles
+    // carrying it are already on hubs, and dropping it would un-protect every
+    // one of them. The three root dotfiles are the 0.7.0 additions — ordinary
+    // files at the project root, so nothing but this list stands between a
+    // payload and the file deciding what the next push ships.
+    expect(NEVER_INCLUDABLE).toEqual([
+      ".git",
+      ".sesh-mover",
+      ".claude-sesh-mover",
+      ".sesh-mover-hubinclude",
+      ".sesh-mover-hubignore",
+      ".sesh-mover-project.json",
+    ]);
   });
 
   it("mayContainReIncluded only descends where a pattern can actually reach", () => {
@@ -677,7 +700,7 @@ describe("hubinclude", () => {
     // Never walk into what can never be carried.
     expect(mayContainReIncluded(".git", ["*"])).toBe(false);
     expect(mayContainReIncluded("vendor/lib/.git", ["*"])).toBe(false);
-    expect(mayContainReIncluded(".claude-sesh-mover", ["*"])).toBe(false);
+    expect(mayContainReIncluded(".sesh-mover", ["*"])).toBe(false);
   });
 
   // --- Snapshot integration ---
@@ -781,11 +804,11 @@ describe("hubinclude", () => {
     }
   });
 
-  it("no hubinclude pattern can put .git or .claude-sesh-mover into a snapshot", async () => {
+  it("no hubinclude pattern can put .git or plugin state into a snapshot", async () => {
     const src = tmp("sesh-inc-src-");
     const dest = tmp("sesh-inc-dest-");
     try {
-      writeInclude(src, "*\n.git\n.git/\n./.git\n.claude-sesh-mover/\nvendor/\n");
+      writeInclude(src, "*\n.git\n.git/\n./.git\n.sesh-mover/\nvendor/\n");
       mkdirSync(join(src, ".git", "objects"), { recursive: true });
       mkdirSync(join(src, "vendor", "lib", ".git"), { recursive: true });
       writeFileSync(join(src, ".git", "config"), "[remote]\n");
@@ -796,12 +819,86 @@ describe("hubinclude", () => {
 
       const r = await snapshotWorkspace(src, dest);
       expect(existsSync(join(dest, ".git"))).toBe(false);
-      expect(existsSync(join(dest, ".claude-sesh-mover"))).toBe(false);
+      expect(existsSync(join(dest, ".sesh-mover"))).toBe(false);
       expect(existsSync(join(dest, "vendor", "lib", ".git"))).toBe(false);
       expect(existsSync(join(dest, "vendor", "lib", "index.js"))).toBe(true);
       expect(r.fileCount).toBe(2); // vendor/lib/index.js + app.ts
-      expect(NEVER_INCLUDABLE).toEqual([".git", ".claude-sesh-mover"]);
+      expect(NEVER_INCLUDABLE).toEqual([
+      ".git",
+      ".sesh-mover",
+      ".claude-sesh-mover",
+      ".sesh-mover-hubinclude",
+      ".sesh-mover-hubignore",
+      ".sesh-mover-project.json",
+    ]);
     } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
+  });
+
+  // The 0.7.0 rename made two things newly reachable, and they are the reason
+  // the floor grew rather than moved: the OLD directory name still sits inside
+  // bundles already on hubs, and the committed rule files are now ordinary
+  // root dotfiles that a payload can name directly with no directory in the
+  // way. Both spellings, both sides (carry and apply), and every fold the
+  // existing check already handles.
+  const FLOOR_SPELLINGS = [
+    ".sesh-mover", ".claude-sesh-mover",
+    ".sesh-mover-hubinclude", ".sesh-mover-hubignore", ".sesh-mover-project.json",
+    ".SESH-MOVER-HUBINCLUDE", ".Claude-Sesh-Mover", ".sesh-mover-hubinclude.",
+    ".sesh-mover-hubinclude ", ".sesh-mover-project.json...",
+  ];
+
+  it("the floor refuses every plugin-state spelling on the CARRY side, at any depth", async () => {
+    for (const name of FLOOR_SPELLINGS) {
+      // `isNeverIncludable` is the predicate every carry path shares; the
+      // per-path assertion below is what `forEachCarriedFile`, `isCarriedPath`
+      // and carry.ts's patch scan all consult.
+      expect([name, isNeverIncludable(name)]).toEqual([name, true]);
+      expect([name, isNeverIncludable(`deep/nested/${name}`)]).toEqual([name, true]);
+      expect([name, isNeverIncludable(`${name}/inside.txt`)]).toEqual([name, true]);
+      // No hubinclude pattern digs under it, however it is spelled.
+      expect([name, isReIncluded(name, ["*", name, `${name}/`])]).toEqual([name, false]);
+      expect([name, isCarriedPath(name, { excludePatterns: [], includePatterns: ["*"] })])
+        .toEqual([name, false]);
+    }
+  });
+
+  it("the floor keeps every plugin-state spelling out of a snapshot and out of an unpack", async () => {
+    const src = tmp("sesh-floor-src-");
+    const dest = tmp("sesh-floor-dest-");
+    const target = tmp("sesh-floor-target-");
+    try {
+      // `*` re-admits everything the convenience excludes drop, so anything
+      // still missing below was stopped by the floor and nothing else.
+      writeInclude(src, "*\n");
+      writeFileSync(join(src, "app.ts"), "ok\n");
+      for (const name of FLOOR_SPELLINGS) {
+        // Skip the spellings a filesystem cannot distinguish from one already
+        // written (macOS/Windows fold case and strip trailing dots/spaces).
+        if (existsSync(join(src, name))) continue;
+        try {
+          writeFileSync(join(src, name), "planted\n");
+        } catch {
+          continue; // Win32 refuses some of these names outright
+        }
+      }
+      mkdirSync(join(src, "sub", ".sesh-mover"), { recursive: true });
+      writeFileSync(join(src, "sub", ".sesh-mover", "config.json"), '{"hub":{"path":"/evil"}}');
+      mkdirSync(join(src, "sub", ".claude-sesh-mover"), { recursive: true });
+      writeFileSync(join(src, "sub", ".claude-sesh-mover", "hubinclude"), "*\n");
+
+      const snap = await snapshotWorkspace(src, dest);
+      expect(snap.fileCount).toBe(1); // app.ts, and nothing else
+      expect(listAll(dest)).toEqual(["app.ts"]);
+
+      // Apply side: the same tree offered as a PAYLOAD (which a current
+      // sesh-mover never produces — this is the hand-made/older-version case).
+      const r = await unpackWorkspace(src, target, { force: true });
+      expect(listAll(target)).toEqual(["app.ts"]);
+      expect(r.refused.length).toBeGreaterThan(0);
+      for (const p of r.refused) expect([p, isNeverIncludable(p)]).toEqual([p, true]);
+    } finally {
+      for (const d of [src, dest, target]) rmSync(d, { recursive: true, force: true });
+    }
   });
 
   it("a case-folded .git store is never snapshotted, hubinclude or not", async () => {
@@ -875,21 +972,21 @@ describe("hubinclude", () => {
   it("unpack refuses payload paths that are plugin or VCS internals", async () => {
     // A bundle this machine produced never contains them (snapshotWorkspace
     // hard-excludes both), so a payload that does is malformed or hostile —
-    // and .claude-sesh-mover/hubinclude is the file that decides what the NEXT
+    // and .sesh-mover-hubinclude is the file that decides what the NEXT
     // push ships, which makes planting it an exfiltration primitive.
     const src = tmp("sesh-inc-src-");
     const target = tmp("sesh-inc-target-");
     try {
-      mkdirSync(join(src, ".claude-sesh-mover"), { recursive: true });
+      mkdirSync(join(src, ".sesh-mover"), { recursive: true });
       mkdirSync(join(src, ".git"), { recursive: true });
-      writeFileSync(join(src, ".claude-sesh-mover", "hubinclude"), "*\n");
+      writeFileSync(join(src, ".sesh-mover-hubinclude"), "*\n");
       writeFileSync(join(src, ".git", "config"), "planted\n");
       writeFileSync(join(src, "ok.txt"), "fine\n");
 
       const r = await unpackWorkspace(src, target, { force: true });
       expect(r.fileCount).toBe(1);
-      expect(r.refused.sort()).toEqual([".claude-sesh-mover", ".git"]);
-      expect(existsSync(join(target, ".claude-sesh-mover"))).toBe(false);
+      expect(r.refused.sort()).toEqual([".git", ".sesh-mover", ".sesh-mover-hubinclude"]);
+      expect(existsSync(join(target, ".sesh-mover"))).toBe(false);
       expect(existsSync(join(target, ".git"))).toBe(false);
       expect(readFileSync(join(target, "ok.txt"), "utf-8")).toBe("fine\n");
     } finally { for (const d of [src, target]) rmSync(d, { recursive: true, force: true }); }

@@ -1,8 +1,8 @@
 import { mkdirSync, openSync, closeSync, writeSync, rmSync, readFileSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { encodeProjectPath } from "../platform.js";
+import { userSeshMoverDir } from "../paths.js";
 
 export const LOCK_STALE_MS = 10 * 60 * 1000;
 
@@ -36,7 +36,7 @@ export interface LockHandle {
 }
 
 function lockPath(projectPath: string): string {
-  return join(homedir(), ".claude-sesh-mover", "locks", `${encodeProjectPath(projectPath)}.lock`);
+  return join(userSeshMoverDir(), "locks", `${encodeProjectPath(projectPath)}.lock`);
 }
 
 // Cross-platform advisory lock for hub operations on a given project. Uses
@@ -47,7 +47,7 @@ function lockPath(projectPath: string): string {
 // dead holder would wedge the project's hub operations forever.
 export function acquireProjectLock(projectPath: string): LockHandle {
   const p = lockPath(projectPath);
-  mkdirSync(join(homedir(), ".claude-sesh-mover", "locks"), { recursive: true });
+  mkdirSync(join(userSeshMoverDir(), "locks"), { recursive: true });
 
   const tryAcquire = (): number | null => {
     try {

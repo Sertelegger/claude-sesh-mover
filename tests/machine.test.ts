@@ -24,7 +24,7 @@ describe("machine", () => {
     expect(id.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     expect(id.name.length).toBeGreaterThan(0);
     expect(id.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-    expect(existsSync(join(tempHome, ".claude-sesh-mover", "machine-id.json"))).toBe(true);
+    expect(existsSync(join(tempHome, ".sesh-mover", "machine-id.json"))).toBe(true);
   });
 
   it("returns the same identity on second call", async () => {
@@ -47,7 +47,7 @@ describe("machine", () => {
     expect(renamed.name).toBe("my-laptop");
     expect(renamed.id).toBe(first.id);
     const raw = JSON.parse(
-      readFileSync(join(tempHome, ".claude-sesh-mover", "machine-id.json"), "utf-8")
+      readFileSync(join(tempHome, ".sesh-mover", "machine-id.json"), "utf-8")
     );
     expect(raw.name).toBe("my-laptop");
   });

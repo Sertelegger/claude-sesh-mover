@@ -1,5 +1,4 @@
 import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
@@ -8,6 +7,7 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { detectPlatform } from "../platform.js";
 import { readConfigOverrides, writeConfigOverrides, setConfigOverride } from "../config.js";
 import type { ErrorResult, HubInitResult, SeshMoverConfig, StorageScope } from "../types.js";
+import { projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 
 export function resolveHubPath(config: SeshMoverConfig): string | null {
   return config.hub.path ? config.hub.path : null;
@@ -70,8 +70,8 @@ export async function hubInit(opts: {
 
   const configDir =
     opts.configScope === "project"
-      ? join(opts.cwd, ".claude-sesh-mover")
-      : join(homedir(), ".claude-sesh-mover");
+      ? projectSeshMoverDir(opts.cwd)
+      : userSeshMoverDir();
   // Overrides, not a defaults-backfilled config: `hub init --scope project`
   // writing every default into the project file would pin them over the user
   // scope for this project (the same defect the `configure --set` path had).

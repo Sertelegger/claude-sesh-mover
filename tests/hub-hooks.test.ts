@@ -32,14 +32,14 @@ function createRealProject(base: string, configDir: string, name: string): strin
 }
 
 function writeSeshMoverConfig(dir: string, hub: Record<string, unknown>): void {
-  const configDir = join(dir, ".claude-sesh-mover");
+  const configDir = join(dir, ".sesh-mover");
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, "config.json"), JSON.stringify({ hub }, null, 2) + "\n");
 }
 
 /** Pin the machine identity a spawned CLI will read out of `$HOME`. */
 function writeMachineId(home: string, id: string, name: string): void {
-  const dir = join(home, ".claude-sesh-mover");
+  const dir = join(home, ".sesh-mover");
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, "machine-id.json"),
@@ -48,10 +48,8 @@ function writeMachineId(home: string, id: string, name: string): void {
 }
 
 function linkProject(projectPath: string, projectId = "11111111-1111-4111-8111-111111111111"): void {
-  const dir = join(projectPath, ".claude-sesh-mover");
-  mkdirSync(dir, { recursive: true });
   writeFileSync(
-    join(dir, "project.json"),
+    join(projectPath, ".sesh-mover-project.json"),
     JSON.stringify(
       { projectId, name: "proj", createdAt: "2026-07-21T00:00:00Z", createdByMachine: "m1" },
       null,
@@ -275,7 +273,7 @@ describe("evaluateHookGate", () => {
 
   it("declines rather than throwing when the project's config file is corrupt", async () => {
     const { evaluateHookGate } = await import("../src/hub/hooks.js");
-    const projConfigDir = join(project, ".claude-sesh-mover");
+    const projConfigDir = join(project, ".sesh-mover");
     mkdirSync(projConfigDir, { recursive: true });
     writeFileSync(join(projConfigDir, "config.json"), "{ not json");
     expect(evaluateHookGate({ cwd: project }, "autoPush")).toEqual({ ok: false, reason: "no-hub" });
@@ -352,7 +350,7 @@ describe("hub hook-session-end (CLI)", () => {
     expect(projectScope.stderr).toBe("");
     expect(projectScope.status).toBe(0);
 
-    rmSync(join(project, ".claude-sesh-mover", "config.json"));
+    rmSync(join(project, ".sesh-mover", "config.json"));
     writeSeshMoverConfig(home, { path: hubDir, autoPush: false });
     const userScope = runHook(JSON.stringify({ cwd: project }));
     expect(userScope.stdout).toBe("");
@@ -755,7 +753,7 @@ describe("hub hook-session-start (CLI)", () => {
     expect(projectScope.stdout).toBe("");
     expect(projectScope.status).toBe(0);
 
-    rmSync(join(project, ".claude-sesh-mover", "config.json"));
+    rmSync(join(project, ".sesh-mover", "config.json"));
     writeSeshMoverConfig(home, { path: hubDir, startupNotice: false });
     const userScope = runHook(JSON.stringify({ cwd: project, source: "startup" }));
     expect(userScope.stdout).toBe("");

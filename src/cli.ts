@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -49,6 +49,7 @@ import type {
   ConfigureResult,
   OnDivergenceMode,
 } from "./types.js";
+import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "./paths.js";
 
 const program = new Command();
 
@@ -109,9 +110,9 @@ program
       if (opts.output) {
         outputDir = opts.output;
       } else if (storage === "project") {
-        outputDir = join(process.cwd(), ".claude-sesh-mover");
+        outputDir = projectSeshMoverDir(process.cwd());
       } else {
-        outputDir = join(homedir(), ".claude-sesh-mover");
+        outputDir = userSeshMoverDir();
       }
       mkdirSync(outputDir, { recursive: true });
 
@@ -371,14 +372,14 @@ program
       const searchDirs: Array<{ dir: string; storage: StorageScope }> = [];
 
       if (opts.storage === "user" || opts.storage === "all") {
-        const userDir = join(homedir(), ".claude-sesh-mover");
+        const userDir = userSeshMoverDir();
         if (existsSync(userDir)) {
           searchDirs.push({ dir: userDir, storage: "user" });
         }
       }
 
       if (opts.storage === "project" || opts.storage === "all") {
-        const projectDir = join(process.cwd(), ".claude-sesh-mover");
+        const projectDir = projectSeshMoverDir(process.cwd());
         if (existsSync(projectDir)) {
           searchDirs.push({ dir: projectDir, storage: "project" });
         }
@@ -426,13 +427,13 @@ program
         }
       }
 
-      // Also scan cwd for export bundles and archives that aren't inside .claude-sesh-mover/
+      // Also scan cwd for export bundles and archives that aren't inside .sesh-mover/
       // This catches exports dropped directly in the project root (e.g., received via file transfer)
       if (opts.storage === "project" || opts.storage === "all") {
         const cwd = process.cwd();
         const cwdEntries = readdirSync(cwd);
         for (const entry of cwdEntries) {
-          if (entry === ".claude-sesh-mover") continue; // already scanned above
+          if (entry === PROJECT_DIR_NAME) continue; // already scanned above
           const entryPath = join(cwd, entry);
           // Check for export directories with manifest.json
           const manifestPath = join(entryPath, "manifest.json");
@@ -503,8 +504,8 @@ program
     try {
       const configDir =
         opts.scope === "project"
-          ? join(process.cwd(), ".claude-sesh-mover")
-          : join(homedir(), ".claude-sesh-mover");
+          ? projectSeshMoverDir(process.cwd())
+          : userSeshMoverDir();
 
       if (opts.reset) {
         // Clear this scope's overrides rather than writing a snapshot of every
@@ -1210,8 +1211,8 @@ function parseFormat(value: string): ExportFormat {
 }
 
 function loadEffectiveConfig(_configDir: string, projectDir: string) {
-  const userConfigDir = join(homedir(), ".claude-sesh-mover");
-  const projectConfigDir = join(projectDir, ".claude-sesh-mover");
+  const userConfigDir = userSeshMoverDir();
+  const projectConfigDir = projectSeshMoverDir(projectDir);
   return computeEffectiveConfig(userConfigDir, projectConfigDir);
 }
 

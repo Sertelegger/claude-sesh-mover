@@ -389,7 +389,7 @@ export interface HubPushResult {
      * 10 — a sample to recognize, not an inventory.
      *
      * Present only on a MANUAL push of a project with a git remote that has no
-     * `.claude-sesh-mover/hubinclude` yet. Absent otherwise, and never emitted by
+     * `.sesh-mover-hubinclude` yet. Absent otherwise, and never emitted by
      * the auto-push hook, whose contract is silence at session exit. Each entry
      * is a valid `hubinclude` pattern for exactly the thing it names, which is
      * why they are reported as git gives them rather than summarized up to their
@@ -522,11 +522,11 @@ export interface HubPullResult {
     workspaceMerge?: WorkspaceMergeReport;
     /**
      * Paths the workspace payload carried that can NEVER be applied, whatever a
-     * pattern says — `.git` and `.claude-sesh-mover` at any depth and in any
+     * pattern says — `.git` and `.sesh-mover` at any depth and in any
      * casing (see `NEVER_INCLUDABLE`). Absent on every ordinary pull.
      *
      * It is a result FIELD rather than warning prose because a skill layer has to
-     * be able to branch on it: a payload naming `.claude-sesh-mover/hubinclude`
+     * be able to branch on it: a payload naming `.sesh-mover-hubinclude`
      * is trying to rewrite the list that decides what this machine's NEXT push
      * ships, which is the strongest signal this command produces, and warning
      * text is not an interface (see `commands/pull.md`). Nothing from these paths
@@ -569,7 +569,7 @@ export interface HubPullResult {
      * A field rather than warning prose because there is a real decision behind
      * it — `reason: "not-requested"` is the routine "you did not pass
      * --apply-carry", while `"unsafe-payload"` means a bundle tried to write
-     * `.claude-sesh-mover` or a symbolic link — and warning text is not an
+     * `.sesh-mover` or a symbolic link — and warning text is not an
      * interface (see `commands/pull.md`).
      */
     carryApplied?: ApplyResult;

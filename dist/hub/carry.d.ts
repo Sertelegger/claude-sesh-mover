@@ -77,7 +77,7 @@ export interface CarryMeta {
      * thousands of files, so a full list would put hundreds of KB of paths into
      * every manifest. The full set is re-derivable on the sending machine from
      * two files the user already has — `git ls-files --others --ignored
-     * --exclude-standard` filtered by `.claude-sesh-mover/hubinclude`.
+     * --exclude-standard` filtered by `.sesh-mover-hubinclude`.
      */
     reIncluded: string[];
     /**
@@ -157,7 +157,7 @@ export interface CaptureCarryOptions {
  * uncommitted changes in full. `trackedIgnored` reports exactly that set rather
  * than leaving it to be inferred. The one filter that DOES apply to the patch is
  * `FLOOR_PATHSPEC`, the `NEVER_INCLUDABLE` floor, because a tracked
- * `.claude-sesh-mover/config.json` can redirect `hub.path` on the machine that
+ * `.sesh-mover/config.json` can redirect `hub.path` on the machine that
  * applies it.
  *
  * The patch is handled as BYTES from end to end. `git diff` writes a text
@@ -295,11 +295,11 @@ export interface ApplyCarryOptions {
  *
  * 1. **The `NEVER_INCLUDABLE` floor.** `git apply` refuses `.git/…` and `..`
  *    traversal itself (measured: exit 128, "invalid path"), but it writes
- *    `.claude-sesh-mover/config.json` — and `.claude-sesh-mover./config.json` —
+ *    `.sesh-mover/config.json` — and `.sesh-mover./config.json` —
  *    without a murmur. The capture side's `FLOOR_PATHSPEC` closes the ordinary
  *    case, but its `icase` mirrors only the CASE half of `isNeverSegment`: no
  *    pathspec spelling folds trailing dots and whitespace without also
- *    swallowing `.claude-sesh-moverX`. An older sesh-mover, a hand-made bundle
+ *    swallowing `.sesh-moverX`. An older sesh-mover, a hand-made bundle
  *    and that trailing-dot spelling all arrive here, and the prize is the file
  *    deciding what this machine's NEXT push ships plus the project-scope
  *    `config.json` that redirects `hub.path`.
@@ -317,7 +317,7 @@ export interface ApplyCarryOptions {
  * - `git apply --numstat -z` is git's own parse — authoritative and unquoted.
  *   But for a RENAME **or a COPY** it prints only the DESTINATION (measured
  *   both), so the source path is invisible to it: `copy from
- *   .claude-sesh-mover/hubinclude` / `copy to stolen.txt` materialises the
+ *   .sesh-mover-hubinclude` / `copy to stolen.txt` materialises the
  *   RECEIVER's own plugin internals at an ordinary path, from where the next
  *   auto-push carries them to the hub. It also cannot run at all on a machine
  *   with no `git`, or on one whose `git` cannot read this repository.
@@ -335,7 +335,7 @@ export interface ApplyCarryOptions {
  * nine above. `similarity index`, `dissimilarity index`, `index` and the four
  * mode lines carry no path. **`rename old `/`rename new ` are git's legacy
  * spelling of `rename from`/`to`, and it still accepts them** — measured: an
- * otherwise identical payload deleted `.claude-sesh-mover/hubinclude` and
+ * otherwise identical payload deleted `.sesh-mover-hubinclude` and
  * created `moved.txt`, `applied: true`, at BOTH layouts, on a receiver with a
  * perfectly healthy `git`, because `--numstat` prints only a rename's
  * destination and the scan did not read the source line.
@@ -392,7 +392,7 @@ export { scanPatchBytes as __scanPatchBytesForTests };
  * Weaken either guard and that stops being true.
  *
  * What is deliberately NOT a guard: untracked files. `git status --porcelain`
- * lists them by default, and `pull` plants `.claude-sesh-mover/project.json`
+ * lists them by default, and `pull` plants `.sesh-mover-project.json`
  * into the project earlier in the same run, so counting them as dirt would
  * refuse every hub-linked git project that has not committed the plugin
  * directory — permanently, since the payload is never offered twice. They are

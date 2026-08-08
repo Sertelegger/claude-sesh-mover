@@ -494,8 +494,8 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
     // to share it.
     const { root, a, i, t } = trees();
     try {
-      mkdirSync(join(t, ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(t, ".claude-sesh-mover", "hubignore"), "# mine\n*.log\n");
+      mkdirSync(join(t, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(t, ".sesh-mover-hubignore"), "# mine\n*.log\n");
       put(a, "debug.log", "old\n");
       put(t, "debug.log", "local log\n");
       put(i, "debug.log", "remote log\n");
@@ -549,7 +549,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
     // before hubinclude, nothing excluded could ever be in an incoming tree.
     //
     // The target deliberately has NO rule files, which is the real product
-    // shape: `hubinclude`/`hubignore` live under `.claude-sesh-mover`, which
+    // shape: `hubinclude`/`hubignore` live under `.sesh-mover`, which
     // never travels in a payload, and a workspace payload only exists for a
     // project with no git remote — so the receiving tree came from the hub and
     // has no copy of the rules that built the bundle. Consulting the target's
@@ -560,7 +560,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
       put(i, join("node_modules", "local-pkg", "lib", "index.js"), "mine\n");
       put(i, join("docs", ".DS_Store"), "junk\n");
       put(i, "README.md", "hello\n");
-      expect(existsSync(join(t, ".claude-sesh-mover"))).toBe(false);
+      expect(existsSync(join(t, ".sesh-mover"))).toBe(false);
 
       const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
       expect(r.created.sort()).toEqual([
@@ -603,8 +603,8 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
       const ancestor = join(root, "ancestor");
       for (const d of [src, unpackTarget, mergeTarget, ancestor]) mkdirSync(d, { recursive: true });
 
-      put(src, join(".claude-sesh-mover", "hubinclude"), "build/\n*.keepme\nnode_modules/local-pkg/\n");
-      put(src, join(".claude-sesh-mover", "hubignore"), "*.log\nbuild\n");
+      put(src, ".sesh-mover-hubinclude", "build/\n*.keepme\nnode_modules/local-pkg/\n");
+      put(src, ".sesh-mover-hubignore", "*.log\nbuild\n");
       put(src, "app.ts", "code\n");
       put(src, "debug.log", "noise\n");                      // hubignore'd
       put(src, join("build", "keep.js"), "generated\n");      // build/ re-included
@@ -614,7 +614,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
       put(src, join("logs", "x.keepme"), "kept\n");           // bare pattern, any depth
       put(src, join(".git", "config"), "[remote]\n");         // never
       // The receiving trees have NO rule files — the real shape, since
-      // `.claude-sesh-mover` never travels in a payload.
+      // `.sesh-mover` never travels in a payload.
 
       const snap = await snapshotWorkspace(src, payload);
       const payloadFiles = listAll(payload).sort();
@@ -626,7 +626,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
 
       const unpacked = await unpackWorkspace(payload, unpackTarget, { force: true });
       expect(unpacked.refused).toEqual([]);
-      expect(listAll(unpackTarget).filter((f) => !f.startsWith(".claude-sesh-mover")).sort())
+      expect(listAll(unpackTarget).filter((f) => !f.startsWith(".sesh-mover")).sort())
         .toEqual(payloadFiles);
 
       const merged = await mergeWorkspaceTrees({
@@ -634,7 +634,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
       });
       expect(merged.created.sort()).toEqual(payloadFiles);
       expect(merged.skipped).toEqual([]);
-      expect(listAll(mergeTarget).filter((f) => !f.startsWith(".claude-sesh-mover")).sort())
+      expect(listAll(mergeTarget).filter((f) => !f.startsWith(".sesh-mover")).sort())
         .toEqual(payloadFiles);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -645,14 +645,14 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
     const { root, a, i, t } = trees();
     try {
       put(i, join(".git", "config"), "[remote]\n");
-      put(i, join(".claude-sesh-mover", "hubinclude"), "*\n");
+      put(i, ".sesh-mover-hubinclude", "*\n");
       put(i, "ok.txt", "fine\n");
       const r = await mergeWorkspaceTrees({ ancestorDir: a, incomingDir: i, targetDir: t });
       expect(r.created).toEqual(["ok.txt"]);
       expect(r.skipped.map((s) => ({ path: s.path, reason: s.reason })).sort((x, y) => x.path.localeCompare(y.path)))
         .toEqual([
-          { path: ".claude-sesh-mover", reason: "payload-internals" },
           { path: ".git", reason: "payload-internals" },
+          { path: ".sesh-mover-hubinclude", reason: "payload-internals" },
         ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -662,7 +662,7 @@ describe("mergeWorkspaceTrees — hubinclude parity with the other apply path", 
 
 describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
   it("a payload can never contribute plugin or VCS internals, whatever their casing", async () => {
-    // .claude-sesh-mover/hubinclude decides what the NEXT push ships, so a
+    // .sesh-mover-hubinclude decides what the NEXT push ships, so a
     // payload that plants it turns a workspace merge into an exfiltration
     // primitive; .git is a store that a peer's copy corrupts rather than
     // merges. The default excludes name both, but case-SENSITIVELY, while the
@@ -673,7 +673,8 @@ describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
     try {
       put(i, join(".GIT", "config"), "[remote]\n");
       put(i, join(".Claude-Sesh-Mover", "hubinclude"), "*\n");
-      put(i, join("sub", ".claude-sesh-mover", "config.json"), '{"hub":{"path":"/evil"}}');
+      put(i, ".Sesh-Mover-HubInclude", "*\n");
+      put(i, join("sub", ".sesh-mover", "config.json"), '{"hub":{"path":"/evil"}}');
       put(i, "ok.txt", "fine\n");
       const r = await mergeWorkspaceTrees({
         ancestorDir: a, incomingDir: i, targetDir: t, excludePatterns: [],
@@ -681,6 +682,7 @@ describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
       expect(r.created).toEqual(["ok.txt"]);
       expect(existsSync(join(t, ".GIT"))).toBe(false);
       expect(existsSync(join(t, ".Claude-Sesh-Mover"))).toBe(false);
+      expect(existsSync(join(t, ".Sesh-Mover-HubInclude"))).toBe(false);
       expect(existsSync(join(t, "sub"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });

@@ -446,7 +446,7 @@ describe("cli", () => {
 
     it("reports an archive's REAL origin platform, not the local one", async () => {
       const homeDir = join(tempDir, "browse-home");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       await writeForeignArchive(join(store, "2026-07-25-faraway.tar.gz"));
 
@@ -471,7 +471,7 @@ describe("cli", () => {
 
     it("marks an unreadable archive honestly instead of inventing values", () => {
       const homeDir = join(tempDir, "browse-home-broken");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       writeFileSync(join(store, "2026-01-01-broken.tar.gz"), "definitely not a tar archive");
 
@@ -493,7 +493,7 @@ describe("cli", () => {
 
     it("reads real metadata for a date-prefixed archive dropped in the project root", async () => {
       // Covers the second fabrication site: the cwd scan below the
-      // .claude-sesh-mover scan, which keeps its date-prefix filename filter.
+      // .sesh-mover scan, which keeps its date-prefix filename filter.
       const projectDir = join(tempDir, "dropped-in-root");
       mkdirSync(projectDir, { recursive: true });
       const homeDir = join(tempDir, "empty-home");
@@ -529,7 +529,7 @@ describe("cli", () => {
       // batching must not drop, duplicate, or reorder-away any entry.
       const total = 24;
       const homeDir = join(tempDir, "many-home");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       const seed = join(tempDir, "seed.tar.gz");
       await writeForeignArchive(seed);
@@ -569,7 +569,7 @@ describe("cli", () => {
       "degrades only the archive that hits a resource failure and still lists the rest",
       async () => {
         const homeDir = join(tempDir, "mixed-home");
-        const store = join(homeDir, ".claude-sesh-mover");
+        const store = join(homeDir, ".sesh-mover");
         mkdirSync(store, { recursive: true });
 
         // A directory export (read without touching an archive at all)...
@@ -625,7 +625,7 @@ describe("cli", () => {
       // escaped as a rejection and Promise.all failed the WHOLE command —
       // success:false with zero entries, worse than the bug being fixed.
       const homeDir = join(tempDir, "notmp-home");
-      const store = join(homeDir, ".claude-sesh-mover");
+      const store = join(homeDir, ".sesh-mover");
       mkdirSync(store, { recursive: true });
       const dirExport = join(store, "2026-07-25-dir-export");
       mkdirSync(dirExport, { recursive: true });
@@ -667,7 +667,7 @@ describe("cli", () => {
     it("shows current config", () => {
       // Isolated HOME on purpose: `--show` reports the EFFECTIVE config, so
       // without one this asserts on whatever the developer running the suite
-      // happens to have configured (it read the real ~/.claude-sesh-mover).
+      // happens to have configured (it read the real ~/.sesh-mover).
       const home = mkdtempSync(join(tmpdir(), "sesh-cfg-show-home-"));
       try {
         const output = sharedRunCli(["configure", "--show", "--json"], {
@@ -745,7 +745,7 @@ describe("cli", () => {
 
         // The file itself holds only what this scope sets.
         const written = JSON.parse(
-          readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8")
+          readFileSync(join(project, ".sesh-mover", "config.json"), "utf-8")
         );
         expect(written).toEqual({ hub: { autoPush: false } });
 
@@ -772,7 +772,7 @@ describe("cli", () => {
         expect(reset.config.hub.autoPush).toBe(true); // the project override is gone
         expect(reset.config.export.storage).toBe("project"); // the user's setting survives
         expect(
-          JSON.parse(readFileSync(join(project, ".claude-sesh-mover", "config.json"), "utf-8"))
+          JSON.parse(readFileSync(join(project, ".sesh-mover", "config.json"), "utf-8"))
         ).toEqual({});
       } finally {
         for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
@@ -837,7 +837,7 @@ describe("cli", () => {
 
       try {
         // Seed machine identity so loadOrCreateMachineId() picks it up deterministically.
-        const seshDir = join(tempHome, ".claude-sesh-mover");
+        const seshDir = join(tempHome, ".sesh-mover");
         mkdirSync(seshDir, { recursive: true });
         writeFileSync(
           join(seshDir, "machine-id.json"),
@@ -1047,7 +1047,7 @@ describe("cli", () => {
       try {
         await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
 
-        // Hub identity writes .claude-sesh-mover/project.json under the real
+        // Hub identity writes .sesh-mover-project.json under the real
         // project directory, so (unlike plain export/import/migrate) push
         // needs a real, writable projectPath. The project is its OWN directory
         // here, not tempDir — the same reason the carry test below gives: the
@@ -1187,7 +1187,7 @@ describe("cli", () => {
         await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
 
         // Same real-directory arrangement as the plain push CLI test above —
-        // hub identity writes .claude-sesh-mover/project.json under the real
+        // hub identity writes .sesh-mover-project.json under the real
         // project directory.
         const fixtureEncoded = "-Users-testuser-Projects-testproject";
         const realEncoded = encodeProjectPath(tempDir);

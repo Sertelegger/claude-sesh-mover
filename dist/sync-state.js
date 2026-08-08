@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { encodeProjectPath } from "./platform.js";
+import { userSeshMoverDir } from "./paths.js";
 import { readManifest } from "./manifest.js";
 import { readLastEntryUuid } from "./jsonl.js";
 export function syncStatePath(projectPath) {
-    return join(homedir(), ".claude-sesh-mover", "sync-state", `${encodeProjectPath(projectPath)}.json`);
+    return join(userSeshMoverDir(), "sync-state", `${encodeProjectPath(projectPath)}.json`);
 }
 function defaultState(projectPath) {
     return {

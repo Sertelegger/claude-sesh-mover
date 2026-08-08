@@ -25,7 +25,7 @@ describe("hub init/status", () => {
       expect(hubJson.schemaVersion).toBe(1);
       const machine = loadOrCreateMachineId();
       expect(existsSync(join(hub, "machines", `${machine.id}.json`))).toBe(true);
-      const cfg = JSON.parse(readFileSync(join(home, ".claude-sesh-mover", "config.json"), "utf-8"));
+      const cfg = JSON.parse(readFileSync(join(home, ".sesh-mover", "config.json"), "utf-8"));
       expect(cfg.hub.path).toBe(hub);
     } finally {
       restore.restore();

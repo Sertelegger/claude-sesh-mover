@@ -185,7 +185,7 @@ describe("integration: full export/import cycle", () => {
     // (writable) source/target project directories — unlike the
     // "/Users/testuser/..."-style literal paths used elsewhere, this test
     // needs an actual filesystem project directory to plant
-    // .claude-sesh-mover/project.json into and read it back from.
+    // .sesh-mover-project.json into and read it back from.
     const carrySourceProjectPath = join(tempDir, "carry-source-project");
     mkdirSync(carrySourceProjectPath, { recursive: true });
     writeLocalProjectId(carrySourceProjectPath, {
@@ -265,7 +265,7 @@ describe("integration: full export/import cycle", () => {
     // unsafe id straight into the export manifest — readManifest/
     // assertSafeManifestIds only guard session ids, not projectId, so this
     // is importer.ts's plant step that must catch it before ever writing it
-    // to the target's .claude-sesh-mover/project.json.
+    // to the target's .sesh-mover-project.json.
     const hostileSourceProjectPath = join(tempDir, "hostile-source-project");
     mkdirSync(hostileSourceProjectPath, { recursive: true });
     writeLocalProjectId(hostileSourceProjectPath, {

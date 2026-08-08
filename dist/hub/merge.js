@@ -283,7 +283,7 @@ function writeSidecar(targetDir, rel, incomingPath, stamp) {
  *
  * **What a payload is filtered by here** (the rule split is argued at the call
  * site): the `NEVER_INCLUDABLE` floor, and the *target's* own
- * `.claude-sesh-mover/hubignore` minus whatever its `hubinclude` names back —
+ * `.sesh-mover-hubignore` minus whatever its `hubinclude` names back —
  * so a file this machine deliberately keeps out of the hub can never be
  * overwritten by an incoming copy of the same name. The built-in convenience
  * excludes take no part: they are the sender's to apply, and re-applying them
@@ -324,7 +324,7 @@ export async function mergeWorkspaceTrees(opts) {
     //   unpack of the same bundle applied it).
     //
     // Re-deciding the sender's carry rules here is not even possible: `hubignore`
-    // and `hubinclude` live under `.claude-sesh-mover`, which never travels in a
+    // and `hubinclude` live under `.sesh-mover`, which never travels in a
     // payload, and a workspace payload exists only for a project with no git
     // remote — so the receiving tree usually has NO copy of the rules that built
     // the bundle it just received. Consulting the target's `hubinclude` alone

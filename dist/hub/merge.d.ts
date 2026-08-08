@@ -202,7 +202,7 @@ export declare function isBinaryFile(path: string): boolean;
  *
  * **What a payload is filtered by here** (the rule split is argued at the call
  * site): the `NEVER_INCLUDABLE` floor, and the *target's* own
- * `.claude-sesh-mover/hubignore` minus whatever its `hubinclude` names back —
+ * `.sesh-mover-hubignore` minus whatever its `hubinclude` names back —
  * so a file this machine deliberately keeps out of the hub can never be
  * overwritten by an incoming copy of the same name. The built-in convenience
  * excludes take no part: they are the sender's to apply, and re-applying them

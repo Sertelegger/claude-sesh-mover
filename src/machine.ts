@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { userSeshMoverDir } from "./paths.js";
 import type { MachineIdentity } from "./types.js";
 
 function machineIdPath(): string {
-  return join(homedir(), ".claude-sesh-mover", "machine-id.json");
+  return join(userSeshMoverDir(), "machine-id.json");
 }
 
 export function readMachineId(): MachineIdentity | null {
@@ -29,7 +30,7 @@ export function loadOrCreateMachineId(): MachineIdentity {
     createdAt: new Date().toISOString(),
   };
   const p = machineIdPath();
-  mkdirSync(join(homedir(), ".claude-sesh-mover"), { recursive: true });
+  mkdirSync(userSeshMoverDir(), { recursive: true });
   writeFileSync(p, JSON.stringify(identity, null, 2) + "\n", "utf-8");
   return identity;
 }
