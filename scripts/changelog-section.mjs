@@ -69,4 +69,37 @@ if (!body) {
   process.exit(1);
 }
 
-process.stdout.write(body + "\n");
+/**
+ * Append the commit-compare link.
+ *
+ * This is the one thing `--generate-notes` did well and the first version of
+ * this script dropped: "which commits are actually in this release" is a
+ * question the prose cannot answer. The previous version is read from the NEXT
+ * heading down in the changelog rather than from git tags, so the link is
+ * derived from the same source as the body and needs no repository access —
+ * which also means it works when generating notes for a tag that does not exist
+ * yet.
+ *
+ * The oldest entry has no predecessor, so it gets no link rather than a broken
+ * one.
+ */
+const nextHeading = lines.slice(end).find(isHeading);
+const prev = nextHeading?.match(/\[([^\]]+)\]/)?.[1];
+
+// `git+https://github.com/owner/repo.git` -> `owner/repo`
+let slug = process.env.GITHUB_REPOSITORY;
+if (!slug) {
+  try {
+    const pkg = JSON.parse(readFileSync("package.json", "utf-8"));
+    slug = /github\.com[:/]([^/]+\/[^/.]+)/.exec(pkg.repository?.url ?? "")?.[1];
+  } catch {
+    /* no package.json, or no repository field — link is omitted below */
+  }
+}
+
+let out = body;
+if (prev && slug) {
+  out += `\n\n---\n\n**Full changelog**: https://github.com/${slug}/compare/v${prev}...v${version}`;
+}
+
+process.stdout.write(out + "\n");
