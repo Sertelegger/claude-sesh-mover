@@ -19,7 +19,7 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, } from "../sync-state.js";
-import { includeFilePath, userDirWarnings } from "../paths.js";
+import { includeFilePath } from "../paths.js";
 /** Cap on `ignoredNotCarried`: a sample the user can recognize, not an inventory. */
 const MAX_IGNORED_REPORTED = 10;
 /**
@@ -175,8 +175,6 @@ export async function hubPush(opts) {
         staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
         const backend = createFsBackend(opts.hubPath);
         const warnings = [];
-        // See hub/status.ts: the user-directory migration notice, if there is one.
-        warnings.push(...userDirWarnings());
         // A budget that could not be read as written. Said once, up front, rather
         // than folded into the decline it causes — the two are different facts, and
         // on an unattended session-end push this is the only trace of the typo.

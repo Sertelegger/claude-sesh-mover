@@ -672,21 +672,22 @@ describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
     const { root, a, i, t } = trees();
     try {
       put(i, join(".GIT", "config"), "[remote]\n");
-      put(i, join(".Claude-Sesh-Mover", "hubinclude"), "*\n"); // pre-0.7.0 shape
-      put(i, ".Sesh-Mover-HubInclude", "*\n");                 // 0.7.0 root dotfile
-      put(i, ".Sesh-Mover-Include", "*\n");                    // 0.8.0 root dotfile
+      put(i, join(".Sesh-Mover", "config.json"), '{"hub":{"path":"/evil"}}');
+      put(i, ".Sesh-Mover-Include", "*\n");
       put(i, ".Sesh-Mover-Ignore", "*\n");
+      put(i, ".Sesh-Mover-Project.JSON", '{"projectId":"evil"}');
       put(i, join("sub", ".sesh-mover", "config.json"), '{"hub":{"path":"/evil"}}');
+      put(i, join("sub", ".SESH-MOVER-INCLUDE"), "*\n");
       put(i, "ok.txt", "fine\n");
       const r = await mergeWorkspaceTrees({
         ancestorDir: a, incomingDir: i, targetDir: t, excludePatterns: [],
       });
       expect(r.created).toEqual(["ok.txt"]);
       expect(existsSync(join(t, ".GIT"))).toBe(false);
-      expect(existsSync(join(t, ".Claude-Sesh-Mover"))).toBe(false);
-      expect(existsSync(join(t, ".Sesh-Mover-HubInclude"))).toBe(false);
+      expect(existsSync(join(t, ".Sesh-Mover"))).toBe(false);
       expect(existsSync(join(t, ".Sesh-Mover-Include"))).toBe(false);
       expect(existsSync(join(t, ".Sesh-Mover-Ignore"))).toBe(false);
+      expect(existsSync(join(t, ".Sesh-Mover-Project.JSON"))).toBe(false);
       expect(existsSync(join(t, "sub"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });

@@ -681,12 +681,12 @@ describe("captureCarry — what must never travel", () => {
       writeFileSync(join(repo, ".sesh-mover", "config.json"), '{"hub":{"path":"/tmp/evil"}}\n');
       writeFileSync(join(repo, ".sesh-mover-include"), "*\n");
       writeFileSync(join(repo, ".sesh-mover-ignore"), "*\n");
-      // The retired 0.7.0 spellings too. Nothing READS them any more, which is
-      // exactly why they are easy to drop from the floor by accident — and a
-      // bundle written by 0.7.0 carries them, so dropping one un-protects a
-      // payload that is already sitting on somebody's hub.
-      writeFileSync(join(repo, ".sesh-mover-hubinclude"), "*\n");
-      writeFileSync(join(repo, ".sesh-mover-hubignore"), "*\n");
+      writeFileSync(join(repo, ".sesh-mover-project.json"), '{"projectId":"p"}\n');
+      // Nested, and case-folded: the floor is per SEGMENT and fold-tolerant, so
+      // the untracked enumeration has to meet it at any depth and in any
+      // spelling a filesystem can hand back.
+      mkdirSync(join(repo, "pkg"), { recursive: true });
+      writeFileSync(join(repo, "pkg", ".sesh-mover-include"), "*\n");
       writeFileSync(join(repo, "real.txt"), "work\n");
       const r = await captureCarry(repo, dest);
       expect(r.captured).toBe(true);
@@ -712,25 +712,23 @@ describe("captureCarry — what must never travel", () => {
       writeFileSync(join(repo, ".sesh-mover", "config.json"), '{"hub":{"path":"/orig"}}\n');
       writeFileSync(join(repo, ".sesh-mover-include"), "docs/\n");
       writeFileSync(join(repo, ".sesh-mover-ignore"), "docs/\n");
-      // Both retired 0.7.0 spellings, tracked, at the root and nested. They are
-      // the ones a floor edit is most likely to drop, since no reader is left
-      // to break — and a 0.7.0 bundle carrying them is on hubs today.
-      writeFileSync(join(repo, ".sesh-mover-hubinclude"), "docs/\n");
-      writeFileSync(join(repo, ".sesh-mover-hubignore"), "docs/\n");
-      // A nested one too: the floor is a per-segment rule at ANY depth, so the
-      // pathspec that mirrors it has to be depth-independent as well.
+      writeFileSync(join(repo, ".sesh-mover-project.json"), '{"projectId":"p"}\n');
+      // Nested ones too: the floor is a per-segment rule at ANY depth, so the
+      // pathspec that mirrors it has to be depth-independent as well — both for
+      // the directory shape and for a root dotfile named inside a subtree.
       mkdirSync(join(repo, "pkg", ".sesh-mover"), { recursive: true });
       writeFileSync(join(repo, "pkg", ".sesh-mover", "config.json"), "{}\n");
-      writeFileSync(join(repo, "pkg", ".sesh-mover-hubinclude"), "docs/\n");
+      writeFileSync(join(repo, "pkg", ".sesh-mover-include"), "docs/\n");
+      writeFileSync(join(repo, "pkg", ".sesh-mover-ignore"), "docs/\n");
       git(repo, ["add", "-A", "-f"]);
       git(repo, ["commit", "-q", "-m", "track plugin state"]);
       writeFileSync(join(repo, ".sesh-mover", "config.json"), '{"hub":{"path":"/EVIL"}}\n');
       writeFileSync(join(repo, ".sesh-mover-include"), "*\nEVIL\n");
       writeFileSync(join(repo, ".sesh-mover-ignore"), "*\nEVIL\n");
-      writeFileSync(join(repo, ".sesh-mover-hubinclude"), "*\nEVIL\n");
-      writeFileSync(join(repo, ".sesh-mover-hubignore"), "*\nEVIL\n");
+      writeFileSync(join(repo, ".sesh-mover-project.json"), '{"projectId":"EVIL"}\n');
       writeFileSync(join(repo, "pkg", ".sesh-mover", "config.json"), '{"x":"EVIL"}\n');
-      writeFileSync(join(repo, "pkg", ".sesh-mover-hubinclude"), "*\nEVIL\n");
+      writeFileSync(join(repo, "pkg", ".sesh-mover-include"), "*\nEVIL\n");
+      writeFileSync(join(repo, "pkg", ".sesh-mover-ignore"), "*\nEVIL\n");
       writeFileSync(join(repo, "tracked.txt"), "real work\n");
 
       const r = await captureCarry(repo, dest);
@@ -1246,17 +1244,14 @@ describe("applyCarry", () => {
     }
   });
 
-  it("refuses a patch naming the include/ignore list under EITHER era's spelling", async () => {
+  it("refuses a patch naming the include/ignore list, in every spelling", async () => {
     // The root dotfiles need the floor more than `.sesh-mover/` does: there is
     // no directory segment between a payload and a file it can name directly,
     // and this file is the one that decides what the NEXT push uploads.
     //
-    // BOTH eras, because the floor only ever grows: bundles written by 0.7.0
-    // spell it `.sesh-mover-hubinclude`, and those bundles are on hubs now.
-    // Dropping a retired name from `PLUGIN_STATE_NAMES` un-protects exactly
-    // them — a payload could plant a legacy list that an older peer still reads.
-    // A repo-relative nested spelling and a Win32 trailing dot are in here too,
-    // since the guard is per SEGMENT and fold-tolerant, not a root-only match.
+    // Every fold the guard handles is here, because the guard is per SEGMENT
+    // and fold-tolerant rather than a root-only exact match: a repo-relative
+    // nested spelling, a case fold, a Win32 trailing dot and a trailing space.
     const repo = gitRepo("apply-listfloor");
     let twin: string | undefined;
     try {
@@ -1265,14 +1260,14 @@ describe("applyCarry", () => {
       for (const path of [
         ".sesh-mover-include",
         ".sesh-mover-ignore",
-        ".sesh-mover-hubinclude",
-        ".sesh-mover-hubignore",
+        ".sesh-mover-project.json",
         "pkg/app/.sesh-mover-include",
-        "pkg/app/.sesh-mover-hubinclude",
+        "pkg/app/.sesh-mover-ignore",
         ".SESH-MOVER-INCLUDE",
-        ".SESH-MOVER-HUBINCLUDE",
+        ".Sesh-Mover-Ignore",
         ".sesh-mover-include.",
-        ".sesh-mover-hubinclude.",
+        ".sesh-mover-ignore ",
+        ".SESH-MOVER-INCLUDE.",
       ]) {
         const patch =
           `diff --git a/${path} b/${path}\nnew file mode 100644\nindex 0000000..d95f3ad\n` +
@@ -2613,7 +2608,7 @@ describe("applyCarry", () => {
     // in the octal spelling: a traditional patch with no `diff --git` at all.
     [
       "octal spelling plus a trailing byte, on a traditional +++",
-      '--- /dev/null\n+++ "b/\\056claude-sesh-mover/config.json"X\n@@ -0,0 +1 @@\n+hi\n',
+      '--- /dev/null\n+++ "b/\\056sesh-mover/config.json"X\n@@ -0,0 +1 @@\n+hi\n',
     ],
     // (2) Git's separator class here is its own `isspace`: SP, TAB and CR all
     // separate the two names (VT and FF do not — measured rejected).
@@ -2811,7 +2806,7 @@ describe("applyCarry", () => {
       [
         "rename from, octal-escaped with a trailing byte",
         'diff --git a/decoy b/moved.txt\nsimilarity index 100%\n' +
-          'rename from "\\056claude-sesh-mover/hubinclude"X\nrename to moved.txt\n',
+          'rename from "\\056sesh-mover-ignore"X\nrename to moved.txt\n',
         "moved.txt",
       ],
       [

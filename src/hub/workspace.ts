@@ -53,14 +53,16 @@ export const DEFAULT_WORKSPACE_EXCLUDES = [
  * TWO THINGS ABOUT THIS LIST ARE PERMANENT, not incidental to whichever rename
  * happened most recently:
  *
- * 1. **Every retired name stays here forever.** That is `.claude-sesh-mover`
- *    (pre-0.7.0) and the two 0.7.0 spellings `.sesh-mover-hubinclude` /
- *    `.sesh-mover-hubignore`. Bundles carrying each of them are already sitting
- *    on hubs and inside export archives, written by the version that used them.
- *    Dropping an old name un-protects exactly those bundles and reopens the
- *    exfiltration primitive above in a new shape — a payload writing a legacy
- *    include list that an older peer still reads. `PLUGIN_STATE_NAMES` only ever
- *    grows; see its comment.
+ * 1. **There is exactly one copy of it.** The list is `PLUGIN_STATE_NAMES` plus
+ *    `.git`, and every side derives from it: the workspace walk, the merge, the
+ *    unpack, carry.ts's `git` pathspecs and its patch byte scan. A second,
+ *    hand-written copy is how a name ends up protected on the carry side and not
+ *    on the apply side — so add a name in `paths.ts` and nowhere else. 0.8.0
+ *    SHRANK this list (it dropped three spellings no version reads any more, as
+ *    part of that release's clean break), which is exactly the kind of edit that
+ *    has to be deliberate: a name leaving here is a security change, pinned by
+ *    exact-contents assertions in `tests/paths.test.ts` and two sites in
+ *    `tests/hub-workspace.test.ts`.
  * 2. **The root dotfiles need the floor MORE than the directory did.**
  *    They are ordinary files at the project root, so there is no directory name
  *    between a payload and them: `.sesh-mover-include` can be named directly.

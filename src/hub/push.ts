@@ -27,7 +27,7 @@ import {
   readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace,
 } from "../sync-state.js";
 import type { ErrorResult, HubLockBusyResult, HubPushResult, HubUnlinkedResult, ProgressEvent } from "../types.js";
-import { includeFilePath, userDirWarnings } from "../paths.js";
+import { includeFilePath } from "../paths.js";
 
 export interface HubPushOptions {
   configDir: string;
@@ -253,8 +253,6 @@ export async function hubPush(
     staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
     const backend = createFsBackend(opts.hubPath);
     const warnings: string[] = [];
-    // See hub/status.ts: the user-directory migration notice, if there is one.
-    warnings.push(...userDirWarnings());
     // A budget that could not be read as written. Said once, up front, rather
     // than folded into the decline it causes — the two are different facts, and
     // on an unattended session-end push this is the only trace of the typo.

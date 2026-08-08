@@ -7,8 +7,6 @@ node_modules/
 # exports, and one directory holding both is what forced the `!` negations this
 # replaces.
 .sesh-mover/
-# The pre-0.7.0 directory, in case an older sesh-mover is still installed somewhere.
-.claude-sesh-mover/
 .envrc
 docs/
 .worktrees/

@@ -440,7 +440,8 @@ describe("the include list", () => {
     for (const p of [".GIT/config", ".Git/config", ".git./config", ".git /config", ".GIT./config"]) {
       expect(isReIncluded(p, ["*"])).toBe(false);
     }
-    expect(isReIncluded(".CLAUDE-SESH-MOVER/hubinclude", ["*"])).toBe(false);
+    expect(isReIncluded(".SESH-MOVER/config.json", ["*"])).toBe(false);
+    expect(isReIncluded(".SESH-MOVER-INCLUDE", ["*"])).toBe(false);
     expect(isNeverIncludable("a/b/.GIT/c")).toBe(true);
     expect(isNeverIncludable("a/b/gitignore")).toBe(false);
   });
@@ -718,21 +719,21 @@ describe("the include list", () => {
   it("NEVER_INCLUDABLE is frozen, not just readonly at compile time", () => {
     expect(Object.isFrozen(NEVER_INCLUDABLE)).toBe(true);
     expect(() => (NEVER_INCLUDABLE as string[]).push(".env")).toThrow();
-    // EVERY retired name is on this list PERMANENTLY: the pre-0.7.0 directory
-    // `.claude-sesh-mover`, and the 0.7.0-only `.sesh-mover-hubinclude` /
-    // `.sesh-mover-hubignore`. Bundles carrying each of them are already on
-    // hubs and in export archives, and dropping one un-protects exactly those.
-    // The root dotfiles need the list more than the directory did — ordinary
-    // files at the project root, so nothing but this list stands between a
-    // payload and the file deciding what the next push ships.
+    // The floor, exactly. This assertion and its twin below (in "no
+    // include-list pattern can put .git or plugin state into a snapshot") are
+    // the two sites that pin the contents — they move together, and the first
+    // fix round of the 0.8.0 rename found only one of them.
+    //
+    // The root dotfiles need this list more than the directory does: ordinary
+    // files at the project root, so nothing but the floor stands between a
+    // payload and the file deciding what the next push ships. Every entry
+    // derives from `PLUGIN_STATE_NAMES` plus `.git`, so a name cannot be
+    // protected on the carry side and not on the apply side.
     expect(NEVER_INCLUDABLE).toEqual([
       ".git",
       ".sesh-mover",
-      ".claude-sesh-mover",
       ".sesh-mover-include",
       ".sesh-mover-ignore",
-      ".sesh-mover-hubinclude",
-      ".sesh-mover-hubignore",
       ".sesh-mover-project.json",
     ]);
   });
@@ -869,48 +870,48 @@ describe("the include list", () => {
       expect(existsSync(join(dest, "vendor", "lib", ".git"))).toBe(false);
       expect(existsSync(join(dest, "vendor", "lib", "index.js"))).toBe(true);
       expect(r.fileCount).toBe(2); // vendor/lib/index.js + app.ts
-      // Exact contents, in order, and it ONLY EVER GROWS: three of these are
-      // names no current version writes or reads (`.claude-sesh-mover` from
-      // before 0.7.0, the two `hub*` spellings from 0.7.0 alone). Bundles
-      // carrying each of them are already on hubs and in export archives, so
-      // deleting a line here un-protects exactly those. If this assertion fails
-      // because a name was REMOVED, the assertion is right and the change is
-      // wrong.
+      // Exact contents, in order — the SECOND of the two sites in this file
+      // that pin them (the first is in "NEVER_INCLUDABLE is frozen, not just
+      // readonly at compile time"). They move together, always: a change that
+      // updates one and not the other leaves the suite disagreeing with itself
+      // about what can never be carried.
       expect(NEVER_INCLUDABLE).toEqual([
       ".git",
       ".sesh-mover",
-      ".claude-sesh-mover",
       ".sesh-mover-include",
       ".sesh-mover-ignore",
-      ".sesh-mover-hubinclude",
-      ".sesh-mover-hubignore",
       ".sesh-mover-project.json",
     ]);
     } finally { for (const d of [src, dest]) rmSync(d, { recursive: true, force: true }); }
   });
 
-  // Every name the floor has EVER held, in every fold the check handles, on
-  // both sides. Two renames put three retired names in here and none of them
-  // may ever leave: `.claude-sesh-mover` (pre-0.7.0) and the 0.7.0-only
-  // `.sesh-mover-hubinclude` / `.sesh-mover-hubignore` are all sitting inside
-  // bundles on hubs right now, so dropping one un-protects exactly those — a
-  // payload could plant a legacy include list that an older peer still reads.
-  // The committed rule files also need the floor MORE than the directory did:
-  // they are ordinary root dotfiles, so a payload names one directly with no
+  // Every name the floor holds, in every fold the check handles, on both sides.
+  //
+  // 0.8.0's clean break cut this list down to the four names the plugin
+  // actually reads (plus `.git`, covered on its own above): a floor entry stops
+  // a payload planting a file some reader consults, and after that release no
+  // reader consults a retired spelling. What the shrink must NOT cost is any
+  // coverage of the SURVIVING names — the five evasion families are unchanged,
+  // so each name still has to hold case-folded, with Win32 trailing dots and
+  // spaces, at any depth, on the carry side and the apply side alike.
+  //
+  // The committed rule files need the floor MORE than the directory does: they
+  // are ordinary root dotfiles, so a payload names one directly with no
   // directory segment in the way.
   const FLOOR_SPELLINGS = [
-    // Current names.
+    // Exact names.
     ".sesh-mover", ".sesh-mover-include", ".sesh-mover-ignore",
     ".sesh-mover-project.json",
-    // Retired names — permanently on the floor.
-    ".claude-sesh-mover", ".sesh-mover-hubinclude", ".sesh-mover-hubignore",
-    // Case folds, both eras.
-    ".SESH-MOVER-INCLUDE", ".Sesh-Mover-Ignore", ".SESH-MOVER-HUBINCLUDE",
-    ".Sesh-Mover-HubIgnore", ".Claude-Sesh-Mover",
-    // Win32 trailing dots and spaces, both eras.
-    ".sesh-mover-include.", ".sesh-mover-include ", ".sesh-mover-ignore.",
-    ".sesh-mover-hubinclude.", ".sesh-mover-hubinclude ",
-    ".sesh-mover-hubignore...", ".sesh-mover-project.json...",
+    // Case folds — one per name, all four covered.
+    ".SESH-MOVER", ".SESH-MOVER-INCLUDE", ".Sesh-Mover-Ignore",
+    ".Sesh-Mover-Project.JSON",
+    // Win32 trailing dots and spaces — again all four.
+    ".sesh-mover.", ".sesh-mover ",
+    ".sesh-mover-include.", ".sesh-mover-include ",
+    ".sesh-mover-ignore.", ".sesh-mover-ignore   ",
+    ".sesh-mover-project.json...",
+    // Both folds at once, since Win32 applies them together.
+    ".SESH-MOVER-IGNORE.", ".Sesh-Mover-Include ",
   ];
 
   it("the floor refuses every plugin-state spelling on the CARRY side, at any depth", async () => {
@@ -949,8 +950,9 @@ describe("the include list", () => {
       }
       mkdirSync(join(src, "sub", ".sesh-mover"), { recursive: true });
       writeFileSync(join(src, "sub", ".sesh-mover", "config.json"), '{"hub":{"path":"/evil"}}');
-      mkdirSync(join(src, "sub", ".claude-sesh-mover"), { recursive: true });
-      writeFileSync(join(src, "sub", ".claude-sesh-mover", "hubinclude"), "*\n");
+      // A root dotfile named at depth: the check is per SEGMENT, so a nested
+      // spelling must be refused exactly like the top-level one.
+      writeFileSync(join(src, "sub", ".sesh-mover-include"), "*\n");
 
       const snap = await snapshotWorkspace(src, dest);
       expect(snap.fileCount).toBe(1); // app.ts, and nothing else

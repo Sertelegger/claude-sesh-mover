@@ -85,17 +85,12 @@ import { copyTreeSync } from "./helpers/copy-tree.js";
  */
 const FLOOR = ".sesh-mover/config.json";
 /**
- * Since 0.7.0 the committed rule file is a ROOT DOTFILE, so a payload can name
- * it with no directory component in the way. One segment, so it adds no new
- * axis to the corpus above — but it is the file that decides what this
- * machine's next push uploads, so the scan has to meet it too.
- *
- * `LEGACY_ROOT_DOTFILE_FLOOR` is the 0.7.0 spelling, retired by 0.8.0 and kept
- * on the floor forever: bundles written by 0.7.0 name it, and they are on hubs
- * now. Both are seeded so a case can aim at either.
+ * The committed rule file is a ROOT DOTFILE, so a payload can name it with no
+ * directory component in the way. One segment, so it adds no new axis to the
+ * corpus above — but it is the file that decides what this machine's next push
+ * uploads, so the scan has to meet it too.
  */
 const ROOT_DOTFILE_FLOOR = ".sesh-mover-include";
-const LEGACY_ROOT_DOTFILE_FLOOR = ".sesh-mover-hubinclude";
 /**
  * The same floor, reached at the LEAF instead of a middle component.
  *
@@ -244,10 +239,8 @@ function oracleRepo(name: string): string {
   git(dir, ["config", "user.name", "Test"]);
   mkdirSync(join(dir, ".sesh-mover"), { recursive: true });
   writeFileSync(join(dir, FLOOR), "v1\n");
-  // The root dotfile floor lives beside it, so a case can name either shape —
-  // in both the current and the retired 0.7.0 spelling.
+  // The root dotfile floor lives beside it, so a case can name either shape.
   writeFileSync(join(dir, ROOT_DOTFILE_FLOOR), "docs/\n");
-  writeFileSync(join(dir, LEGACY_ROOT_DOTFILE_FLOOR), "docs/\n");
   mkdirSync(join(dir, "docs"), { recursive: true });
   writeFileSync(join(dir, "docs", "notes.txt"), "v1\n");
   writeFileSync(join(dir, "decoy.txt"), "v1\n");

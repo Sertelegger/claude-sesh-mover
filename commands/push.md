@@ -41,7 +41,7 @@ You are running the sesh-mover push command. Follow these steps:
    - listing a path means it is **uploaded on the next push** of this project (it rides the git carry described above), and a later push reports it back in `carry.reIncluded`;
    - creating the file also *stops this suggestion appearing*, since its existence is what suppresses `ignoredNotCarried`.
 
-   Never pre-select entries, never widen one (`docs/specs/notes.md` stays that path — don't turn it into `docs/`), and never offer `.git` or any path sesh-mover owns (`.sesh-mover/`, the `.sesh-mover-*` root dotfiles, the pre-0.7.0 `.claude-sesh-mover/`): those can never be carried and a pattern naming one does nothing. If the user declines, don't ask again in this session.
+   Never pre-select entries, never widen one (`docs/specs/notes.md` stays that path — don't turn it into `docs/`), and never offer `.git` or any path sesh-mover owns (`.sesh-mover/`, the `.sesh-mover-*` root dotfiles): those can never be carried and a pattern naming one does nothing. If the user declines, don't ask again in this session.
 
 5. Report a final summary: hub project id, sessions pushed (count, and full-vs-continuation breakdown), whether a workspace snapshot was included, and whether the project was newly linked or created during this run.
 
