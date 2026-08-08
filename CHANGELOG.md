@@ -2,7 +2,7 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
-## [Unreleased]
+## [0.7.0] — 2026-08-07
 
 ### Changed
 
