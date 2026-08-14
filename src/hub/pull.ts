@@ -24,6 +24,7 @@ import { applyCarry, type ApplyResult, type CarryMeta } from "./carry.js";
 import {
   adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS,
 } from "./append.js";
+import { initApplyState } from "./pull-apply-state.js";
 import { extractArchive } from "../archiver.js";
 import { importSession } from "../importer.js";
 import { discoverSessions } from "../discovery.js";
@@ -1135,155 +1136,10 @@ export async function hubPull(
 
     opts.onProgress?.({ phase: "hub-pull", percent: 0 });
 
-    let workspaceUnpacked: HubPullResult["workspaceUnpacked"] = null;
-    let workspaceMerge: WorkspaceMergeReport | undefined;
-    let workspaceRefused: string[] | undefined;
-    // Set when a manifest declares a workspace payload the bundle does not
-    // contain (see the guard below). A FIELD, not just the warning, because it
-    // is field-indistinguishable from the routine no-ancestor skip otherwise —
-    // same null workspaceUnpacked, same absent workspaceMerge — and the two
-    // want opposite advice (that skip's remedies cannot deliver a payload that
-    // was never in the bundle).
-    let workspaceDeclaredMissing: boolean | undefined;
-    // Which bundle in this chain carries the workspace generation to apply:
-    // the NEWEST one that has a payload, not needed[0].
-    //
-    // A chain is pulled in one pass and every bundle is recorded as received
-    // by the end of it, so any generation that isn't applied now is never
-    // offered again. Applying the OLDEST would therefore leave the tree
-    // permanently behind the hub after two unpulled pushes — and, worse, would
-    // record that stale generation as this machine's ancestor. Falls back to
-    // index 0 when NO record claims a payload, which keeps the manifest check
-    // below the sole authority in that case (Slice-1 behavior).
-    //
-    // That fallback is index 0 rather than "the newest bundle whose manifest
-    // has one" because the manifests aren't read yet here. It can only disagree
-    // with the manifests if a record's `hasWorkspace` is wrong, and the one
-    // write site sets both from the same push (hub/push.ts), so the two cannot
-    // drift in practice. If they ever did — a record claiming a payload whose
-    // manifest lacks one — the gate would fire on that bundle, find no
-    // `manifest.workspace`, and do nothing, suppressing an earlier bundle's
-    // genuine payload for that pull.
-    let workspaceBundleIndex = 0;
-    for (let i = needed.length - 1; i >= 0; i--) {
-      if (needed[i].hasWorkspace) { workspaceBundleIndex = i; break; }
-    }
-    // Every generation the bundles in this chain declare they descend from,
-    // oldest first — the peer's half of the "common to both trees" test that
-    // `chooseMergeAncestor` intersects with our own generation history.
-    const chainWorkspaceBases: Array<string | null> = [];
-    const importedSessions: HubPullResult["importedSessions"] = [];
-    const skippedSessions: HubPullResult["skippedSessions"] = [];
-    const appended: NonNullable<HubPullResult["appended"]> = [];
-    let lastImportedNewId: string | null = null;
-    let lastBundleManifest: ExportManifest | null = null;
-    // The local session THIS pull has landed content in (imported or extended)
-    // — null until something lands. It is both the thread mapping written at
-    // the end and the preferred splice target for later bundles in the same
-    // chain, since the mapping itself isn't written until the loop is done.
-    let threadLandedSessionId: string | null = null;
-    // The last two-sided fork this pull ran into, and whether a bundle was
-    // deliberately left unapplied because of one. A chain is pulled in order,
-    // so a later bundle's divergence supersedes an earlier one's.
-    let lastDivergence: HubPullDivergence | undefined;
-    let skippedByDivergence = false;
-    /**
-     * A divergence left this thread undecided, so the WHOLE chain stops here.
-     *
-     * Skipping only the diverged bundle and carrying on was the eighth
-     * foreclosure of this milestone, and the second to survive a guard built
-     * for the class. The mechanism: the next bundle in the chain is anchored on
-     * the head the skipped one would have installed, so it can never chain onto
-     * the local session either — it reaches the divergence branch with
-     * `adoptAvailable: false`, is fragment-imported, and IS recorded. That
-     * flips `appliedNothing`, the index is republished, `divergence.resolution`
-     * (one field for the whole pull) is overwritten "skip" -> "fragment", and
-     * the user who asked to adopt silently gets a third transcript with no
-     * indication their answer was dropped. Every remedy is then foreclosed:
-     * "Nothing to pull" / "the latest copy is already local".
-     *
-     * A skip is a promise that this pull applied and recorded NOTHING for this
-     * thread. That promise is only keepable at the granularity of the thread,
-     * because the bundles in a chain are not independent — so the loop breaks.
-     */
-    let divergenceAborted = false;
-    /** How many bundles of the chain were left unfetched by that break. */
-    let deferredBundles = 0;
-    /**
-     * Which bundle the break landed on, or -1 for "the chain ran to the end".
-     *
-     * The abort is thread-wide, but it is NOT a rollback, and the difference is
-     * the whole reason this index exists. A chain is walked in order, so bundles
-     * `0..abortIndex - 1` were spliced or imported AND RECORDED before the fork
-     * was discovered; only `abortIndex` onward is still on offer. Everything
-     * that phrases the abort — the warnings, the carry gate, the thread mapping
-     * — has to split on that boundary instead of treating the whole thread as
-     * untouched, which is only true at `abortIndex === 0`.
-     */
-    let abortIndex = -1;
-    /**
-     * Where THIS pull's own writes to a given local transcript begin: the file's
-     * byte size immediately before the first splice or adoption it performed
-     * there. Absent for a transcript this pull has not written to.
-     *
-     * Used to keep `localEntriesSinceAnchor` honest. That field answers "how far
-     * has the user's own copy run past the shared anchor", and a later bundle in
-     * the same chain measures it on a file an EARLIER bundle of the same pull
-     * just appended to — so without this the pull counts its own delivery as the
-     * user's divergence and reports a fork twice as wide as the real one.
-     */
-    const ourWritesFrom = new Map<string, number>();
-    // The newest carry payload in this chain, if any — see the loop.
-    let lastCarry: {
-      dir: string; meta: CarryMeta; bundleFile: string; bundleIndex: number;
-    } | null = null;
-    /**
-     * The index of the last bundle this pull actually finished handling, and its
-     * manifest. Distinct from "the last bundle in `needed`" once a divergence
-     * can stop the chain early — see the thread-mapping block at the end, which
-     * used to name a bundle that was never fetched.
-     */
-    let lastAppliedIndex = -1;
-
-    /**
-     * What this pull had ALREADY applied and recorded when a divergence stopped
-     * the chain at bundle `upTo`. Empty at `upTo === 0`, where the abort really
-     * does mean nothing happened.
-     *
-     * Measured on an aborted `--on-divergence skip` pull at `upTo === 1`: the
-     * base transcript went 5 -> 7 lines, `peers[...].received` gained an entry,
-     * the hub-peer ledger recorded a new head and this machine's index file was
-     * republished — while the shipped warning said "skipped, nothing changed".
-     * The skill layer repeats these sentences verbatim, so they have to be true
-     * on both sides of the boundary.
-     */
-    const describeApplied = (upTo: number): string => {
-      if (upTo <= 0) return "";
-      const bits: string[] = [];
-      const entries = appended.reduce((n, a) => n + a.entriesAppended, 0);
-      if (entries > 0) {
-        const targets = [...new Set(appended.map((a) => a.baseSessionId))];
-        bits.push(
-          `${entries} entr${entries === 1 ? "y" : "ies"} spliced into session${targets.length === 1 ? "" : "s"} ${targets.join(", ")}`
-        );
-      }
-      if (importedSessions.length > 0) {
-        bits.push(`${importedSessions.length} session${importedSessions.length === 1 ? "" : "s"} imported`);
-      }
-      if (skippedSessions.length > 0) {
-        bits.push(
-          `${skippedSessions.length} session${skippedSessions.length === 1 ? "" : "s"} already present`
-        );
-      }
-      const what = bits.length > 0 ? bits.join(", ") : "no session content landed from them";
-      return `the ${upTo} earlier bundle${upTo === 1 ? "" : "s"} in this chain ${upTo === 1 ? "was" : "were"} already applied and recorded (${what})`;
-    };
-
-    /** Earliest wins: our writes to a transcript start at the first of them. */
-    const rememberOurWrite = (path: string, from: number): void => {
-      const prior = ourWritesFrom.get(path);
-      ourWritesFrom.set(path, prior === undefined ? from : Math.min(prior, from));
-    };
+    // Every accumulator this pull's per-bundle loop writes, in one MUTABLE
+    // object passed by reference. Nothing here may be snapshotted or copied —
+    // see pull-apply-state.ts.
+    const st = initApplyState({ needed });
 
     for (const [i, record] of needed.entries()) {
       const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
@@ -1352,7 +1208,7 @@ export async function hubPull(
       }
 
       if (bundleManifest.workspace) {
-        chainWorkspaceBases.push(bundleManifest.workspace.basedOn?.bundleId ?? null);
+        st.chainWorkspaceBases.push(bundleManifest.workspace.basedOn?.bundleId ?? null);
       }
 
       // The carry is applied AFTER the whole chain, and the newest one wins:
@@ -1368,7 +1224,7 @@ export async function hubPull(
       // only reachable copy of someone's uncommitted work while the warning
       // said it had been "left in its bundle". See the gate after the loop.
       if (bundleManifest.carry) {
-        lastCarry = {
+        st.lastCarry = {
           dir: join(extractDir, "carry"),
           meta: bundleManifest.carry,
           bundleFile: record.file,
@@ -1428,7 +1284,7 @@ export async function hubPull(
       // directory is still recognized, so a single `!==` would read a freshly
       // linked project as having real content and skip the merge.
       const incomingDir = join(extractDir, "workspace");
-      const workspaceDeclared = i === workspaceBundleIndex && !!bundleManifest.workspace;
+      const workspaceDeclared = i === st.workspaceBundleIndex && !!bundleManifest.workspace;
 
       // First, a payload the manifest declares and the bundle does not contain.
       // Both application paths below start by READING that directory, so an
@@ -1447,7 +1303,7 @@ export async function hubPull(
       // exists to close. No sesh-mover produces that, but the sentence below
       // claims to cover a hand-made bundle, so the check has to mean it.
       if (workspaceDeclared && !isReadableDir(incomingDir)) {
-        workspaceDeclaredMissing = true;
+        st.workspaceDeclaredMissing = true;
         warnings.push(
           "The bundle's manifest declares a workspace payload but the bundle does not contain one, so there was nothing to apply and this project's files were left untouched. It was written by an older sesh-mover whose snapshot carried no files, damaged in transit, or not produced by sesh-mover at all."
         );
@@ -1466,7 +1322,7 @@ export async function hubPull(
         // will read.
         if (hasRealContent && !opts.forceWorkspace) {
           const ancestor = await chooseMergeAncestor(
-            backend, chainWorkspaceBases, known, tempRoot
+            backend, st.chainWorkspaceBases, known, tempRoot
           );
           ancestorDir = ancestor.dir;
           warnings.push(...ancestor.warnings);
@@ -1487,8 +1343,8 @@ export async function hubPull(
             incomingDir,
             targetDir: effectiveProjectPath,
           });
-          workspaceMerge = report;
-          workspaceUnpacked = {
+          st.workspaceMerge = report;
+          st.workspaceUnpacked = {
             path: effectiveProjectPath,
             fileCount:
               report.taken.length + report.created.length + report.restored.length +
@@ -1537,12 +1393,12 @@ export async function hubPull(
               effectiveProjectPath,
               { force: !!opts.forceWorkspace || !hasRealContent }
             );
-            workspaceUnpacked = { path: effectiveProjectPath, fileCount: ws.fileCount };
+            st.workspaceUnpacked = { path: effectiveProjectPath, fileCount: ws.fileCount };
             if (ws.symlinksSkipped > 0) {
               warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
             }
             if (ws.refused.length > 0) {
-              workspaceRefused = ws.refused;
+              st.workspaceRefused = ws.refused;
               // Deliberately does NOT accuse the sender. A bundle written by a
               // sesh-mover older than this guard, on a case-insensitive
               // filesystem, legitimately carried a `.GIT` store — the very leak
@@ -1630,11 +1486,11 @@ export async function hubPull(
             threadBaseCandidates(
               readSyncState(effectiveProjectPath),
               target.threadId,
-              threadLandedSessionId,
+              st.threadLandedSessionId,
               targetProjectDir
             ),
             anchorUuid,
-            threadLandedSessionId
+            st.threadLandedSessionId
           );
 
           if (baseSessionId) {
@@ -1662,7 +1518,7 @@ export async function hubPull(
             });
 
             if (outcome.kind === "appended") {
-              rememberOurWrite(basePath, baseSizeBeforeAppend);
+              st.rememberOurWrite(basePath, baseSizeBeforeAppend);
               recordSplice({
                 projectPath: effectiveProjectPath, basePath, baseSessionId,
                 peerId: sourceCopy.machineId, hubPeerId, manifest: bundleManifest,
@@ -1685,14 +1541,14 @@ export async function hubPull(
                 );
               }
 
-              appended.push({
+              st.appended.push({
                 threadId: target.threadId,
                 baseSessionId,
                 entriesAppended: outcome.entriesAppended,
               });
-              threadLandedSessionId = baseSessionId;
-              lastAppliedIndex = i;
-              lastBundleManifest = bundleManifest;
+              st.threadLandedSessionId = baseSessionId;
+              st.lastAppliedIndex = i;
+              st.lastBundleManifest = bundleManifest;
               continue; // bundle handled — no fragment import
             }
 
@@ -1716,7 +1572,7 @@ export async function hubPull(
               // between the anchor and our first byte, which are the real fork.
               const rawSinceAnchor =
                 anchorOffset === null ? 0 : await countEntriesAfterOffset(basePath, anchorOffset);
-              const ourStart = ourWritesFrom.get(basePath);
+              const ourStart = st.ourWritesFrom.get(basePath);
               const oursSinceAnchor =
                 anchorOffset === null || ourStart === undefined
                   ? 0
@@ -1741,7 +1597,7 @@ export async function hubPull(
                 adoptAvailable: anchorOffset !== null,
                 resolution: mode,
               };
-              lastDivergence = divergence;
+              st.lastDivergence = divergence;
 
               // The two sides of the fork, phrased for the user. When the
               // anchor isn't in the local session at all there IS no shared
@@ -1777,15 +1633,15 @@ export async function hubPull(
                 warnings.push(
                   i === 0
                     ? `Thread ${target.threadId} has diverged: ${forkSummary} — skipped, nothing changed. Re-run with --on-divergence fragment${divergence.adoptAvailable ? " or adopt-hub" : ""} to decide.`
-                    : `Thread ${target.threadId} has diverged: ${forkSummary} — this bundle was skipped and the fork is still undecided, but ${describeApplied(i)}, so this pull was not a no-op. Re-run with --on-divergence fragment${divergence.adoptAvailable ? " or adopt-hub" : ""} to decide; the re-run resumes at this bundle, not at the start of the chain.`
+                    : `Thread ${target.threadId} has diverged: ${forkSummary} — this bundle was skipped and the fork is still undecided, but ${st.describeApplied(i)}, so this pull was not a no-op. Re-run with --on-divergence fragment${divergence.adoptAvailable ? " or adopt-hub" : ""} to decide; the re-run resumes at this bundle, not at the start of the chain.`
                 );
-                skippedByDivergence = true;
+                st.skippedByDivergence = true;
                 // The whole thread stops here, not just this bundle — see
                 // `divergenceAborted`. Nothing is recorded FOR THIS BUNDLE OR
                 // ANY LATER ONE, so the decision can still be made in full.
-                divergenceAborted = true;
-                abortIndex = i;
-                deferredBundles = needed.length - 1 - i;
+                st.divergenceAborted = true;
+                st.abortIndex = i;
+                st.deferredBundles = needed.length - 1 - i;
                 break;
               }
 
@@ -1807,13 +1663,13 @@ export async function hubPull(
                 warnings.push(
                   i === 0
                     ? `adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Nothing was applied and nothing was recorded: exit that session, then re-run with --on-divergence adopt-hub --force-append (or --on-divergence fragment to keep both as separate sessions).`
-                    : `adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Nothing was applied or recorded for this bundle or any later one in the chain, so the adoption is still open; ${describeApplied(i)}. Exit that session, then re-run with --on-divergence adopt-hub --force-append (or --on-divergence fragment to keep both as separate sessions) — the re-run resumes at this bundle.`
+                    : `adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Nothing was applied or recorded for this bundle or any later one in the chain, so the adoption is still open; ${st.describeApplied(i)}. Exit that session, then re-run with --on-divergence adopt-hub --force-append (or --on-divergence fragment to keep both as separate sessions) — the re-run resumes at this bundle.`
                 );
                 divergence.resolution = "skip";
-                skippedByDivergence = true;
-                divergenceAborted = true;
-                abortIndex = i;
-                deferredBundles = needed.length - 1 - i;
+                st.skippedByDivergence = true;
+                st.divergenceAborted = true;
+                st.abortIndex = i;
+                st.deferredBundles = needed.length - 1 - i;
                 break;
               }
 
@@ -1878,7 +1734,7 @@ export async function hubPull(
                   }
 
                   divergence.preservedSessionId = preservedSessionId;
-                  appended.push({
+                  st.appended.push({
                     threadId: target.threadId,
                     baseSessionId,
                     entriesAppended: adopt.entriesAppended,
@@ -1894,10 +1750,10 @@ export async function hubPull(
                       `Session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago and was adopted anyway because --force-append was passed. If a Claude Code session is still open on it, exit it now: anything it writes from here chains onto the adopted hub branch, not onto the local branch preserved as ${preservedSessionId}.`
                     );
                   }
-                  threadLandedSessionId = baseSessionId;
-                  lastAppliedIndex = i;
-                  lastBundleManifest = bundleManifest;
-                  rememberOurWrite(basePath, anchorOffset!);
+                  st.threadLandedSessionId = baseSessionId;
+                  st.lastAppliedIndex = i;
+                  st.lastBundleManifest = bundleManifest;
+                  st.rememberOurWrite(basePath, anchorOffset!);
                   continue; // bundle handled — no fragment import
                 }
 
@@ -1968,25 +1824,25 @@ export async function hubPull(
         sessionIds: [record.sessionIdInBundle],
       });
       if (!importResult.success) return importResult; // importer already rolled back partial writes
-      lastAppliedIndex = i;
-      lastBundleManifest = bundleManifest;
-      importedSessions.push(...importResult.importedSessions);
-      skippedSessions.push(...importResult.skippedSessions);
+      st.lastAppliedIndex = i;
+      st.lastBundleManifest = bundleManifest;
+      st.importedSessions.push(...importResult.importedSessions);
+      st.skippedSessions.push(...importResult.skippedSessions);
       warnings.push(...importResult.warnings);
       if (importResult.importedSessions.length > 0) {
-        lastImportedNewId = importResult.importedSessions[importResult.importedSessions.length - 1].newId;
+        st.lastImportedNewId = importResult.importedSessions[importResult.importedSessions.length - 1].newId;
         // The freshly written session now carries the thread: a later
         // continuation in this same chain must splice onto IT, not onto
         // whatever older session the mapping still points at. Its mtime is
         // inside this operation, so the liveness guard exempts it.
-        threadLandedSessionId = lastImportedNewId;
+        st.threadLandedSessionId = st.lastImportedNewId;
         // The hub is the origin of this bundle's content, so as far as this
         // machine's OWN sync-state is concerned the hub already has it up to
         // this head — record that against the hub's own peer id (not the
         // originating machine's, which importSession already recorded above)
         // so a future push of just-appended content is recognized as a
         // continuation instead of re-uploading the whole session as "full".
-        recordSentToPeer(effectiveProjectPath, { id: hubPeerId, name: "hub" }, lastImportedNewId, {
+        recordSentToPeer(effectiveProjectPath, { id: hubPeerId, name: "hub" }, st.lastImportedNewId, {
           headEntryUuid: record.headEntryUuid,
           messageCount: record.messageCount,
           sentAsType: record.type,
@@ -2024,12 +1880,12 @@ export async function hubPull(
      * WHERE the payload came from, not on whether an abort happened.
      */
     const carrySuppressed =
-      divergenceAborted && lastCarry !== null && lastCarry.bundleIndex >= abortIndex;
-    if (divergenceAborted) {
+      st.divergenceAborted && st.lastCarry !== null && st.lastCarry.bundleIndex >= st.abortIndex;
+    if (st.divergenceAborted) {
       const parts: string[] = [];
-      if (deferredBundles > 0) {
+      if (st.deferredBundles > 0) {
         parts.push(
-          `the ${deferredBundles} later bundle${deferredBundles === 1 ? "" : "s"} in this thread's chain ${deferredBundles === 1 ? "was" : "were"} not fetched`
+          `the ${st.deferredBundles} later bundle${st.deferredBundles === 1 ? "" : "s"} in this thread's chain ${st.deferredBundles === 1 ? "was" : "were"} not fetched`
         );
       }
       if (carrySuppressed) {
@@ -2038,27 +1894,27 @@ export async function hubPull(
       if (parts.length > 0) {
         warnings.push(
           `Because that decision is still open, ${parts.join(" and ")} — nothing from ${parts.length === 1 ? "it" : "them"} was applied, saved or recorded either.` +
-            (abortIndex > 0
-              ? ` The ${abortIndex} bundle${abortIndex === 1 ? "" : "s"} before it in the chain had already been applied and recorded, so your answer applies from the diverged bundle onward rather than to the whole thread.`
+            (st.abortIndex > 0
+              ? ` The ${st.abortIndex} bundle${st.abortIndex === 1 ? "" : "s"} before it in the chain had already been applied and recorded, so your answer applies from the diverged bundle onward rather than to the whole thread.`
               : " Whichever answer you give next applies to the whole thread rather than half of it.")
         );
       }
     }
-    if (lastCarry && !carrySuppressed) {
-      carryAvailable = lastCarry.meta;
+    if (st.lastCarry && !carrySuppressed) {
+      carryAvailable = st.lastCarry.meta;
       // isDirectory, not exists — see the workspace guard above.
-      if (!isReadableDir(lastCarry.dir)) {
+      if (!isReadableDir(st.lastCarry.dir)) {
         warnings.push(
           "The bundle's manifest declares carried uncommitted changes but the bundle does not contain them, so there was nothing to apply. The bundle is damaged or was not produced by sesh-mover."
         );
       } else {
         carryApplied = await applyCarry({
-          carryDir: lastCarry.dir,
+          carryDir: st.lastCarry.dir,
           targetPath: effectiveProjectPath,
-          meta: lastCarry.meta,
+          meta: st.lastCarry.meta,
           saveOnly: !opts.applyCarry,
         });
-        warnings.push(...describeCarryApply(carryApplied, lastCarry.meta, lastCarry.bundleFile));
+        warnings.push(...describeCarryApply(carryApplied, st.lastCarry.meta, st.lastCarry.bundleFile));
       }
     }
 
@@ -2080,15 +1936,15 @@ export async function hubPull(
     // changes — so ask about a bundle that was really handled, and fall back to
     // the diverged one when the abort landed at the head of the chain.
     const lastRecord =
-      needed[lastAppliedIndex >= 0 ? lastAppliedIndex : divergenceAborted ? abortIndex : needed.length - 1];
+      needed[st.lastAppliedIndex >= 0 ? st.lastAppliedIndex : st.divergenceAborted ? st.abortIndex : needed.length - 1];
     const stateAfter = readSyncState(effectiveProjectPath);
     const lastSessionManifest =
-      lastBundleManifest?.sessions.find((s) => s.sessionId === lastRecord.sessionIdInBundle) ?? null;
+      st.lastBundleManifest?.sessions.find((s) => s.sessionId === lastRecord.sessionIdInBundle) ?? null;
     const hashRegistryFallback = lastSessionManifest
       ? stateAfter.imported[lastSessionManifest.integrityHash]?.localSessionId
       : undefined;
     const localSessionId: string | null =
-      threadLandedSessionId ??
+      st.threadLandedSessionId ??
       stateAfter.peers[sourceCopy.machineId]?.received?.[lastRecord.sessionIdInBundle]?.localSessionId ??
       hashRegistryFallback ??
       null;
@@ -2096,7 +1952,7 @@ export async function hubPull(
     if (localSessionId !== null) {
       setThreadId(stateAfter, hub.hubId, localSessionId, target.threadId);
       writeSyncState(stateAfter);
-    } else if (!skippedByDivergence) {
+    } else if (!st.skippedByDivergence) {
       // Never map a thread to a fabricated id (an empty string would poison
       // the index projection below and every future pull's dedup).
       //
@@ -2130,10 +1986,10 @@ export async function hubPull(
     // it was for one pull and the next push/pull (or `hub reindex`) rewrites
     // it — it is a derived file by design.
     const appliedNothing =
-      importedSessions.length === 0 &&
-      skippedSessions.length === 0 &&
-      appended.length === 0;
-    if (!(skippedByDivergence && appliedNothing)) {
+      st.importedSessions.length === 0 &&
+      st.skippedSessions.length === 0 &&
+      st.appended.length === 0;
+    if (!(st.skippedByDivergence && appliedNothing)) {
       const sessionsNow = discoverSessions(opts.configDir, effectiveProjectPath).map((s) => ({
         sessionId: s.sessionId,
         slug: s.slug,
@@ -2164,17 +2020,17 @@ export async function hubPull(
       command: "pull",
       threadId: target.threadId,
       sourceMachineId: sourceCopy.machineId,
-      importedSessions,
-      skippedSessions,
+      importedSessions: st.importedSessions,
+      skippedSessions: st.skippedSessions,
       localSessionId,
-      workspaceUnpacked,
-      workspaceMerge,
-      workspaceRefused,
-      workspaceDeclaredMissing,
+      workspaceUnpacked: st.workspaceUnpacked,
+      workspaceMerge: st.workspaceMerge,
+      workspaceRefused: st.workspaceRefused,
+      workspaceDeclaredMissing: st.workspaceDeclaredMissing,
       carryAvailable,
       carryApplied,
-      appended: appended.length > 0 ? appended : undefined,
-      divergence: lastDivergence,
+      appended: st.appended.length > 0 ? st.appended : undefined,
+      divergence: st.lastDivergence,
       unfetchableBundles,
       warnings,
     };
