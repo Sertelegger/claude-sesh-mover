@@ -48,7 +48,7 @@ const REGISTRY: FlagUse[] = [
     why: "A successful merge withheld a file. This pull recorded its bundles, so the remedies are aimed at the NEXT payload from that machine.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-carry.ts",
     match: "Pass --apply-carry on a future pull",
     klass: "future-only",
     why: "The carry decision cannot be revisited for this bundle; the saved payload is the remedy for THIS one.",

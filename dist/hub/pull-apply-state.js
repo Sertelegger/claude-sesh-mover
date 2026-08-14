@@ -1,4 +1,28 @@
 /**
+ * An undecided divergence stopped the chain, so a payload out of a bundle
+ * the user is about to pull AGAIN stops with it: applying or saving it now
+ * would leave a second copy of the same working tree beside the one the
+ * re-run delivers, and "nothing was applied" has to mean the whole bundle.
+ *
+ * That rationale reaches exactly as far as re-runnability, and no further.
+ * `lastCarry` is chosen from the newest carrying bundle anywhere in
+ * `0..abortIndex`, while the abort only defers `abortIndex` onward — so a
+ * payload from an earlier bundle belongs to one this pull already recorded.
+ * Suppressing that one deleted the only reachable copy of another machine's
+ * uncommitted work (`selectNeededBundles` drops the bundle on the re-run;
+ * the archive is left on the hub, extractable only by hand) while the
+ * warning claimed it had been left in its bundle for next time. Gate on
+ * WHERE the payload came from, not on whether an abort happened.
+ *
+ * ONE computation site, deliberately: the carry stage decides whether to apply
+ * on this predicate and the sessions disclosure decides whether to SAY the
+ * payload was left behind on it. Two copies is how those two answer
+ * differently, which is the shape the data loss above took.
+ */
+export function isCarrySuppressed(st) {
+    return st.divergenceAborted && st.lastCarry !== null && st.lastCarry.bundleIndex >= st.abortIndex;
+}
+/**
  * Build the per-pull apply state. Called once, immediately before the
  * per-bundle loop; every accumulator starts here at its "nothing has happened
  * yet" value.

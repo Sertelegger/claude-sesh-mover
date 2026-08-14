@@ -10,9 +10,10 @@ import { findUnfetchableBundles, newerThreadCopy, } from "./threads.js";
 import { createMachineNameLookup, shapeThreads } from "./whereis.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
 import { mergeWorkspaceTrees } from "./merge.js";
-import { applyCarry } from "./carry.js";
 import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS, } from "./append.js";
-import { initApplyState } from "./pull-apply-state.js";
+import { runApplyCarryStage } from "./pull-apply-carry.js";
+import { isReadableDir } from "./fs-probe.js";
+import { initApplyState, isCarrySuppressed } from "./pull-apply-state.js";
 import { runFetchStage } from "./pull-fetch.js";
 import { runRecordStage } from "./pull-record.js";
 import { runResolveStage } from "./pull-resolve.js";
@@ -84,24 +85,6 @@ export function selectThreadBase(candidates, anchorUuid, preferred) {
  * activity, but it is not conversation, and "which copy has the most
  * conversation" is the question these fields are asked.
  */
-/**
- * Is this path a directory we can list?
- *
- * Both "the bundle declares a payload it does not contain" guards use this
- * rather than `existsSync`, because the failure they exist to close is a
- * `readdirSync` throwing out of `hubPull` BEFORE the session import — which a
- * plain file at that path does just as well (ENOTDIR) as a missing one
- * (ENOENT). Any error reads as "not usable": the caller's next move is to warn
- * and skip, which is the right answer for a permission failure too.
- */
-function isReadableDir(path) {
-    try {
-        return statSync(path).isDirectory();
-    }
-    catch {
-        return false;
-    }
-}
 function readSessionTail(path) {
     const e = readLastConversationEntry(path);
     if (!e)
@@ -480,63 +463,6 @@ function describeWorkspaceMerge(r) {
     }
     if (r.restored.length > 0) {
         out.push(`${count(r.restored.length)} that you had deleted here ${were(r.restored.length)} changed on the other machine, so ${r.restored.length === 1 ? "it came" : "they came"} back rather than losing that work: ${names(r.restored)}. Delete ${r.restored.length === 1 ? "it" : "them"} again if you still don't want ${r.restored.length === 1 ? "it" : "them"}.`);
-    }
-    return out;
-}
-/**
- * What happened to a carried payload, in sentences a user can act on.
- *
- * Every branch here has to be honest about ONE fact that shapes all of them:
- * this pull records its bundles as received before it returns, so re-running it
- * — with or without `--apply-carry` — answers "Already up to date" and never
- * offers this payload again. Naming that re-run as a remedy is the foreclosure
- * this milestone keeps producing, so no branch below names it. What is named
- * instead is the saved directory, which is a copy the user already has.
- */
-function describeCarryApply(result, meta, bundleFile) {
-    const out = [];
-    const origin = `branch ${meta.branch} at commit ${meta.baseCommit.slice(0, 8)}`;
-    if (!result.applied) {
-        const lost = `The uncommitted changes this pull carried (${origin}) were not applied: ${result.detail}. ` +
-            (result.savedTo === null
-                ? `They could not be saved beside the project either, so the only remaining copy is inside ${bundleFile} on the hub — extract that archive by hand to recover them.`
-                : `The whole payload — patch, untracked files and a README ${
-                // Two declines withhold the commands on purpose (a refused payload,
-                // and a patch git could not parse here), so promising them on every
-                // decline sends the user looking for something that is not there.
-                result.savedCommands
-                    ? "with the exact commands"
-                    : "explaining what was found and what was withheld"} — is saved at ${result.savedTo}. Nothing was written to your working tree.`);
-        out.push(result.reason === "not-requested"
-            ? lost + " Pass --apply-carry on a future pull to have them applied straight into the tree instead."
-            : lost);
-        if (result.refused.length > 0) {
-            // The saved copy is the ONLY remedy on every decline, and its README
-            // tells the user to `cp -R '<saved>/untracked/.' .` — which copies
-            // dot-entries. So the floor runs on the save too, and what it dropped has
-            // to be said here as well as in that README: the user reads this first.
-            out.push(`${result.refused.length} path(s) in that payload were left out of the saved copy because they name plugin or VCS internals that never travel (${result.refused.slice(0, 5).join(", ")}). They are not in the saved directory, so the commands in its README cannot write them here. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`);
-        }
-        if (result.reason === "unsafe-payload") {
-            // The same disclosure `workspaceRefused` carries, and the same rule: do
-            // not accuse the sender. An older sesh-mover, on a case-insensitive
-            // filesystem, legitimately produced payloads this guard now refuses.
-            out.push("That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-include, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it.");
-        }
-        return out;
-    }
-    out.push(`Applied the uncommitted changes this pull carried (${origin}): ${result.filesChanged} file(s) from the patch, ${result.untrackedCopied} untracked file(s) copied. They are uncommitted here too — \`git status\` shows them, and \`git checkout -- .\` undoes the patch half.`);
-    if (meta.inProgress) {
-        out.push(`Those changes were captured during an in-progress ${meta.inProgress} on the other machine, so the patch contained conflict markers as ordinary file content and the ${meta.inProgress} itself did not travel — search for <<<<<<< before working on them.`);
-    }
-    if (result.collisions.length > 0) {
-        out.push(`${result.collisions.length} carried file(s) already existed here with different content, so yours were left alone and the incoming copies were written beside them as *.incoming-*: ${result.collisions.slice(0, 5).join(", ")}. Reconcile and delete the sidecars — they are untracked files, so a later push would carry them too.`);
-    }
-    if (result.refused.length > 0) {
-        out.push(`${result.refused.length} carried file(s) were refused because they name plugin or VCS internals that never travel (${result.refused.slice(0, 5).join(", ")}). Nothing from them was written. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`);
-    }
-    if (result.blocked.length > 0) {
-        out.push(`${result.blocked.length} carried file(s) were not written because of what already occupies their path here (${[...new Set(result.blocked.map((b) => b.reason))].join(", ")}): ${result.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them.`);
     }
     return out;
 }
@@ -1507,25 +1433,7 @@ export async function hubPull(opts) {
         // only when it has one, so a bundle carrying both did not come from a
         // current sesh-mover. If one ever does, the workspace application dirties
         // the tree and the carry declines — the safe order.
-        let carryAvailable;
-        let carryApplied;
-        /**
-         * An undecided divergence stopped the chain, so a payload out of a bundle
-         * the user is about to pull AGAIN stops with it: applying or saving it now
-         * would leave a second copy of the same working tree beside the one the
-         * re-run delivers, and "nothing was applied" has to mean the whole bundle.
-         *
-         * That rationale reaches exactly as far as re-runnability, and no further.
-         * `lastCarry` is chosen from the newest carrying bundle anywhere in
-         * `0..abortIndex`, while the abort only defers `abortIndex` onward — so a
-         * payload from an earlier bundle belongs to one this pull already recorded.
-         * Suppressing that one deleted the only reachable copy of another machine's
-         * uncommitted work (`selectNeededBundles` drops the bundle on the re-run;
-         * the archive is left on the hub, extractable only by hand) while the
-         * warning claimed it had been left in its bundle for next time. Gate on
-         * WHERE the payload came from, not on whether an abort happened.
-         */
-        const carrySuppressed = st.divergenceAborted && st.lastCarry !== null && st.lastCarry.bundleIndex >= st.abortIndex;
+        const carrySuppressed = isCarrySuppressed(st);
         if (st.divergenceAborted) {
             const parts = [];
             if (st.deferredBundles > 0) {
@@ -1541,22 +1449,16 @@ export async function hubPull(opts) {
                         : " Whichever answer you give next applies to the whole thread rather than half of it."));
             }
         }
-        if (st.lastCarry && !carrySuppressed) {
-            carryAvailable = st.lastCarry.meta;
-            // isDirectory, not exists — see the workspace guard above.
-            if (!isReadableDir(st.lastCarry.dir)) {
-                warnings.push("The bundle's manifest declares carried uncommitted changes but the bundle does not contain them, so there was nothing to apply. The bundle is damaged or was not produced by sesh-mover.");
-            }
-            else {
-                carryApplied = await applyCarry({
-                    carryDir: st.lastCarry.dir,
-                    targetPath: effectiveProjectPath,
-                    meta: st.lastCarry.meta,
-                    saveOnly: !opts.applyCarry,
-                });
-                warnings.push(...describeCarryApply(carryApplied, st.lastCarry.meta, st.lastCarry.bundleFile));
-            }
-        }
+        // `applyRequested: false` is NOT a skip — the stage still SAVES the
+        // payload beside the project. See the module doc before changing this.
+        const carryStage = await runApplyCarryStage({
+            targetPath: effectiveProjectPath,
+            applyRequested: opts.applyCarry === true,
+            apply: st,
+        });
+        warnings.push(...carryStage.reasons);
+        const carryAvailable = carryStage.value?.carryAvailable;
+        const carryApplied = carryStage.value?.carryApplied;
         const recorded = await runRecordStage({
             backend,
             configDir: opts.configDir,

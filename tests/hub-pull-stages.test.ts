@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-stages.js";
 import type { ErrorResult, ExportManifest } from "../src/types.js";
-import { initApplyState } from "../src/hub/pull-apply-state.js";
+import { initApplyState, type PulledCarry } from "../src/hub/pull-apply-state.js";
+import { runApplyCarryStage } from "../src/hub/pull-apply-carry.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import type { HubBackend } from "../src/hub/backend.js";
 import { readMachineIndex } from "../src/hub/index-file.js";
@@ -22,6 +23,7 @@ import { runResolveStage } from "../src/hub/pull-resolve.js";
 import { createArchive } from "../src/archiver.js";
 import { computeIntegrityHashFromFile, writeManifest } from "../src/manifest.js";
 import { encodeProjectPath } from "../src/platform.js";
+import { projectSeshMoverDir } from "../src/paths.js";
 import { readSyncState, writeSyncState } from "../src/sync-state.js";
 import { bundle, entry, idx, peer, syncState, writeCorruptBundle } from "./helpers/hub-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
@@ -854,5 +856,214 @@ describe("fetch stage", () => {
 
     expect(st.lastCarry?.bundleFile).toBe(newer.file);
     expect(st.lastCarry?.bundleIndex).toBe(1);
+  });
+});
+
+/**
+ * The carry stage's whole hazard is that `applyRequested: false` does NOT mean
+ * "skip". It means SAVE: the stage still calls `applyCarry` with `saveOnly`,
+ * which parks the payload under the project before declining. Short-circuiting
+ * to a skip before that call destroys another machine's uncommitted work — this
+ * pull records its bundles as received, so a re-run answers "Already up to
+ * date", and the extraction directory is removed when `hubPull` returns.
+ *
+ * So the assertions below are about WHERE the bytes ended up, not only about
+ * the status: a stub that returns a plausible-looking outcome without writing
+ * anything is exactly the bug.
+ */
+describe("apply.carry stage", () => {
+  let home: string;
+  let homeHandle: HomeOverrideHandle;
+  const temps: string[] = [];
+
+  const tmp = (prefix: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    temps.push(dir);
+    return dir;
+  };
+
+  beforeEach(() => {
+    // `saveCarryPayload` falls back to `~/.sesh-mover/` when the in-project
+    // destination is unusable, so an un-overridden HOME lets a failing test
+    // write a peer payload into the real user's home directory.
+    home = tmp("sm-carry-home-");
+    homeHandle = overrideHome(home);
+  });
+
+  afterEach(() => {
+    homeHandle.restore();
+    for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const meta = (over: Partial<CarryMeta> = {}): CarryMeta => ({
+    baseCommit: "0123456789abcdef0123456789abcdef01234567",
+    branch: "feature/carry",
+    detached: false,
+    inProgress: null,
+    capturedAt: "2026-08-13T10:00:00.000Z",
+    untrackedCount: 1,
+    untrackedBytes: 10,
+    patchBytes: 0,
+    reIncludedCount: 0,
+    reIncluded: [],
+    trackedIgnoredCount: 0,
+    trackedIgnored: [],
+    repoPrefix: "",
+    ...over,
+  });
+
+  /** A bundle's extracted `carry/` directory: one untracked file, no patch. */
+  const payloadDir = (): string => {
+    const dir = tmp("sm-carry-payload-");
+    mkdirSync(join(dir, "untracked"), { recursive: true });
+    writeFileSync(join(dir, "untracked", "note.txt"), "peer work\n", "utf-8");
+    return dir;
+  };
+
+  const carried = (over: Partial<PulledCarry> = {}): PulledCarry => ({
+    dir: payloadDir(),
+    meta: meta(),
+    bundleFile: "projects/p1/bundles/b7.tar.gz",
+    bundleIndex: 0,
+    ...over,
+  });
+
+  const declined = (r: unknown): { reason: string; savedTo: string | null } => {
+    const result = r as { applied: boolean; reason?: string; savedTo?: string | null };
+    if (result === undefined || result.applied !== false) {
+      throw new Error(`expected a declined ApplyResult, got ${JSON.stringify(r)}`);
+    }
+    return { reason: result.reason ?? "", savedTo: result.savedTo ?? null };
+  };
+
+  /**
+   * The invariant this whole module exists to protect: not asking for the carry
+   * still SAVES it. `status === "applied"` and `carryApplied.applied === false`
+   * are different claims and this is the case where they disagree.
+   */
+  it("saves the payload beside the project when --apply-carry was not requested", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry = carried();
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: false,
+      apply: { lastCarry: carry, divergenceAborted: false, abortIndex: -1 },
+    });
+
+    expect(out.status).toBe("applied");
+    expect(out.value?.carryAvailable).toBe(carry.meta);
+    const { reason, savedTo } = declined(out.value?.carryApplied);
+    expect(reason).toBe("not-requested");
+    expect(savedTo).not.toBeNull();
+    // A real directory holding the real bytes — not merely a reported path.
+    expect(savedTo?.startsWith(projectSeshMoverDir(proj))).toBe(true);
+    expect(existsSync(join(savedTo as string, "untracked", "note.txt"))).toBe(true);
+    expect(readFileSync(join(savedTo as string, "untracked", "note.txt"), "utf-8")).toBe(
+      "peer work\n"
+    );
+    expect(out.reasons.join(" ")).toContain(savedTo as string);
+    expect(out.reasons.join(" ")).toContain("Pass --apply-carry on a future pull");
+  });
+
+  /** The ordinary no-op: no bundle in the chain carried anything. Say nothing. */
+  it("skips with zero reasons when the chain carried no payload", async () => {
+    const out = await runApplyCarryStage({
+      targetPath: tmp("sm-carry-proj-"),
+      applyRequested: true,
+      apply: { lastCarry: null, divergenceAborted: false, abortIndex: -1 },
+    });
+
+    expect(out.status).toBe("skipped");
+    expect(out.reasons).toEqual([]);
+    expect(out.value).toBeNull();
+  });
+
+  /**
+   * The suppression gate turns on WHERE the payload came from, never on
+   * "did an abort happen". A payload out of a bundle this pull already
+   * recorded is not on offer again, so suppressing it deletes the only
+   * reachable copy — the measured data loss this gate was rewritten for.
+   */
+  it("still saves a payload from a bundle the pull already recorded, after a divergence abort", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry = carried({ bundleIndex: 0 });
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: false,
+      apply: { lastCarry: carry, divergenceAborted: true, abortIndex: 1 },
+    });
+
+    expect(out.status).toBe("applied");
+    const { savedTo } = declined(out.value?.carryApplied);
+    expect(existsSync(join(savedTo as string, "untracked", "note.txt"))).toBe(true);
+  });
+
+  /** At or past the abort index the bundle is re-offered next pull, so defer. */
+  it("defers a payload from the bundle the divergence abort landed on", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry = carried({ bundleIndex: 1 });
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: false,
+      apply: { lastCarry: carry, divergenceAborted: true, abortIndex: 1 },
+    });
+
+    expect(out.status).toBe("skipped");
+    expect(out.reasons).toEqual([]);
+    expect(out.value).toBeNull();
+    // Nothing parked anywhere: the re-run is what delivers this one.
+    expect(existsSync(projectSeshMoverDir(proj))).toBe(false);
+  });
+
+  /**
+   * `carryAvailable` is assigned before the readable-dir check, so a damaged
+   * bundle reports the payload it DECLARED even though nothing was applied —
+   * a skip that still carries a value.
+   */
+  it("reports the declared payload when the bundle does not contain it", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry: PulledCarry = {
+      dir: join(tmp("sm-carry-gone-"), "carry"),
+      meta: meta(),
+      bundleFile: "projects/p1/bundles/b9.tar.gz",
+      bundleIndex: 0,
+    };
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: true,
+      apply: { lastCarry: carry, divergenceAborted: false, abortIndex: -1 },
+    });
+
+    expect(out.status).toBe("skipped");
+    expect(out.reasons).toHaveLength(1);
+    expect(out.reasons[0]).toContain("the bundle does not contain them");
+    expect(out.value?.carryAvailable).toBe(carry.meta);
+    expect(out.value?.carryApplied).toBeUndefined();
+    expect(existsSync(projectSeshMoverDir(proj))).toBe(false);
+  });
+
+  /** A plain file where the carry directory belongs reads the same way (ENOTDIR). */
+  it("treats a file at the carry path as a bundle that carries nothing", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const holder = tmp("sm-carry-file-");
+    const notADir = join(holder, "carry");
+    writeFileSync(notADir, "not a directory", "utf-8");
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: true,
+      apply: {
+        lastCarry: { dir: notADir, meta: meta(), bundleFile: "b.tar.gz", bundleIndex: 0 },
+        divergenceAborted: false,
+        abortIndex: -1,
+      },
+    });
+
+    expect(out.status).toBe("skipped");
+    expect(out.value?.carryApplied).toBeUndefined();
   });
 });
