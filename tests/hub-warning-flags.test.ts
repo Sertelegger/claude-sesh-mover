@@ -42,7 +42,7 @@ interface FlagUse {
 const REGISTRY: FlagUse[] = [
   // ---- src/hub/pull.ts -----------------------------------------------------
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "re-pull the next workspace payload with --target-path",
     klass: "future-only",
     why: "A successful merge withheld a file. This pull recorded its bundles, so the remedies are aimed at the NEXT payload from that machine.",
@@ -60,19 +60,19 @@ const REGISTRY: FlagUse[] = [
     why: "The pull refused before touching anything (unlinked project); the same invocation plus --project-id runs from the top. The escape returns before registerMachine and before any hub write, so 'touching anything' stayed true when the resolve stage moved out of pull.ts.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "no common point to merge from and NOTHING was written",
     klass: "future-only",
     why: "The no-ancestor workspace skip. Sessions imported and the bundles are recorded, so this pull cannot be re-run for the payload — and because a skip records no generation, the state is sticky until a later payload is applied with one of the named flags.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "no 3-way merge was attempted even though this machine has workspace generations",
     klass: "descriptive",
     why: "Restates what --force-workspace just did. Nothing is being asked of the user.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "To use this destination anyway, re-run with --force-workspace",
     klass: "retry-works",
     why: "An explicit --target-path that is not empty aborts the pull before this bundle's session import, so nothing is recorded and the re-run reaches the same payload.",

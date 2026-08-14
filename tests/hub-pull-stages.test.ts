@@ -24,7 +24,10 @@ import { createArchive } from "../src/archiver.js";
 import { computeIntegrityHashFromFile, writeManifest } from "../src/manifest.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { projectSeshMoverDir } from "../src/paths.js";
-import { readSyncState, writeSyncState } from "../src/sync-state.js";
+import {
+  knownWorkspaceGenerations, readSyncState, setLastWorkspace, writeSyncState,
+} from "../src/sync-state.js";
+import { runApplyWorkspaceStage } from "../src/hub/pull-apply-workspace.js";
 import { bundle, entry, idx, peer, syncState, writeCorruptBundle } from "./helpers/hub-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
@@ -1065,5 +1068,100 @@ describe("apply.carry stage", () => {
 
     expect(out.status).toBe("skipped");
     expect(out.value?.carryApplied).toBeUndefined();
+  });
+});
+
+describe("apply.workspace stage", () => {
+  let root: string;
+  let home: HomeOverrideHandle;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "sm-ws-"));
+    mkdirSync(join(root, "home"), { recursive: true });
+    // Sync-state lives under the user's home, and the generation history this
+    // stage reads and (must not) write is the whole point of the assertion.
+    home = overrideHome(join(root, "home"));
+  });
+
+  afterEach(() => {
+    home.restore();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /**
+   * The no-common-point skip, reached the only way it can carry TWO reasons.
+   *
+   * The intersection is deliberately NON-empty — our history names `gen-shared`
+   * and the incoming chain declares it — so `chooseMergeAncestor` gets as far as
+   * fetching, finds the generation gone from the hub, and degrades to
+   * `{ dir: null }` WITH a sentence naming it. The stage then falls into the
+   * no-ancestor branch, which adds its own. Both have to survive: the
+   * degradation sentence is the only thing that says WHY a machine holding a
+   * shared generation still got nothing, and it has no other source.
+   *
+   * The empty-tree case is NOT this test. An empty project plus an empty
+   * intersection gives `hasRealContent === false`, which takes the bootstrap
+   * unpack and returns `applied` — asserting "skipped" there would break the
+   * bootstrap this stage must keep.
+   */
+  it("emits the ancestor degradation AND the no-common-point sentence, and records no generation", async () => {
+    const hubDir = join(root, "hub");
+    const tempRoot = join(root, "temp");
+    const project = join(root, "project");
+    const extractDir = join(root, "extract");
+    mkdirSync(hubDir, { recursive: true });
+    mkdirSync(tempRoot, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    mkdirSync(join(extractDir, "workspace"), { recursive: true });
+    // Real content on both sides: an incoming payload to apply, and a local
+    // file that makes `hasRealContent` true so the bootstrap branch cannot fire.
+    writeFileSync(join(extractDir, "workspace", "incoming.txt"), "theirs\n", "utf-8");
+    writeFileSync(join(project, "local.txt"), "mine\n", "utf-8");
+
+    const backend = createFsBackend(hubDir);
+
+    // Our half of the intersection: one generation on record, whose bundle is
+    // NOT on the hub (pruned, or not yet synced to this machine).
+    const before = readSyncState(project);
+    setLastWorkspace(before, "hub-1", {
+      bundleId: "gen-shared",
+      file: `${bundleDir("p1", "m-other")}/2026-08-01T00-00-00-000Z_gen-shared.tar.gz`,
+      pushedAt: "2026-08-01T00:00:00.000Z",
+    });
+    writeSyncState(before);
+
+    const out = await runApplyWorkspaceStage({
+      backend,
+      extractDir,
+      effectiveProjectPath: project,
+      targetPathGiven: false,
+      forceWorkspace: false,
+      bundleDeclaresWorkspace: true,
+      chainWorkspaceBases: ["gen-shared"],
+      hubId: "hub-1",
+      record: {
+        bundleId: "b1",
+        file: `${bundleDir("p1", "m-other")}/2026-08-02T00-00-00-000Z_b1.tar.gz`,
+        pushedAt: "2026-08-02T00:00:00.000Z",
+      },
+      tempRoot,
+    });
+
+    expect(out.status).toBe("skipped");
+    expect(out.value).toBeNull();
+    expect(out.reasons).toHaveLength(2);
+    expect(out.reasons[0]).toContain("gen-shared");
+    expect(out.reasons[0]).toContain("is no longer on the hub");
+    expect(out.reasons[1]).toContain("no common point to merge from and NOTHING was written");
+
+    // Nothing was written: not the payload...
+    expect(existsSync(join(project, "incoming.txt"))).toBe(false);
+    expect(readFileSync(join(project, "local.txt"), "utf-8")).toBe("mine\n");
+    // ...and above all not a generation. Recording one for a payload this tree
+    // never received is exactly how the next merge reads the whole payload as
+    // "deleted here".
+    expect(knownWorkspaceGenerations(readSyncState(project)).map((g) => g.bundleId)).toEqual([
+      "gen-shared",
+    ]);
   });
 });
