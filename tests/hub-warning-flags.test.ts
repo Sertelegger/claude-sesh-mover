@@ -54,10 +54,10 @@ const REGISTRY: FlagUse[] = [
     why: "The carry decision cannot be revisited for this bundle; the saved payload is the remedy for THIS one.",
   },
   {
-    file: "pull.ts",
+    file: "pull-resolve.ts",
     match: "Pass --project-id <id> to link to an existing hub project.",
     klass: "retry-works",
-    why: "The pull refused before touching anything (unlinked project); the same invocation plus --project-id runs from the top.",
+    why: "The pull refused before touching anything (unlinked project); the same invocation plus --project-id runs from the top. The escape returns before registerMachine and before any hub write, so 'touching anything' stayed true when the resolve stage moved out of pull.ts.",
   },
   {
     file: "pull.ts",

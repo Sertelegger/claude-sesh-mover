@@ -1,16 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-stages.js";
 import type { ErrorResult } from "../src/types.js";
 import { initApplyState } from "../src/hub/pull-apply-state.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readMachineIndex } from "../src/hub/index-file.js";
+import { localProjectIdPath, writeLocalProjectId } from "../src/hub/identity.js";
+import { HUB_JSON, indexPath, projectJsonPath } from "../src/hub/layout.js";
 import { runRecordStage, type RecordApplyView } from "../src/hub/pull-record.js";
+import { runResolveStage } from "../src/hub/pull-resolve.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { readSyncState, writeSyncState } from "../src/sync-state.js";
-import { bundle, peer, syncState } from "./helpers/hub-fixtures.js";
+import { bundle, entry, idx, peer, syncState } from "./helpers/hub-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
 describe("stage outcome constructors", () => {
@@ -387,5 +390,173 @@ describe("record stage", () => {
     expect(out.value?.indexWritten).toBe(true);
     expect(out.reasons).toHaveLength(1);
     expect(out.reasons[0]).toContain("its session could not be identified");
+  });
+});
+
+describe("resolve stage", () => {
+  let root: string;
+  let home: HomeOverrideHandle;
+  let hubDir: string;
+  let projectPath: string;
+
+  const HUB_ID = "hub-1";
+  const PROJECT_ID = "hub-project-1";
+  const CANDIDATE = { projectId: PROJECT_ID, name: "atlas", gitRemotes: ["github.com/acme/atlas"] };
+
+  /** Write one hub-relative file, creating its directories. */
+  function writeHubFile(rel: string, body: unknown): void {
+    const p = join(hubDir, rel);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(body, null, 2) + "\n", "utf-8");
+  }
+
+  function input(over: { projectIdOverride?: string } = {}) {
+    return {
+      backend: createFsBackend(hubDir),
+      projectPath,
+      hubPath: hubDir,
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "sm-resolve-"));
+    mkdirSync(join(root, "home"), { recursive: true });
+    home = overrideHome(join(root, "home"));
+    hubDir = join(root, "hub");
+    projectPath = join(root, "proj");
+    mkdirSync(projectPath, { recursive: true });
+    writeHubFile(HUB_JSON, { schemaVersion: 1, hubId: HUB_ID, createdAt: "2026-08-01T00:00:00.000Z" });
+    writeHubFile(projectJsonPath(PROJECT_ID), {
+      schemaVersion: 1,
+      projectId: PROJECT_ID,
+      name: CANDIDATE.name,
+      matchers: { gitRemotes: CANDIDATE.gitRemotes },
+      createdAt: "2026-08-01T00:00:00.000Z",
+      createdByMachine: "m2",
+    });
+  });
+
+  afterEach(() => {
+    home.restore();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** One other machine's index, listing a single thread. */
+  function writePeerIndex(machineId = "m2", threadId = "t-1"): void {
+    writeHubFile(
+      indexPath(PROJECT_ID, machineId),
+      idx(machineId, {
+        [threadId]: entry({
+          localSessionId: `local-${machineId}`,
+          headEntryUuid: "head-b0",
+          bundles: [bundle({ bundleId: "b0" })],
+        }),
+      })
+    );
+  }
+
+  /**
+   * THE reason this stage does not use `StageOutcome`.
+   *
+   * `stageRefuse` carries `value: null` and a list of strings, so routing the
+   * unlinked escape through it destroys `linkCandidates` — the structured list
+   * `/sesh-mover:pull` reads to offer the user a hub project to link to. The
+   * assertion is deliberately `toEqual` on the whole result: the stage hands
+   * back the FINISHED `HubUnlinkedResult`, not ingredients for the caller to
+   * rebuild one out of.
+   */
+  it("returns the finished HubUnlinkedResult, candidates intact, when the project is unlinked", async () => {
+    const out = await runResolveStage(input());
+
+    expect(out.kind).toBe("return");
+    if (out.kind !== "return") return;
+    expect(out.result).toEqual({
+      success: false,
+      command: "pull",
+      reason: "unlinked",
+      linkCandidates: [CANDIDATE],
+      suggestion: "Pass --project-id <id> to link to an existing hub project.",
+    });
+    // The escape happens BEFORE registerMachine, and it links nothing.
+    expect(existsSync(join(hubDir, "machines"))).toBe(false);
+    expect(existsSync(localProjectIdPath(projectPath))).toBe(false);
+  });
+
+  /**
+   * `hub` and `hubPeerId` are read at seven sites below the extracted range
+   * (thread mapping, workspace generations, the hub-peer receipt ledger), so a
+   * value of just `{ local, resolved }` would not compile at the call site.
+   */
+  it("proceeds with the linked identity, the hub record, its peer id and the resolved threads", async () => {
+    writeLocalProjectId(projectPath, {
+      projectId: PROJECT_ID, name: CANDIDATE.name,
+      createdAt: "2026-08-01T00:00:00.000Z", createdByMachine: "m2",
+    });
+    writePeerIndex();
+
+    const out = await runResolveStage(input());
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.reasons).toEqual([]);
+    expect(out.value.local.projectId).toBe(PROJECT_ID);
+    expect(out.value.hub.hubId).toBe(HUB_ID);
+    expect(out.value.hubPeerId).toBe(`hub:${HUB_ID}`);
+    expect(out.value.resolved.map((t) => t.threadId)).toEqual(["t-1"]);
+    expect(out.value.resolved[0].latest.machineId).toBe("m2");
+    // registerMachine runs on this path only — one file, this machine's.
+    expect(readdirSync(join(hubDir, "machines"))).toHaveLength(1);
+  });
+
+  it("links via --project-id without consulting the identity resolver", async () => {
+    writePeerIndex();
+
+    const out = await runResolveStage(input({ projectIdOverride: PROJECT_ID }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.local).toMatchObject({ projectId: PROJECT_ID, name: CANDIDATE.name });
+    expect(existsSync(localProjectIdPath(projectPath))).toBe(true);
+    expect(out.value.resolved).toHaveLength(1);
+  });
+
+  /**
+   * `readAllIndexes`'s warnings are the stage's `reasons` — the caller spreads
+   * them into `warnings` at the point the old inline `warnings.push` sat, so a
+   * corrupt peer index still reaches the user.
+   */
+  it("folds readAllIndexes warnings into reasons", async () => {
+    writeLocalProjectId(projectPath, {
+      projectId: PROJECT_ID, name: CANDIDATE.name,
+      createdAt: "2026-08-01T00:00:00.000Z", createdByMachine: "m2",
+    });
+    writePeerIndex();
+    mkdirSync(dirname(join(hubDir, indexPath(PROJECT_ID, "m3"))), { recursive: true });
+    writeFileSync(join(hubDir, indexPath(PROJECT_ID, "m3")), "{ not json", "utf-8");
+
+    const out = await runResolveStage(input());
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.reasons).toEqual([
+      "index file for machine m3 is unreadable (corrupt or not yet synced) — skipped.",
+    ]);
+    expect(out.value.resolved).toHaveLength(1);
+  });
+
+  /**
+   * No `try`/`catch` anywhere in the stage: "the hub path is not a hub" must
+   * keep escaping to cli.ts, which is what turns it into an ErrorResult. A
+   * stage that swallowed it would report `unlinked` for a mistyped hub path.
+   */
+  it("lets a non-hub path throw instead of reporting it as unlinked", async () => {
+    writeLocalProjectId(projectPath, {
+      projectId: PROJECT_ID, name: CANDIDATE.name,
+      createdAt: "2026-08-01T00:00:00.000Z", createdByMachine: "m2",
+    });
+    rmSync(join(hubDir, HUB_JSON));
+
+    await expect(runResolveStage(input())).rejects.toThrow();
   });
 });

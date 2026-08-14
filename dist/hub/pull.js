@@ -5,12 +5,8 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend } from "./backend.js";
-import { HUB_JSON } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
-import { resolveProjectIdentity, linkToHubProject } from "./identity.js";
-import { registerMachine } from "./init.js";
-import { readAllIndexes } from "./index-file.js";
-import { resolveThreads, findUnfetchableBundles, newerThreadCopy, } from "./threads.js";
+import { findUnfetchableBundles, newerThreadCopy, } from "./threads.js";
 import { createMachineNameLookup, shapeThreads } from "./whereis.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
 import { mergeWorkspaceTrees } from "./merge.js";
@@ -18,6 +14,7 @@ import { applyCarry } from "./carry.js";
 import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS, } from "./append.js";
 import { initApplyState } from "./pull-apply-state.js";
 import { runRecordStage } from "./pull-record.js";
+import { runResolveStage } from "./pull-resolve.js";
 import { extractArchive } from "../archiver.js";
 import { importSession } from "../importer.js";
 import { loadOrCreateMachineId } from "../machine.js";
@@ -641,36 +638,19 @@ export async function hubPull(opts) {
         // nonexistent until the workspace-unpack step runs; if linking wrote
         // .sesh-mover under it first, the "project path doesn't exist
         // locally" gate on the workspace flow (step 8) would never fire.
-        let local;
-        if (opts.projectIdOverride) {
-            local = await linkToHubProject(backend, opts.projectPath, opts.projectIdOverride);
-        }
-        else {
-            const resolution = await resolveProjectIdentity(backend, opts.projectPath);
-            if (resolution.kind === "linked") {
-                local = resolution.local;
-            }
-            else if (resolution.kind === "match") {
-                local = await linkToHubProject(backend, opts.projectPath, resolution.hubProject.projectId);
-                warnings.push(`Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`);
-            }
-            else {
-                return {
-                    success: false, command: "pull", reason: "unlinked",
-                    linkCandidates: resolution.candidates,
-                    suggestion: "Pass --project-id <id> to link to an existing hub project.",
-                };
-            }
-        }
-        await registerMachine(opts.hubPath);
-        // Read once, reused both for the hub-peer bookkeeping below (recognizing
-        // pulled content as already-known-to-the-hub) and for this thread's
-        // mapping write further down.
-        const hub = JSON.parse((await backend.read(HUB_JSON)).toString());
-        const hubPeerId = `hub:${hub.hubId}`;
-        const { indexes, warnings: indexWarnings } = await readAllIndexes(backend, local.projectId);
-        warnings.push(...indexWarnings);
-        const resolved = resolveThreads(indexes);
+        const resolveStage = await runResolveStage({
+            backend,
+            projectPath: opts.projectPath,
+            hubPath: opts.hubPath,
+            projectIdOverride: opts.projectIdOverride,
+        });
+        // The unlinked escape is the finished result, candidates and all — it
+        // carries no reasons, and the warnings collected so far are discarded with
+        // it exactly as they were before this was a stage.
+        if (resolveStage.kind === "return")
+            return resolveStage.result;
+        const { local, hub, hubPeerId, resolved } = resolveStage.value;
+        warnings.push(...resolveStage.reasons);
         if (!opts.threadId && !opts.latest) {
             // Same project path the real pull below keys its sync-state off, so the
             // pick list's `unfetchableBundles` says exactly what pulling that thread
