@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stageOk, stageSkip, stageRefuse } from "../src/hub/pull-stages.js";
+import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-stages.js";
+import type { ErrorResult } from "../src/types.js";
 import { initApplyState } from "../src/hub/pull-apply-state.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readMachineIndex } from "../src/hub/index-file.js";
@@ -35,6 +36,75 @@ describe("stage outcome constructors", () => {
     expect(r.status).toBe("refused");
     expect(r.value).toBeNull();
     expect(r.reasons).toEqual(["target not empty"]);
+  });
+
+  /**
+   * The workspace stage's no-ancestor skip emits `chooseMergeAncestor`'s 0..k
+   * degradation reasons PLUS the no-common-point sentence — a list, in order,
+   * from two sources.
+   */
+  it("stageSkip accepts a list of reasons and keeps their order", () => {
+    const s = stageSkip<{ count: number }>([
+      "bundle b1 was not fetchable",
+      "no workspace generation is common to both trees",
+    ]);
+    expect(s.status).toBe("skipped");
+    expect(s.value).toBeNull();
+    expect(s.reasons).toEqual([
+      "bundle b1 was not fetchable",
+      "no workspace generation is common to both trees",
+    ]);
+  });
+
+  /**
+   * The common gate-false no-op — no workspace payload in the chain at all —
+   * is not a story worth telling the user, so it must emit ZERO reasons.
+   */
+  it("stageSkip accepts an empty reason list", () => {
+    const s = stageSkip<{ count: number }>([]);
+    expect(s.status).toBe("skipped");
+    expect(s.value).toBeNull();
+    expect(s.reasons).toEqual([]);
+  });
+
+  it("stageSkip can carry a value for a skip that still has a shape to hand back", () => {
+    const s = stageSkip<{ count: number }>([], { count: 0 });
+    expect(s.status).toBe("skipped");
+    expect(s.value).toEqual({ count: 0 });
+    expect(s.reasons).toEqual([]);
+  });
+
+  it("stageSkip does not mutate a caller's reason array", () => {
+    const reasons = ["one"];
+    const s = stageSkip<{ count: number }>(reasons);
+    s.reasons.push("two");
+    expect(reasons).toEqual(["one"]);
+  });
+
+  /**
+   * `aborted` is the opposite of `refused`: the pull STOPS and `terminal` is
+   * the ErrorResult hubPull returns verbatim. Conflating the two would let a
+   * caller continue past a workspace abort, importing sessions and recording
+   * the bundle.
+   */
+  it("stageAbort carries the terminal ErrorResult and echoes its message as the reason", () => {
+    const terminal: ErrorResult = {
+      success: false,
+      command: "hub-pull",
+      error: "target project directory is not empty",
+      suggestion: "re-run with --force-workspace",
+    };
+    const a = stageAbort<{ count: number }>(terminal);
+    expect(a.status).toBe("aborted");
+    expect(a.value).toBeNull();
+    expect(a.reasons).toEqual(["target project directory is not empty"]);
+    expect(a.terminal).toBe(terminal);
+  });
+
+  it("only an aborted outcome carries a terminal ErrorResult", () => {
+    expect(stageOk({ count: 1 }).terminal).toBeUndefined();
+    expect(stageSkip<{ count: number }>("nothing to do").terminal).toBeUndefined();
+    expect(stageRefuse<{ count: number }>("target not empty").terminal).toBeUndefined();
   });
 });
 
