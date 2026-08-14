@@ -1,19 +1,29 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-stages.js";
-import type { ErrorResult } from "../src/types.js";
+import type { ErrorResult, ExportManifest } from "../src/types.js";
 import { initApplyState } from "../src/hub/pull-apply-state.js";
 import { createFsBackend } from "../src/hub/backend.js";
+import type { HubBackend } from "../src/hub/backend.js";
 import { readMachineIndex } from "../src/hub/index-file.js";
 import { localProjectIdPath, writeLocalProjectId } from "../src/hub/identity.js";
-import { HUB_JSON, indexPath, projectJsonPath } from "../src/hub/layout.js";
+import {
+  HUB_JSON, bundleDir, bundleFileName, indexPath, projectJsonPath,
+  type HubBundleRecord,
+} from "../src/hub/layout.js";
+import type { CarryMeta } from "../src/hub/carry.js";
+import { runFetchStage } from "../src/hub/pull-fetch.js";
 import { runRecordStage, type RecordApplyView } from "../src/hub/pull-record.js";
 import { runResolveStage } from "../src/hub/pull-resolve.js";
+import { createArchive } from "../src/archiver.js";
+import { computeIntegrityHashFromFile, writeManifest } from "../src/manifest.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { readSyncState, writeSyncState } from "../src/sync-state.js";
-import { bundle, entry, idx, peer, syncState } from "./helpers/hub-fixtures.js";
+import { bundle, entry, idx, peer, syncState, writeCorruptBundle } from "./helpers/hub-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
 describe("stage outcome constructors", () => {
@@ -558,5 +568,291 @@ describe("resolve stage", () => {
     rmSync(join(hubDir, HUB_JSON));
 
     await expect(runResolveStage(input())).rejects.toThrow();
+  });
+});
+
+describe("fetch stage", () => {
+  let root: string;
+  let hubDir: string;
+  let tempRoot: string;
+  let backend: HubBackend;
+
+  const MACHINE_ID = "m2";
+
+  /** A carry payload's metadata — only its presence and identity matter here. */
+  const CARRY: CarryMeta = {
+    baseCommit: "0".repeat(40),
+    branch: "main",
+    detached: false,
+    inProgress: null,
+    capturedAt: "2026-08-01T00:00:00.000Z",
+    untrackedCount: 1,
+    untrackedBytes: 12,
+    patchBytes: 0,
+    reIncludedCount: 0,
+    reIncluded: [],
+    trackedIgnoredCount: 0,
+    trackedIgnored: [],
+    repoPrefix: "",
+  };
+
+  /**
+   * An INTACT bundle on the hub — a real `.tar.gz` whose manifest is stamped by
+   * the real writer, so it passes every check this stage runs. The knobs are the
+   * two things the stage acts on (a declared workspace generation, a carry) plus
+   * the one damage shape `writeCorruptBundle` does not cover: a manifest that is
+   * perfectly self-consistent while the transcript it names is absent.
+   */
+  async function writeHealthyBundle(
+    over: {
+      bundleId?: string;
+      sessionId?: string;
+      pushedAt?: string;
+      basedOn?: string | null;
+      carry?: boolean;
+      omitSessionFile?: boolean;
+    } = {}
+  ): Promise<HubBundleRecord> {
+    const bundleId = over.bundleId ?? "b0";
+    const sessionId = over.sessionId ?? `sess-${bundleId}`;
+    const pushedAt = over.pushedAt ?? "2026-08-01T00:00:00.000Z";
+
+    const staging = mkdtempSync(join(root, "staging-"));
+    // "bundle" as the top-level name for the same reason push.ts uses it:
+    // extractArchive strips exactly one wrapper segment.
+    const bundleStaging = join(staging, "bundle");
+    mkdirSync(join(bundleStaging, "sessions"), { recursive: true });
+
+    const jsonlPath = join(bundleStaging, "sessions", `${sessionId}.jsonl`);
+    const entries = [
+      {
+        sessionId, cwd: "/x", version: "2.1.81", gitBranch: "main", slug: "fetch-stage",
+        uuid: `${bundleId}-1`, parentUuid: null, timestamp: "2026-08-01T10:00:00.000Z",
+        type: "user", message: { role: "user", content: "hello" },
+      },
+    ];
+    writeFileSync(jsonlPath, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+
+    const manifest: ExportManifest = {
+      version: 1,
+      plugin: "sesh-mover",
+      exportedAt: pushedAt,
+      sourcePlatform: "linux",
+      sourceProjectPath: "/x",
+      sourceConfigDir: "/x/.claude",
+      sourceClaudeVersion: "2.1.81",
+      sessionScope: "current",
+      includedLayers: ["jsonl"],
+      projectId: "p1",
+      sourceMachineId: MACHINE_ID,
+      sessions: [
+        {
+          sessionId,
+          slug: "fetch-stage",
+          summary: "an intact bundle",
+          createdAt: "2026-08-01T10:00:00.000Z",
+          lastActiveAt: "2026-08-01T10:00:00.000Z",
+          messageCount: entries.length,
+          gitBranch: "main",
+          entrypoint: "cli",
+          integrityHash: await computeIntegrityHashFromFile(jsonlPath),
+          type: "full",
+        },
+      ],
+    };
+    if (over.basedOn !== undefined) {
+      mkdirSync(join(bundleStaging, "workspace"), { recursive: true });
+      writeFileSync(join(bundleStaging, "workspace", "README.md"), "# hi\n", "utf-8");
+      manifest.workspace = {
+        fileCount: 1,
+        byteSize: 5,
+        snapshotAt: pushedAt,
+        basedOn: over.basedOn === null ? null : { bundleId: over.basedOn, file: "irrelevant" },
+      };
+    }
+    if (over.carry) {
+      mkdirSync(join(bundleStaging, "carry", "untracked"), { recursive: true });
+      writeFileSync(join(bundleStaging, "carry", "untracked", "scratch.txt"), "wip\n", "utf-8");
+      manifest.carry = CARRY;
+    }
+    writeManifest(bundleStaging, manifest);
+
+    // AFTER the manifest is stamped: sessionsDigest covers the session list and
+    // its hashes, never the files beside it, so removing the transcript leaves a
+    // manifest that is internally self-consistent and lying.
+    if (over.omitSessionFile) rmSync(jsonlPath);
+
+    const archivePath = join(staging, "bundle.tar.gz");
+    await createArchive(bundleStaging, archivePath, "gzip");
+    const file = `${bundleDir("p1", MACHINE_ID)}/${bundleFileName(pushedAt, bundleId)}`;
+    await backend.writeAtomic(file, readFileSync(archivePath));
+    rmSync(staging, { recursive: true, force: true });
+
+    return {
+      bundleId,
+      file,
+      type: "full",
+      sessionIdInBundle: sessionId,
+      fromEntryUuid: null,
+      headEntryUuid: `${bundleId}-1`,
+      messageCount: entries.length,
+      pushedAt,
+      hasWorkspace: over.basedOn !== undefined,
+    };
+  }
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "sm-fetch-"));
+    hubDir = join(root, "hub");
+    tempRoot = join(root, "temp");
+    mkdirSync(hubDir, { recursive: true });
+    mkdirSync(tempRoot, { recursive: true });
+    backend = createFsBackend(hubDir);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /**
+   * The digest guard, reached the long way round.
+   *
+   * The assertions on the temp dir are the point: a stage that never downloaded,
+   * never extracted, or tripped the *other* guard would also report "aborted",
+   * so the test checks that the archive is on disk, that the manifest was
+   * extracted and read, and that the transcript the manifest names IS present —
+   * leaving the manifest's own damaged session list as the only thing that could
+   * have stopped it.
+   */
+  it("aborts a bundle whose manifest is no longer the one the exporter stamped", async () => {
+    const record = await writeCorruptBundle(backend, "p1");
+    const st = initApplyState({ needed: [record] });
+
+    const out = await runFetchStage({
+      backend, record, bundleIndex: 0, tempRoot, state: st,
+    });
+
+    expect(out.status).toBe("aborted");
+    expect(out.value).toBeNull();
+    expect(out.terminal).toMatchObject({ success: false, command: "pull" });
+    expect(out.terminal?.error).toContain(`Bundle ${record.bundleId} failed its integrity check`);
+    // Both user-facing fields travel, not just the headline.
+    expect(out.terminal?.suggestion).toContain("Nothing from this bundle was applied.");
+    expect(out.terminal?.suggestion).toContain("this check detects damage, not tampering");
+
+    // It got all the way through download -> extract -> readManifest...
+    const extractDir = join(tempRoot, record.bundleId);
+    expect(existsSync(join(tempRoot, `${record.bundleId}.tar.gz`))).toBe(true);
+    expect(existsSync(join(extractDir, "manifest.json"))).toBe(true);
+    // ...and the OTHER guard cannot be what fired: the declared transcript is there.
+    expect(
+      existsSync(join(extractDir, "sessions", `${record.sessionIdInBundle}.jsonl`))
+    ).toBe(true);
+
+    // A refused bundle contributes no merge ancestor and no carry.
+    expect(st.chainWorkspaceBases).toEqual([]);
+    expect(st.lastCarry).toBeNull();
+  });
+
+  /**
+   * Partly redundant with `importSession`'s own check, and deliberately kept
+   * here anyway: the append path guards the identical path and silently
+   * DECLINES, so without this the bundle would be counted as imported.
+   */
+  it("aborts when the manifest declares a session the bundle does not contain", async () => {
+    const record = await writeHealthyBundle({ omitSessionFile: true, basedOn: "gen-1", carry: true });
+    const st = initApplyState({ needed: [record] });
+
+    const out = await runFetchStage({
+      backend, record, bundleIndex: 0, tempRoot, state: st,
+    });
+
+    expect(out.status).toBe("aborted");
+    expect(out.value).toBeNull();
+    expect(out.terminal?.error).toContain(
+      `declares session ${record.sessionIdInBundle} but does not contain it`
+    );
+    expect(out.terminal?.suggestion).toContain("Nothing from this bundle was applied.");
+    // The manifest passed its own digest check, so this is the second guard.
+    expect(out.terminal?.error).not.toContain("integrity check");
+    // Refused before either accumulator was written, even though this manifest
+    // declares both a workspace generation and a carry.
+    expect(st.chainWorkspaceBases).toEqual([]);
+    expect(st.lastCarry).toBeNull();
+  });
+
+  /**
+   * The two writes are MUTATIONS of the shared state, not return values: the
+   * generation has to be visible to `chooseMergeAncestor` in this same loop
+   * iteration, below the workspace gate that runs right after this stage.
+   */
+  it("records the chain's workspace base and the newest carry into the shared state", async () => {
+    const record = await writeHealthyBundle({ basedOn: "gen-1", carry: true });
+    const st = initApplyState({ needed: [record] });
+
+    const out = await runFetchStage({
+      backend, record, bundleIndex: 3, tempRoot, state: st,
+    });
+
+    expect(out.status).toBe("applied");
+    expect(out.reasons).toEqual([]);
+    expect(out.value?.extractDir).toBe(join(tempRoot, record.bundleId));
+    expect(out.value?.manifest.sessions[0].sessionId).toBe(record.sessionIdInBundle);
+
+    expect(st.chainWorkspaceBases).toEqual(["gen-1"]);
+    expect(st.lastCarry).toEqual({
+      dir: join(tempRoot, record.bundleId, "carry"),
+      meta: CARRY,
+      bundleFile: record.file,
+      // The caller's index, not a count of anything the stage saw — the carry
+      // gate after the loop splits on it.
+      bundleIndex: 3,
+    });
+  });
+
+  /** A first workspace push declares no ancestor, and `null` is that generation. */
+  it("records a null generation for a bundle that declares no base", async () => {
+    const record = await writeHealthyBundle({ basedOn: null });
+    const st = initApplyState({ needed: [record] });
+
+    await runFetchStage({ backend, record, bundleIndex: 0, tempRoot, state: st });
+
+    expect(st.chainWorkspaceBases).toEqual([null]);
+  });
+
+  /**
+   * Newest-wins **only if present**. A later bundle with no carry must leave the
+   * earlier one alone — `st.lastCarry = value.carry ?? null` at a call site would
+   * silently discard another machine's uncommitted work, which is why the guard
+   * is welded to the assignment inside the stage.
+   */
+  it("does not clear an earlier bundle's carry when a later bundle has none", async () => {
+    const withCarry = await writeHealthyBundle({ bundleId: "b0", carry: true });
+    const without = await writeHealthyBundle({
+      bundleId: "b1", pushedAt: "2026-08-02T00:00:00.000Z",
+    });
+    const st = initApplyState({ needed: [withCarry, without] });
+
+    await runFetchStage({ backend, record: withCarry, bundleIndex: 0, tempRoot, state: st });
+    expect(st.lastCarry?.bundleFile).toBe(withCarry.file);
+
+    await runFetchStage({ backend, record: without, bundleIndex: 1, tempRoot, state: st });
+    expect(st.lastCarry?.bundleFile).toBe(withCarry.file);
+    expect(st.lastCarry?.bundleIndex).toBe(0);
+  });
+
+  /** A newer carry in the same chain supersedes an older one — that half still holds. */
+  it("lets a later bundle's carry supersede an earlier one", async () => {
+    const older = await writeHealthyBundle({ bundleId: "b0", carry: true });
+    const newer = await writeHealthyBundle({
+      bundleId: "b1", pushedAt: "2026-08-02T00:00:00.000Z", carry: true,
+    });
+    const st = initApplyState({ needed: [older, newer] });
+
+    await runFetchStage({ backend, record: older, bundleIndex: 0, tempRoot, state: st });
+    await runFetchStage({ backend, record: newer, bundleIndex: 1, tempRoot, state: st });
+
+    expect(st.lastCarry?.bundleFile).toBe(newer.file);
+    expect(st.lastCarry?.bundleIndex).toBe(1);
   });
 });

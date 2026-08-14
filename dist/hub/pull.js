@@ -13,12 +13,13 @@ import { mergeWorkspaceTrees } from "./merge.js";
 import { applyCarry } from "./carry.js";
 import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS, } from "./append.js";
 import { initApplyState } from "./pull-apply-state.js";
+import { runFetchStage } from "./pull-fetch.js";
 import { runRecordStage } from "./pull-record.js";
 import { runResolveStage } from "./pull-resolve.js";
 import { extractArchive } from "../archiver.js";
 import { importSession } from "../importer.js";
 import { loadOrCreateMachineId } from "../machine.js";
-import { computeIntegrityHashFromFile, readManifest, verifySessionsDigest } from "../manifest.js";
+import { computeIntegrityHashFromFile } from "../manifest.js";
 import { countJsonlLines, findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
@@ -940,90 +941,25 @@ export async function hubPull(opts) {
         // see pull-apply-state.ts.
         const st = initApplyState({ needed });
         for (const [i, record] of needed.entries()) {
-            const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
-            const out = createWriteStream(tarPath);
-            // record.file is hub-sourced (read out of another machine's index
-            // file) and used as a path immediately below — the backend's
-            // assertHubRelPath (hub/layout.ts, enforced inside every HubBackend
-            // method, see hub/backend.ts) is the containment that rejects
-            // traversal/absolute paths before anything touches the filesystem.
-            await pipeline(await backend.readStream(record.file), out);
-            const extractDir = join(tempRoot, record.bundleId);
-            mkdirSync(extractDir, { recursive: true });
-            await extractArchive(tarPath, extractDir);
-            // Archiver-rooting reality check: createArchive tars the staging dir
-            // with `cwd: dirname(sourceDir)` and a single top-level entry
-            // (basename(sourceDir), i.e. "bundle" for push's staging), and
-            // extractArchive always calls tar.extract with strip:1 — which
-            // removes exactly that one wrapper segment. So manifest.json/sessions/
-            // etc. land directly under extractDir, the same way cli.ts's import
-            // action treats its own tempExtractDir as the exportPath (no nested
-            // "bundle/" to join).
-            const bundleManifest = readManifest(extractDir);
-            /**
-             * Nothing in this bundle is trusted until the manifest is shown to be the
-             * one the pushing machine's exporter wrote, and nothing it declares is
-             * trusted until the file is actually there.
-             *
-             * Both checks have to happen HERE rather than being left to
-             * `importSession` at the bottom of the loop, because everything between
-             * the two reads the manifest as fact: the workspace merge and the carry
-             * are keyed off it, and the append path splices a continuation into a
-             * transcript the user already owns after checking the delta against
-             * `bundleSession.integrityHash` — a hash out of this same manifest. A
-             * damaged session list makes that comparison meaningless, and a
-             * `sessionIdInBundle` with no file behind it used to fall through the
-             * append path's `existsSync(deltaPath)` guard into an import that counted
-             * it as imported anyway.
-             *
-             * A damaged bundle stops the whole chain rather than being skipped: bundle
-             * N+1 is anchored on bundle N's head (ledger: "a chain is not a set of
-             * independent items"), so there is no such thing as carrying on past a
-             * missing link. Returning here means earlier bundles in this pull stay
-             * applied and recorded — the same shape `importSession`'s own hard failure
-             * has always had at this call site.
-             */
-            const bundleDigestProblem = verifySessionsDigest(bundleManifest);
-            if (bundleDigestProblem) {
-                return {
-                    success: false,
-                    command: "pull",
-                    error: `Bundle ${record.bundleId} failed its integrity check: ${bundleDigestProblem}`,
-                    suggestion: "Nothing from this bundle was applied. The hub's copy is damaged or was edited after it was written — this check detects damage, not tampering. Ask the machine that pushed it to push again; the bundles applied before it in this chain are recorded and will not be refetched.",
-                };
-            }
-            const declaredJsonl = join(extractDir, "sessions", `${record.sessionIdInBundle}.jsonl`);
-            if (!existsSync(declaredJsonl)) {
-                return {
-                    success: false,
-                    command: "pull",
-                    error: `Bundle ${record.bundleId} declares session ${record.sessionIdInBundle} but does not contain it (${record.file}).`,
-                    suggestion: "Nothing from this bundle was applied. The archive on the hub is truncated or was only partially written — if the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again.",
-                };
-            }
-            if (bundleManifest.workspace) {
-                st.chainWorkspaceBases.push(bundleManifest.workspace.basedOn?.bundleId ?? null);
-            }
-            // The carry is applied AFTER the whole chain, and the newest one wins:
-            // each payload is a full `git diff HEAD` of the sender's tree at that
-            // moment, so an older one in the same chain describes a superseded
-            // working tree. Recorded here because the extraction directories only
-            // live until this function returns.
-            // `bundleIndex` is load-bearing, not bookkeeping: a divergence abort
-            // suppresses the carry, and that suppression is only correct for a
-            // payload the user will actually be offered again. A carry out of a
-            // bundle EARLIER than the abort belongs to a bundle this pull already
-            // recorded — the re-run will never see it, and dropping it deleted the
-            // only reachable copy of someone's uncommitted work while the warning
-            // said it had been "left in its bundle". See the gate after the loop.
-            if (bundleManifest.carry) {
-                st.lastCarry = {
-                    dir: join(extractDir, "carry"),
-                    meta: bundleManifest.carry,
-                    bundleFile: record.file,
-                    bundleIndex: i,
-                };
-            }
+            // Download, unpack and read the manifest — and, on the way through,
+            // write this bundle's workspace generation and carry into `st`. Both are
+            // MUTATIONS rather than returned values on purpose (see pull-fetch.ts):
+            // the generation must be in `st.chainWorkspaceBases` before the workspace
+            // gate a few lines below reads it, and a returned optional carry invites
+            // `?? null` at this call site, which would clear an earlier bundle's carry
+            // whenever a later bundle has none.
+            const fetched = await runFetchStage({
+                backend, record, bundleIndex: i, tempRoot, state: st,
+            });
+            // The only correct handling of a fetch abort. `break` would fall through
+            // to the carry gate, the thread mapping, `writeSyncState` and
+            // `writeMachineIndex` and then return `success: true` — a refusal turned
+            // into a successful pull. `continue` would violate the chain invariant
+            // (bundle N+1 is anchored on N's head) and fragment-import AND record the
+            // next bundle, foreclosing the remedy the message names.
+            if (fetched.status === "aborted")
+                return fetched.terminal;
+            const { extractDir, manifest: bundleManifest } = fetched.value;
             // Workspace gate (the chain's newest workspace-carrying bundle only).
             // Slice 1's four branches are preserved; what changed is that the
             // APPLICATION step is now a 3-way merge whenever a generation COMMON TO
