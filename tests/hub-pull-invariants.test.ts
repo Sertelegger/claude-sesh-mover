@@ -29,24 +29,74 @@ function hubPullBody(): string {
  * trimmed. This is an ALLOWLIST, not a count: the point is that adding a
  * clock read to the pull pipeline has to be a deliberate, reviewed act.
  *
- * Only the first entry is the operation-scope capture. The other two are
- * audited exceptions that do NOT feed append.ts's self-write exemption:
+ * There is now exactly one, the operation-scope capture. `hubPull` used to
+ * carry two audited exceptions alongside it — the adopt-hub `baseAgeMs`
+ * heuristic and a history.jsonl display `timestamp` — and both left with the
+ * `apply.sessions` stage. Neither was deleted: a stage file may not read the
+ * clock at all (the last test below), so each became a parameter (`ageNowMs`,
+ * `historyNowMs`, plus `historyNowDate` for the date string that reads no
+ * clock but takes the same route), and `hubPull` passes `opNowMs` for them
+ * today.
  *
- * - `baseAgeMs` is the adopt-hub divergence heuristic — an age used for a
- *   freshness window and a human-readable "modified Ns ago" message. The
- *   exemption on the same line is still `opNowMs` (`baseMtimeMs < opNowMs`).
- * - `timestamp` is a history.jsonl display record for the preserved local
- *   branch. It is not a liveness input at all.
+ * That is deliberately NOT the same as folding them into `opNowMs`. The
+ * parameters stay distinct because they are different kinds of value:
+ * `opNowMs` is a boundary ("anything at or after this was written by us") and
+ * must never be refreshed, while `ageNowMs` feeds a duration rendered to the
+ * user as "modified Ns ago" and may legitimately be made fresher later. The
+ * self-write exemption itself is untouched and still compares against
+ * `opNowMs`.
  *
- * If a stage extraction moves either exception into a `pull-*.ts` file, it
- * must be turned into a parameter first — the second test below forbids a
- * clock read in a stage file outright, deliberately, and that rule wins.
+ * Passing `opNowMs` for `ageNowMs` today is a real, accepted behavior change,
+ * and its direction is the opposite of what an earlier version of this comment
+ * claimed. `opNowMs` is captured before the lock, so the reported age is SHORT
+ * by the pull's runtime. A smaller age makes `looksLive` more likely true, so
+ * `adopt-hub` gets refused where a fresh clock would have adopted — an
+ * adoption can become a refusal, never a refusal a truncation. Making it exact
+ * means a fresh `Date.now()` at the call site, which this list would then have
+ * to permit.
+ *
+ * So a stage extraction that moves a clock read must parameterize it and
+ * shrink this list in the same commit — the stage-file rule wins.
  */
-const ALLOWED_CLOCK_READS_IN_HUB_PULL = [
-  "const opNowMs = Date.now();",
-  "const baseAgeMs = Date.now() - baseMtimeMs;",
-  "timestamp: Date.now(),",
-];
+const ALLOWED_CLOCK_READS_IN_HUB_PULL = ["const opNowMs = Date.now();"];
+
+/**
+ * `new Date()` is the same wall-clock read wearing a different hat, and it
+ * slipped past the `Date.now()` grep below for the whole of Slice 2: the
+ * history.jsonl display date on the adopt path was
+ * `new Date().toISOString().slice(0, 10)`, sitting in the middle of a range
+ * that was about to be extracted into a file this suite would then certify as
+ * clock-free. An argument makes the call a formatter rather than a clock
+ * (`new Date(opNowMs)`), so only the ZERO-argument form counts.
+ *
+ * Default is none: a stage file with no entry here may not contain one at all.
+ * The single exemption is audited and pre-existing, moved verbatim by the
+ * record-stage extraction:
+ *
+ * - `pull-record.ts` stamps `updatedAt` on this machine's own index file.
+ *   The checkable fact that makes this safe, rather than merely plausible:
+ *   **`updatedAt` is write-only across the whole of `src/`.** It is written
+ *   here and in `reindex.ts` (which writes the empty string for it), and read
+ *   nowhere — not by `resolveThreads`, not by the latest-copy tiebreak, not by
+ *   any liveness guard. So no decision anywhere can depend on which clock
+ *   produced it. Verify that claim before extending this list, and if
+ *   `updatedAt` ever gains a reader, this entry must go.
+ *
+ *   The follow-up is to parameterize it the next time `pull-record.ts` is
+ *   opened — `runRecordStage` already takes an input object, so it is a
+ *   two-line change with no behavioral consequence — and then delete this
+ *   entry to restore an unconditional ban.
+ *
+ * SCOPE, stated honestly: this loop matches `pull-*.ts`, which excludes
+ * `pull.ts` itself, and `hubPullBody()` slices from `hubPull`'s declaration,
+ * so helpers above it are outside both greps. `recordSplice` in `pull.ts`
+ * contains a live `new Date().toISOString()` on the pull's write path today.
+ * The guarantee here is "no STAGE FILE reads the clock", not "the pull
+ * pipeline doesn't".
+ */
+const ALLOWED_BARE_NEW_DATE_BY_STAGE_FILE: Record<string, string[]> = {
+  "pull-record.ts": ["now: new Date().toISOString(),"],
+};
 
 /**
  * `opNowMs` must be read exactly once, in pull.ts, and passed into stages.
@@ -88,6 +138,17 @@ describe("pull pipeline clock discipline", () => {
     for (const f of stageFiles) {
       const src = readFileSync(join(HUB_DIR, f), "utf-8");
       expect(src, `${f} must receive opNowMs as a parameter`).not.toMatch(/Date\.now\(\)/);
+      // ...and the same rule for the other spelling — see
+      // ALLOWED_BARE_NEW_DATE_BY_STAGE_FILE. An absent entry means an empty
+      // list, i.e. the plain "no bare new Date() in a stage file" ban.
+      const bare = src
+        .split("\n")
+        .filter((l) => /new Date\(\s*\)/.test(l))
+        .map((l) => l.trim());
+      expect(
+        bare,
+        `${f} must take its "now" as a parameter, not read one — or be listed in ALLOWED_BARE_NEW_DATE_BY_STAGE_FILE with a reason`
+      ).toEqual(ALLOWED_BARE_NEW_DATE_BY_STAGE_FILE[f] ?? []);
     }
   });
 });

@@ -24,43 +24,16 @@ export interface HubPullOptions {
     onDivergence?: OnDivergenceMode;
     onProgress?: (ev: ProgressEvent) => void;
 }
-export interface ThreadBaseCandidate {
-    localSessionId: string;
-    /** Uuid of the session's last entry, or null when it can't be read. */
-    headEntryUuid: string | null;
-    /** Timestamp of that last entry, or null when it can't be read. */
-    lastActiveAt: string | null;
-}
 /**
- * Pick which of a thread's local sessions a continuation should splice onto.
- *
- * A thread maps to MORE THAN ONE local session as a matter of course: every
- * time a splice is declined (a live-looking base, a chain that doesn't line
- * up, `--no-append`) the fragment import mints a new session and maps it onto
- * the same thread, while the older mapping stays. "Whichever key comes first"
- * therefore returns the OLDEST session forever, and since the continuation
- * chain has moved on, every subsequent pull chain-mismatches and forks off
- * another fragment — a state `--force-append` cannot rescue, because force
- * never skips the chain guard. index-file.ts:30-41 refuses the mirror-image
- * shortcut in the forward direction for the same reason.
- *
- * So: the delta's anchor decides. The session whose head IS the entry this
- * continuation follows is the one it belongs on, whatever the map's insertion
- * order says — which is also what makes a poisoned map self-healing, since
- * the fragment that stranded the thread is exactly the session carrying the
- * anchor next time round.
- *
- * Order of preference:
- *   1. sessions whose head uuid equals `anchorUuid` (when it's known and any
- *      candidate matches) — otherwise every candidate stays in the running,
- *      so the caller still gets a sensible base to name in the decline;
- *   2. `preferred` (the session THIS pull already landed content in) if it
- *      survived step 1;
- *   3. most recent `lastActiveAt`, ties broken by lexically greatest session
- *      id — a strict total order, so the answer never depends on map or
- *      directory iteration order.
+ * Re-exported rather than re-declared. `apply.sessions` owns the thread-base
+ * choice — it re-reads sync-state per bundle to make it — but `selectThreadBase`
+ * and its candidate type are part of this package's PUBLIC surface:
+ * `src/index.ts` does `export * from "./hub/pull.js"`, and `tests/hub-pull.test.ts`
+ * imports it from here. Dropping this line silently deletes a named export from
+ * the package entrypoint, and `dist/` is committed, so it would ship.
+ * Importing it back the other way would make the two modules circular.
  */
-export declare function selectThreadBase(candidates: ThreadBaseCandidate[], anchorUuid: string | null, preferred: string | null): string | null;
+export { selectThreadBase, type ThreadBaseCandidate } from "./pull-apply-sessions.js";
 /**
  * The half of a thread this pull cannot reach, in words.
  *

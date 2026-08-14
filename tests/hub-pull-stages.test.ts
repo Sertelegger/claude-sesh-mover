@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
+  appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync,
+  utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-stages.js";
-import type { ErrorResult, ExportManifest } from "../src/types.js";
+import type { ErrorResult, ExportManifest, HubPullResult } from "../src/types.js";
 import { initApplyState, type PulledCarry } from "../src/hub/pull-apply-state.js";
 import { runApplyCarryStage } from "../src/hub/pull-apply-carry.js";
 import { createFsBackend } from "../src/hub/backend.js";
@@ -28,7 +29,19 @@ import {
   knownWorkspaceGenerations, readSyncState, setLastWorkspace, writeSyncState,
 } from "../src/sync-state.js";
 import { runApplyWorkspaceStage } from "../src/hub/pull-apply-workspace.js";
-import { bundle, entry, idx, peer, syncState, writeCorruptBundle } from "./helpers/hub-fixtures.js";
+import {
+  runApplySessionsStage, type RecordSpliceInput,
+} from "../src/hub/pull-apply-sessions.js";
+import { hubInit } from "../src/hub/init.js";
+import { hubPull } from "../src/hub/pull.js";
+import { hubPush } from "../src/hub/push.js";
+import { readLastEntryUuid } from "../src/jsonl.js";
+import { setThreadId } from "../src/sync-state.js";
+import { createFixtureTree } from "./fixtures/create-fixtures.js";
+import {
+  FIXTURE_ENCODED, FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID,
+  arrangeDivergence, bundle, entry, idx, makeLookLive, peer, syncState, writeCorruptBundle,
+} from "./helpers/hub-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
 describe("stage outcome constructors", () => {
@@ -1163,5 +1176,450 @@ describe("apply.workspace stage", () => {
     expect(knownWorkspaceGenerations(readSyncState(project)).map((g) => g.bundleId)).toEqual([
       "gen-shared",
     ]);
+  });
+});
+
+describe("apply.sessions stage", () => {
+  let root: string;
+  let home: string;
+  let handle: HomeOverrideHandle;
+  let configDir: string;
+  let projectPath: string;
+  let targetProjectDir: string;
+  let extractDir: string;
+
+  const THREAD_ID = "t-sessions";
+  const HUB_ID = "hub-1";
+  const HUB_PEER_ID = "hub:hub-1";
+  const SOURCE_MACHINE = "m-source";
+  /** A fixed operation boundary — the stage must never read a clock of its own. */
+  const OP_NOW_MS = Date.parse("2026-08-14T12:00:00.000Z");
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "sm-sessions-"));
+    home = join(root, "home");
+    mkdirSync(home, { recursive: true });
+    handle = overrideHome(home);
+    configDir = join(root, "config");
+    projectPath = join(root, "project");
+    mkdirSync(projectPath, { recursive: true });
+    targetProjectDir = join(configDir, "projects", encodeProjectPath(projectPath));
+    mkdirSync(targetProjectDir, { recursive: true });
+    extractDir = join(root, "extract");
+  });
+
+  afterEach(() => {
+    handle.restore();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function conversationEntry(
+    over: { uuid: string; parentUuid: string | null; sessionId: string; text: string }
+  ): Record<string, unknown> {
+    return {
+      uuid: over.uuid,
+      parentUuid: over.parentUuid,
+      timestamp: "2026-08-01T10:00:00.000Z",
+      sessionId: over.sessionId,
+      cwd: "/source/project",
+      version: "2.1.81",
+      gitBranch: "main",
+      type: "user",
+      message: { role: "user", content: over.text },
+    };
+  }
+
+  /**
+   * A bundle already unpacked into `extractDir` — exactly what the fetch stage
+   * hands this one, minus the hub round trip it does not care about.
+   */
+  async function writeBundleDir(over: {
+    type: HubBundleRecord["type"];
+    sessionId?: string;
+    entries: Array<Record<string, unknown>>;
+    fromEntryUuid?: string | null;
+  }): Promise<{ manifest: ExportManifest; record: HubBundleRecord }> {
+    const sessionId = over.sessionId ?? "bundle-session";
+    mkdirSync(join(extractDir, "sessions"), { recursive: true });
+    const jsonlPath = join(extractDir, "sessions", `${sessionId}.jsonl`);
+    writeFileSync(jsonlPath, over.entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+    const manifest: ExportManifest = {
+      version: 1,
+      plugin: "sesh-mover",
+      exportedAt: "2026-08-01T00:00:00.000Z",
+      sourcePlatform: "linux",
+      sourceProjectPath: "/source/project",
+      sourceConfigDir: "/source/.claude",
+      sourceClaudeVersion: "2.1.81",
+      sessionScope: "current",
+      includedLayers: ["jsonl"],
+      projectId: "p1",
+      sourceMachineId: SOURCE_MACHINE,
+      sessions: [
+        {
+          sessionId,
+          slug: "apply-sessions",
+          summary: "a bundle for the apply.sessions stage",
+          createdAt: "2026-08-01T10:00:00.000Z",
+          lastActiveAt: "2026-08-01T10:00:00.000Z",
+          messageCount: over.entries.length,
+          gitBranch: "main",
+          entrypoint: "cli",
+          integrityHash: await computeIntegrityHashFromFile(jsonlPath),
+          type: over.type,
+        },
+      ],
+    };
+    writeManifest(extractDir, manifest);
+    const last = over.entries[over.entries.length - 1] as { uuid: string };
+    return {
+      manifest,
+      record: {
+        bundleId: "b0",
+        file: `${bundleDir("p1", SOURCE_MACHINE)}/${bundleFileName("2026-08-01T00:00:00.000Z", "b0")}`,
+        type: over.type,
+        sessionIdInBundle: sessionId,
+        fromEntryUuid: over.fromEntryUuid ?? null,
+        headEntryUuid: last.uuid,
+        messageCount: over.entries.length,
+        pushedAt: "2026-08-01T00:00:00.000Z",
+        hasWorkspace: false,
+      },
+    };
+  }
+
+  function stageInput(over: {
+    manifest: ExportManifest;
+    record: HubBundleRecord;
+    state: ReturnType<typeof initApplyState>;
+    recordSplice?: (b: RecordSpliceInput) => void;
+    noAppend?: boolean;
+  }): Parameters<typeof runApplySessionsStage>[0] {
+    return {
+      extractDir,
+      bundleManifest: over.manifest,
+      record: over.record,
+      bundleIndex: 0,
+      chainLength: 1,
+      projectPath,
+      configDir,
+      targetProjectDir,
+      claudeVersion: "2.1.81",
+      threadId: THREAD_ID,
+      sourceMachineId: SOURCE_MACHINE,
+      hubPeerId: HUB_PEER_ID,
+      noAppend: over.noAppend ?? false,
+      forceAppend: false,
+      onDivergence: undefined,
+      opNowMs: OP_NOW_MS,
+      ageNowMs: OP_NOW_MS,
+      historyNowDate: "2026-08-14",
+      historyNowMs: OP_NOW_MS,
+      state: over.state,
+      recordSplice: over.recordSplice ?? ((): void => {}),
+      countEntriesAfterOffset: async (): Promise<number> => 0,
+    };
+  }
+
+  it("imports a full bundle as its own session and lets the loop carry on", async () => {
+    const { manifest, record } = await writeBundleDir({
+      type: "full",
+      entries: [
+        conversationEntry({ uuid: "f-1", parentUuid: null, sessionId: "bundle-session", text: "hello" }),
+        conversationEntry({ uuid: "f-2", parentUuid: "f-1", sessionId: "bundle-session", text: "again" }),
+      ],
+    });
+    const st = initApplyState({ needed: [record] });
+    const spliced: RecordSpliceInput[] = [];
+
+    const out = await runApplySessionsStage(
+      stageInput({ manifest, record, state: st, recordSplice: (b) => spliced.push(b) })
+    );
+
+    expect(out.control).toEqual({ kind: "next" });
+    // The state is the caller's object, mutated in place — never a copy.
+    expect(st.importedSessions).toHaveLength(1);
+    expect(st.threadLandedSessionId).toBe(st.importedSessions[0].newId);
+    expect(st.lastImportedNewId).toBe(st.importedSessions[0].newId);
+    expect(st.lastAppliedIndex).toBe(0);
+    expect(st.lastBundleManifest).toBe(manifest);
+    // A full bundle never reaches the splice paths.
+    expect(spliced).toHaveLength(0);
+    expect(st.appended).toHaveLength(0);
+    // The hub ledger is credited so a push back does not re-ship what we took.
+    const after = readSyncState(projectPath);
+    expect(after.peers[HUB_PEER_ID]?.sent[st.lastImportedNewId!]?.headEntryUuid).toBe("f-2");
+  });
+
+  /**
+   * A local base this thread already owns, whose head IS the anchor of the
+   * continuation built beside it — the arrangement the append path exists for.
+   */
+  async function arrangeSpliceable(): Promise<{
+    baseSessionId: string;
+    basePath: string;
+    manifest: ExportManifest;
+    record: HubBundleRecord;
+  }> {
+    const baseSessionId = "11111111-2222-3333-4444-555555555555";
+    const basePath = join(targetProjectDir, `${baseSessionId}.jsonl`);
+    writeFileSync(
+      basePath,
+      [
+        conversationEntry({ uuid: "base-1", parentUuid: null, sessionId: baseSessionId, text: "start" }),
+        conversationEntry({ uuid: "base-2", parentUuid: "base-1", sessionId: baseSessionId, text: "carry on" }),
+      ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+      "utf-8"
+    );
+    // Out of append.ts's liveness window: this transcript is not being written
+    // to by a live Claude Code session.
+    const old = new Date(OP_NOW_MS - 60 * 60 * 1000);
+    utimesSync(basePath, old, old);
+
+    const state = readSyncState(projectPath);
+    setThreadId(state, HUB_ID, baseSessionId, THREAD_ID);
+    writeSyncState(state);
+
+    const built = await writeBundleDir({
+      type: "continuation",
+      fromEntryUuid: "base-2",
+      entries: [
+        conversationEntry({ uuid: "c-1", parentUuid: "base-2", sessionId: "bundle-session", text: "more" }),
+        conversationEntry({ uuid: "c-2", parentUuid: "c-1", sessionId: "bundle-session", text: "and more" }),
+      ],
+    });
+    return { baseSessionId, basePath, ...built };
+  }
+
+  it("splices a chaining continuation onto the thread's local base", async () => {
+    const a = await arrangeSpliceable();
+    const st = initApplyState({ needed: [a.record] });
+    const spliced: RecordSpliceInput[] = [];
+
+    const out = await runApplySessionsStage(
+      stageInput({
+        manifest: a.manifest, record: a.record, state: st,
+        recordSplice: (b) => spliced.push(b),
+      })
+    );
+
+    expect(out.control).toEqual({ kind: "next" });
+    expect(st.appended).toEqual([
+      { threadId: THREAD_ID, baseSessionId: a.baseSessionId, entriesAppended: 2 },
+    ]);
+    expect(st.importedSessions).toHaveLength(0);
+    expect(st.threadLandedSessionId).toBe(a.baseSessionId);
+    // The splice bookkeeping is the caller's callback, invoked with this pull's
+    // own identifiers.
+    expect(spliced).toHaveLength(1);
+    expect(spliced[0]).toMatchObject({
+      projectPath, baseSessionId: a.baseSessionId, peerId: SOURCE_MACHINE,
+      hubPeerId: HUB_PEER_ID, newHeadUuid: "c-2",
+    });
+    // Rewritten before the splice: append.ts does neither the path rewrite nor
+    // the version adaptation, so the SPLICED entries must carry this machine's
+    // paths and this session's id, not the bundle's.
+    const lines = readFileSync(a.basePath, "utf-8")
+      .trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.map((l) => l.uuid)).toEqual(["base-1", "base-2", "c-1", "c-2"]);
+    expect(lines.slice(2).map((l) => l.cwd)).toEqual([projectPath, projectPath]);
+    expect(lines.slice(2).map((l) => l.sessionId)).toEqual([a.baseSessionId, a.baseSessionId]);
+  });
+
+  it("imports as a fragment instead of splicing when --no-append is set", async () => {
+    const a = await arrangeSpliceable();
+    const before = readFileSync(a.basePath, "utf-8");
+    const st = initApplyState({ needed: [a.record] });
+    const spliced: RecordSpliceInput[] = [];
+
+    const out = await runApplySessionsStage(
+      stageInput({
+        manifest: a.manifest, record: a.record, state: st, noAppend: true,
+        recordSplice: (b) => spliced.push(b),
+      })
+    );
+
+    expect(out.control).toEqual({ kind: "next" });
+    expect(st.appended).toHaveLength(0);
+    expect(spliced).toHaveLength(0);
+    expect(st.importedSessions).toHaveLength(1);
+    expect(readFileSync(a.basePath, "utf-8")).toBe(before);
+  });
+
+  /**
+   * THE ALIASING REGRESSION.
+   *
+   * `st.lastDivergence = divergence` shares one object: `.resolution` is
+   * rewritten at three points after that assignment and `.preservedSessionId`
+   * at one. Assigning a spread, or returning the object for the caller to
+   * assign, freezes `resolution` at the mode the user ASKED for and leaves
+   * `preservedSessionId` permanently undefined — with no type error, because
+   * both shapes satisfy `HubPullDivergence`.
+   *
+   * Both halves are checked here: the refusal writes "skip" over "adopt-hub",
+   * and the forced re-run writes the preserved session id.
+   */
+  it("keeps the divergence object aliased across its later mutations", async () => {
+    const a = await arrangeDivergence();
+    try {
+      makeLookLive(a.basePath);
+
+      const refused = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", claudeVersion: "2.1.81",
+      });
+      expect(refused.success).toBe(true);
+      if (!refused.success) return;
+      const r = refused as HubPullResult;
+      // Written AFTER `st.lastDivergence = divergence`. A copy reports the
+      // requested "adopt-hub" here and the refusal becomes invisible.
+      expect(r.divergence?.resolution).toBe("skip");
+      expect(r.divergence?.preservedSessionId).toBeUndefined();
+      expect(r.appended ?? []).toHaveLength(0);
+      expect(r.importedSessions).toHaveLength(0);
+
+      const forced = await hubPull({
+        configDir: a.configDirA, projectPath: a.projectA, hubPath: a.hub,
+        latest: true, onDivergence: "adopt-hub", forceAppend: true, claudeVersion: "2.1.81",
+      });
+      expect(forced.success).toBe(true);
+      if (!forced.success) return;
+      const f = forced as HubPullResult;
+      expect(f.divergence?.resolution).toBe("adopt-hub");
+      // The fourth post-assignment write. A copy leaves this undefined and the
+      // preserved branch becomes unreportable.
+      expect(f.divergence?.preservedSessionId).toBeTruthy();
+      expect(existsSync(join(a.projectDirA, `${f.divergence!.preservedSessionId}.jsonl`))).toBe(true);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  /**
+   * THE STOP-CHAIN REGRESSION.
+   *
+   * The divergence escapes are `break`s, not `continue`s, and the workspace
+   * gate is evaluated at the TOP of each iteration — so breaking at bundle 0
+   * is what keeps a payload sitting on bundle 1 from being applied by a pull
+   * the user is about to re-run. Translate `stop-chain` into anything else and
+   * the workspace half lands while the session half is still undecided,
+   * silently, on a chain length nothing else in the suite exercises.
+   */
+  it("a divergence break at bundle 0 forecloses bundle 1's workspace payload", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sm-stop-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sm-stop-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sm-stop-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sm-stop-fix-"));
+    const projectB = mkdtempSync(join(tmpdir(), "sm-stop-projB-"));
+    const wsLines = (edits: Record<number, string> = {}): string =>
+      Array.from({ length: 9 }, (_, n) => edits[n + 1] ?? `L${n + 1}`).join("\n") + "\n";
+    let restore = overrideHome(homeA);
+    try {
+      // --- A: a git-less project with one shared file, pushed once ----------
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = join(base, "projA-stop");
+      mkdirSync(projectA, { recursive: true });
+      writeFileSync(join(projectA, "shared.txt"), wsLines());
+      const encodedA = encodeProjectPath(projectA);
+      cpSync(join(configDirA, "projects", FIXTURE_ENCODED), join(configDirA, "projects", encodedA), {
+        recursive: true,
+      });
+      const aJsonl = join(configDirA, "projects", encodedA, `${FIXTURE_SESSION_ID}.jsonl`);
+
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const push1 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(push1.success).toBe(true);
+      if (!push1.success) return;
+      expect(push1.hasWorkspace).toBe(true);
+
+      // --- B bootstraps off push #1, then forks the thread locally ----------
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      writeLocalProjectId(projectB, {
+        projectId: push1.projectId, name: "projA-stop",
+        createdAt: "2026-04-10T00:00:00.000Z", createdByMachine: "machine-a",
+      });
+      const bootstrap = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(bootstrap.success).toBe(true);
+      if (!bootstrap.success) return;
+      const bSessionId = (bootstrap as HubPullResult).localSessionId;
+      expect(bSessionId).toBeTruthy();
+      const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${bSessionId}.jsonl`);
+      expect(readFileSync(join(projectB, "shared.txt"), "utf-8")).toBe(wsLines());
+
+      appendFileSync(
+        bJsonl,
+        JSON.stringify({
+          uuid: "b-local-1", parentUuid: FIXTURE_HEAD_UUID, timestamp: "2026-05-01T10:00:00Z",
+          sessionId: bSessionId, cwd: projectB, version: "2.1.81", type: "user",
+          message: { role: "user", content: "meanwhile, on B" },
+        }) + "\n",
+        "utf-8"
+      );
+      const old = new Date(Date.now() - 60 * 60 * 1000);
+      utimesSync(bJsonl, old, old);
+
+      // --- A pushes twice: a two-bundle chain, payload on the NEWER one -----
+      restore.restore();
+      restore = overrideHome(homeA);
+      for (const [n, tree] of [
+        [1, wsLines({ 2: "GEN-2" })],
+        [2, wsLines({ 2: "GEN-2", 4: "GEN-3" })],
+      ] as Array<[number, string]>) {
+        writeFileSync(join(projectA, "shared.txt"), tree);
+        const anchor = readLastEntryUuid(aJsonl);
+        expect(anchor).toBeTruthy();
+        appendFileSync(
+          aJsonl,
+          JSON.stringify({
+            uuid: `a-ws-${n}`, parentUuid: anchor,
+            timestamp: new Date(Date.parse("2026-04-11T10:00:00Z") + n * 60_000).toISOString(),
+            sessionId: FIXTURE_SESSION_ID, cwd: projectA, version: "2.1.81", type: "user",
+            message: { role: "user", content: `more work on A (${n})` },
+          }) + "\n",
+          "utf-8"
+        );
+        const push = await hubPush({
+          configDir: configDirA, projectPath: projectA, hubPath: hub, claudeVersion: "2.1.81",
+        });
+        expect(push.success, `A's push #${n + 1} must succeed`).toBe(true);
+        if (!push.success) return;
+        expect(push.hasWorkspace).toBe(true);
+      }
+
+      // --- The act: B pulls the chain with --on-divergence skip -------------
+      restore.restore();
+      restore = overrideHome(homeB);
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, onDivergence: "skip", claudeVersion: "2.1.81",
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      // Bundle 0 diverged and stopped the whole chain...
+      expect(p.divergence?.resolution).toBe("skip");
+      expect(p.importedSessions).toHaveLength(0);
+      expect(p.appended ?? []).toHaveLength(0);
+      // ...so bundle 1's workspace payload was never reached. A `continue` (or
+      // a `return` the caller reads as "carry on") applies it here.
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(readFileSync(join(projectB, "shared.txt"), "utf-8")).toBe(wsLines());
+      expect(p.warnings.join(" ")).toContain("1 later bundle in this thread's chain was not fetched");
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base, projectB]) {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
   });
 });

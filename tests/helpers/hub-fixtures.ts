@@ -3,16 +3,26 @@
  * hub-threads.test.ts in Task 9 so hub-whereis.test.ts can reuse the same
  * shorthand instead of copy-pasting it).
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createArchive } from "../../src/archiver.js";
 import { computeIntegrityHashFromFile, writeManifest } from "../../src/manifest.js";
 import { bundleDir, bundleFileName } from "../../src/hub/layout.js";
+import { hubInit } from "../../src/hub/init.js";
+import { hubPull } from "../../src/hub/pull.js";
+import { hubPush } from "../../src/hub/push.js";
+import { writeLocalProjectId } from "../../src/hub/identity.js";
+import { readLastEntryUuid } from "../../src/jsonl.js";
+import { encodeProjectPath } from "../../src/platform.js";
 import type { HubBackend } from "../../src/hub/backend.js";
 import type { HubBundleRecord, HubIndexJson } from "../../src/hub/layout.js";
-import type { ExportManifest, SyncState, SyncStatePeer } from "../../src/types.js";
+import type { ExportManifest, HubPullResult, SyncState, SyncStatePeer } from "../../src/types.js";
 import type { ThreadCopy } from "../../src/hub/threads.js";
+import { createFixtureTree } from "../fixtures/create-fixtures.js";
+import { overrideHome } from "./env.js";
 
 export function idx(machineId: string, threads: HubIndexJson["threads"]): HubIndexJson {
   return {
@@ -329,5 +339,209 @@ export async function writeCorruptBundle(
     };
   } finally {
     rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+// ---- Two-machine continuation arrangements ----
+//
+// COPIED from tests/hub-pull.test.ts rather than moved: that file is the
+// oracle for this behavior and stays untouched. Only the parts the stage tests
+// need are here (the default two-entry continuation; no git carry, no win32
+// entry maker), so the two copies are deliberately not interchangeable.
+
+/** The fixture project's encoded config-dir folder name. */
+export const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
+/** The fixture transcript's session id. */
+export const FIXTURE_SESSION_ID = "550e8400-e29b-41d4-a716-446655440000";
+/** Uuid of the fixture session's last entry — every continuation's anchor. */
+export const FIXTURE_HEAD_UUID = "entry-3";
+
+/**
+ * Identity linking writes `.sesh-mover-project.json` under the real project
+ * directory and this sandbox cannot create top-level dirs like "/Users", so
+ * every hub test works against a REAL directory with the fixture's session
+ * content copied into its encoded config-dir slot.
+ */
+export function createRealProject(base: string, configDir: string, name: string): string {
+  const realProj = join(base, name);
+  mkdirSync(realProj, { recursive: true });
+  writeFileSync(join(realProj, "README.md"), "hello\n");
+  const realEncoded = encodeProjectPath(realProj);
+  cpSync(join(configDir, "projects", FIXTURE_ENCODED), join(configDir, "projects", realEncoded), {
+    recursive: true,
+  });
+  return realProj;
+}
+
+export function appendEntries(path: string, entries: Array<Record<string, unknown>>): void {
+  appendFileSync(path, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+}
+
+/** Push a session file out of the append liveness window. */
+export function ageOutOfLiveWindow(path: string): void {
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  utimesSync(path, old, old);
+}
+
+/**
+ * Make a base look like a live Claude Code session: modified inside the
+ * liveness window but STRICTLY in the past. Stamping "now" here is a race —
+ * hubPull captures its own operation boundary a moment later, and if both land
+ * in the same millisecond the self-write exemption fires and the append
+ * proceeds instead of declining.
+ */
+export function makeLookLive(path: string): void {
+  const recent = new Date(Date.now() - 30_000);
+  utimesSync(path, recent, recent);
+}
+
+type EntryMaker = (
+  parentUuid: string,
+  sessionId: string,
+  projectPath: string
+) => Array<Record<string, unknown>>;
+
+/** Two plain entries whose only path field is the SOURCE machine's cwd. */
+export const plainEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
+  {
+    uuid: "b-entry-4", parentUuid, timestamp: "2026-04-11T09:00:00Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "user",
+    message: { role: "user", content: "picking this up on the other machine" },
+  },
+  {
+    uuid: "b-entry-5", parentUuid: "b-entry-4", timestamp: "2026-04-11T09:00:05Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "assistant",
+    message: { model: "claude-opus-4-6", id: "msg_cont", content: [{ type: "text", text: "On it." }] },
+  },
+];
+
+/** Two entries machine A adds to its own base, forking the thread locally. */
+export const localEntries: EntryMaker = (parentUuid, sessionId, projectPath) => [
+  {
+    uuid: "a-local-1", parentUuid, timestamp: "2026-04-11T10:00:00Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "user",
+    message: { role: "user", content: "meanwhile, back on machine A" },
+  },
+  {
+    uuid: "a-local-2", parentUuid: "a-local-1", timestamp: "2026-04-11T10:00:05Z", sessionId,
+    cwd: projectPath, version: "2.1.81", type: "assistant",
+    message: { model: "claude-opus-4-6", id: "msg_local", content: [{ type: "text", text: "Carrying on here." }] },
+  },
+];
+
+export interface ContinuationArrangement {
+  hub: string;
+  configDirA: string;
+  projectA: string;
+  projectDirA: string;
+  projectB: string;
+  configDirB: string;
+  projectId: string;
+  baseSessionId: string;
+  basePath: string;
+  cleanup(): void;
+}
+
+/**
+ * The shared two-machine continuation arrangement:
+ *
+ *   1. machine A pushes the fixture session (full bundle),
+ *   2. machine B pulls it, appends `makeEntries(...)` to its imported copy,
+ *      and pushes the resulting continuation bundle,
+ *   3. HOME is switched back to A and A's base session file is aged out of the
+ *      append liveness window (it was written seconds ago by the fixture copy,
+ *      which would otherwise make every test a "recently-active" decline).
+ *
+ * B's appended entries deliberately carry B's OWN paths — the pull under test
+ * is what has to translate them onto A.
+ */
+export async function arrangeContinuation(
+  makeEntries: EntryMaker = plainEntries
+): Promise<ContinuationArrangement> {
+  const homeA = mkdtempSync(join(tmpdir(), "sesh-stage-homeA-"));
+  const homeB = mkdtempSync(join(tmpdir(), "sesh-stage-homeB-"));
+  const hub = mkdtempSync(join(tmpdir(), "sesh-stage-hub-"));
+  const base = mkdtempSync(join(tmpdir(), "sesh-stage-fix-"));
+  let projectB: string | undefined;
+  let restore = overrideHome(homeA);
+  const cleanup = (): void => {
+    restore.restore();
+    for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+    if (projectB) rmSync(projectB, { recursive: true, force: true });
+  };
+
+  try {
+    const { configDir: configDirA } = createFixtureTree(base);
+    const projectA = createRealProject(base, configDirA, "projA");
+    await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+    const pushA = await hubPush({
+      configDir: configDirA, projectPath: projectA, hubPath: hub,
+      createProject: true, noWorkspace: true, claudeVersion: "2.1.81",
+    });
+    if (!pushA.success) throw new Error(`arrange: A's push failed: ${JSON.stringify(pushA)}`);
+
+    restore.restore();
+    restore = overrideHome(homeB);
+
+    const configDirB = join(homeB, ".claude");
+    projectB = mkdtempSync(join(tmpdir(), "sesh-stage-projB-"));
+    writeLocalProjectId(projectB, {
+      projectId: pushA.projectId, name: "projA",
+      createdAt: "2026-04-10T00:00:00.000Z", createdByMachine: "machine-a",
+    });
+    const pullB = await hubPull({
+      configDir: configDirB, projectPath: projectB, hubPath: hub,
+      latest: true, claudeVersion: "2.1.81",
+    });
+    if (!pullB.success) throw new Error(`arrange: B's pull failed: ${JSON.stringify(pullB)}`);
+    const localB = (pullB as HubPullResult).localSessionId;
+    if (!localB) throw new Error("arrange: B's pull identified no local session");
+
+    const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${localB}.jsonl`);
+    const anchor = readLastEntryUuid(bJsonl);
+    if (!anchor) throw new Error("arrange: B's session has no head entry");
+    appendEntries(bJsonl, makeEntries(anchor, localB, projectB));
+    const pushed = await hubPush({
+      configDir: configDirB, projectPath: projectB, hubPath: hub,
+      noWorkspace: true, claudeVersion: "2.1.81",
+    });
+    if (!pushed.success) throw new Error(`arrange: B's push failed: ${JSON.stringify(pushed)}`);
+    if (pushed.pushedSessions[0]?.type !== "continuation") {
+      throw new Error("arrange: B pushed a full bundle, not a continuation");
+    }
+
+    restore.restore();
+    restore = overrideHome(homeA);
+
+    const projectDirA = join(configDirA, "projects", encodeProjectPath(projectA));
+    const basePath = join(projectDirA, `${FIXTURE_SESSION_ID}.jsonl`);
+    ageOutOfLiveWindow(basePath);
+
+    return {
+      hub, configDirA, projectA, projectDirA, projectB, configDirB,
+      projectId: pushA.projectId, baseSessionId: FIXTURE_SESSION_ID, basePath, cleanup,
+    };
+  } catch (e) {
+    cleanup();
+    throw e;
+  }
+}
+
+/**
+ * `arrangeContinuation`, then fork A's side too: A extends its base from the
+ * very entry B's continuation is anchored on, without pushing. The base is aged
+ * back out of the live window afterwards — appending just moved its mtime to
+ * now, which would otherwise make every divergence test a liveness story
+ * instead of the one it names.
+ */
+export async function arrangeDivergence(): Promise<ContinuationArrangement> {
+  const a = await arrangeContinuation();
+  try {
+    appendEntries(a.basePath, localEntries(FIXTURE_HEAD_UUID, a.baseSessionId, a.projectA));
+    ageOutOfLiveWindow(a.basePath);
+    return a;
+  } catch (e) {
+    a.cleanup();
+    throw e;
   }
 }
