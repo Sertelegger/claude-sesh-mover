@@ -53,17 +53,43 @@ See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
   [#38](https://github.com/Sertelegger/claude-sesh-mover/issues/38) (stop re-implementing
   git's patch-header parser in the carry apply path and ask git instead) and the
   disclosure-side half of #35.
-- **Slice 4 — web service + UI.** A hosted alternative to the filesystem backend (own
-  design pass — auth, multi-user access control, and a browsable UI are all out of scope
-  for the dumb-storage model above and need dedicated design work). **Two threat-model
-  items are hard gates on it,** both fine under Slice 1's "a folder shared between machines
-  you own" model and neither acceptable for a shared or hostile hub:
-  [#36](https://github.com/Sertelegger/claude-sesh-mover/issues/36) — the built-in
-  workspace excludes are a convenience default, not a security boundary, so an applied
-  payload can write ordinary project files — and
+- **Slice 4 — self-hosted service + web UI.** A service the owner runs (a NAS to begin
+  with) that machines push to and pull from over HTTP, plus a browsable UI. Design pass
+  done: `docs/superpowers/specs/2026-08-15-hub-slice4-service-and-ui-design.md`. The
+  service stays **dumb storage** — every mutation goes through the existing `HubBackend`
+  contract expressed over HTTP and the server interprets nothing on the write path — and
+  derives exactly one read-only projection for the UI, by importing the same
+  `resolveThreads` the CLI uses rather than reimplementing it. It runs in three phases:
+
+  | phase | deployment | auth |
+  |---|---|---|
+  | 4a | LAN, single user | none |
+  | 4b | internet-reachable | device tokens keyed to `machineId`, TLS |
+  | 4c | multiple users, isolated hub spaces | + identity and namespace isolation |
+
+  **The two threat-model items gate phase 4c only — not the slice.** This entry
+  previously called them hard gates on all of Slice 4, which was wrong and made the slice
+  look further away than it is. Both are statements about *trusting the machine that
+  pushed*: [#36](https://github.com/Sertelegger/claude-sesh-mover/issues/36) — the
+  built-in workspace excludes are a convenience default, not a security boundary, so an
+  applied payload can write ordinary project files — and
   [#37](https://github.com/Sertelegger/claude-sesh-mover/issues/37) — the merge-ancestor
   "common to both trees" guarantee is verified on our side and self-reported by the peer,
-  which no filesystem backend can attest.
+  which no filesystem backend can attest. In 4a and 4b the pusher is a machine the owner
+  already owns, which is exactly Slice 1's "a folder shared between machines you own"
+  model; moving that folder behind HTTP on hardware the same person owns changes the
+  transport, not who is trusted. Both must close before a second person's machine can push
+  into the same service.
+
+  Two consequences worth recording here rather than only in the spec. **Encryption at rest
+  moves from housekeeping to a 4b prerequisite** — and because the server computes the
+  view, index files must stay readable to it, so the split is: encrypt bundle payloads,
+  leave indexes plaintext, and accept that the service sees thread structure, machine
+  names and timestamps while conversation content stays sealed. **Neither the server nor a
+  browser can answer "is this thread current *here*?"** — that depends on the requesting
+  machine's local sync-state and session files, which the hub has never seen — so machines
+  report a local-state summary (ids and timestamps only, never content), and every
+  rendering of it carries an as-of stamp or it lies.
 
 **Why build it (landscape as of 2026-07):** Claude Code local CLI sessions are machine-local
 with no native sync; Remote Control steers live sessions but transfers nothing and requires
