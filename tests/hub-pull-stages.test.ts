@@ -14,19 +14,22 @@ import type { HubBackend } from "../src/hub/backend.js";
 import { readMachineIndex } from "../src/hub/index-file.js";
 import { localProjectIdPath, writeLocalProjectId } from "../src/hub/identity.js";
 import {
-  HUB_JSON, bundleDir, bundleFileName, indexPath, projectJsonPath,
-  type HubBundleRecord,
+  HUB_JSON, bundleDir, bundleFileName, indexPath, machinePath, projectJsonPath,
+  type HubBundleRecord, type HubIndexJson,
 } from "../src/hub/layout.js";
 import type { CarryMeta } from "../src/hub/carry.js";
 import { runFetchStage } from "../src/hub/pull-fetch.js";
 import { runRecordStage, type RecordApplyView } from "../src/hub/pull-record.js";
 import { runResolveStage } from "../src/hub/pull-resolve.js";
+import { runSelectStage } from "../src/hub/pull-select.js";
+import { resolveThreads } from "../src/hub/threads.js";
 import { createArchive } from "../src/archiver.js";
 import { computeIntegrityHashFromFile, writeManifest } from "../src/manifest.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { projectSeshMoverDir } from "../src/paths.js";
 import {
-  knownWorkspaceGenerations, readSyncState, setLastWorkspace, writeSyncState,
+  getThreadId, knownWorkspaceGenerations, readSyncState, setLastWorkspace, syncStatePath,
+  writeSyncState,
 } from "../src/sync-state.js";
 import { runApplyWorkspaceStage } from "../src/hub/pull-apply-workspace.js";
 import {
@@ -40,7 +43,8 @@ import { setThreadId } from "../src/sync-state.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import {
   FIXTURE_ENCODED, FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID,
-  arrangeDivergence, bundle, entry, idx, makeLookLive, peer, syncState, writeCorruptBundle,
+  arrangeDivergence, bundle, currentThreadIndexes, emptySyncState, entry, idx, makeLookLive, peer,
+  syncState, writeCorruptBundle,
 } from "./helpers/hub-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
@@ -1621,5 +1625,292 @@ describe("apply.sessions stage", () => {
         rmSync(d, { recursive: true, force: true });
       }
     }
+  });
+});
+
+// ---- select stage -----------------------------------------------------------
+
+/**
+ * SELECT + REPAIR, and the tests are written to the second half as much as the
+ * first: `backfillThreadMappings` WRITES sync-state, so two of the seven exits
+ * hand back `success: false` over a changed disk. "This exit changed nothing"
+ * is therefore only assertable where the arrangement leaves nothing to repair
+ * (the all-current case below, which has no peer receipts at all) — everywhere
+ * else the assertion is the SPECIFIC repair, or its specific absence.
+ *
+ * Everything here runs under `overrideHome`: the stage does its own sync-state
+ * I/O by design (a passed-in `SyncState` would collapse the peek/read split
+ * that decides which branch has earned the right to rename a corrupt file
+ * aside), and that file lives under $HOME.
+ */
+describe("select stage", () => {
+  let root: string;
+  let home: HomeOverrideHandle;
+  let hubDir: string;
+  let projectPath: string;
+  let targetProjectDir: string;
+
+  const HUB_ID = "hub-1";
+  const ME = "m1";
+
+  /** The one bundle a peer offers in these arrangements. */
+  const PEER_BUNDLE: HubBundleRecord = bundle({
+    bundleId: "b0",
+    file: "projects/p/bundles/m2/b0.tar.gz",
+    type: "full",
+    sessionIdInBundle: "sess-1",
+    headEntryUuid: "head-b0",
+  });
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "sm-select-"));
+    mkdirSync(join(root, "home"), { recursive: true });
+    home = overrideHome(join(root, "home"));
+    hubDir = join(root, "hub");
+    mkdirSync(hubDir, { recursive: true });
+    projectPath = join(root, "proj");
+    targetProjectDir = join(root, "config", "projects", encodeProjectPath(projectPath));
+    mkdirSync(targetProjectDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    home.restore();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function input(
+    over: { indexes?: HubIndexJson[]; threadId?: string; latest?: boolean } = {}
+  ) {
+    return {
+      backend: createFsBackend(hubDir),
+      resolved: resolveThreads(over.indexes ?? currentThreadIndexes({ machineId: ME })),
+      machineId: ME,
+      hubId: HUB_ID,
+      threadId: over.threadId,
+      latest: over.latest,
+      effectiveProjectPath: projectPath,
+      targetProjectDir,
+    };
+  }
+
+  /** Only the file's EXISTENCE is what `backend.exists` reports to this stage. */
+  function writeBundleFile(rel: string): void {
+    const p = join(hubDir, rel);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, "bundle bytes are the fetch stage's problem", "utf-8");
+  }
+
+  /** One other machine's index for thread `t-1`, offering `PEER_BUNDLE`. */
+  function peerIndex(machineId = "m2"): HubIndexJson {
+    return idx(machineId, {
+      "t-1": entry({
+        localSessionId: `local-${machineId}`,
+        headEntryUuid: "head-b0",
+        bundles: [PEER_BUNDLE],
+      }),
+    });
+  }
+
+  /**
+   * The arrangement that drives all four of the moved closures in one call:
+   * `isCurrent` says yes for every thread, `alternateSource` finds no other
+   * machine to fetch from, `discloseUnfetchable` has nothing to disclose, and
+   * `backfillThreadMappings` finds nothing to repair — so this is the one exit
+   * where "the state file is untouched" is a true statement rather than a
+   * convenient one.
+   */
+  it("--latest with every thread current stops with the exact reason and repairs nothing", async () => {
+    writeSyncState(emptySyncState(projectPath));
+    const before = readFileSync(syncStatePath(projectPath), "utf-8");
+
+    const out = await runSelectStage(input({ latest: true }));
+
+    expect(out.kind).toBe("stop");
+    if (out.kind !== "stop") return;
+    expect(out.result).toEqual({
+      success: false,
+      command: "pull",
+      // No repair fired, so `details` carries nothing.
+      details: undefined,
+      error: "Nothing to pull: all threads are current on this machine.",
+      suggestion: "Run whereis to double-check thread status.",
+    });
+    expect(readFileSync(syncStatePath(projectPath), "utf-8")).toBe(before);
+  });
+
+  /**
+   * The pick list is `success: true`, which is why this stage cannot use
+   * `stageAbort` — and it carries no `warnings`: the caller owns that list (it
+   * already holds the stale-lock warning and the resolve stage's reasons), so
+   * handing it in only to get it back would be a detour.
+   */
+  it("returns the pick list, with no warnings channel, when neither --thread nor --latest is given", async () => {
+    const out = await runSelectStage(input());
+
+    expect(out.kind).toBe("pick-list");
+    if (out.kind !== "pick-list") return;
+    // resolveThreads orders desc by latest activity; t2 is the newer fixture thread.
+    expect(out.threads.map((t) => t.threadId)).toEqual(["t2", "t1"]);
+    expect("warnings" in out).toBe(false);
+  });
+
+  it("stops when --thread names a thread this project does not have on the hub", async () => {
+    const out = await runSelectStage(input({ threadId: "nope" }));
+
+    expect(out.kind).toBe("stop");
+    if (out.kind !== "stop") return;
+    expect(out.result).toEqual({
+      success: false,
+      command: "pull",
+      error: 'No thread "nope" found for this project on the hub.',
+      suggestion: "Run whereis to list available threads.",
+    });
+  });
+
+  /**
+   * The narrowing is the point of the result shape: a later stage gets the
+   * thread id and the source machine id, never the `ResolvedThread` they came
+   * from — `copies` is the field with the iteration-order ban on it, and
+   * handing it on is how a later stage re-derives the selection.
+   */
+  it("proceeds with a narrowed selection and nothing to re-derive it from", async () => {
+    writeBundleFile(PEER_BUNDLE.file);
+
+    const out = await runSelectStage(input({ indexes: [peerIndex()], latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.warnings).toEqual([]);
+    expect(out.value).toEqual({
+      threadId: "t-1",
+      sourceMachineId: "m2",
+      needed: [PEER_BUNDLE],
+      unfetchableBundles: undefined,
+    });
+    expect(Object.keys(out.value).sort()).toEqual([
+      "needed", "sourceMachineId", "threadId", "unfetchableBundles",
+    ]);
+  });
+
+  /**
+   * The second exit that cannot be an `ErrorResult`: `NotYetSyncedResult` has
+   * no `error` field, so a `stageAbort` synthesizing `reasons: [result.error]`
+   * would carry `undefined`.
+   */
+  it("stops with not-yet-synced, and no error field, when a needed bundle has not landed here yet", async () => {
+    const out = await runSelectStage(input({ indexes: [peerIndex()], latest: true }));
+
+    expect(out.kind).toBe("stop");
+    if (out.kind !== "stop") return;
+    expect(out.result).toEqual({
+      success: false,
+      command: "pull",
+      reason: "not-yet-synced",
+      missing: [PEER_BUNDLE.file],
+      suggestion: "The hub folder has not finished syncing these files — retry in a moment.",
+    });
+    expect("error" in out.result).toBe(false);
+  });
+
+  /**
+   * #28's crash window, on the exit an interrupted pull's re-run actually lands
+   * in: every bundle is already recorded as received, so `needed` is empty —
+   * and the mapping that says which thread the local session belongs to is
+   * missing. The repair WRITES, under a `success: false` result.
+   */
+  it("repairs an absent thread mapping on the already-up-to-date exit and reports it in details", async () => {
+    writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        m2: peer({
+          received: {
+            "sess-1": {
+              localSessionId: "local-1", type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+            },
+          },
+        }),
+      },
+    });
+
+    const out = await runSelectStage(input({ indexes: [peerIndex()], latest: true }));
+
+    expect(out.kind).toBe("stop");
+    if (out.kind !== "stop") return;
+    const result = out.result as ErrorResult;
+    expect(result.error).toBe("Already up to date with the source machine.");
+    expect(result.suggestion).toBe("Run whereis to confirm.");
+    expect(result.details).toContain("the mapping has been restored");
+    const after = readSyncState(projectPath);
+    expect(getThreadId(after, "local-1")).toBe("t-1");
+    expect(after.hub?.hubId).toBe(HUB_ID);
+  });
+
+  /**
+   * Warning push #1 of the two this stage emits. The newest copy is ours, but a
+   * peer still lists a bundle we never received — the shape a divergence left
+   * undecided plus one auto-push produces.
+   */
+  it("warns and switches source when the newest copy is ours but a peer lists an unreceived bundle", async () => {
+    writeBundleFile(PEER_BUNDLE.file);
+    mkdirSync(join(hubDir, "machines"), { recursive: true });
+    writeFileSync(
+      join(hubDir, machinePath("m2")),
+      JSON.stringify({ id: "m2", name: "laptop", platform: "linux", lastSeenAt: "t" }),
+      "utf-8"
+    );
+    const mine = idx(ME, {
+      "t-1": entry({
+        localSessionId: "local-mine",
+        headEntryUuid: "head-mine",
+        lastActiveAt: "2026-07-22T00:00:00Z",
+        bundles: [],
+      }),
+    });
+
+    const out = await runSelectStage(input({ indexes: [mine, peerIndex()], latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.sourceMachineId).toBe("m2");
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings[0]).toContain(
+      "The most recent copy of thread t-1 is this machine's own, but laptop still lists bundles this machine has never received"
+    );
+  });
+
+  /**
+   * Warning push #2, plus the typed field the skill layer branches on. A third
+   * machine lists a bundle the resolved source does not, and a pull only ever
+   * reads one machine's list.
+   */
+  it("discloses a third machine's unreachable bundles as both a typed field and a warning", async () => {
+    writeBundleFile(PEER_BUNDLE.file);
+    const third = idx("m3", {
+      "t-1": entry({
+        localSessionId: "local-m3",
+        headEntryUuid: "head-b9",
+        lastActiveAt: "2026-07-20T00:00:00Z",
+        bundles: [
+          bundle({
+            bundleId: "b9",
+            file: "projects/p/bundles/m3/b9.tar.gz",
+            sessionIdInBundle: "sess-9",
+            headEntryUuid: "head-b9",
+          }),
+        ],
+      }),
+    });
+
+    const out = await runSelectStage(input({ indexes: [peerIndex(), third], latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.sourceMachineId).toBe("m2");
+    expect(out.value.unfetchableBundles).toEqual([
+      { machineId: "m3", machineName: null, bundleIds: ["b9"] },
+    ]);
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings[0]).toContain("Thread t-1 could not be pulled whole");
   });
 });

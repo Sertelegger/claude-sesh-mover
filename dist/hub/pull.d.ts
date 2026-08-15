@@ -1,5 +1,4 @@
-import { type HubBundleRecord } from "./layout.js";
-import type { ErrorResult, HubLockBusyResult, HubPullListResult, HubPullResult, HubUnlinkedResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent, UnfetchableBundleGroup } from "../types.js";
+import type { ErrorResult, HubLockBusyResult, HubPullListResult, HubPullResult, HubUnlinkedResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
 export interface HubPullOptions {
     configDir: string;
     projectPath: string;
@@ -35,31 +34,16 @@ export interface HubPullOptions {
  */
 export { selectThreadBase, type ThreadBaseCandidate } from "./pull-apply-sessions.js";
 /**
- * The half of a thread this pull cannot reach, in words.
+ * Same rule, same reason, for the two helpers the `select` stage took with it:
+ * both are imported from HERE by `tests/hub-pull.test.ts` (each with its own
+ * `(pure)` describe block), and `src/index.ts`'s `export * from "./hub/pull.js"`
+ * puts them on the package entrypoint. Dropping this line deletes two named
+ * exports from a shipped, committed `dist/`.
  *
- * Deliberately names NO remedy: there is no `--from-machine`, `--thread` and
- * `--target-path` resolve to the same single source, and `hub reindex` only
- * rebuilds this machine's index from its own bundles. Saying plainly that a
- * thread split across machines cannot be assembled yet is honest; inventing a
- * flag would put this in the milestone's own foreclosure class — a warning
- * whose stated remedy silently does nothing.
- *
- * Machine names are capped at three so a hub with many machines still
- * produces one readable sentence; the full set is in the typed field.
- *
- * MACHINE NAMES ARE NOT UNIQUE. They come from the hostname, so a VM clone or
- * two default installs on same-named hosts give two machine ids one name — and
- * this sentence names a machine three times in three different roles, which
- * with bare names degenerates to "mbp holds bundles that mbp does not list …
- * the one machine it resolves to (mbp)". Any name shared by two of the roles in
- * THIS sentence therefore carries its machine id.
+ * `describeUnfetchable` in particular could not stay behind: `discloseUnfetchable`
+ * moved with the stage and calls it, so leaving it here would make the two
+ * modules circular.
  */
-export declare function describeUnfetchable(threadId: string, groups: UnfetchableBundleGroup[], source: {
-    machineId: string;
-    machineName: string | null;
-}): string;
-export declare function selectNeededBundles(bundles: HubBundleRecord[], received: Record<string, {
-    localSessionId: string;
-}> | undefined, localSessionFileExists: (localSessionId: string) => boolean): HubBundleRecord[];
+export { selectNeededBundles, describeUnfetchable } from "./pull-select.js";
 export declare function hubPull(opts: HubPullOptions): Promise<HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult>;
 //# sourceMappingURL=pull.d.ts.map
