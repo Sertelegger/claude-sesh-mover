@@ -1002,7 +1002,7 @@ export interface SyncState {
      * This is the merge's whole ancestor mechanism: a generation may be used as
      * a 3-way merge base only if it is common to BOTH trees, and membership in
      * this list is exactly the "we held it too" half of that test — no clocks
-     * involved. See `hub/pull.ts`'s `chooseMergeAncestor`, which intersects it
+     * involved. See `hub/pull-apply-workspace.ts`'s `chooseMergeAncestor`, which intersects it
      * with what the incoming chain declares it descends from.
      */
     workspaceGenerations?: WorkspaceGenerationRef[];

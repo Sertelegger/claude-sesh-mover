@@ -84,8 +84,14 @@ See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
   Two consequences worth recording here rather than only in the spec. **Encryption at rest
   moves from housekeeping to a 4b prerequisite** — and because the server computes the
   view, index files must stay readable to it, so the split is: encrypt bundle payloads,
-  leave indexes plaintext, and accept that the service sees thread structure, machine
-  names and timestamps while conversation content stays sealed. **Neither the server nor a
+  leave indexes plaintext. What that exposes is **more than metadata, and saying otherwise
+  would be a false assurance**: `HubThreadEntry.slug` is Claude Code's
+  conversation-derived title, and `hub reindex` additionally writes a real
+  `extractSummaryFromFile` result — up to 100 characters of the first user message —
+  where `hub push` writes only the slug (`reindex.ts:156` vs `push.ts:730`, a
+  disagreement between two writers of the same file that is worth closing on its own
+  merits). So a plaintext index leaks session *titles* today and message *excerpts* after
+  any reindex. Transcript bodies stay sealed; the index does not. **Neither the server nor a
   browser can answer "is this thread current *here*?"** — that depends on the requesting
   machine's local sync-state and session files, which the hub has never seen — so machines
   report a local-state summary (ids and timestamps only, never content), and every
