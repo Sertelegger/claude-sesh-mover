@@ -28,8 +28,22 @@ import type { HubPullResult } from "../src/types.js";
  */
 const HUB_DIR = join(import.meta.dirname, "..", "src", "hub");
 
+/**
+ * Read a source file with line endings normalised to LF.
+ *
+ * The repo has no `.gitattributes`, so a Windows checkout gets CRLF. Every
+ * structural assertion in this file greps raw source, and the ones that search
+ * for a literal newline — `indexOf("\n    }\n")` — silently find nothing under
+ * CRLF and fail as `expected -1 to be greater than N`. Normalising here keeps
+ * one reading of the source on every platform; the alternative, teaching each
+ * assertion about `\r`, is the same fix written five times.
+ */
+function readSource(path: string): string {
+  return readFileSync(path, "utf-8").replace(/\r\n/g, "\n");
+}
+
 function hubPullBody(): string {
-  const src = readFileSync(join(HUB_DIR, "pull.ts"), "utf-8");
+  const src = readSource(join(HUB_DIR, "pull.ts"));
   const start = src.indexOf("export async function hubPull(");
   expect(start, "hubPull must exist in src/hub/pull.ts").toBeGreaterThan(-1);
   return src.slice(start);
@@ -147,7 +161,7 @@ describe("pull pipeline clock discipline", () => {
     );
     expect(stageFiles.length).toBeGreaterThan(0);
     for (const f of stageFiles) {
-      const src = readFileSync(join(HUB_DIR, f), "utf-8");
+      const src = readSource(join(HUB_DIR, f));
       expect(src, `${f} must receive opNowMs as a parameter`).not.toMatch(/Date\.now\(\)/);
       // ...and the same rule for the other spelling — see
       // ALLOWED_BARE_NEW_DATE_BY_STAGE_FILE. An absent entry means an empty
