@@ -15,7 +15,7 @@ import type { SyncState, WhereisResult, WhereisThread } from "../types.js";
  * that turns a hub-supplied machine id into a display name goes through here.
  */
 export declare function createMachineNameLookup(backend: HubBackend): (id: string) => Promise<string | null>;
-export declare function shapeThreads(backend: HubBackend, resolved: ResolvedThread[], meId: string, state: SyncState): Promise<WhereisThread[]>;
+export declare function shapeThreads(backend: HubBackend, resolved: ResolvedThread[], meId: string, state: SyncState, targetProjectDir: string): Promise<WhereisThread[]>;
 export declare function hubWhereis(opts: {
     configDir: string;
     projectPath: string;

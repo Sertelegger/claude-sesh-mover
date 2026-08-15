@@ -44,6 +44,7 @@ export { selectThreadBase, type ThreadBaseCandidate } from "./pull-apply-session
  * moved with the stage and calls it, so leaving it here would make the two
  * modules circular.
  */
-export { selectNeededBundles, describeUnfetchable } from "./pull-select.js";
+export { describeUnfetchable } from "./pull-select.js";
+export { selectNeededBundles } from "./threads.js";
 export declare function hubPull(opts: HubPullOptions): Promise<HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult>;
 //# sourceMappingURL=pull.d.ts.map

@@ -1,9 +1,20 @@
+import { join } from "node:path";
 import { createFsBackend, type HubBackend } from "./backend.js";
 import { machinePath, type HubMachineJson } from "./layout.js";
 import { resolveProjectIdentity } from "./identity.js";
 import { readAllIndexes } from "./index-file.js";
+// #44: `pullNeeded` is the same question `pull` asks, so it goes through the
+// same function. The import direction makes this module and pull-select
+// mutually referential (pull-select takes `shapeThreads` and
+// `createMachineNameLookup` from here), which is safe and deliberate rather
+// than accidental: both sides are hoisted `export function` declarations and
+// neither module calls the other while its own body is evaluating, so the ESM
+// cycle resolves before either is invoked. The alternative was a fourth copy
+// of a selection rule that has already disagreed with itself once.
+import { pullSourceFor } from "./threads.js";
 import { resolveThreads, findUnfetchableBundles, type ResolvedThread } from "./threads.js";
 import { loadOrCreateMachineId } from "../machine.js";
+import { encodeProjectPath } from "../platform.js";
 import { peekSyncState } from "../sync-state.js";
 import type { SyncState, WhereisResult, WhereisThread } from "../types.js";
 
@@ -44,17 +55,30 @@ export function createMachineNameLookup(
 // keeps `unfetchableBundles` from crying wolf: without it every thread whose
 // history this machine already holds in full would still look split. Read it
 // with peekSyncState — whereis must not write.
+//
+// `targetProjectDir` (`<configDir>/projects/<encoded project path>`) is the
+// second half of that bookkeeping and arrived with #44: `pullSourceFor` trusts
+// a receipt only while the local session file it names still exists, so
+// answering "would a pull fetch anything" needs to know where a local session
+// file WOULD be. It is only ever probed for existence; nothing is read or
+// written there.
 export async function shapeThreads(
   backend: HubBackend,
   resolved: ResolvedThread[],
   meId: string,
-  state: SyncState
+  state: SyncState,
+  targetProjectDir: string
 ): Promise<WhereisThread[]> {
   const machineName = createMachineNameLookup(backend);
 
   const threads: WhereisThread[] = [];
   for (const t of resolved) {
     const localEntry = t.copies.find((c) => c.machineId === meId) ?? null;
+    // HEAD EQUALITY, AND ONLY AS A DISPLAY FIELD. It says "the newest head the
+    // hub knows of is the one my local file ends at" — a true and useful thing
+    // to show, and NOT the question of whether a pull would fetch something
+    // (#44). It fed `pullNeeded` until this fix, which is how `whereis` came to
+    // report `pullNeeded: false` for a thread `pull --thread <id>` fetched.
     const current = localEntry !== null && localEntry.headEntryUuid === t.latest.headEntryUuid;
     // Asked of the copy a pull would actually resolve to (`latest`), so this
     // answers the same question `pull` answers, before the user runs it.
@@ -87,7 +111,14 @@ export async function shapeThreads(
       localCopy: localEntry
         ? { localSessionId: localEntry.localSessionId, headEntryUuid: localEntry.headEntryUuid, current }
         : null,
-      pullNeeded: t.latest.machineId !== meId && !current,
+      // The pull's own selector, not a restatement of it: this is the field the
+      // SessionStart notice filters on and the field the skill layer turns into
+      // "run /sesh-mover:pull", so it has to be true exactly when a pull of
+      // this thread would fetch a bundle. `pullSourceFor` covers the case where
+      // the newest copy is ours too (a peer can still list something we never
+      // received), so no `machineId` test is needed alongside it.
+      pullNeeded:
+        pullSourceFor(t, state, { machineId: meId, targetProjectDir }) !== undefined,
       unfetchableBundles:
         unfetchable.length > 0
           ? await Promise.all(
@@ -149,7 +180,16 @@ export async function hubWhereis(opts: {
   const resolved = resolveThreads(indexes);
 
   const me = loadOrCreateMachineId();
-  const threads = await shapeThreads(backend, resolved, me.id, peekSyncState(opts.projectPath));
+  // The same path `hubPull` builds for the project it is about (pull.ts's
+  // `targetProjectDir`), so `pullNeeded` and the pull agree about which local
+  // session files exist. `configDir` was already on this options object and
+  // unused; this is what it is for.
+  const targetProjectDir = join(
+    opts.configDir, "projects", encodeProjectPath(opts.projectPath)
+  );
+  const threads = await shapeThreads(
+    backend, resolved, me.id, peekSyncState(opts.projectPath), targetProjectDir
+  );
 
   return { success: true, command: "whereis", linked: true, projectId, threads, warnings };
 }

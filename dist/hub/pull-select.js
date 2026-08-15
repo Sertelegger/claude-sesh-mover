@@ -24,13 +24,21 @@
  * `--latest` pull that finds nothing to do start renaming state files aside, on
  * the code path the SessionStart hook also runs.
  *
- * This is the seam #35 (chain assembly) and #44 (the `--latest` re-gate) land
- * in: `needed` being drawn from ONE machine's bundle list, and `alternateSource`
- * being the only widening of that, are both stated here and nowhere else.
+ * This is the seam #35 (chain assembly) lands in: `needed` being drawn from
+ * ONE machine's bundle list, and `alternateSource` being the only widening of
+ * that, are both stated here and nowhere else.
+ *
+ * #44 has landed, and it is HALF the fix. Every selector — `--thread`,
+ * `--latest`, and `whereis`'s `pullNeeded` — now asks one question, through
+ * `pullSourceFor`: are any of the bundles the resolved machine lists still
+ * unreceived here? Head equality no longer decides anything; it survives only
+ * as `WhereisThread.localCopy.current`, a display field. What did NOT change is
+ * that the question is asked of one machine's list, so #35's cross-machine case
+ * still answers "nothing to pull" — see `pullSourceFor`.
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { findUnfetchableBundles, newerThreadCopy, } from "./threads.js";
+import { alternateSource, findUnfetchableBundles, pullSourceFor, selectNeededBundles, } from "./threads.js";
 import { createMachineNameLookup, shapeThreads } from "./whereis.js";
 import { readSyncState, peekSyncState, writeSyncState, getThreadId, setThreadId, } from "../sync-state.js";
 /**
@@ -77,56 +85,6 @@ export function describeUnfetchable(threadId, groups, source) {
         `sesh-mover cannot yet assemble a thread whose history is split across machines. ` +
         `Nothing is lost: every bundle is still on the hub.`);
 }
-// Last full bundle + everything after it, minus records already received AND
-// still present locally (mirrors the importer's own dedup verification: a
-// registry/peer record can outlive the file it points at, e.g. after a
-// migrate deleted it, so "already received" is only trusted when the file is
-// still there).
-export function selectNeededBundles(bundles, received, localSessionFileExists) {
-    let lastFull = -1;
-    for (let i = 0; i < bundles.length; i++)
-        if (bundles[i].type === "full")
-            lastFull = i;
-    const chain = lastFull >= 0 ? bundles.slice(lastFull) : bundles.slice();
-    return chain.filter((r) => {
-        const prior = received?.[r.sessionIdInBundle];
-        return !(prior && localSessionFileExists(prior.localSessionId));
-    });
-}
-/** Does this machine already hold the thread's newest head? */
-export function isCurrent(t, machineId) {
-    const localEntry = t.copies.find((c) => c.machineId === machineId);
-    return !!localEntry && localEntry.headEntryUuid === t.latest.headEntryUuid;
-}
-/**
- * A copy OTHER than this machine's that still lists bundles this machine
- * has never received — the answer to "the newest head is mine, so is there
- * anything left on the hub for me?", which is NOT the same question.
- *
- * The two come apart on the ordinary divergence flow, and the default-on
- * auto-push makes it routine. `/sesh-mover:pull` probes with
- * `--on-divergence skip` and re-runs with the user's answer; between the
- * two, one SessionEnd hook publishes this machine's own diverged branch,
- * which is more recently active than the hub's side. `target.latest` is
- * then local, and refusing outright ("the latest copy of this thread is
- * already local" / "all threads are current") drops the answer the user
- * just gave for a bundle that is still sitting on the hub, unreceived.
- *
- * Deliberately narrow. It only ever fires when `target.latest` is THIS
- * machine, so it cannot change which copy an ordinary pull resolves to, and
- * it never merges two machines' bundle records into one list (ledger: that
- * linearity is what Task 8's `basedOn` chain walk rests on). Assembling a
- * thread whose history is split across two OTHER machines is still a later
- * slice — `findUnfetchableBundles` remains the disclosure for that.
- *
- * `newerThreadCopy` for the preference so the choice is a strict total order over the
- * candidate set rather than index-file iteration order.
- */
-export function alternateSource(t, st, ctx) {
-    const candidates = t.copies.filter((c) => c.machineId !== ctx.machineId &&
-        selectNeededBundles(c.bundles, st.peers[c.machineId]?.received, (id) => existsSync(join(ctx.targetProjectDir, `${id}.jsonl`))).length > 0);
-    return candidates.length === 0 ? undefined : candidates.reduce(newerThreadCopy);
-}
 export async function runSelectStage(input) {
     const { backend, resolved, machineId, hubId, effectiveProjectPath, targetProjectDir } = input;
     const warnings = [];
@@ -137,19 +95,21 @@ export async function runSelectStage(input) {
         // without applying anything, and it is the only place in pull that reads
         // sync-state without going on to write it — a corrupt file must not be
         // renamed aside by a run that does nothing else.
-        const threads = await shapeThreads(backend, resolved, machineId, peekSyncState(effectiveProjectPath));
+        const threads = await shapeThreads(backend, resolved, machineId, peekSyncState(effectiveProjectPath), targetProjectDir);
         return { kind: "pick-list", threads };
     }
     /**
      * The #35 disclosure for a branch that returns BEFORE fetching anything.
      *
      * "Nothing to pull" and "the latest copy is already local" are the two
-     * answers a machine holding half a cross-machine thread gets most often —
-     * head equality is exactly what a fragment produces (see the head-equality
-     * trap in the ledger), so `isCurrent` is TRUE for the thread that is most
-     * incomplete. Saying "all threads are current" there is the nag loop this
-     * disclosure exists to break, one step earlier than the `needed.length ===
-     * 0` branch that already handles it.
+     * answers a machine holding half a cross-machine thread gets most often, and
+     * #44's re-gate did NOT retire either of them: a fragment whose remaining
+     * bundles are listed by a machine the pull does not resolve to is exactly the
+     * shape where the resolved machine's own list is fully received, so the
+     * thread that is most incomplete still reaches these branches. Answering it
+     * with a bare "nothing to pull" is the nag loop this disclosure exists to
+     * break, one step earlier than the `needed.length === 0` branch that already
+     * handles it.
      *
      * peekSyncState, not readSyncState: these branches apply nothing, and a
      * corrupt state file must not be renamed aside by a run that does nothing
@@ -192,14 +152,21 @@ export async function runSelectStage(input) {
      * holding the content with the receipts to prove it, and no record of which
      * thread it belongs to.
      *
-     * WHAT THAT COSTS, MEASURED. The re-pull sees every bundle already received,
-     * so it answers "Already up to date with the source machine" (or, once this
-     * machine has an index entry with a matching head, "Nothing to pull: all
-     * threads are current") and returns — never reaching the mapping block. The
-     * next push then finds a local session with no thread id and MINTS A NEW
-     * THREAD for it, whose only bundle is a `continuation` with no base anywhere
-     * in its own chain: the unreconstructable thread `recordSentToPeer`'s own
-     * doc forbids. `whereis` shows two threads for one conversation.
+     * WHAT THAT COSTS, MEASURED. The re-pull sees every bundle already received
+     * and returns — never reaching the mapping block. The next push then finds a
+     * local session with no thread id and MINTS A NEW THREAD for it, whose only
+     * bundle is a `continuation` with no base anywhere in its own chain: the
+     * unreconstructable thread `recordSentToPeer`'s own doc forbids. `whereis`
+     * shows two threads for one conversation.
+     *
+     * WHICH EXIT THAT RE-RUN LANDS IN, and #44 moved it. `--thread <id>` still
+     * reaches the `needed.length === 0` branch ("Already up to date with the
+     * source machine"). `--latest` no longer does: the same receipts that empty
+     * `needed` now also make `pullSourceFor` yield no source, so it stops one
+     * branch earlier, at "nothing to pull" — which repairs MORE, not less, since
+     * that branch backfills across every resolved thread rather than the single
+     * one `--thread` named. Both exits call this closure; that is the invariant,
+     * not which of them a given run hits.
      *
      * WHY EVERY CANDIDATE IS MAPPED RATHER THAN THE "RIGHT" ONE. A chain that
      * fragmented leaves several local sessions carrying one thread's content,
@@ -269,17 +236,18 @@ export async function runSelectStage(input) {
         }
     }
     else {
-        // --latest: resolveThreads already sorts desc by latest activity —
-        // take the first thread that is NOT already current on this machine.
-        // Then, only if none qualifies, the thread whose newest copy is ours but
-        // which still has an unreceived bundle waiting on another machine — see
-        // `alternateSource`.
-        target =
-            resolved.find((t) => !isCurrent(t, machineId)) ??
-                resolved.find((t) => t.latest.machineId === machineId &&
-                    alternateSource(t, peekSyncState(effectiveProjectPath), {
-                        machineId, targetProjectDir,
-                    }) !== undefined);
+        // --latest: resolveThreads already sorts desc by latest activity — take
+        // the first thread a pull would actually fetch something for. ONE find,
+        // over `pullSourceFor`, because a second predicate here is exactly the #44
+        // disagreement: this used to skip a thread whose head matched (which says
+        // nothing about which bundles arrived) and then re-ask a receipt question
+        // of the local-machine case alone.
+        //
+        // peekSyncState, hoisted out of the find, not readSyncState: this branch
+        // may apply nothing, and only `readSyncState` renames a corrupt file aside
+        // (module doc, and the same rule the two closures above follow).
+        const peeked = peekSyncState(effectiveProjectPath);
+        target = resolved.find((t) => pullSourceFor(t, peeked, { machineId, targetProjectDir }) !== undefined);
         if (!target) {
             const split = await discloseUnfetchable(resolved);
             const repaired = backfillThreadMappings(resolved);
@@ -287,9 +255,15 @@ export async function runSelectStage(input) {
                 kind: "stop",
                 result: {
                     success: false, command: "pull",
+                    // RECEIPT-SHAPED, because that is what was tested. "All threads are
+                    // current" was a claim about heads, and after the re-gate above the
+                    // code no longer asks that question of anything: a thread is skipped
+                    // here because every bundle the machine it resolves to lists is
+                    // already accounted for on this machine, which is a strictly
+                    // narrower statement and the only one earned.
                     error: split
-                        ? `Nothing to pull: every thread is current with the machine it resolves to, but not every thread is whole here. ${split}`
-                        : "Nothing to pull: all threads are current on this machine.",
+                        ? `Nothing to pull: every bundle the machine each thread resolves to lists has already been received here, but not every thread is whole here. ${split}`
+                        : "Nothing to pull: every bundle the machine each thread resolves to lists has already been received here.",
                     details: repaired,
                     suggestion: split
                         ? "Nothing is left for this machine to fetch from the machine this thread resolves to. The remaining bundles sit on a machine whose bundle list this pull did not read, and no flag makes one pull read two machines' lists, so a thread whose history is split across machines cannot be assembled here yet. Run whereis — the same threads report it as unfetchableBundles."

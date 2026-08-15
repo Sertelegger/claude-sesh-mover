@@ -454,6 +454,18 @@ export interface WhereisThread {
         headEntryUuid: string;
         current: boolean;
     } | null;
+    /**
+     * Would a pull of this thread fetch a bundle that has never arrived here?
+     *
+     * The pull's OWN selector answers it (`pullSourceFor`), so `whereis`, `pull
+     * --latest` and `pull --thread <id>` cannot disagree about it — they did
+     * until #44, when this field was head equality (`latest is on another machine
+     * AND (no local copy or local head != latest head)`) and the pull was
+     * receipts. A head can arrive by a route that recorded no bundle, so the two
+     * come apart in both directions: this is true on a thread whose
+     * `localCopy.current` is also true, and false on a thread whose `latest` is
+     * another machine.
+     */
     pullNeeded: boolean;
     /**
      * Set when at least one machine other than this one and the latest copy's
