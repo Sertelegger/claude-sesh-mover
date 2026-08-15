@@ -196,6 +196,60 @@ function appendEntry(path: string, entry: Record<string, unknown>): void {
  * i.e. today's list interleaves as `[b0 session, b1 workspace]`, and a
  * stage-major concatenation would produce `[b1 workspace, b0 session]`.
  */
+/**
+ * `hubPull` is sequencing, not implementation.
+ *
+ * It began this refactor at 1438 lines and ended it at 301, spread across
+ * eight stage modules. The number below is a RATCHET against regrowth, not a
+ * target and not a measurement of anything: it is the body's real length plus
+ * a little headroom. If a legitimate change pushes past it, raise it in the
+ * same commit and say why — do not contort the sequencing to fit a figure.
+ *
+ * What is deliberately still here, and why it is not glue:
+ *
+ * - The lock. Acquisition and release must live in one function with the
+ *   `finally`; splitting them across a module boundary is how a wedged lock
+ *   outlives its operation.
+ * - `opNowMs`. One capture, before the lock, passed down. See the clock
+ *   discipline block above.
+ * - The divergence-abort disclosure. It is the only warning in the pull that
+ *   needs facts from TWO stages — `deferredBundles`/`abortIndex`/
+ *   `divergenceAborted` from sessions, `carrySuppressed` from carry. The
+ *   original plan had it moving into the sessions stage's break path; that
+ *   would make the sessions stage compute `isCarrySuppressed`, which reads
+ *   `lastCarry`, which is carry's. A cross-stage fact belongs to the
+ *   sequencer.
+ */
+describe("hubPull is sequencing", () => {
+  it("keeps hubPull's body within the ratchet", () => {
+    const lines = hubPullBody().split("\n").length;
+    expect(
+      lines,
+      "hubPull grew — extract the new work into a stage, or raise this ratchet in the same commit and say why"
+    ).toBeLessThan(340);
+  });
+
+  it("spreads each in-loop stage's reasons inside the loop, not after it", () => {
+    const body = hubPullBody();
+    const loopAt = body.indexOf("for (const [i, record] of needed.entries())");
+    expect(loopAt, "the per-bundle loop must still be in hubPull").toBeGreaterThan(-1);
+    // The loop's closing brace: the first line that is exactly four spaces
+    // and a brace after the header.
+    const afterLoop = body.indexOf("\n    }\n", loopAt);
+    expect(afterLoop).toBeGreaterThan(loopAt);
+    const inLoop = body.slice(loopAt, afterLoop);
+    // fetch/workspace/sessions are three phases of ONE loop body. Collecting
+    // their reasons and concatenating after the loop reorders a multi-bundle
+    // chain's warnings — see the "pull warning order" block below, which
+    // catches the behaviour; this catches the shape.
+    for (const stage of ["ws.reasons", "ss.reasons"]) {
+      expect(inLoop, `${stage} must be spread inside the per-bundle loop`).toContain(
+        `warnings.push(...${stage})`
+      );
+    }
+  });
+});
+
 describe("pull warning order", () => {
   it("emits each bundle's warnings in loop order: bundle 0's session warning precedes bundle 1's workspace warning", async () => {
     const homeA = mkdtempSync(join(tmpdir(), "sesh-order-homeA-"));
