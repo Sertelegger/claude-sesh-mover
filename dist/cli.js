@@ -581,6 +581,28 @@ hub
     }
 });
 hub
+    .command("unlink")
+    .description("Remove this project's hub link — disarms the session-end auto-push for this directory")
+    .option("--project-path <path>", "Override project path (default: cwd)")
+    .option("--force", "Skip the project lock")
+    .action(async (opts) => {
+    try {
+        // NO hub lookup and no config dir, deliberately — unlink is the DISARM
+        // path for a default-on automation, so it must not depend on the thing
+        // being disarmed. A user whose share is unmounted (or who has already
+        // cleared `hub.path`) would otherwise be told "No hub configured" by the
+        // one command that could turn the automation off. See src/hub/unlink.ts.
+        const { hubUnlink } = await import("./hub/unlink.js");
+        output(hubUnlink({
+            projectPath: opts.projectPath ?? process.cwd(),
+            force: !!opts.force,
+        }));
+    }
+    catch (e) {
+        outputError("hub-unlink", e);
+    }
+});
+hub
     .command("reindex")
     .description("Rebuild this machine's hub index for the current project from its own bundles")
     .option("--project-path <path>", "Override project path (default: cwd)")
@@ -1193,6 +1215,24 @@ function recordAutoPushOutcome(projectPath, result) {
             const error = typeof r.error === "string" ? r.error : JSON.stringify(result);
             const suggestion = typeof r.suggestion === "string" ? ` ${r.suggestion}` : "";
             notes.push(`${error}${suggestion}`);
+            // The link disclosure, carried across as its own note.
+            //
+            // This is the reason `HubPushFailedResult` puts the link state in FIELDS
+            // rather than only in `details`: nothing here reads `details`, and this
+            // function is the sole surviving trace of an unattended push. A push that
+            // failed while leaving the project linked leaves the auto-push armed to
+            // fail again tomorrow, which is exactly the thing a user needs told.
+            if (typeof r.linked === "boolean") {
+                notes.push(r.linked
+                    ? `This project IS still linked to hub project ${String(r.projectId)}, so the session-end auto-push stays armed for it — run \`sesh-mover hub unlink\` here to turn it off.`
+                    : `This project is NOT linked to the hub${r.linkRolledBack === true ? " (the link this push created was removed again)" : ""}, so the session-end auto-push is off for it until a push links it again.`);
+            }
+            if (typeof r.orphanHubProjectId === "string") {
+                notes.push(`Hub project ${r.orphanHubProjectId} was created before the failure and nothing removes a hub project; a later push can pass --project-id ${r.orphanHubProjectId} to link to that one.`);
+            }
+            if (r.orphanBundle === true) {
+                notes.push("A bundle reached the hub but this machine's index was not updated to reference it, so no other machine can see it yet; the next successful push republishes the index.");
+            }
         }
         // Nothing to say and nothing already on record is the overwhelmingly common
         // case (a clean push of a project with no disclosures). Still recorded, so

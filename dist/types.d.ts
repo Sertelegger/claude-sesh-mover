@@ -414,6 +414,48 @@ export interface HubPushResult {
     carry?: CarryMeta;
 }
 /**
+ * A push that threw AFTER the point where it could have linked this project.
+ * Structurally an `ErrorResult` (`success: false`, `command: "push"`, `error`,
+ * optional `details`/`suggestion`) with the link state added as FIELDS.
+ *
+ * The fields are the point. What the user has to be told is not in the
+ * exception and never was — whether this directory is linked *right now*,
+ * because a link is the consent gate for the default-on SessionEnd auto-push,
+ * and for a git-less project that push uploads the whole working tree. Until
+ * this shape existed that fact lived only as English prose inside `details`,
+ * and `recordAutoPushOutcome` (cli.ts) — the ONLY reader an unattended
+ * session-end push has — records `error` and `suggestion` and never looks at
+ * `details`. So the one push nobody watches was also the one that lost the
+ * disclosure entirely. Branch on the fields; treat `details` as prose.
+ *
+ * `reason` says "failed-after-link" for every failure past the identity
+ * decision, including the ones where no link was written at all (`linked:
+ * false`, `linkRolledBack: false`): the discriminator marks the phase, and
+ * `linked` — not the reason string — answers the question about state.
+ */
+export interface HubPushFailedResult {
+    success: false;
+    command: "push";
+    reason: "failed-after-link";
+    error: string;
+    details?: string;
+    suggestion?: string;
+    /** TRUE = this directory is linked RIGHT NOW, so SessionEnd auto-push is armed. */
+    linked: boolean;
+    /** The hub project the link names (or would have named). */
+    projectId: string;
+    /** This push made the link and removed it again. */
+    linkRolledBack: boolean;
+    /**
+     * A hub project this push minted that nothing removes — retry with
+     * `--project-id <it>` rather than minting a second. Null when this push
+     * created none.
+     */
+    orphanHubProjectId: string | null;
+    /** Bundle reached the hub but no index references it. */
+    orphanBundle: boolean;
+}
+/**
  * One machine's bundles for a thread that a pull resolving to some OTHER
  * machine cannot fetch — the reported shape of `findUnfetchableBundles`
  * (hub/threads.ts), with the hub's display name for the machine attached.
@@ -492,6 +534,14 @@ export interface WhereisResult {
     threads: WhereisThread[];
     warnings: string[];
 }
+/**
+ * A command that needs a hub project and found this directory linked to none.
+ *
+ * **Not to be confused with `HubUnlinkResult`** (no "ed"), which is the SUCCESS
+ * result of the `hub unlink` verb — the deliberate act of removing a link.
+ * This one is a refusal: nothing happened, and `linkCandidates` is the pick
+ * list for linking.
+ */
 export interface HubUnlinkedResult {
     success: false;
     command: "push" | "pull" | "whereis";
@@ -505,10 +555,18 @@ export interface HubUnlinkedResult {
 }
 export interface HubLockBusyResult {
     success: false;
-    command: "push" | "pull";
+    command: "push" | "pull" | "hub-unlink";
     reason: "lock-busy";
     holderPid: number | null;
     ageSeconds: number | null;
+    /**
+     * The lock error's own message (which pid, how old). Set by `hub unlink`,
+     * whose refusal a HUMAN reads while deciding whether to wait or to `--force`
+     * past it; push and pull leave it absent, because for them a busy lock means
+     * another operation is already doing the work and the caller is told to
+     * retry, not to adjudicate.
+     */
+    error?: string;
     suggestion: string;
 }
 export interface HubPullResult {
@@ -660,7 +718,39 @@ export interface HubReindexResult {
     }>;
     warnings: string[];
 }
-export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | WhereisResult | HubUnlinkedResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | HubReindexResult | ErrorResult;
+/**
+ * The result of the `hub unlink` verb: this directory's hub link was removed
+ * (or was already absent).
+ *
+ * **Not to be confused with `HubUnlinkedResult`** (with the "ed"), which is the
+ * REFUSAL a push/pull/whereis returns when it needs a link and finds none.
+ * This one is a success: the link is gone because the user asked for it to be.
+ *
+ * Unlinking is deliberately the narrowest possible act — it removes one file
+ * and writes nothing to the hub — so most of what a caller needs to relay is
+ * about what was NOT touched. Hence `projectId` (kept so a re-link can pass
+ * `--project-id` and keep this project's sync bookkeeping meaningful) and
+ * `warnings` (the sync-state that stays behind, a lock that was skipped).
+ */
+export interface HubUnlinkResult {
+    success: true;
+    command: "hub-unlink";
+    /** false = idempotent no-op: nothing was linked here to begin with. */
+    wasLinked: boolean;
+    /** The hub project this directory was linked to, so a re-link can name it. */
+    projectId: string | null;
+    /** The one file that was removed, or null when there was none. */
+    removedPath: string | null;
+    /**
+     * Both Claude Code hooks are inert for this directory now. Linking IS the
+     * consent gate (`evaluateHookGate` reads exactly this file), so removing it
+     * disarms the SessionEnd auto-push and the SessionStart notice at once —
+     * for THIS directory only.
+     */
+    automationDisarmed: boolean;
+    warnings: string[];
+}
+export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | HubPushFailedResult | WhereisResult | HubUnlinkedResult | HubUnlinkResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | HubReindexResult | ErrorResult;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;
@@ -787,7 +877,7 @@ export interface SyncState {
          * This is the merge's whole ancestor mechanism: a generation may be used as
          * a 3-way merge base only if it is common to BOTH trees, and membership in
          * this list is exactly the "we held it too" half of that test — no clocks
-         * involved. See `hub/pull.ts`'s `chooseMergeAncestor`, which intersects it
+         * involved. See `hub/pull-apply-workspace.ts`'s `chooseMergeAncestor`, which intersects it
          * with what the incoming chain declares it descends from.
          */
         workspaceGenerations?: WorkspaceGenerationRef[];

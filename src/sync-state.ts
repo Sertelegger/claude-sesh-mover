@@ -336,7 +336,7 @@ export function setLastAutoPush(
  * This is one half of the "common to both trees" test that a 3-way merge base
  * must pass. The other half is what the incoming bundle chain declares it
  * descends from (`manifest.workspace.basedOn`); the intersection is the set of
- * legal bases, and `hub/pull.ts`'s `chooseMergeAncestor` takes the newest of
+ * legal bases, and `hub/pull-apply-workspace.ts`'s `chooseMergeAncestor` takes the newest of
  * them.
  *
  * No timestamp is involved in that decision, deliberately. `pushedAt` is the

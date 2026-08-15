@@ -205,7 +205,19 @@ export async function resolveProjectIdentity(backend, projectPath) {
         })),
     };
 }
-export async function createHubProject(backend, projectPath, machineId) {
+/**
+ * The HUB-side half of `createHubProject`: mint an id and write
+ * `projects/<id>/project.json`. Writes NOTHING under the project directory.
+ *
+ * Split out because the two halves have different failure semantics and a
+ * caller may need them at different moments. The hub write cannot be undone —
+ * there is no `backend.delete` call anywhere in src/ — while the local link
+ * can, so `hub/push.ts` records "a hub project was minted" the instant this
+ * resolves and defers the local link until the bundle is on the hub. Fusing
+ * them, as this function's caller below does, means a throw BETWEEN the two
+ * writes leaves an orphan hub project no result mentions.
+ */
+export async function mintHubProject(backend, projectPath, machineId) {
     const local = {
         projectId: randomUUID(),
         name: basename(projectPath),
@@ -221,18 +233,36 @@ export async function createHubProject(backend, projectPath, machineId) {
         createdByMachine: machineId,
     };
     await backend.writeAtomic(projectJsonPath(local.projectId), JSON.stringify(hub, null, 2) + "\n");
+    return local;
+}
+export async function createHubProject(backend, projectPath, machineId) {
+    const local = await mintHubProject(backend, projectPath, machineId);
     writeLocalProjectId(projectPath, local);
     return local;
 }
-export async function linkToHubProject(backend, projectPath, projectId) {
+/**
+ * Read a hub project as the `LocalProjectId` a link to it would carry, WITHOUT
+ * writing that link.
+ *
+ * The read is not a formality: it is the existence gate that keeps a typo'd
+ * `--project-id` from linking a directory to a hub project that does not
+ * exist, and `assertSafeHubId` is the path-safety chokepoint. Callers that
+ * want the gate at one moment and the link at another (see `hub/push.ts`) take
+ * this and `writeLocalProjectId` separately; everyone else takes
+ * `linkToHubProject`, which is exactly the two in sequence.
+ */
+export async function readHubProjectAsLocal(backend, projectId) {
     assertSafeHubId(projectId, "projectId");
     const hub = JSON.parse((await backend.read(projectJsonPath(projectId))).toString());
-    const local = {
+    return {
         projectId: hub.projectId,
         name: hub.name,
         createdAt: hub.createdAt,
         createdByMachine: hub.createdByMachine,
     };
+}
+export async function linkToHubProject(backend, projectPath, projectId) {
+    const local = await readHubProjectAsLocal(backend, projectId);
     writeLocalProjectId(projectPath, local);
     return local;
 }

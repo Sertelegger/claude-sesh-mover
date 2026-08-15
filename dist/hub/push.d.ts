@@ -1,4 +1,4 @@
-import type { ErrorResult, HubLockBusyResult, HubPushResult, HubUnlinkedResult, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubLockBusyResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, ProgressEvent } from "../types.js";
 export interface HubPushOptions {
     configDir: string;
     projectPath: string;
@@ -41,5 +41,5 @@ export interface HubPushOptions {
     quiet?: boolean;
     onProgress?: (ev: ProgressEvent) => void;
 }
-export declare function hubPush(opts: HubPushOptions): Promise<HubPushResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult>;
+export declare function hubPush(opts: HubPushOptions): Promise<HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | ErrorResult>;
 //# sourceMappingURL=push.d.ts.map
