@@ -15,7 +15,18 @@ import { readLastEntryUuid } from "../src/jsonl.js";
 import { encodeProjectPath } from "../src/platform.js";
 import type { HubPullResult } from "../src/types.js";
 
-const HUB_DIR = new URL("../src/hub/", import.meta.url).pathname;
+/**
+ * `import.meta.dirname`, NOT `new URL(..., import.meta.url).pathname`.
+ *
+ * A file URL's `pathname` is `/D:/a/repo/src/hub/` on Windows — the leading
+ * slash is part of the URL grammar, not the path — so every `join()` off it
+ * produced `D:\D:\a\repo\src\hub\pull.ts` and ENOENT. The five source-scanning
+ * tests in this file were latent-broken on Windows from the commit that added
+ * them; nothing caught it until CI ran the branch on a non-Linux runner,
+ * because every local run was Linux. `tests/hub-warning-flags.test.ts` scans
+ * this same directory and got it right, so match it rather than reinventing.
+ */
+const HUB_DIR = join(import.meta.dirname, "..", "src", "hub");
 
 function hubPullBody(): string {
   const src = readFileSync(join(HUB_DIR, "pull.ts"), "utf-8");
