@@ -40,75 +40,75 @@ interface FlagUse {
 }
 
 const REGISTRY: FlagUse[] = [
-  // ---- src/hub/pull.ts -----------------------------------------------------
+  // ---- the pull pipeline (src/hub/pull*.ts) --------------------------------
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "re-pull the next workspace payload with --target-path",
     klass: "future-only",
     why: "A successful merge withheld a file. This pull recorded its bundles, so the remedies are aimed at the NEXT payload from that machine.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-carry.ts",
     match: "Pass --apply-carry on a future pull",
     klass: "future-only",
     why: "The carry decision cannot be revisited for this bundle; the saved payload is the remedy for THIS one.",
   },
   {
-    file: "pull.ts",
+    file: "pull-resolve.ts",
     match: "Pass --project-id <id> to link to an existing hub project.",
     klass: "retry-works",
-    why: "The pull refused before touching anything (unlinked project); the same invocation plus --project-id runs from the top.",
+    why: "The pull refused before touching anything (unlinked project); the same invocation plus --project-id runs from the top. The escape returns before registerMachine and before any hub write, so 'touching anything' stayed true when the resolve stage moved out of pull.ts.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "no common point to merge from and NOTHING was written",
     klass: "future-only",
     why: "The no-ancestor workspace skip. Sessions imported and the bundles are recorded, so this pull cannot be re-run for the payload — and because a skip records no generation, the state is sticky until a later payload is applied with one of the named flags.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "no 3-way merge was attempted even though this machine has workspace generations",
     klass: "descriptive",
     why: "Restates what --force-workspace just did. Nothing is being asked of the user.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-workspace.ts",
     match: "To use this destination anyway, re-run with --force-workspace",
     klass: "retry-works",
     why: "An explicit --target-path that is not empty aborts the pull before this bundle's session import, so nothing is recorded and the re-run reaches the same payload.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-sessions.ts",
     match: "skipped, nothing changed. Re-run with --on-divergence",
     klass: "retry-works",
     why: "--on-divergence skip is the mode that deliberately applies and records nothing, precisely so the choice can be made on a re-run. Only true because the skip ABORTS THE WHOLE THREAD's chain (`divergenceAborted`): skipping just the diverged bundle left the next one in the chain to fragment-import and be recorded, which republished the index and foreclosed the re-run.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-sessions.ts",
     match: "this bundle was skipped and the fork is still undecided, but",
     klass: "retry-works",
     why: "The same divergence skip, worded for a break part-way through a chain. Still retry-works, and for the same reason: nothing is applied or recorded for THIS bundle or any later one, so the re-run reaches the fork. What changed is the honesty of the rest of the sentence — the bundles BEFORE it in the chain were applied and recorded, and the old text claimed the whole pull had changed nothing.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-sessions.ts",
     match: "adopt-hub refused for thread",
     klass: "retry-works",
     why: "The liveness refusal was given SKIP semantics for this exact reason (Task 4 fix round 2), and thread-wide ABORT semantics for the second half of it (final round): nothing applied, nothing recorded, no later bundle of the chain fetched, so --force-append on the re-run reaches the adoption. With a per-bundle skip the promise held only for a single-bundle chain.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-sessions.ts",
     match: "was adopted anyway because --force-append was passed",
     klass: "descriptive",
     why: "Restates the consequence the user consented to, after the fact.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-sessions.ts",
     match: "close the Claude Code session writing to that transcript before pulling",
     klass: "future-only",
     why: "The plain-append liveness decline. THIS bundle is fragment-imported and recorded, so no re-run reaches it — but --force-append on the NEXT pull of the thread does splice that pull's continuation (measured), so the flag is named with that scoping rather than withheld.",
   },
   {
-    file: "pull.ts",
+    file: "pull-apply-sessions.ts",
     match: "that decision stands for it — adopt-hub cannot be applied to it afterwards",
     klass: "future-only",
     why: "The default `fragment` resolution. The fragment import records the bundle, so adopt-hub can never be applied to it; --on-divergence skip is named only as the mode to run the NEXT divergence under.",

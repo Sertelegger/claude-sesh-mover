@@ -1,49 +1,28 @@
-import {
-  mkdtempSync, rmSync, mkdirSync, createReadStream, createWriteStream, existsSync, readdirSync,
-  appendFileSync, copyFileSync, statSync,
-} from "node:fs";
+import { mkdtempSync, rmSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { pipeline } from "node:stream/promises";
-import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend, type HubBackend } from "./backend.js";
-import { HUB_JSON, type HubBundleRecord, type HubJson } from "./layout.js";
+import { type HubBundleRecord } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
-import { resolveProjectIdentity, linkToHubProject, type LocalProjectId } from "./identity.js";
-import { registerMachine } from "./init.js";
-import { buildIndexFile, readMachineIndex, writeMachineIndex, readAllIndexes } from "./index-file.js";
-import {
-  resolveThreads, findUnfetchableBundles, newerThreadCopy,
-  type ResolvedThread, type ThreadCopy,
-} from "./threads.js";
-import { createMachineNameLookup, shapeThreads } from "./whereis.js";
-import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
-import { mergeWorkspaceTrees, type WorkspaceMergeReport } from "./merge.js";
-import { applyCarry, type ApplyResult, type CarryMeta } from "./carry.js";
-import {
-  adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS,
-} from "./append.js";
-import { extractArchive } from "../archiver.js";
-import { importSession } from "../importer.js";
-import { discoverSessions } from "../discovery.js";
+import { runApplyCarryStage } from "./pull-apply-carry.js";
+import { runApplySessionsStage } from "./pull-apply-sessions.js";
+import { runApplyWorkspaceStage } from "./pull-apply-workspace.js";
+import { initApplyState, isCarrySuppressed } from "./pull-apply-state.js";
+import { runFetchStage } from "./pull-fetch.js";
+import { runRecordStage } from "./pull-record.js";
+import { runResolveStage } from "./pull-resolve.js";
+import { runSelectStage } from "./pull-select.js";
 import { loadOrCreateMachineId } from "../machine.js";
-import { computeIntegrityHashFromFile, readManifest, verifySessionsDigest } from "../manifest.js";
-import {
-  countJsonlLines, findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid,
-} from "../jsonl.js";
+import { countJsonlLines } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
-import { buildImportRewriteContext, rewriteJsonlStream, type RewriteContext } from "../rewriter.js";
-import { getApplicableAdapters } from "../version-adapters.js";
 import {
-  readSyncState, peekSyncState, writeSyncState, getThreadId, setThreadId, setLastWorkspace,
-  recordSentToPeer, knownWorkspaceGenerations,
+  readSyncState, writeSyncState, recordSentToPeer,
 } from "../sync-state.js";
 import type {
   ErrorResult,
   ExportManifest,
   HubLockBusyResult,
-  HubPullDivergence,
   HubPullListResult,
   HubPullResult,
   HubUnlinkedResult,
@@ -51,11 +30,7 @@ import type {
   OnDivergenceMode,
   ProgressEvent,
   SessionManifest,
-  SyncState,
-  UnfetchableBundleGroup,
-  WorkspaceGenerationRef,
 } from "../types.js";
-import { isPluginStateName } from "../paths.js";
 
 export interface HubPullOptions {
   configDir: string;
@@ -82,185 +57,29 @@ export interface HubPullOptions {
   onProgress?: (ev: ProgressEvent) => void;
 }
 
-export interface ThreadBaseCandidate {
-  localSessionId: string;
-  /** Uuid of the session's last entry, or null when it can't be read. */
-  headEntryUuid: string | null;
-  /** Timestamp of that last entry, or null when it can't be read. */
-  lastActiveAt: string | null;
-}
+/**
+ * Re-exported rather than re-declared. `apply.sessions` owns the thread-base
+ * choice — it re-reads sync-state per bundle to make it — but `selectThreadBase`
+ * and its candidate type are part of this package's PUBLIC surface:
+ * `src/index.ts` does `export * from "./hub/pull.js"`, and `tests/hub-pull.test.ts`
+ * imports it from here. Dropping this line silently deletes a named export from
+ * the package entrypoint, and `dist/` is committed, so it would ship.
+ * Importing it back the other way would make the two modules circular.
+ */
+export { selectThreadBase, type ThreadBaseCandidate } from "./pull-apply-sessions.js";
 
 /**
- * Pick which of a thread's local sessions a continuation should splice onto.
+ * Same rule, same reason, for the two helpers the `select` stage took with it:
+ * both are imported from HERE by `tests/hub-pull.test.ts` (each with its own
+ * `(pure)` describe block), and `src/index.ts`'s `export * from "./hub/pull.js"`
+ * puts them on the package entrypoint. Dropping this line deletes two named
+ * exports from a shipped, committed `dist/`.
  *
- * A thread maps to MORE THAN ONE local session as a matter of course: every
- * time a splice is declined (a live-looking base, a chain that doesn't line
- * up, `--no-append`) the fragment import mints a new session and maps it onto
- * the same thread, while the older mapping stays. "Whichever key comes first"
- * therefore returns the OLDEST session forever, and since the continuation
- * chain has moved on, every subsequent pull chain-mismatches and forks off
- * another fragment — a state `--force-append` cannot rescue, because force
- * never skips the chain guard. index-file.ts:30-41 refuses the mirror-image
- * shortcut in the forward direction for the same reason.
- *
- * So: the delta's anchor decides. The session whose head IS the entry this
- * continuation follows is the one it belongs on, whatever the map's insertion
- * order says — which is also what makes a poisoned map self-healing, since
- * the fragment that stranded the thread is exactly the session carrying the
- * anchor next time round.
- *
- * Order of preference:
- *   1. sessions whose head uuid equals `anchorUuid` (when it's known and any
- *      candidate matches) — otherwise every candidate stays in the running,
- *      so the caller still gets a sensible base to name in the decline;
- *   2. `preferred` (the session THIS pull already landed content in) if it
- *      survived step 1;
- *   3. most recent `lastActiveAt`, ties broken by lexically greatest session
- *      id — a strict total order, so the answer never depends on map or
- *      directory iteration order.
+ * `describeUnfetchable` in particular could not stay behind: `discloseUnfetchable`
+ * moved with the stage and calls it, so leaving it here would make the two
+ * modules circular.
  */
-export function selectThreadBase(
-  candidates: ThreadBaseCandidate[],
-  anchorUuid: string | null,
-  preferred: string | null
-): string | null {
-  if (candidates.length === 0) return null;
-  const anchored = anchorUuid
-    ? candidates.filter((c) => c.headEntryUuid !== null && c.headEntryUuid === anchorUuid)
-    : [];
-  const pool = anchored.length > 0 ? anchored : candidates;
-
-  if (preferred && pool.some((c) => c.localSessionId === preferred)) return preferred;
-
-  return pool.reduce((best, c) => {
-    const a = best.lastActiveAt ?? "";
-    const b = c.lastActiveAt ?? "";
-    if (a !== b) return b > a ? c : best;
-    return c.localSessionId > best.localSessionId ? c : best;
-  }).localSessionId;
-}
-
-/**
- * Head uuid + last-entry timestamp from one bounded tail read.
- *
- * Both come from the SAME entry — the last conversation entry — on purpose.
- * `selectThreadBase` above uses them as a pair (anchor match first, then
- * recency), and `resolveThreads` does the same across machines; taking the
- * uuid from one line and the timestamp from a later bookkeeping line would
- * describe two different points in the transcript and make that comparison
- * incoherent. A `queue-operation` or `pr-link` timestamp is real wall-clock
- * activity, but it is not conversation, and "which copy has the most
- * conversation" is the question these fields are asked.
- */
-/**
- * Is this path a directory we can list?
- *
- * Both "the bundle declares a payload it does not contain" guards use this
- * rather than `existsSync`, because the failure they exist to close is a
- * `readdirSync` throwing out of `hubPull` BEFORE the session import — which a
- * plain file at that path does just as well (ENOTDIR) as a missing one
- * (ENOENT). Any error reads as "not usable": the caller's next move is to warn
- * and skip, which is the right answer for a permission failure too.
- */
-function isReadableDir(path: string): boolean {
-  try {
-    return statSync(path).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function readSessionTail(path: string): Omit<ThreadBaseCandidate, "localSessionId"> {
-  const e = readLastConversationEntry(path);
-  if (!e) return { headEntryUuid: null, lastActiveAt: null };
-  return {
-    headEntryUuid: typeof e.uuid === "string" ? e.uuid : null,
-    lastActiveAt: typeof e.timestamp === "string" ? e.timestamp : null,
-  };
-}
-
-/**
- * Every local session currently mapped to `threadId`, plus the one this pull
- * has already landed content in (which isn't in the map yet — thread mappings
- * are only written once the whole chain has been applied). Sessions whose
- * file is gone are dropped: a mapping outlives the file it points at.
- */
-function threadBaseCandidates(
-  state: SyncState,
-  threadId: string,
-  pendingSessionId: string | null,
-  targetProjectDir: string
-): ThreadBaseCandidate[] {
-  const ids = new Set<string>();
-  for (const [localSessionId, tid] of Object.entries(state.hub?.threadByLocalSession ?? {})) {
-    if (tid === threadId) ids.add(localSessionId);
-  }
-  if (pendingSessionId) ids.add(pendingSessionId);
-
-  const candidates: ThreadBaseCandidate[] = [];
-  for (const localSessionId of ids) {
-    const p = join(targetProjectDir, `${localSessionId}.jsonl`);
-    if (!existsSync(p)) continue;
-    candidates.push({ localSessionId, ...readSessionTail(p) });
-  }
-  return candidates;
-}
-
-/**
- * A spliced continuation's layer files belong to the BASE session, so they
- * land in the base's directories rather than under the bundle's (now
- * discarded) session id.
- *
- * Subagent JSONL — and ONLY subagent JSONL — is rewritten through the same
- * context as the transcript, exactly as importer.ts does it: those files are
- * Claude Code transcripts carrying the source machine's `cwd` and tool output,
- * so a plain copy would leave foreign paths behind in the one place nobody
- * looks. tool-results and file-history are opaque user data (a file-history
- * backup of a `.jsonl` the user was editing is NOT a transcript) and are
- * copied byte-for-byte. Existing files are never overwritten: layer files are
- * uuid-named, so a collision means the same artifact already arrived.
- */
-async function copyLayerDirs(
-  extractDir: string,
-  bundleSessionId: string,
-  targetProjectDir: string,
-  baseSessionId: string,
-  targetConfigDir: string,
-  ctx: RewriteContext
-): Promise<void> {
-  const pairs: Array<{ from: string; to: string; rewriteJsonl: boolean }> = [
-    {
-      from: join(extractDir, "sessions", bundleSessionId, "subagents"),
-      to: join(targetProjectDir, baseSessionId, "subagents"),
-      rewriteJsonl: true,
-    },
-    {
-      from: join(extractDir, "sessions", bundleSessionId, "tool-results"),
-      to: join(targetProjectDir, baseSessionId, "tool-results"),
-      rewriteJsonl: false,
-    },
-    {
-      from: join(extractDir, "file-history", bundleSessionId),
-      to: join(targetConfigDir, "file-history", baseSessionId),
-      rewriteJsonl: false,
-    },
-  ];
-  for (const { from, to, rewriteJsonl } of pairs) {
-    if (!existsSync(from)) continue;
-    mkdirSync(to, { recursive: true });
-    for (const f of readdirSync(from)) {
-      const dest = join(to, f);
-      if (existsSync(dest)) continue;
-      if (rewriteJsonl && f.endsWith(".jsonl")) {
-        // Path rewrite + the base's session id, never version adapters —
-        // the same rule importer.ts follows for subagents.
-        await rewriteJsonlStream(join(from, f), dest, ctx, { newSessionId: baseSessionId });
-      } else {
-        copyFileSync(join(from, f), dest);
-      }
-    }
-  }
-}
+export { selectNeededBundles, describeUnfetchable } from "./pull-select.js";
 
 /**
  * How many entries the local base holds beyond the common anchor — the "your
@@ -352,398 +171,6 @@ function recordSplice(b: {
   });
 }
 
-/**
- * Fetch one candidate workspace generation off the hub and unpack it into a
- * temp dir: the common-ancestor tree a 3-way merge needs (design §5.2).
- * `chooseMergeAncestor` decides WHICH generation; this only retrieves it.
- *
- * The hub already stores every generation — each workspace payload is a full
- * snapshot — so sync-state only holds a POINTER, and the tree comes back down
- * the same validated path as any other bundle (`record.file` and this
- * `ref.file` both go through the backend's `assertHubRelPath`, and
- * `extractArchive` rejects absolute/traversing/symlink tar entries before
- * anything is written).
- *
- * Every failure degrades to `{ dir: null }` with a warning rather than
- * throwing, and the caller then runs no-ancestor mode (§5.4). The reasons are
- * all ordinary: the bundle was pruned from the hub, the hub folder has not
- * finished syncing it, an older generation predates workspace payloads, or the
- * archive is unreadable. None of them is a reason to fail a pull whose sessions
- * are perfectly fine — and no-ancestor mode never overwrites anything.
- *
- * Each attempt gets its OWN scratch directory: `chooseMergeAncestor` can call
- * this twice, and a failed extraction may already have written part of a tree.
- * Sharing one directory would silently hand back a blend of two generations.
- */
-async function fetchAncestorWorkspace(
-  backend: HubBackend,
-  ref: { bundleId: string; file: string },
-  tempRoot: string
-): Promise<{ dir: string | null; warning?: string }> {
-  const degraded = (why: string): { dir: null; warning: string } => ({
-    dir: null,
-    warning:
-      `The workspace generation ${ref.bundleId}, which this pull would have merged against, ` +
-      `${why} — so that payload could not be merged 3-way against it.`,
-  });
-  try {
-    if (!(await backend.exists(ref.file))) {
-      return degraded("is no longer on the hub (pruned, or not yet synced to this machine)");
-    }
-    const work = mkdtempSync(join(tempRoot, "ancestor-"));
-    const tarPath = join(work, "ancestor.tar.gz");
-    await pipeline(await backend.readStream(ref.file), createWriteStream(tarPath));
-    const bundleDir = join(work, "bundle");
-    mkdirSync(bundleDir, { recursive: true });
-    await extractArchive(tarPath, bundleDir);
-    const tree = join(bundleDir, "workspace");
-    if (!existsSync(tree)) return degraded("carries no workspace tree");
-    return { dir: tree };
-  } catch (e) {
-    return degraded(`could not be read back (${(e as Error).message})`);
-  }
-}
-
-/**
- * Which generation to merge against — or none.
- *
- * **The invariant: a merge may only use a generation common to BOTH trees.**
- * Everything below is that one rule made executable, and every way this has
- * gone wrong so far was a violation of it:
- *
- * - Design §5.2 says "the generation this machine last pushed or applied". That
- *   is common exactly while both machines were in step, and silently
- *   destructive when they were not — which auto-push makes routine, since every
- *   session end pushes whether or not this machine has pulled the other's work.
- *   (gen-2 is common; A pushes gen-3; B, still at gen-2, pushes gen-4; A merges
- *   gen-4 against gen-3, every file of A's reads as unchanged, and A's tree is
- *   "taken" back to B's older copy — measured, reported as a clean merge.)
- * - Trusting the incoming payload's declared base on its own is the mirror
- *   defect: `basedOn` is common to the PEER and the hub, never to us. A machine
- *   holding no generation at all would merge against a tree it has never held,
- *   read the peer's own files as "deleted here", and withhold them permanently
- *   — also measured.
- * - Ordering the two by `pushedAt` cannot fix either, because `pushedAt` is the
- *   PUSHING machine's wall clock (the hub is a passive filesystem and stamps
- *   nothing). A one-hour skew on one machine reinstated the silent revert
- *   verbatim, reported as a `taken` row.
- *
- * So the decision is a SET INTERSECTION, with no clock in it anywhere:
- *
- *   ours   = every generation this machine's tree has passed through
- *            (`knownWorkspaceGenerations`, most recent first)
- *   theirs = every generation the bundles in THIS pull's chain declare they
- *            descend from (`manifest.workspace.basedOn`, oldest chain entry
- *            first)
- *
- * A generation in both was held by both trees, so it is a legal base. The
- * NEWEST such generation (smallest index in `ours`) is the tightest one, and
- * that is what wins.
- *
- * Read that guarantee precisely: OUR half is verified (membership in a list this
- * machine wrote), THEIRS is asserted (`basedOn` is a self-report). A peer that
- * lies — naming a generation of ours it never held — gets that generation used
- * as the base, which is the silent-revert shape again. That is a residual, not a
- * regression: a forged `pushedAt` bought the same thing before this rule
- * existed, and an honest pusher can only ever declare its own `lastWorkspace`.
- * Closing it needs the hub to attest what a bundle descends from, which the
- * filesystem backend cannot do. Under Slice 1's "your own machines" threat model
- * that is acceptable; it would not be under a shared or hostile hub. Empty intersection means we genuinely cannot name a common
- * point — so the payload degrades to no-ancestor mode (§5.4), which is loud and
- * changes nothing, rather than being merged against a guess.
- *
- * Why the whole chain and not just the applied payload's own base: being simply
- * BEHIND is the ordinary case, and a peer that pushed twice since our last sync
- * declares a base we never held (its own previous generation) — while the
- * EARLIER bundle in the same chain declares one we do hold. Walking the chain
- * is what keeps routine repeat pulls merging instead of skipping.
- *
- * The chain is one machine's own pushes (a machine's index lists only bundles it
- * pushed — `hub/pull.ts` writes its index with `newBundles: []`), so the bases
- * within a chain are linear and every earlier one is an ancestor of the applied
- * payload. That linearity is what makes "newest match across the chain" safe;
- * if index writing ever starts merging other machines' bundle records into one
- * thread list, this reasoning breaks before the code does.
- *
- * Known gap, three machines: C's chain declares C's generations. If this machine
- * shares a generation with C only through A, the intersection is empty and the
- * payload skips — even though a genuinely common older generation sits in our
- * own history. Worse, the skip is STICKY: C's next push declares the bundle we
- * just skipped, so every later pull skips too, until this machine pushes a
- * generation C then pulls, or the user reaches for a flag. Fixing it means
- * walking `basedOn` back through the hub's own bundle manifests rather than
- * stopping at the chain; deferred, not overlooked.
- *
- * Fallback direction: candidates after the first are `ours` continued from the
- * winner, i.e. strictly OLDER generations of our own. A base older than the
- * true common ancestor fails toward "keep local" and VISIBLE conflicts; a newer
- * one fails toward silently overwriting work. So a candidate that cannot be
- * fetched (pruned from the hub, not yet synced, unreadable) falls through
- * downward only, never back up to our head — and a merge that ran against a
- * fallback says so.
- */
-async function chooseMergeAncestor(
-  backend: HubBackend,
-  /**
-   * Bundle ids the incoming chain declares it descends from, oldest first.
-   * Only the id is consulted: the peer's `file` never becomes a path here (we
-   * use OUR record of the same generation), so a forged one cannot reach the
-   * filesystem at all.
-   */
-  chainBaseBundleIds: Array<string | null>,
-  known: WorkspaceGenerationRef[],
-  tempRoot: string
-): Promise<{ dir: string | null; warnings: string[] }> {
-  let idx = -1;
-  for (const bundleId of chainBaseBundleIds) {
-    if (!bundleId) continue; // the peer's first workspace push declares none
-    const j = known.findIndex((g) => g.bundleId === bundleId);
-    if (j >= 0 && (idx === -1 || j < idx)) idx = j;
-  }
-  if (idx === -1) return { dir: null, warnings: [] };
-
-  const warnings: string[] = [];
-  const candidates = known.slice(idx);
-  const tried = new Set<string>();
-  for (const [n, ref] of candidates.entries()) {
-    if (tried.has(ref.file)) continue;
-    tried.add(ref.file);
-    const attempt = await fetchAncestorWorkspace(backend, ref, tempRoot);
-    if (attempt.dir !== null) {
-      if (n > 0) {
-        warnings.push(
-          `Merged against an older workspace generation (${ref.bundleId}) than the closest one shared with the other machine, which could not be fetched — so files that changed here since then may be reported as conflicts even where the other machine left them alone.`
-        );
-      }
-      return { dir: attempt.dir, warnings };
-    }
-    if (attempt.warning) warnings.push(attempt.warning);
-  }
-  return { dir: null, warnings };
-}
-
-/**
- * The merge's per-file decisions, phrased for the human reading the pull.
- *
- * Everything the merge *withheld* has to be said out loud, not just what it
- * wrote: `skipped` paths park nothing at all (see merge.ts's `SkipReason`), and
- * a `localDeleted` row cannot be claimed to be a deletion, only described.
- * Silence on either would look exactly like a successful sync.
- *
- * No remedy sentence tells the user to "re-pull to get this" — the bundle is
- * recorded as received by the end of this pull, so a re-run finds nothing to
- * do. Remedies here are things that change the NEXT pull's outcome.
- */
-function describeWorkspaceMerge(r: WorkspaceMergeReport): string[] {
-  const out: string[] = [];
-  const names = (paths: string[]): string =>
-    paths.slice(0, 5).join(", ") + (paths.length > 5 ? `, and ${paths.length - 5} more` : "");
-  const count = (n: number): string => `${n} workspace file${n === 1 ? "" : "s"}`;
-  // Agreement helpers: `count()` produces a singular subject at n = 1, so every
-  // verb and pronoun downstream of it has to agree or the sentence reads as
-  // broken English on the most common case of all ("1 workspace file were…").
-  const were = (n: number): string => (n === 1 ? "was" : "were");
-  const they = (n: number): string => (n === 1 ? "It is" : "They are");
-
-  if (r.conflicted.length > 0) {
-    out.push(
-      `${count(r.conflicted.length)} ${were(r.conflicted.length)} merged with conflict markers and need resolving by hand — search for "<<<<<<< local": ${names(r.conflicted)}. Conflicts are normal here: edits on adjacent lines conflict, and a file added independently on both machines conflicts over its whole length.`
-    );
-  }
-  if (r.gitUnavailable) {
-    out.push(
-      "No usable `git merge-file` on this machine, so files edited on both machines could not be merged — your copies were left exactly as they are and the other machine's versions were parked beside them. Install git (or put it on PATH) to have future pulls merge them automatically."
-    );
-  }
-  if (r.sidecars.length > 0) {
-    out.push(
-      `${count(r.sidecars.length)} could not be merged, so your ${r.sidecars.length === 1 ? "copy was" : "copies were"} kept and the other machine's saved alongside as ${r.sidecars.length === 1 ? "a *.theirs-* file" : "*.theirs-* files"}: ${names(r.sidecars.map((s) => s.path))}. Delete ${r.sidecars.length === 1 ? "the sidecar" : "the sidecars"} once you've reconciled ${r.sidecars.length === 1 ? "it" : "them"} — they are ordinary files and will be pushed to the hub otherwise.`
-    );
-  }
-  if (r.skipped.length > 0) {
-    out.push(
-      `${count(r.skipped.length)} ${were(r.skipped.length)} not applied at all and nothing was written near ${r.skipped.length === 1 ? "it" : "them"} (${[...new Set(r.skipped.map((s) => s.reason))].join(", ")}): ${names(r.skipped.map((s) => s.path))}. The incoming ${r.skipped.length === 1 ? "copy is" : "copies are"} still on the hub.`
-    );
-  }
-  if (r.upstreamDeleted.length > 0) {
-    out.push(
-      `${count(r.upstreamDeleted.length)} ${were(r.upstreamDeleted.length)} deleted on the other machine but kept here (this merge never deletes your files): ${names(r.upstreamDeleted)}.`
-    );
-  }
-  if (r.localDeleted.length > 0) {
-    // Deliberately NOT phrased as "files you deleted". The merge cannot know
-    // that: this row means "in the last shared generation, gone here now, and
-    // untouched on the other machine", which a deletion produces — and so does
-    // a file an earlier sync of ours could not write (its own warning said so
-    // at the time, but that was a previous run). The distinction is invisible
-    // from here and the consequence is not: the shared generation advances past
-    // these paths on every pull, so nothing will offer them again on its own.
-    // Saying "you deleted them" would make the second case unrecognizable and
-    // leave it with no remedy to reach for.
-    out.push(
-      `${count(r.localDeleted.length)} that ${were(r.localDeleted.length)} in the last generation shared with the other machine ${r.localDeleted.length === 1 ? "is" : "are"} gone here and ${were(r.localDeleted.length)} not restored: ${names(r.localDeleted)}. ${they(r.localDeleted.length)} unchanged on the other machine, so this is what you asked for if you deleted ${r.localDeleted.length === 1 ? "it" : "them"} here — but an earlier sync that could not write ${r.localDeleted.length === 1 ? "that path" : "those paths"} (a symlink or a permissions failure it warned about at the time) looks identical from here. Nothing will offer ${r.localDeleted.length === 1 ? "it" : "them"} again on its own. If you did not delete ${r.localDeleted.length === 1 ? "it" : "them"}: the non-destructive route is to re-pull the next workspace payload with --target-path <fresh-dir> and copy ${r.localDeleted.length === 1 ? "that file" : "those files"} across by hand. Passing --force-workspace instead unpacks the hub's copy over THIS directory, OVERWRITING any file of the same name — including local edits this merge has been preserving for you.`
-    );
-  }
-  if (r.restored.length > 0) {
-    out.push(
-      `${count(r.restored.length)} that you had deleted here ${were(r.restored.length)} changed on the other machine, so ${r.restored.length === 1 ? "it came" : "they came"} back rather than losing that work: ${names(r.restored)}. Delete ${r.restored.length === 1 ? "it" : "them"} again if you still don't want ${r.restored.length === 1 ? "it" : "them"}.`
-    );
-  }
-  return out;
-}
-
-/**
- * What happened to a carried payload, in sentences a user can act on.
- *
- * Every branch here has to be honest about ONE fact that shapes all of them:
- * this pull records its bundles as received before it returns, so re-running it
- * — with or without `--apply-carry` — answers "Already up to date" and never
- * offers this payload again. Naming that re-run as a remedy is the foreclosure
- * this milestone keeps producing, so no branch below names it. What is named
- * instead is the saved directory, which is a copy the user already has.
- */
-function describeCarryApply(
-  result: ApplyResult,
-  meta: CarryMeta,
-  bundleFile: string
-): string[] {
-  const out: string[] = [];
-  const origin = `branch ${meta.branch} at commit ${meta.baseCommit.slice(0, 8)}`;
-  if (!result.applied) {
-    const lost =
-      `The uncommitted changes this pull carried (${origin}) were not applied: ${result.detail}. ` +
-      (result.savedTo === null
-        ? `They could not be saved beside the project either, so the only remaining copy is inside ${bundleFile} on the hub — extract that archive by hand to recover them.`
-        : `The whole payload — patch, untracked files and a README ${
-            // Two declines withhold the commands on purpose (a refused payload,
-            // and a patch git could not parse here), so promising them on every
-            // decline sends the user looking for something that is not there.
-            result.savedCommands
-              ? "with the exact commands"
-              : "explaining what was found and what was withheld"
-          } — is saved at ${result.savedTo}. Nothing was written to your working tree.`);
-    out.push(
-      result.reason === "not-requested"
-        ? lost + " Pass --apply-carry on a future pull to have them applied straight into the tree instead."
-        : lost
-    );
-    if (result.refused.length > 0) {
-      // The saved copy is the ONLY remedy on every decline, and its README
-      // tells the user to `cp -R '<saved>/untracked/.' .` — which copies
-      // dot-entries. So the floor runs on the save too, and what it dropped has
-      // to be said here as well as in that README: the user reads this first.
-      out.push(
-        `${result.refused.length} path(s) in that payload were left out of the saved copy because they name plugin or VCS internals that never travel (${result.refused.slice(0, 5).join(", ")}). They are not in the saved directory, so the commands in its README cannot write them here. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`
-      );
-    }
-    if (result.reason === "unsafe-payload") {
-      // The same disclosure `workspaceRefused` carries, and the same rule: do
-      // not accuse the sender. An older sesh-mover, on a case-insensitive
-      // filesystem, legitimately produced payloads this guard now refuses.
-      out.push(
-        "That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-include, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it."
-      );
-    }
-    return out;
-  }
-  out.push(
-    `Applied the uncommitted changes this pull carried (${origin}): ${result.filesChanged} file(s) from the patch, ${result.untrackedCopied} untracked file(s) copied. They are uncommitted here too — \`git status\` shows them, and \`git checkout -- .\` undoes the patch half.`
-  );
-  if (meta.inProgress) {
-    out.push(
-      `Those changes were captured during an in-progress ${meta.inProgress} on the other machine, so the patch contained conflict markers as ordinary file content and the ${meta.inProgress} itself did not travel — search for <<<<<<< before working on them.`
-    );
-  }
-  if (result.collisions.length > 0) {
-    out.push(
-      `${result.collisions.length} carried file(s) already existed here with different content, so yours were left alone and the incoming copies were written beside them as *.incoming-*: ${result.collisions.slice(0, 5).join(", ")}. Reconcile and delete the sidecars — they are untracked files, so a later push would carry them too.`
-    );
-  }
-  if (result.refused.length > 0) {
-    out.push(
-      `${result.refused.length} carried file(s) were refused because they name plugin or VCS internals that never travel (${result.refused.slice(0, 5).join(", ")}). Nothing from them was written. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`
-    );
-  }
-  if (result.blocked.length > 0) {
-    out.push(
-      `${result.blocked.length} carried file(s) were not written because of what already occupies their path here (${[...new Set(result.blocked.map((b) => b.reason))].join(", ")}): ${result.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them.`
-    );
-  }
-  return out;
-}
-
-/**
- * The half of a thread this pull cannot reach, in words.
- *
- * Deliberately names NO remedy: there is no `--from-machine`, `--thread` and
- * `--target-path` resolve to the same single source, and `hub reindex` only
- * rebuilds this machine's index from its own bundles. Saying plainly that a
- * thread split across machines cannot be assembled yet is honest; inventing a
- * flag would put this in the milestone's own foreclosure class — a warning
- * whose stated remedy silently does nothing.
- *
- * Machine names are capped at three so a hub with many machines still
- * produces one readable sentence; the full set is in the typed field.
- *
- * MACHINE NAMES ARE NOT UNIQUE. They come from the hostname, so a VM clone or
- * two default installs on same-named hosts give two machine ids one name — and
- * this sentence names a machine three times in three different roles, which
- * with bare names degenerates to "mbp holds bundles that mbp does not list …
- * the one machine it resolves to (mbp)". Any name shared by two of the roles in
- * THIS sentence therefore carries its machine id.
- */
-export function describeUnfetchable(
-  threadId: string,
-  groups: UnfetchableBundleGroup[],
-  source: { machineId: string; machineName: string | null }
-): string {
-  const NAMED = 3;
-  const byName = new Map<string, number>();
-  for (const m of [source, ...groups]) {
-    if (m.machineName) byName.set(m.machineName, (byName.get(m.machineName) ?? 0) + 1);
-  }
-  const label = (m: { machineId: string; machineName?: string | null }): string =>
-    !m.machineName
-      ? m.machineId
-      : (byName.get(m.machineName) ?? 0) > 1
-        ? `${m.machineName} [${m.machineId}]`
-        : m.machineName;
-  const sourceLabel = label(source);
-  const one = (g: UnfetchableBundleGroup): string =>
-    `${label(g)} (${g.bundleIds.length} bundle${g.bundleIds.length === 1 ? "" : "s"})`;
-  const rest = groups.length - NAMED;
-  const list =
-    groups.slice(0, NAMED).map(one).join(", ") +
-    (rest > 0 ? ` and ${rest} more machine${rest === 1 ? "" : "s"}` : "");
-  const hold = groups.length === 1 ? "holds bundles" : "hold bundles";
-  return (
-    `Thread ${threadId} could not be pulled whole: ${list} ${hold} for it that ${sourceLabel} does not list, ` +
-    `and a pull only ever fetches the bundle list of the one machine it resolves to (${sourceLabel}). ` +
-    `The entries in those bundles are not on this machine, and no flag or re-run fetches them — ` +
-    `sesh-mover cannot yet assemble a thread whose history is split across machines. ` +
-    `Nothing is lost: every bundle is still on the hub.`
-  );
-}
-
-// Last full bundle + everything after it, minus records already received AND
-// still present locally (mirrors the importer's own dedup verification: a
-// registry/peer record can outlive the file it points at, e.g. after a
-// migrate deleted it, so "already received" is only trusted when the file is
-// still there).
-export function selectNeededBundles(
-  bundles: HubBundleRecord[],
-  received: Record<string, { localSessionId: string }> | undefined,
-  localSessionFileExists: (localSessionId: string) => boolean
-): HubBundleRecord[] {
-  let lastFull = -1;
-  for (let i = 0; i < bundles.length; i++) if (bundles[i].type === "full") lastFull = i;
-  const chain = lastFull >= 0 ? bundles.slice(lastFull) : bundles.slice();
-  return chain.filter((r) => {
-    const prior = received?.[r.sessionIdInBundle];
-    return !(prior && localSessionFileExists(prior.localSessionId));
-  });
-}
-
 export async function hubPull(
   opts: HubPullOptions
 ): Promise<
@@ -795,1204 +222,173 @@ export async function hubPull(
     // nonexistent until the workspace-unpack step runs; if linking wrote
     // .sesh-mover under it first, the "project path doesn't exist
     // locally" gate on the workspace flow (step 8) would never fire.
-    let local: LocalProjectId;
-    if (opts.projectIdOverride) {
-      local = await linkToHubProject(backend, opts.projectPath, opts.projectIdOverride);
-    } else {
-      const resolution = await resolveProjectIdentity(backend, opts.projectPath);
-      if (resolution.kind === "linked") {
-        local = resolution.local;
-      } else if (resolution.kind === "match") {
-        local = await linkToHubProject(backend, opts.projectPath, resolution.hubProject.projectId);
-        warnings.push(`Linked to hub project ${resolution.hubProject.name} via git remote ${resolution.matchedRemote}.`);
-      } else {
-        return {
-          success: false, command: "pull", reason: "unlinked",
-          linkCandidates: resolution.candidates,
-          suggestion: "Pass --project-id <id> to link to an existing hub project.",
-        };
-      }
-    }
-
-    await registerMachine(opts.hubPath);
-
-    // Read once, reused both for the hub-peer bookkeeping below (recognizing
-    // pulled content as already-known-to-the-hub) and for this thread's
-    // mapping write further down.
-    const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
-    const hubPeerId = `hub:${hub.hubId}`;
-
-    const { indexes, warnings: indexWarnings } = await readAllIndexes(backend, local.projectId);
-    warnings.push(...indexWarnings);
-    const resolved = resolveThreads(indexes);
-
-    if (!opts.threadId && !opts.latest) {
-      // Same project path the real pull below keys its sync-state off, so the
-      // pick list's `unfetchableBundles` says exactly what pulling that thread
-      // would report. peekSyncState, not readSyncState: this branch returns
-      // without applying anything, and it is the only place in pull that reads
-      // sync-state without going on to write it — a corrupt file must not be
-      // renamed aside by a run that does nothing else.
-      const threads = await shapeThreads(
-        backend, resolved, machine.id, peekSyncState(opts.targetPath ?? opts.projectPath)
-      );
-      return { success: true, command: "pull", pickRequired: true, threads, warnings };
-    }
-
-    const isCurrent = (t: ResolvedThread): boolean => {
-      const localEntry = t.copies.find((c) => c.machineId === machine.id);
-      return !!localEntry && localEntry.headEntryUuid === t.latest.headEntryUuid;
-    };
+    const resolveStage = await runResolveStage({
+      backend,
+      projectPath: opts.projectPath,
+      hubPath: opts.hubPath,
+      projectIdOverride: opts.projectIdOverride,
+    });
+    // The unlinked escape is the finished result, candidates and all — it
+    // carries no reasons, and the warnings collected so far are discarded with
+    // it exactly as they were before this was a stage.
+    if (resolveStage.kind === "return") return resolveStage.result;
+    const { local, hub, hubPeerId, resolved } = resolveStage.value;
+    warnings.push(...resolveStage.reasons);
 
     // Everything below (dedup/sync-state, workspace unpack, session import,
     // and this machine's own index projection) is keyed off the EFFECTIVE
-    // project path: --target-path when given, else opts.projectPath. Declared
-    // here rather than after thread selection so the two "there is nothing to
-    // pull" early returns can read sync-state too — see `discloseUnfetchable`.
+    // project path: --target-path when given, else opts.projectPath. It is
+    // also what the select stage keys ITS sync-state reads off, so the pick
+    // list and the two "nothing to pull" exits describe the same project the
+    // real pull would have applied to.
     const effectiveProjectPath = opts.targetPath ?? opts.projectPath;
-
-    /**
-     * The #35 disclosure for a branch that returns BEFORE fetching anything.
-     *
-     * "Nothing to pull" and "the latest copy is already local" are the two
-     * answers a machine holding half a cross-machine thread gets most often —
-     * head equality is exactly what a fragment produces (see the head-equality
-     * trap in the ledger), so `isCurrent` is TRUE for the thread that is most
-     * incomplete. Saying "all threads are current" there is the nag loop this
-     * disclosure exists to break, one step earlier than the `needed.length ===
-     * 0` branch that already handles it.
-     *
-     * peekSyncState, not readSyncState: these branches apply nothing, and a
-     * corrupt state file must not be renamed aside by a run that does nothing
-     * else (same rule as the pick-list branch above).
-     */
-    const discloseUnfetchable = async (candidates: ResolvedThread[]): Promise<string | null> => {
-      const peeked = peekSyncState(effectiveProjectPath);
-      const machineName = createMachineNameLookup(backend);
-      const lines: string[] = [];
-      for (const t of candidates) {
-        const sets = findUnfetchableBundles({
-          copies: t.copies,
-          sourceMachineId: t.latest.machineId,
-          localMachineId: machine.id,
-          state: peeked,
-        });
-        if (sets.length === 0) continue;
-        const groups = await Promise.all(
-          sets.map(async (u) => ({
-            machineId: u.machineId,
-            machineName: await machineName(u.machineId),
-            bundleIds: u.bundleIds,
-          }))
-        );
-        lines.push(
-          describeUnfetchable(t.threadId, groups, {
-            machineId: t.latest.machineId,
-            machineName: await machineName(t.latest.machineId),
-          })
-        );
-      }
-      return lines.length > 0 ? lines.join(" ") : null;
-    };
-
     const targetProjectDir = join(opts.configDir, "projects", encodeProjectPath(effectiveProjectPath));
 
-    /**
-     * Repair for #28's crash window, on every branch that returns before the
-     * thread-mapping block at the bottom of this function can run.
-     *
-     * THE WINDOW. `peers[...].received` is written INSIDE the bundle loop (by
-     * `importSession`, and by `recordSplice` on the append path), while
-     * `setThreadId` runs only after the whole chain, the workspace merge and the
-     * carry apply. Slice 2 widened the gap considerably. A pull interrupted in
-     * between — Ctrl-C, a crash, a laptop lid — therefore leaves this machine
-     * holding the content with the receipts to prove it, and no record of which
-     * thread it belongs to.
-     *
-     * WHAT THAT COSTS, MEASURED. The re-pull sees every bundle already received,
-     * so it answers "Already up to date with the source machine" (or, once this
-     * machine has an index entry with a matching head, "Nothing to pull: all
-     * threads are current") and returns — never reaching the mapping block. The
-     * next push then finds a local session with no thread id and MINTS A NEW
-     * THREAD for it, whose only bundle is a `continuation` with no base anywhere
-     * in its own chain: the unreconstructable thread `recordSentToPeer`'s own
-     * doc forbids. `whereis` shows two threads for one conversation.
-     *
-     * WHY EVERY CANDIDATE IS MAPPED RATHER THAN THE "RIGHT" ONE. A chain that
-     * fragmented leaves several local sessions carrying one thread's content,
-     * and picking between them here would need a preference this branch has no
-     * information to form — and any preference read off `t.copies` would be
-     * index-file ITERATION ORDER, which this module bans for anything
-     * user-visible. It does not need one: `buildIndexFile` already resolves
-     * many-sessions-to-one-thread by recency, and `selectThreadBase` picks the
-     * base by the delta's own anchor. Mapping the set is order-independent by
-     * construction and strictly more information than mapping one of them.
-     *
-     * A session already mapped to some thread is never re-pointed: this repairs
-     * an ABSENT mapping and is not a route by which a pull that fetched nothing
-     * can move a session between threads.
-     */
-    const backfillThreadMappings = (threads: ResolvedThread[]): string | undefined => {
-      const peeked = peekSyncState(effectiveProjectPath);
-      const wanted = new Map<string, string>(); // localSessionId -> threadId
-      for (const t of threads) {
-        for (const copy of t.copies) {
-          const peer = peeked.peers[copy.machineId];
-          if (!peer) continue;
-          for (const b of copy.bundles) {
-            const localId = peer.received?.[b.sessionIdInBundle]?.localSessionId;
-            if (!localId) continue;
-            if (getThreadId(peeked, localId)) continue; // already mapped — leave it
-            if (!existsSync(join(targetProjectDir, `${localId}.jsonl`))) continue;
-            wanted.set(localId, t.threadId);
-          }
-        }
-      }
-      if (wanted.size === 0) return undefined;
-      // Only now is the state read for WRITING. These branches apply nothing,
-      // and `readSyncState` renames a corrupt file aside — a repair that has
-      // something to write has earned that, a run with nothing to write has not
-      // (same rule the `peekSyncState` callers around here follow).
-      const st = readSyncState(effectiveProjectPath);
-      let wrote = 0;
-      for (const [localId, threadId] of wanted) {
-        if (getThreadId(st, localId)) continue;
-        setThreadId(st, hub.hubId, localId, threadId);
-        wrote++;
-      }
-      if (wrote === 0) return undefined;
-      writeSyncState(st);
-      return `${wrote} local session${wrote === 1 ? "" : "s"} held this project's hub content with no thread mapping recorded — the mapping has been restored, so the next push continues the existing thread instead of starting a second one for the same conversation. That gap is what an interrupted pull leaves behind.`;
-    };
-
-    /**
-     * A copy OTHER than this machine's that still lists bundles this machine
-     * has never received — the answer to "the newest head is mine, so is there
-     * anything left on the hub for me?", which is NOT the same question.
-     *
-     * The two come apart on the ordinary divergence flow, and the default-on
-     * auto-push makes it routine. `/sesh-mover:pull` probes with
-     * `--on-divergence skip` and re-runs with the user's answer; between the
-     * two, one SessionEnd hook publishes this machine's own diverged branch,
-     * which is more recently active than the hub's side. `target.latest` is
-     * then local, and refusing outright ("the latest copy of this thread is
-     * already local" / "all threads are current") drops the answer the user
-     * just gave for a bundle that is still sitting on the hub, unreceived.
-     *
-     * Deliberately narrow. It only ever fires when `target.latest` is THIS
-     * machine, so it cannot change which copy an ordinary pull resolves to, and
-     * it never merges two machines' bundle records into one list (ledger: that
-     * linearity is what Task 8's `basedOn` chain walk rests on). Assembling a
-     * thread whose history is split across two OTHER machines is still a later
-     * slice — `findUnfetchableBundles` remains the disclosure for that.
-     *
-     * `newerThreadCopy` for the preference so the choice is a strict total order over the
-     * candidate set rather than index-file iteration order.
-     */
-    const alternateSource = (t: ResolvedThread, st: SyncState): ThreadCopy | undefined => {
-      const candidates = t.copies.filter(
-        (c) =>
-          c.machineId !== machine.id &&
-          selectNeededBundles(c.bundles, st.peers[c.machineId]?.received, (id) =>
-            existsSync(join(targetProjectDir, `${id}.jsonl`))
-          ).length > 0
-      );
-      return candidates.length === 0 ? undefined : candidates.reduce(newerThreadCopy);
-    };
-
-    let target: ResolvedThread | undefined;
-    if (opts.threadId) {
-      target = resolved.find((t) => t.threadId === opts.threadId);
-      if (!target) {
-        return {
-          success: false, command: "pull",
-          error: `No thread "${opts.threadId}" found for this project on the hub.`,
-          suggestion: "Run whereis to list available threads.",
-        };
-      }
-    } else {
-      // --latest: resolveThreads already sorts desc by latest activity —
-      // take the first thread that is NOT already current on this machine.
-      // Then, only if none qualifies, the thread whose newest copy is ours but
-      // which still has an unreceived bundle waiting on another machine — see
-      // `alternateSource`.
-      target =
-        resolved.find((t) => !isCurrent(t)) ??
-        resolved.find(
-          (t) =>
-            t.latest.machineId === machine.id &&
-            alternateSource(t, peekSyncState(effectiveProjectPath)) !== undefined
-        );
-      if (!target) {
-        const split = await discloseUnfetchable(resolved);
-        const repaired = backfillThreadMappings(resolved);
-        return {
-          success: false, command: "pull",
-          error: split
-            ? `Nothing to pull: every thread is current with the machine it resolves to, but not every thread is whole here. ${split}`
-            : "Nothing to pull: all threads are current on this machine.",
-          details: repaired,
-          suggestion: split
-            ? "Nothing is left for this machine to fetch from the machine this thread resolves to. The remaining bundles sit on a machine whose bundle list this pull did not read, and no flag makes one pull read two machines' lists, so a thread whose history is split across machines cannot be assembled here yet. Run whereis — the same threads report it as unfetchableBundles."
-            : "Run whereis to double-check thread status.",
-        };
-      }
-    }
-
-    let sourceCopy = target.latest;
-    if (sourceCopy.machineId === machine.id) {
-      const alternate = alternateSource(target, peekSyncState(effectiveProjectPath));
-      if (!alternate) {
-        const split = await discloseUnfetchable([target]);
-        return {
-          success: false, command: "pull",
-          error: split
-            ? `The latest copy of this thread is already local, but the thread is not whole here. ${split}`
-            : "The latest copy of this thread is already local.",
-          suggestion: split
-            ? "Nothing is left for this machine to fetch from the machine this thread resolves to. The remaining bundles sit on a machine whose bundle list this pull did not read, and no flag makes one pull read two machines' lists, so a thread whose history is split across machines cannot be assembled here yet. Run whereis — the same thread reports it as unfetchableBundles."
-            : "Run whereis to confirm — there is nothing to pull.",
-        };
-      }
-      const label = (await createMachineNameLookup(backend)(alternate.machineId)) ?? alternate.machineId;
-      warnings.push(
-        `The most recent copy of thread ${target.threadId} is this machine's own, but ${label} still lists bundles this machine has never received — this pull fetched those instead of answering "the latest copy is already local". That is the ordinary shape after a divergence was left undecided and this machine's own session was pushed in the meantime.`
-      );
-      sourceCopy = alternate;
-    }
-
-    const state = readSyncState(effectiveProjectPath);
-    const received = state.peers[sourceCopy.machineId]?.received;
-    const needed = selectNeededBundles(
-      sourceCopy.bundles,
-      received,
-      (localSessionId) => existsSync(join(targetProjectDir, `${localSessionId}.jsonl`))
-    );
-    // DISCLOSURE ONLY — see findUnfetchableBundles. It reads no timestamp, it
-    // merges nothing into the source's bundle list, and nothing below it
-    // changes what this pull fetches, applies, records, orders or resolves to.
-    // A pull that gets half a cross-machine thread still gets exactly the same
-    // half it got before; it just no longer does so in silence.
-    const unfetchableSets = findUnfetchableBundles({
-      copies: target.copies,
-      sourceMachineId: sourceCopy.machineId,
-      localMachineId: machine.id,
-      state,
+    // Which thread, whose copy of it, and which of that copy's bundles this
+    // machine still needs. NOT a pure selector: two of its `stop` results have
+    // repaired an absent thread mapping on the way out, so a `success: false`
+    // here does not mean the disk is unchanged (see pull-select.ts).
+    const sel = await runSelectStage({
+      backend,
+      resolved,
+      machineId: machine.id,
+      hubId: hub.hubId,
+      threadId: opts.threadId,
+      latest: opts.latest,
+      effectiveProjectPath,
+      targetProjectDir,
     });
-    let unfetchableBundles: UnfetchableBundleGroup[] | undefined;
-    let unfetchableText: string | undefined;
-    if (unfetchableSets.length > 0) {
-      const machineName = createMachineNameLookup(backend);
-      unfetchableBundles = await Promise.all(
-        unfetchableSets.map(async (u) => ({
-          machineId: u.machineId,
-          machineName: await machineName(u.machineId),
-          bundleIds: u.bundleIds,
-        }))
-      );
-      unfetchableText = describeUnfetchable(target.threadId, unfetchableBundles, {
-        machineId: sourceCopy.machineId,
-        machineName: await machineName(sourceCopy.machineId),
-      });
-      warnings.push(unfetchableText);
+    // ORDER IS THE CONTRACT, not a style choice: every `stop` is dispatched
+    // BEFORE the stage's warnings are spread. The stage collects the
+    // alternate-source sentence and the unfetchable disclosure as it goes, and
+    // the results it stops with carry no `warnings` field at all — the old
+    // straight-line code discarded that text on exactly these branches, and
+    // spreading first would start shipping it.
+    if (sel.kind === "stop") return sel.result;
+    if (sel.kind === "pick-list") {
+      // `warnings` is the caller's (the stale-lock steal and the resolve
+      // stage's reasons are already in it), so the list result is assembled
+      // here rather than handed into the stage and back.
+      return { success: true, command: "pull", pickRequired: true, threads: sel.threads, warnings };
     }
-
-    if (needed.length === 0) {
-      // Both variants below return without reaching the mapping block — see
-      // backfillThreadMappings. This is the branch an interrupted pull's re-run
-      // actually lands in when this machine has no index entry for the thread:
-      // every bundle is already recorded as received, so `needed` is empty.
-      const repaired = backfillThreadMappings([target]);
-      if (unfetchableText) {
-        // The nag loop this defect produces: whereis says the thread needs
-        // pulling, the SessionStart notice repeats it, and every pull used to
-        // answer "already up to date" — true of the source machine, false of
-        // the thread. Say which.
-        return {
-          success: false, command: "pull",
-          error: `Already up to date with the source machine, but this thread is not whole here. ${unfetchableText}`,
-          details: repaired,
-          suggestion:
-            "Nothing is left for this machine to fetch from the machine this thread resolves to. The remaining bundles sit on a machine whose bundle list this pull did not read, and no flag makes one pull read two machines' lists, so a thread whose history is split across machines cannot be assembled here yet. Run whereis — the same threads report it as unfetchableBundles.",
-        };
-      }
-      return {
-        success: false, command: "pull",
-        error: "Already up to date with the source machine.",
-        details: repaired,
-        suggestion: "Run whereis to confirm.",
-      };
-    }
-
-    const missing: string[] = [];
-    for (const record of needed) if (!(await backend.exists(record.file))) missing.push(record.file);
-    if (missing.length > 0) {
-      return {
-        success: false, command: "pull", reason: "not-yet-synced", missing,
-        suggestion: "The hub folder has not finished syncing these files — retry in a moment.",
-      };
-    }
+    warnings.push(...sel.warnings);
+    // Narrowed on purpose — ids, not the ResolvedThread/ThreadCopy they came
+    // from. Nothing below can re-derive the selection from `copies`, the field
+    // carrying the iteration-order ban.
+    const { threadId, sourceMachineId, needed, unfetchableBundles } = sel.value;
 
     opts.onProgress?.({ phase: "hub-pull", percent: 0 });
 
-    let workspaceUnpacked: HubPullResult["workspaceUnpacked"] = null;
-    let workspaceMerge: WorkspaceMergeReport | undefined;
-    let workspaceRefused: string[] | undefined;
-    // Set when a manifest declares a workspace payload the bundle does not
-    // contain (see the guard below). A FIELD, not just the warning, because it
-    // is field-indistinguishable from the routine no-ancestor skip otherwise —
-    // same null workspaceUnpacked, same absent workspaceMerge — and the two
-    // want opposite advice (that skip's remedies cannot deliver a payload that
-    // was never in the bundle).
-    let workspaceDeclaredMissing: boolean | undefined;
-    // Which bundle in this chain carries the workspace generation to apply:
-    // the NEWEST one that has a payload, not needed[0].
-    //
-    // A chain is pulled in one pass and every bundle is recorded as received
-    // by the end of it, so any generation that isn't applied now is never
-    // offered again. Applying the OLDEST would therefore leave the tree
-    // permanently behind the hub after two unpulled pushes — and, worse, would
-    // record that stale generation as this machine's ancestor. Falls back to
-    // index 0 when NO record claims a payload, which keeps the manifest check
-    // below the sole authority in that case (Slice-1 behavior).
-    //
-    // That fallback is index 0 rather than "the newest bundle whose manifest
-    // has one" because the manifests aren't read yet here. It can only disagree
-    // with the manifests if a record's `hasWorkspace` is wrong, and the one
-    // write site sets both from the same push (hub/push.ts), so the two cannot
-    // drift in practice. If they ever did — a record claiming a payload whose
-    // manifest lacks one — the gate would fire on that bundle, find no
-    // `manifest.workspace`, and do nothing, suppressing an earlier bundle's
-    // genuine payload for that pull.
-    let workspaceBundleIndex = 0;
-    for (let i = needed.length - 1; i >= 0; i--) {
-      if (needed[i].hasWorkspace) { workspaceBundleIndex = i; break; }
-    }
-    // Every generation the bundles in this chain declare they descend from,
-    // oldest first — the peer's half of the "common to both trees" test that
-    // `chooseMergeAncestor` intersects with our own generation history.
-    const chainWorkspaceBases: Array<string | null> = [];
-    const importedSessions: HubPullResult["importedSessions"] = [];
-    const skippedSessions: HubPullResult["skippedSessions"] = [];
-    const appended: NonNullable<HubPullResult["appended"]> = [];
-    let lastImportedNewId: string | null = null;
-    let lastBundleManifest: ExportManifest | null = null;
-    // The local session THIS pull has landed content in (imported or extended)
-    // — null until something lands. It is both the thread mapping written at
-    // the end and the preferred splice target for later bundles in the same
-    // chain, since the mapping itself isn't written until the loop is done.
-    let threadLandedSessionId: string | null = null;
-    // The last two-sided fork this pull ran into, and whether a bundle was
-    // deliberately left unapplied because of one. A chain is pulled in order,
-    // so a later bundle's divergence supersedes an earlier one's.
-    let lastDivergence: HubPullDivergence | undefined;
-    let skippedByDivergence = false;
-    /**
-     * A divergence left this thread undecided, so the WHOLE chain stops here.
-     *
-     * Skipping only the diverged bundle and carrying on was the eighth
-     * foreclosure of this milestone, and the second to survive a guard built
-     * for the class. The mechanism: the next bundle in the chain is anchored on
-     * the head the skipped one would have installed, so it can never chain onto
-     * the local session either — it reaches the divergence branch with
-     * `adoptAvailable: false`, is fragment-imported, and IS recorded. That
-     * flips `appliedNothing`, the index is republished, `divergence.resolution`
-     * (one field for the whole pull) is overwritten "skip" -> "fragment", and
-     * the user who asked to adopt silently gets a third transcript with no
-     * indication their answer was dropped. Every remedy is then foreclosed:
-     * "Nothing to pull" / "the latest copy is already local".
-     *
-     * A skip is a promise that this pull applied and recorded NOTHING for this
-     * thread. That promise is only keepable at the granularity of the thread,
-     * because the bundles in a chain are not independent — so the loop breaks.
-     */
-    let divergenceAborted = false;
-    /** How many bundles of the chain were left unfetched by that break. */
-    let deferredBundles = 0;
-    /**
-     * Which bundle the break landed on, or -1 for "the chain ran to the end".
-     *
-     * The abort is thread-wide, but it is NOT a rollback, and the difference is
-     * the whole reason this index exists. A chain is walked in order, so bundles
-     * `0..abortIndex - 1` were spliced or imported AND RECORDED before the fork
-     * was discovered; only `abortIndex` onward is still on offer. Everything
-     * that phrases the abort — the warnings, the carry gate, the thread mapping
-     * — has to split on that boundary instead of treating the whole thread as
-     * untouched, which is only true at `abortIndex === 0`.
-     */
-    let abortIndex = -1;
-    /**
-     * Where THIS pull's own writes to a given local transcript begin: the file's
-     * byte size immediately before the first splice or adoption it performed
-     * there. Absent for a transcript this pull has not written to.
-     *
-     * Used to keep `localEntriesSinceAnchor` honest. That field answers "how far
-     * has the user's own copy run past the shared anchor", and a later bundle in
-     * the same chain measures it on a file an EARLIER bundle of the same pull
-     * just appended to — so without this the pull counts its own delivery as the
-     * user's divergence and reports a fork twice as wide as the real one.
-     */
-    const ourWritesFrom = new Map<string, number>();
-    // The newest carry payload in this chain, if any — see the loop.
-    let lastCarry: {
-      dir: string; meta: CarryMeta; bundleFile: string; bundleIndex: number;
-    } | null = null;
-    /**
-     * The index of the last bundle this pull actually finished handling, and its
-     * manifest. Distinct from "the last bundle in `needed`" once a divergence
-     * can stop the chain early — see the thread-mapping block at the end, which
-     * used to name a bundle that was never fetched.
-     */
-    let lastAppliedIndex = -1;
-
-    /**
-     * What this pull had ALREADY applied and recorded when a divergence stopped
-     * the chain at bundle `upTo`. Empty at `upTo === 0`, where the abort really
-     * does mean nothing happened.
-     *
-     * Measured on an aborted `--on-divergence skip` pull at `upTo === 1`: the
-     * base transcript went 5 -> 7 lines, `peers[...].received` gained an entry,
-     * the hub-peer ledger recorded a new head and this machine's index file was
-     * republished — while the shipped warning said "skipped, nothing changed".
-     * The skill layer repeats these sentences verbatim, so they have to be true
-     * on both sides of the boundary.
-     */
-    const describeApplied = (upTo: number): string => {
-      if (upTo <= 0) return "";
-      const bits: string[] = [];
-      const entries = appended.reduce((n, a) => n + a.entriesAppended, 0);
-      if (entries > 0) {
-        const targets = [...new Set(appended.map((a) => a.baseSessionId))];
-        bits.push(
-          `${entries} entr${entries === 1 ? "y" : "ies"} spliced into session${targets.length === 1 ? "" : "s"} ${targets.join(", ")}`
-        );
-      }
-      if (importedSessions.length > 0) {
-        bits.push(`${importedSessions.length} session${importedSessions.length === 1 ? "" : "s"} imported`);
-      }
-      if (skippedSessions.length > 0) {
-        bits.push(
-          `${skippedSessions.length} session${skippedSessions.length === 1 ? "" : "s"} already present`
-        );
-      }
-      const what = bits.length > 0 ? bits.join(", ") : "no session content landed from them";
-      return `the ${upTo} earlier bundle${upTo === 1 ? "" : "s"} in this chain ${upTo === 1 ? "was" : "were"} already applied and recorded (${what})`;
-    };
-
-    /** Earliest wins: our writes to a transcript start at the first of them. */
-    const rememberOurWrite = (path: string, from: number): void => {
-      const prior = ourWritesFrom.get(path);
-      ourWritesFrom.set(path, prior === undefined ? from : Math.min(prior, from));
-    };
+    // Every accumulator this pull's per-bundle loop writes, in one MUTABLE
+    // object passed by reference. Nothing here may be snapshotted or copied —
+    // see pull-apply-state.ts.
+    const st = initApplyState({ needed });
 
     for (const [i, record] of needed.entries()) {
-      const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
-      const out = createWriteStream(tarPath);
-      // record.file is hub-sourced (read out of another machine's index
-      // file) and used as a path immediately below — the backend's
-      // assertHubRelPath (hub/layout.ts, enforced inside every HubBackend
-      // method, see hub/backend.ts) is the containment that rejects
-      // traversal/absolute paths before anything touches the filesystem.
-      await pipeline(await backend.readStream(record.file), out);
-      const extractDir = join(tempRoot, record.bundleId);
-      mkdirSync(extractDir, { recursive: true });
-      await extractArchive(tarPath, extractDir);
-      // Archiver-rooting reality check: createArchive tars the staging dir
-      // with `cwd: dirname(sourceDir)` and a single top-level entry
-      // (basename(sourceDir), i.e. "bundle" for push's staging), and
-      // extractArchive always calls tar.extract with strip:1 — which
-      // removes exactly that one wrapper segment. So manifest.json/sessions/
-      // etc. land directly under extractDir, the same way cli.ts's import
-      // action treats its own tempExtractDir as the exportPath (no nested
-      // "bundle/" to join).
-      const bundleManifest = readManifest(extractDir);
-
-      /**
-       * Nothing in this bundle is trusted until the manifest is shown to be the
-       * one the pushing machine's exporter wrote, and nothing it declares is
-       * trusted until the file is actually there.
-       *
-       * Both checks have to happen HERE rather than being left to
-       * `importSession` at the bottom of the loop, because everything between
-       * the two reads the manifest as fact: the workspace merge and the carry
-       * are keyed off it, and the append path splices a continuation into a
-       * transcript the user already owns after checking the delta against
-       * `bundleSession.integrityHash` — a hash out of this same manifest. A
-       * damaged session list makes that comparison meaningless, and a
-       * `sessionIdInBundle` with no file behind it used to fall through the
-       * append path's `existsSync(deltaPath)` guard into an import that counted
-       * it as imported anyway.
-       *
-       * A damaged bundle stops the whole chain rather than being skipped: bundle
-       * N+1 is anchored on bundle N's head (ledger: "a chain is not a set of
-       * independent items"), so there is no such thing as carrying on past a
-       * missing link. Returning here means earlier bundles in this pull stay
-       * applied and recorded — the same shape `importSession`'s own hard failure
-       * has always had at this call site.
-       */
-      const bundleDigestProblem = verifySessionsDigest(bundleManifest);
-      if (bundleDigestProblem) {
-        return {
-          success: false,
-          command: "pull",
-          error: `Bundle ${record.bundleId} failed its integrity check: ${bundleDigestProblem}`,
-          suggestion:
-            "Nothing from this bundle was applied. The hub's copy is damaged or was edited after it was written — this check detects damage, not tampering. Ask the machine that pushed it to push again; the bundles applied before it in this chain are recorded and will not be refetched.",
-        };
-      }
-      const declaredJsonl = join(extractDir, "sessions", `${record.sessionIdInBundle}.jsonl`);
-      if (!existsSync(declaredJsonl)) {
-        return {
-          success: false,
-          command: "pull",
-          error: `Bundle ${record.bundleId} declares session ${record.sessionIdInBundle} but does not contain it (${record.file}).`,
-          suggestion:
-            "Nothing from this bundle was applied. The archive on the hub is truncated or was only partially written — if the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again.",
-        };
-      }
-
-      if (bundleManifest.workspace) {
-        chainWorkspaceBases.push(bundleManifest.workspace.basedOn?.bundleId ?? null);
-      }
-
-      // The carry is applied AFTER the whole chain, and the newest one wins:
-      // each payload is a full `git diff HEAD` of the sender's tree at that
-      // moment, so an older one in the same chain describes a superseded
-      // working tree. Recorded here because the extraction directories only
-      // live until this function returns.
-      // `bundleIndex` is load-bearing, not bookkeeping: a divergence abort
-      // suppresses the carry, and that suppression is only correct for a
-      // payload the user will actually be offered again. A carry out of a
-      // bundle EARLIER than the abort belongs to a bundle this pull already
-      // recorded — the re-run will never see it, and dropping it deleted the
-      // only reachable copy of someone's uncommitted work while the warning
-      // said it had been "left in its bundle". See the gate after the loop.
-      if (bundleManifest.carry) {
-        lastCarry = {
-          dir: join(extractDir, "carry"),
-          meta: bundleManifest.carry,
-          bundleFile: record.file,
-          bundleIndex: i,
-        };
-      }
-
-      // Workspace gate (the chain's newest workspace-carrying bundle only).
-      // Slice 1's four branches are preserved; what changed is that the
-      // APPLICATION step is now a 3-way merge whenever a generation COMMON TO
-      // BOTH TREES can be named (design §5.5, and see `chooseMergeAncestor` for
-      // why nothing weaker will do):
-      //
-      // - target absent, empty, or
-      //   metadata-only                -> unpack (bootstrap; no force needed).
-      //                                   NEVER merge: with an empty tree every
-      //                                   file reads as "deleted here" and the
-      //                                   merge would write nothing at all.
-      // - common generation found,
-      //   target has real content,
-      //   no --force-workspace         -> 3-way MERGE. No force needed: merging
-      //                                   cannot lose local work, so requiring
-      //                                   a destructive-sounding flag for it
-      //                                   would be backwards.
-      // - --force-workspace, target has
-      //   real content                 -> unpack with force, i.e.
-      //                                   OVERWRITE-ON-COLLISION (§5.4), merge
-      //                                   or no merge. The flag keeps ONE
-      //                                   meaning — "overwrite, don't combine"
-      //                                   — and it is deliberately not made
-      //                                   inert by having a generation on
-      //                                   record: it is the only way to ask for
-      //                                   the hub's copy wholesale, and the only
-      //                                   remedy for a file a merge withheld.
-      // - no common generation, explicit
-      //   --target-path, has real
-      //   content, no force            -> let unpackWorkspace throw, surface
-      //                                   an ErrorResult with the
-      //                                   --force-workspace suggestion (the
-      //                                   user asked for that destination;
-      //                                   refuse loudly)
-      // - no common generation, no
-      //   explicit --target-path,
-      //   project dir has real content,
-      //   no force                     -> SKIP with a warning (routine repeat
-      //                                   pulls of non-git projects must not
-      //                                   start erroring)
-      //
-      // Plugin state counts as non-content on BOTH sides: identity linking
-      // above may have just planted `.sesh-mover-project.json` into an
-      // otherwise fresh directory (the in-place bootstrap flow, --project-id
-      // with no --target-path), and that metadata alone must neither trigger
-      // the routine-skip branch nor trip unpackWorkspace's own emptiness check
-      // — hence force is also set when the dir holds nothing but our metadata.
-      // `isPluginStateName` rather than one literal name: since 0.7.0 the
-      // metadata is a directory AND three root dotfiles, and the pre-0.7.0
-      // directory is still recognized, so a single `!==` would read a freshly
-      // linked project as having real content and skip the merge.
-      const incomingDir = join(extractDir, "workspace");
-      const workspaceDeclared = i === workspaceBundleIndex && !!bundleManifest.workspace;
-
-      // First, a payload the manifest declares and the bundle does not contain.
-      // Both application paths below start by READING that directory, so an
-      // absent one threw ENOENT straight out of hubPull: no sessions imported,
-      // nothing recorded, and therefore the identical crash on every retry —
-      // the optional half taking down the transcripts that are the point of the
-      // operation. Every sesh-mover before the accompanying snapshotWorkspace
-      // fix wrote exactly this bundle whenever a snapshot carried no files (an
-      // empty project, or an ignore list broad enough to drop the whole tree), so
-      // those bundles are on hubs now; a hand-made or truncated one says the
-      // same thing. Deliberately the same shape as the carry's own "declares it
-      // but does not contain it" guard further down.
-      // `isDirectory`, not `existsSync`: a bundle whose `workspace` entry is a
-      // FILE reaches the same `readdirSync` and throws ENOTDIR out of hubPull
-      // before the session import — the identical terminal shape this guard
-      // exists to close. No sesh-mover produces that, but the sentence below
-      // claims to cover a hand-made bundle, so the check has to mean it.
-      if (workspaceDeclared && !isReadableDir(incomingDir)) {
-        workspaceDeclaredMissing = true;
-        warnings.push(
-          "The bundle's manifest declares a workspace payload but the bundle does not contain one, so there was nothing to apply and this project's files were left untouched. It was written by an older sesh-mover whose snapshot carried no files, damaged in transit, or not produced by sesh-mover at all."
-        );
-      } else if (workspaceDeclared) {
-        const entries = existsSync(effectiveProjectPath) ? readdirSync(effectiveProjectPath) : [];
-        const hasRealContent = entries.some((n) => !isPluginStateName(n));
-
-        // Ancestor lookup is keyed off the EFFECTIVE project path, like every
-        // other piece of local bookkeeping here — a pull into a fresh
-        // --target-path has no sync-state there and therefore no generation
-        // history, which is correct: that tree shares nothing with the hub.
-        const known = knownWorkspaceGenerations(readSyncState(effectiveProjectPath));
-        let ancestorDir: string | null = null;
-        // --force-workspace is an explicit "overwrite, don't combine", so it
-        // skips the ancestor hunt entirely rather than fetching a tree nothing
-        // will read.
-        if (hasRealContent && !opts.forceWorkspace) {
-          const ancestor = await chooseMergeAncestor(
-            backend, chainWorkspaceBases, known, tempRoot
-          );
-          ancestorDir = ancestor.dir;
-          warnings.push(...ancestor.warnings);
-        }
-
-        if (ancestorDir !== null) {
-          // No git probe up front, deliberately. mergeWorkspaceTrees only needs
-          // git for files changed on BOTH sides; take/keep/create/no-op rows —
-          // the overwhelming majority on a routine pull — are decided by
-          // content hash alone. Falling back to no-ancestor mode because git is
-          // missing would skip the payload outright on a non-empty tree, and
-          // since the bundle is recorded as received by the end of this pull,
-          // "install git and re-pull" would be advice that cannot work. The
-          // merge degrades per file instead (sidecars + `gitUnavailable`), and
-          // describeWorkspaceMerge says so.
-          const report = await mergeWorkspaceTrees({
-            ancestorDir,
-            incomingDir,
-            targetDir: effectiveProjectPath,
-          });
-          workspaceMerge = report;
-          workspaceUnpacked = {
-            path: effectiveProjectPath,
-            fileCount:
-              report.taken.length + report.created.length + report.restored.length +
-              report.merged.length + report.conflicted.length,
-          };
-          // Record the new ancestor IMMEDIATELY, before the session half of
-          // this pull can fail. The tree already reflects this generation; if a
-          // later fault sent us back to the old one, the next pull would merge
-          // an already-merged (possibly conflict-marked) file against a stale
-          // base and manufacture conflicts out of work that was already done.
-          const stateWs = readSyncState(effectiveProjectPath);
-          setLastWorkspace(stateWs, hub.hubId, {
-            bundleId: record.bundleId, file: record.file, pushedAt: record.pushedAt,
-          });
-          writeSyncState(stateWs);
-          warnings.push(...describeWorkspaceMerge(report));
-        } else if (hasRealContent && !opts.forceWorkspace && !opts.targetPath) {
-          // The two flags are named for the NEXT payload, never as a re-run of
-          // this pull: this bundle is recorded as received by the end of it, so
-          // an immediate repeat answers "already up to date" without reaching
-          // the files. This branch also records NO generation (recording one
-          // this tree never received is how the next merge reads the whole
-          // payload as "deleted here"), so nothing about it self-heals. Every
-          // payload from that machine skips exactly like this until one is
-          // applied, and every workspace bundle written before 0.6.0 declares
-          // no ancestor at all, which is precisely how a first 0.6.0 pull lands
-          // here.
-          //
-          // THE TWO FLAGS ARE NOT INTERCHANGEABLE and the old text said they
-          // were ("whichever you use, that machine and this one then share a
-          // generation"). Every piece of local bookkeeping here — including
-          // `setLastWorkspace` — is keyed off `effectiveProjectPath`, which IS
-          // the --target-path when one is given, so the generation an unpack
-          // there records belongs to the FRESH directory's sync-state. This
-          // project directory still has none, and its next payload produces a
-          // byte-identical skip. Only --force-workspace ends the repetition
-          // HERE. Measured: skip -> --target-path <fresh> -> zero
-          // workspaceGenerations under the project's own key -> identical skip.
-          warnings.push(
-            "Bundle carries a workspace payload but the project directory already has content and no workspace generation is shared between this machine and the payload, so there is no common point to merge from and NOTHING was written. The sessions imported normally, and the payload is still in the bundle on the hub. This pull cannot be re-run to get it — its bundles are recorded now — and it will not resolve itself: no generation is recorded for a payload that was not applied, so the next payload from that machine skips for the same reason. Only one thing ends that repetition for THIS directory: --force-workspace on a LATER pull, which unpacks the hub's copy over it, OVERWRITING any file of the same name, after which the two machines share a generation and later payloads merge 3-way. --target-path <fresh-dir> on a later pull is the non-destructive way to SEE a payload — it unpacks elsewhere and touches nothing here — but the generation it records belongs to that fresh directory, so pulls into this one go on skipping exactly like this."
-          );
-        } else {
-          try {
-            const ws = await unpackWorkspace(
-              incomingDir,
-              effectiveProjectPath,
-              { force: !!opts.forceWorkspace || !hasRealContent }
-            );
-            workspaceUnpacked = { path: effectiveProjectPath, fileCount: ws.fileCount };
-            if (ws.symlinksSkipped > 0) {
-              warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
-            }
-            if (ws.refused.length > 0) {
-              workspaceRefused = ws.refused;
-              // Deliberately does NOT accuse the sender. A bundle written by a
-              // sesh-mover older than this guard, on a case-insensitive
-              // filesystem, legitimately carried a `.GIT` store — the very leak
-              // the guard closed — so "hand-made or damaged" would be a false
-              // accusation in the commonest case that reaches here.
-              warnings.push(
-                `${ws.refused.length} path(s) in the workspace payload were refused because they name plugin or VCS internals that never travel (${ws.refused.slice(0, 5).join(", ")}). Nothing from them was written here. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`
-              );
-            }
-            if (ws.blocked.length > 0) {
-              warnings.push(
-                `${ws.blocked.length} workspace file(s) were not unpacked because of what already occupies their path here (${[...new Set(ws.blocked.map((b) => b.reason))].join(", ")}): ${ws.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them; the incoming copies are still on the hub.`
-              );
-            }
-            if (hasRealContent) {
-              warnings.push(
-                opts.forceWorkspace && known.length > 0
-                  ? "The workspace payload was unpacked over the existing directory, overwriting any file of the same name, because --force-workspace was passed — no 3-way merge was attempted even though this machine has workspace generations on record. Anything of yours that the payload does not contain is still here."
-                  : "The workspace payload was unpacked over the existing directory, overwriting any file of the same name — no workspace generation is shared between this machine and the payload, so there was no common point to combine them from."
-              );
-            }
-            // Both application paths record the generation: whatever was
-            // overwritten now matches it, and anything only this machine has is
-            // absent from it, which is exactly how the next merge should read
-            // this tree.
-            const stateWs = readSyncState(effectiveProjectPath);
-            setLastWorkspace(stateWs, hub.hubId, {
-              bundleId: record.bundleId, file: record.file, pushedAt: record.pushedAt,
-            });
-            writeSyncState(stateWs);
-          } catch (e) {
-            if (e instanceof WorkspaceTargetNotEmptyError) {
-              return {
-                success: false, command: "pull",
-                error: e.message,
-                // Not "merge": this branch is only reached when
-                // chooseMergeAncestor found NO generation common to both trees,
-                // so a merge is impossible here by construction — and
-                // --force-workspace would skip the merge even if one were
-                // available. Recommending a merge at the exact point the code
-                // has ruled one out is how a user consents to an overwrite
-                // thinking their local files will be combined.
-                suggestion:
-                  "Nothing was written. To use this destination anyway, re-run with --force-workspace: it unpacks the hub's copy over the existing (non-empty) directory, OVERWRITING any file of the same name — it does not combine the two. To keep that directory untouched, point --target-path at an empty one instead.",
-              };
-            }
-            throw e;
-          }
-        }
-      }
-
-      // Append path: a continuation whose chain matches one of this thread's
-      // local sessions splices onto that session, so the conversation stays
-      // one resumable transcript. Every guard lives in append.ts and ANY
-      // decline falls through to the import below — content always arrives,
-      // at worst as the Slice-1 fragment.
-      const bundleSession = bundleManifest.sessions.find(
-        (s) => s.sessionId === record.sessionIdInBundle
-      );
-      const deltaPath = join(extractDir, "sessions", `${record.sessionIdInBundle}.jsonl`);
-      if (record.type === "continuation" && !opts.noAppend && bundleSession && existsSync(deltaPath)) {
-        // Integrity parity with importSession (importer.ts step 3), and the
-        // reason it is a REFUSAL here rather than the importer's warning: a
-        // splice mutates a transcript the user already owns, and nothing
-        // rolls that back once it is verified and committed. A truncated
-        // delta that still gunzips and still chains (a half-synced hub file)
-        // would otherwise be welded into their session silently. Declining
-        // hands the bundle to the fragment path, which lands it in a NEW file
-        // and emits the importer's own "Data may be corrupted" warning — the
-        // content still arrives, the user still hears about it, and the file
-        // they already had is untouched.
-        const actualHash = await computeIntegrityHashFromFile(deltaPath);
-        if (actualHash !== bundleSession.integrityHash) {
-          warnings.push(
-            `Continuation for thread ${target.threadId} failed its integrity check (bundle content doesn't match the manifest hash) — not spliced into the existing session; importing it as a separate session instead.`
-          );
-        } else {
-          // Which of this thread's local sessions does this delta continue?
-          // Decided by the delta's own anchor, never by map order — see
-          // selectThreadBase. Re-read state because importSession rewrites it
-          // between iterations.
-          const deltaInfo = await readDeltaChainInfo(deltaPath);
-          const anchorUuid = deltaInfo.firstEntryParentUuid;
-          const baseSessionId = selectThreadBase(
-            threadBaseCandidates(
-              readSyncState(effectiveProjectPath),
-              target.threadId,
-              threadLandedSessionId,
-              targetProjectDir
-            ),
-            anchorUuid,
-            threadLandedSessionId
-          );
-
-          if (baseSessionId) {
-            const basePath = join(targetProjectDir, `${baseSessionId}.jsonl`);
-            // Identical derivation to importSession's — same manifest, same
-            // target — so a spliced continuation and an imported fragment
-            // carry byte-identical rewrites.
-            const ctx = buildImportRewriteContext(
-              bundleManifest,
-              effectiveProjectPath,
-              opts.configDir
-            );
-            // Captured before the attempt, kept only if it succeeds: a declined
-            // append writes nothing, and recording an offset for it would make a
-            // later bundle discount entries that ARE the user's own.
-            const baseSizeBeforeAppend = statSync(basePath).size;
-            const outcome = await tryAppendContinuation({
-              basePath,
-              baseSessionId,
-              deltaPath,
-              ctx,
-              adapters: getApplicableAdapters(bundleManifest.sourceClaudeVersion, opts.claudeVersion),
-              opNowMs,
-              force: !!opts.forceAppend,
-            });
-
-            if (outcome.kind === "appended") {
-              rememberOurWrite(basePath, baseSizeBeforeAppend);
-              recordSplice({
-                projectPath: effectiveProjectPath, basePath, baseSessionId,
-                peerId: sourceCopy.machineId, hubPeerId, manifest: bundleManifest,
-                record, bundleSession, newHeadUuid: outcome.newHeadUuid,
-              });
-
-              // Best effort by design: layers are auxiliary artifacts
-              // (subagent transcripts, tool-result blobs, file-history
-              // backups). Losing them costs detail, never transcript
-              // integrity — and the splice above is already committed, so a
-              // throw here would be strictly worse than a warning.
-              try {
-                await copyLayerDirs(
-                  extractDir, record.sessionIdInBundle,
-                  targetProjectDir, baseSessionId, opts.configDir, ctx
-                );
-              } catch (e) {
-                warnings.push(
-                  `Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${(e as Error).message}) — the transcript is complete; those side files are missing.`
-                );
-              }
-
-              appended.push({
-                threadId: target.threadId,
-                baseSessionId,
-                entriesAppended: outcome.entriesAppended,
-              });
-              threadLandedSessionId = baseSessionId;
-              lastAppliedIndex = i;
-              lastBundleManifest = bundleManifest;
-              continue; // bundle handled — no fragment import
-            }
-
-            // A chain mismatch is not just "couldn't splice": it means this
-            // thread was extended on BOTH machines from a common anchor, so
-            // neither branch continues the other. The fragment fallback is
-            // safe but leaves the user with two half-conversations and no way
-            // forward, so the mode decides — and whatever happens, the shape
-            // of the fork is reported so the skill layer can explain it.
-            if (outcome.reason === "chain-mismatch") {
-              const anchorOffset = anchorUuid
-                ? await findEntryOffsetByUuid(basePath, anchorUuid)
-                : null;
-              // "Entries the hub hasn't seen" must mean the USER's entries. An
-              // earlier bundle of this same pull may have spliced onto this very
-              // transcript, and those entries came FROM the hub moments ago — a
-              // measured fork of 4 was 2 local entries plus this pull's own 2.
-              // Our writes are contiguous at the end of the file, so everything
-              // at or after `ourStart` is ours; counting from the later of the
-              // two offsets subtracts exactly that tail and leaves the entries
-              // between the anchor and our first byte, which are the real fork.
-              const rawSinceAnchor =
-                anchorOffset === null ? 0 : await countEntriesAfterOffset(basePath, anchorOffset);
-              const ourStart = ourWritesFrom.get(basePath);
-              const oursSinceAnchor =
-                anchorOffset === null || ourStart === undefined
-                  ? 0
-                  : await countEntriesAfterOffset(basePath, Math.max(anchorOffset, ourStart));
-              const baseMtimeMs = statSync(basePath).mtimeMs;
-              const mode = opts.onDivergence ?? "fragment";
-              const divergence: HubPullDivergence = {
-                threadId: target.threadId,
-                anchorUuid: anchorUuid ?? "",
-                localSessionId: baseSessionId,
-                localHeadUuid: readLastEntryUuid(basePath) ?? "",
-                localEntriesSinceAnchor: Math.max(0, rawSinceAnchor - oursSinceAnchor),
-                localLastActiveAt: new Date(baseMtimeMs).toISOString(),
-                hubHeadUuid: deltaInfo.lastEntryUuid ?? "",
-                // The synthetic continuation header is bundle plumbing, not a
-                // message — counting it would overstate the hub's side by one.
-                hubEntriesSinceAnchor: Math.max(
-                  0,
-                  bundleSession.messageCount - (deltaInfo.headerPresent ? 1 : 0)
-                ),
-                hubLastActiveAt: record.pushedAt,
-                adoptAvailable: anchorOffset !== null,
-                resolution: mode,
-              };
-              lastDivergence = divergence;
-
-              // The two sides of the fork, phrased for the user. When the
-              // anchor isn't in the local session at all there IS no shared
-              // point to count from — `localEntriesSinceAnchor` is 0 by
-              // definition, and reporting "0 entries the hub hasn't seen"
-              // about a session that doesn't even contain the anchor is
-              // simply false. Say what actually happened instead.
-              const plural = (n: number): string => `${n} entr${n === 1 ? "y" : "ies"}`;
-              const forkSummary = divergence.adoptAvailable
-                ? `your session ${baseSessionId} continues ${divergence.anchorUuid} with ${plural(divergence.localEntriesSinceAnchor)} the hub hasn't seen, and the hub's copy continues the same entry with ${plural(divergence.hubEntriesSinceAnchor)} of its own`
-                : `the hub's continuation follows entry ${divergence.anchorUuid}, which session ${baseSessionId} does not contain at all (unrelated or compacted history), so there is no shared point to splice at`;
-
-              // Adoption TRUNCATES a transcript the user already owns, which
-              // is strictly more destructive than the append that does check
-              // liveness — and the chain guard fires first, so a diverged base
-              // reaches here with no liveness scrutiny whatsoever. The most
-              // likely invocation is a pull run from INSIDE the diverged
-              // session, which is guaranteed to keep appending: its in-memory
-              // head would be an entry the file no longer ends with, so its
-              // next write chains onto the hub's branch instead of its own.
-              // Refuse by default, exactly as migrator.ts refuses a
-              // self-migration, and let --force-append be the consent.
-              const baseAgeMs = Date.now() - baseMtimeMs;
-              const looksLive = baseMtimeMs < opNowMs && baseAgeMs < APPEND_LIVE_WINDOW_MS;
-
-              if (mode === "skip") {
-                // Two texts, because "nothing changed" is only true at the head
-                // of the chain. At i > 0 the abort still leaves the FORK
-                // undecided and this bundle unrecorded — which is what keeps the
-                // re-run honest — but the bundles before it are applied and
-                // recorded, and saying otherwise is a false statement about the
-                // user's own transcripts.
-                warnings.push(
-                  i === 0
-                    ? `Thread ${target.threadId} has diverged: ${forkSummary} — skipped, nothing changed. Re-run with --on-divergence fragment${divergence.adoptAvailable ? " or adopt-hub" : ""} to decide.`
-                    : `Thread ${target.threadId} has diverged: ${forkSummary} — this bundle was skipped and the fork is still undecided, but ${describeApplied(i)}, so this pull was not a no-op. Re-run with --on-divergence fragment${divergence.adoptAvailable ? " or adopt-hub" : ""} to decide; the re-run resumes at this bundle, not at the start of the chain.`
-                );
-                skippedByDivergence = true;
-                // The whole thread stops here, not just this bundle — see
-                // `divergenceAborted`. Nothing is recorded FOR THIS BUNDLE OR
-                // ANY LATER ONE, so the decision can still be made in full.
-                divergenceAborted = true;
-                abortIndex = i;
-                deferredBundles = needed.length - 1 - i;
-                break;
-              }
-
-              if (mode === "adopt-hub" && divergence.adoptAvailable && looksLive && !opts.forceAppend) {
-                // Refuse with SKIP semantics, never fragment, and stop the
-                // WHOLE THREAD rather than this one bundle. Falling through to
-                // the import would record the bundle in peers[...].received,
-                // selectNeededBundles would drop it from every later pull, and
-                // the instruction in this very warning would be impossible to
-                // carry out — "already up to date" on the re-run, recoverable
-                // only by hand-editing sync-state. Carrying on to the NEXT
-                // bundle of the chain foreclosed it just as thoroughly and far
-                // less visibly (see `divergenceAborted`). Refusing an operation
-                // must never also foreclose it, and a user who asked to adopt
-                // should not be permanently handed a fragment instead.
-                // `skippedByDivergence` is what keeps the thread resolvable (it
-                // suppresses the index rewrite and the "could not be
-                // identified" warning).
-                warnings.push(
-                  i === 0
-                    ? `adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Nothing was applied and nothing was recorded: exit that session, then re-run with --on-divergence adopt-hub --force-append (or --on-divergence fragment to keep both as separate sessions).`
-                    : `adopt-hub refused for thread ${target.threadId}: session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago, so a Claude Code session may still be open on it — adopting would truncate a transcript that is being written to, and anything it writes afterwards would chain onto the hub's branch instead of yours. Nothing was applied or recorded for this bundle or any later one in the chain, so the adoption is still open; ${describeApplied(i)}. Exit that session, then re-run with --on-divergence adopt-hub --force-append (or --on-divergence fragment to keep both as separate sessions) — the re-run resumes at this bundle.`
-                );
-                divergence.resolution = "skip";
-                skippedByDivergence = true;
-                divergenceAborted = true;
-                abortIndex = i;
-                deferredBundles = needed.length - 1 - i;
-                break;
-              }
-
-              if (mode === "adopt-hub" && divergence.adoptAvailable) {
-                const preservedSessionId = randomUUID();
-                const preservedPath = join(targetProjectDir, `${preservedSessionId}.jsonl`);
-                const adopt = await adoptHubBranch({
-                  basePath, baseSessionId, deltaPath,
-                  anchorOffset: anchorOffset!,
-                  preservedSessionId, preservedPath, ctx,
-                  adapters: getApplicableAdapters(
-                    bundleManifest.sourceClaudeVersion, opts.claudeVersion
-                  ),
-                });
-
-                if (adopt.kind === "adopted") {
-                  // Same ordering rule as the plain append: durable
-                  // bookkeeping first, then everything whose loss is a
-                  // nuisance rather than a correctness problem.
-                  recordSplice({
-                    projectPath: effectiveProjectPath, basePath, baseSessionId,
-                    peerId: sourceCopy.machineId, hubPeerId, manifest: bundleManifest,
-                    record, bundleSession, newHeadUuid: adopt.newHeadUuid,
-                  });
-                  // Register the preserved branch so it is resumable and
-                  // findable. The "preserved" marker lives HERE, in the
-                  // display name — never as an injected entry in the
-                  // transcript itself.
-                  try {
-                    appendFileSync(
-                      join(opts.configDir, "history.jsonl"),
-                      JSON.stringify({
-                        display: `${bundleSession.slug} (local divergence, preserved ${new Date().toISOString().slice(0, 10)})`,
-                        pastedContents: {},
-                        timestamp: Date.now(),
-                        project: effectiveProjectPath,
-                        sessionId: preservedSessionId,
-                      }) + "\n",
-                      "utf-8"
-                    );
-                  } catch (e) {
-                    warnings.push(
-                      `Your local branch was preserved as session ${preservedSessionId}, but registering it in history.jsonl failed (${(e as Error).message}) — the file is there and \`claude --resume ${preservedSessionId}\` still works; it just won't be listed.`
-                    );
-                  }
-                  // The adopted branch's layer files, onto the base — exactly
-                  // as for a plain append. The PRESERVED session deliberately
-                  // gets none: layer files are uuid-named under the base
-                  // session's directories and stay there, shared history and
-                  // local branch alike. Duplicating arbitrarily large blobs to
-                  // give a second session the same auxiliary detail is a poor
-                  // trade; the preserved transcript is complete without them.
-                  try {
-                    await copyLayerDirs(
-                      extractDir, record.sessionIdInBundle,
-                      targetProjectDir, baseSessionId, opts.configDir, ctx
-                    );
-                  } catch (e) {
-                    warnings.push(
-                      `The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${(e as Error).message}) — the transcript is complete; those side files are missing.`
-                    );
-                  }
-
-                  divergence.preservedSessionId = preservedSessionId;
-                  appended.push({
-                    threadId: target.threadId,
-                    baseSessionId,
-                    entriesAppended: adopt.entriesAppended,
-                  });
-                  warnings.push(
-                    `Adopted the hub branch for thread ${target.threadId} into session ${baseSessionId}; your local branch was preserved in full as session ${preservedSessionId}, which has no thread mapping and will therefore be published as its own thread on the next push.`
-                  );
-                  // Only reachable with --force-append (the refusal above owns
-                  // the unforced case), so this is the consequence the user
-                  // consented to, restated now that it is real.
-                  if (looksLive) {
-                    warnings.push(
-                      `Session ${baseSessionId} was modified ${Math.round(baseAgeMs / 1000)}s ago and was adopted anyway because --force-append was passed. If a Claude Code session is still open on it, exit it now: anything it writes from here chains onto the adopted hub branch, not onto the local branch preserved as ${preservedSessionId}.`
-                    );
-                  }
-                  threadLandedSessionId = baseSessionId;
-                  lastAppliedIndex = i;
-                  lastBundleManifest = bundleManifest;
-                  rememberOurWrite(basePath, anchorOffset!);
-                  continue; // bundle handled — no fragment import
-                }
-
-                warnings.push(
-                  // "left unchanged", not "restored unchanged": a `failed`
-                  // adoption covers both the restored-byte-for-byte case and
-                  // the (more common) one where the fault landed before the
-                  // truncate and nothing was ever written, so nothing was
-                  // restored either. Either way the user's session is as it
-                  // was, which is the part that matters to them.
-                  `adopt-hub failed for thread ${target.threadId} and session ${baseSessionId} was left unchanged (${adopt.detail}) — importing the hub's branch as a separate session instead.`
-                );
-                divergence.resolution = "fragment";
-              } else if (mode === "adopt-hub") {
-                warnings.push(
-                  `adopt-hub is unavailable for thread ${target.threadId}: the continuation's anchor ${divergence.anchorUuid} is not present in the local session ${baseSessionId} (unrelated or compacted history) — importing the hub's branch as a separate session instead.`
-                );
-                divergence.resolution = "fragment";
-              } else if (divergence.adoptAvailable) {
-                // No re-run is offered, because none exists: the fragment
-                // import below records this bundle, after which
-                // `--on-divergence adopt-hub` reports "already up to date" and
-                // never reaches the fork. `skip` is named only as the mode to
-                // run the NEXT divergence under — it applies and records
-                // nothing, which is what keeps the choice open.
-                warnings.push(
-                  `Thread ${target.threadId} has diverged: ${forkSummary}, so the hub's branch was imported as a separate session and nothing local was touched. Both branches are now local sessions and this bundle is recorded as received, so that decision stands for it — adopt-hub cannot be applied to it afterwards. To be asked instead of having fragment chosen for you, pull with --on-divergence skip (what /sesh-mover:pull always passes) or set hub.onDivergence=skip.`
-                );
-              } else {
-                warnings.push(
-                  `Thread ${target.threadId} could not be continued locally: ${forkSummary}. The hub's branch was imported as a separate session and nothing local was touched — adopt-hub cannot help here.`
-                );
-              }
-              // fall through to the fragment import
-            } else {
-              // THIS bundle is foreclosed — the fragment import below records
-              // it, so nothing reaches it again — but the flag is not, and the
-              // two were being conflated. `--force-append` on the NEXT pull of
-              // this thread overrides the liveness guard for the continuation
-              // THAT pull carries, and it does splice (measured: one transcript,
-              // not two). So the scoping has to be explicit rather than the flag
-              // being withheld: naming it unscoped told users to re-run a pull
-              // that cannot work, and withholding it entirely told them nothing
-              // works, which is equally false. The preventive advice stays
-              // first because it is the answer that needs no flag. (The decline
-              // is left as a fragment rather than converted to a skip, unlike
-              // the adopt-hub refusal: a plain append is the default path, and
-              // the invariant that content always arrives — at worst as a
-              // second session — is worth more here than the chance to retry.)
-              const preventive =
-                outcome.reason === "recently-active"
-                  ? " Nothing local was touched. This bundle is now recorded, so no re-run applies it to the existing session. To have later continuations of this thread spliced in, close the Claude Code session writing to that transcript before pulling — and note that an earlier sesh-mover pull's own write to that session looks the same from here, in which case there is no session to close and passing --force-append on the next pull of this thread splices that pull's continuation instead."
-                  : "";
-              warnings.push(
-                `Continuation for thread ${target.threadId} could not be appended to the local session (${outcome.detail}) — imported as a separate session instead.${preventive}`
-              );
-            }
-          }
-        }
-      }
-
-      const importResult = await importSession({
-        exportPath: extractDir,
-        targetConfigDir: opts.configDir,
-        targetProjectPath: effectiveProjectPath,
-        targetClaudeVersion: opts.claudeVersion,
-        dryRun: false,
-        sessionIds: [record.sessionIdInBundle],
+      // Download, unpack and read the manifest — and, on the way through,
+      // write this bundle's workspace generation and carry into `st`. Both are
+      // MUTATIONS rather than returned values on purpose (see pull-fetch.ts):
+      // the generation must be in `st.chainWorkspaceBases` before the workspace
+      // gate a few lines below reads it, and a returned optional carry invites
+      // `?? null` at this call site, which would clear an earlier bundle's carry
+      // whenever a later bundle has none.
+      const fetched = await runFetchStage({
+        backend, record, bundleIndex: i, tempRoot, state: st,
       });
-      if (!importResult.success) return importResult; // importer already rolled back partial writes
-      lastAppliedIndex = i;
-      lastBundleManifest = bundleManifest;
-      importedSessions.push(...importResult.importedSessions);
-      skippedSessions.push(...importResult.skippedSessions);
-      warnings.push(...importResult.warnings);
-      if (importResult.importedSessions.length > 0) {
-        lastImportedNewId = importResult.importedSessions[importResult.importedSessions.length - 1].newId;
-        // The freshly written session now carries the thread: a later
-        // continuation in this same chain must splice onto IT, not onto
-        // whatever older session the mapping still points at. Its mtime is
-        // inside this operation, so the liveness guard exempts it.
-        threadLandedSessionId = lastImportedNewId;
-        // The hub is the origin of this bundle's content, so as far as this
-        // machine's OWN sync-state is concerned the hub already has it up to
-        // this head — record that against the hub's own peer id (not the
-        // originating machine's, which importSession already recorded above)
-        // so a future push of just-appended content is recognized as a
-        // continuation instead of re-uploading the whole session as "full".
-        recordSentToPeer(effectiveProjectPath, { id: hubPeerId, name: "hub" }, lastImportedNewId, {
-          headEntryUuid: record.headEntryUuid,
-          messageCount: record.messageCount,
-          sentAsType: record.type,
-          sentAsSessionId: record.sessionIdInBundle,
-        });
+      // The only correct handling of a fetch abort. `break` would fall through
+      // to the carry gate, the thread mapping, `writeSyncState` and
+      // `writeMachineIndex` and then return `success: true` — a refusal turned
+      // into a successful pull. `continue` would violate the chain invariant
+      // (bundle N+1 is anchored on N's head) and fragment-import AND record the
+      // next bundle, foreclosing the remedy the message names.
+      if (fetched.status === "aborted") return fetched.terminal!;
+      const { extractDir, manifest: bundleManifest } = fetched.value!;
+
+      // Merge, unpack, or decline the chain's workspace payload. Self-gating:
+      // called on every bundle, does its work only on the newest one carrying a
+      // generation. It stays INSIDE the loop for two reasons — the generation
+      // the fetch above just pushed into `st.chainWorkspaceBases` is read by
+      // the ancestor hunt in this same iteration, and an earlier bundle's
+      // integrity abort has to be able to stop the pull before it runs.
+      const ws = await runApplyWorkspaceStage({
+        backend,
+        extractDir,
+        effectiveProjectPath,
+        // GIVEN-ness, not path equality: naming a destination is an explicit
+        // "use this one", and the routine skip is only for the destination the
+        // user never named.
+        targetPathGiven: !!opts.targetPath,
+        forceWorkspace: !!opts.forceWorkspace,
+        bundleDeclaresWorkspace: i === st.workspaceBundleIndex && !!bundleManifest.workspace,
+        chainWorkspaceBases: st.chainWorkspaceBases,
+        hubId: hub.hubId,
+        record,
+        tempRoot,
+      });
+      // Terminal, never apply-safe. Carrying on past it would import this
+      // bundle's sessions and record it, foreclosing the --force-workspace
+      // re-run the abort's own message promises.
+      if (ws.status === "aborted") return ws.terminal!;
+      if (ws.value) {
+        st.workspaceUnpacked = ws.value.unpacked;
+        st.workspaceMerge = ws.value.merge;
+        st.workspaceRefused = ws.value.refused;
+        st.workspaceDeclaredMissing = ws.value.declaredMissing;
       }
+      // Spread HERE, inside the loop, at the position the moved code occupied:
+      // these interleave with the session warnings of the same and earlier
+      // bundles, and a stage-major concatenation reorders them (see
+      // tests/hub-pull-invariants.test.ts).
+      warnings.push(...ws.reasons);
+
+      // Splice onto an existing transcript, adopt the hub's branch over a
+      // diverged one, or import this bundle's session as its own. `st` is
+      // handed over BY REFERENCE and mutated in place — never snapshotted.
+      const ss = await runApplySessionsStage({
+        extractDir,
+        bundleManifest,
+        record,
+        bundleIndex: i,
+        chainLength: needed.length,
+        projectPath: effectiveProjectPath,
+        configDir: opts.configDir,
+        targetProjectDir,
+        claudeVersion: opts.claudeVersion,
+        threadId,
+        sourceMachineId,
+        hubPeerId,
+        noAppend: !!opts.noAppend,
+        forceAppend: !!opts.forceAppend,
+        onDivergence: opts.onDivergence,
+        opNowMs,
+        // Three wall-clock reads used to live inside the moved code and are
+        // parameters now: a stage file may not read the clock at all (see
+        // tests/hub-pull-invariants.test.ts). `ageNowMs` stays SEPARATE from
+        // `opNowMs` even though this call passes the same value — one is a
+        // boundary ("at or after this was written by us"), the other a duration
+        // rendered as "modified 37s ago", and only the second may ever be
+        // refreshed. `new Date(opNowMs)` takes an argument, so it is not a
+        // clock read.
+        ageNowMs: opNowMs,
+        historyNowDate: new Date(opNowMs).toISOString().slice(0, 10),
+        historyNowMs: opNowMs,
+        state: st,
+        recordSplice,
+        countEntriesAfterOffset,
+      });
+      // Spread HERE, at the position the moved code occupied and after the
+      // workspace stage's reasons: the three in-loop stages are phases of one
+      // loop body and their reasons interleave per bundle.
+      warnings.push(...ss.reasons);
+      // Forwarded VERBATIM, `command: "import"` and all — it is the importer's
+      // own diagnosis carrying the importer's own suggestion, and the
+      // importer's warnings are dropped with it exactly as before.
+      if (ss.control.kind === "fail") return ss.control.result;
+      // A REAL break, never a continue. A divergence stops the whole thread,
+      // and since the workspace gate is evaluated at the TOP of each iteration
+      // this is also what stops a payload on a LATER bundle being applied by a
+      // pull the user is about to re-run.
+      if (ss.control.kind === "stop-chain") break;
     }
 
     // Git-diff carry (design §6.2) — after the whole chain, because the newest
@@ -2005,31 +401,12 @@ export async function hubPull(
     // only when it has one, so a bundle carrying both did not come from a
     // current sesh-mover. If one ever does, the workspace application dirties
     // the tree and the carry declines — the safe order.
-    let carryAvailable: CarryMeta | undefined;
-    let carryApplied: ApplyResult | undefined;
-    /**
-     * An undecided divergence stopped the chain, so a payload out of a bundle
-     * the user is about to pull AGAIN stops with it: applying or saving it now
-     * would leave a second copy of the same working tree beside the one the
-     * re-run delivers, and "nothing was applied" has to mean the whole bundle.
-     *
-     * That rationale reaches exactly as far as re-runnability, and no further.
-     * `lastCarry` is chosen from the newest carrying bundle anywhere in
-     * `0..abortIndex`, while the abort only defers `abortIndex` onward — so a
-     * payload from an earlier bundle belongs to one this pull already recorded.
-     * Suppressing that one deleted the only reachable copy of another machine's
-     * uncommitted work (`selectNeededBundles` drops the bundle on the re-run;
-     * the archive is left on the hub, extractable only by hand) while the
-     * warning claimed it had been left in its bundle for next time. Gate on
-     * WHERE the payload came from, not on whether an abort happened.
-     */
-    const carrySuppressed =
-      divergenceAborted && lastCarry !== null && lastCarry.bundleIndex >= abortIndex;
-    if (divergenceAborted) {
+    const carrySuppressed = isCarrySuppressed(st);
+    if (st.divergenceAborted) {
       const parts: string[] = [];
-      if (deferredBundles > 0) {
+      if (st.deferredBundles > 0) {
         parts.push(
-          `the ${deferredBundles} later bundle${deferredBundles === 1 ? "" : "s"} in this thread's chain ${deferredBundles === 1 ? "was" : "were"} not fetched`
+          `the ${st.deferredBundles} later bundle${st.deferredBundles === 1 ? "" : "s"} in this thread's chain ${st.deferredBundles === 1 ? "was" : "were"} not fetched`
         );
       }
       if (carrySuppressed) {
@@ -2038,143 +415,55 @@ export async function hubPull(
       if (parts.length > 0) {
         warnings.push(
           `Because that decision is still open, ${parts.join(" and ")} — nothing from ${parts.length === 1 ? "it" : "them"} was applied, saved or recorded either.` +
-            (abortIndex > 0
-              ? ` The ${abortIndex} bundle${abortIndex === 1 ? "" : "s"} before it in the chain had already been applied and recorded, so your answer applies from the diverged bundle onward rather than to the whole thread.`
+            (st.abortIndex > 0
+              ? ` The ${st.abortIndex} bundle${st.abortIndex === 1 ? "" : "s"} before it in the chain had already been applied and recorded, so your answer applies from the diverged bundle onward rather than to the whole thread.`
               : " Whichever answer you give next applies to the whole thread rather than half of it.")
         );
       }
     }
-    if (lastCarry && !carrySuppressed) {
-      carryAvailable = lastCarry.meta;
-      // isDirectory, not exists — see the workspace guard above.
-      if (!isReadableDir(lastCarry.dir)) {
-        warnings.push(
-          "The bundle's manifest declares carried uncommitted changes but the bundle does not contain them, so there was nothing to apply. The bundle is damaged or was not produced by sesh-mover."
-        );
-      } else {
-        carryApplied = await applyCarry({
-          carryDir: lastCarry.dir,
-          targetPath: effectiveProjectPath,
-          meta: lastCarry.meta,
-          saveOnly: !opts.applyCarry,
-        });
-        warnings.push(...describeCarryApply(carryApplied, lastCarry.meta, lastCarry.bundleFile));
-      }
-    }
+    // `applyRequested: false` is NOT a skip — the stage still SAVES the
+    // payload beside the project. See the module doc before changing this.
+    const carryStage = await runApplyCarryStage({
+      targetPath: effectiveProjectPath,
+      applyRequested: opts.applyCarry === true,
+      apply: st,
+    });
+    warnings.push(...carryStage.reasons);
+    const carryAvailable = carryStage.value?.carryAvailable;
+    const carryApplied = carryStage.value?.carryApplied;
 
-    // Thread mapping: prefer the session this pull actually landed content
-    // in (an imported fragment or an appended base); if every bundle in the
-    // chain was skipped, fall back to (1) the local session id an earlier
-    // receipt from this peer was recorded against, then (2) the imported-hash
-    // registry — the cross-route duplicate case, where identical content
-    // arrived earlier via a plain import (no peer bookkeeping) and the
-    // importer skipped it via state.imported[integrityHash] rather than
-    // peers[...].received.
-    //
-    // `lastRecord` is the last bundle this pull actually FETCHED, which stopped
-    // being `needed[needed.length - 1]` the moment a divergence could break the
-    // loop: after an abort that index names a bundle nobody opened, and looking
-    // its `sessionIdInBundle` up in `received` is a question about content this
-    // machine never saw. It misses harmlessly today (that key is only ever
-    // written by an import that did happen), but it is a landmine if the keying
-    // changes — so ask about a bundle that was really handled, and fall back to
-    // the diverged one when the abort landed at the head of the chain.
-    const lastRecord =
-      needed[lastAppliedIndex >= 0 ? lastAppliedIndex : divergenceAborted ? abortIndex : needed.length - 1];
-    const stateAfter = readSyncState(effectiveProjectPath);
-    const lastSessionManifest =
-      lastBundleManifest?.sessions.find((s) => s.sessionId === lastRecord.sessionIdInBundle) ?? null;
-    const hashRegistryFallback = lastSessionManifest
-      ? stateAfter.imported[lastSessionManifest.integrityHash]?.localSessionId
-      : undefined;
-    const localSessionId: string | null =
-      threadLandedSessionId ??
-      stateAfter.peers[sourceCopy.machineId]?.received?.[lastRecord.sessionIdInBundle]?.localSessionId ??
-      hashRegistryFallback ??
-      null;
-
-    if (localSessionId !== null) {
-      setThreadId(stateAfter, hub.hubId, localSessionId, target.threadId);
-      writeSyncState(stateAfter);
-    } else if (!skippedByDivergence) {
-      // Never map a thread to a fabricated id (an empty string would poison
-      // the index projection below and every future pull's dedup).
-      //
-      // Gated on the divergence skip, which lands here by design: nothing was
-      // applied, so there is nothing to map, and the skip warning has already
-      // said exactly that. "Its session could not be identified" would be a
-      // second, contradictory story about a deliberate no-op.
-      warnings.push(
-        "pulled content already exists locally but its session could not be identified — a future push from this machine will re-map the thread"
-      );
-    }
-
-    // Rewrite our machine index over current local sessions — pulls never
-    // create bundles, so newBundles is always empty here.
-    //
-    // Unless the run was a pure divergence skip, where "nothing changed" has
-    // to include the index. The projection reads the LOCAL session head, so
-    // rewriting it here would publish the local branch's head — which no
-    // bundle on the hub backs — and make this machine the thread's most
-    // recent copy. The re-run the skip warning promises would then be refused
-    // outright ("the latest copy of this thread is already local"), turning
-    // "decide later" into "decide never".
-    //
-    // A workspace application deliberately does NOT count here. The index is a
-    // projection of SESSIONS — unpacking or merging files into the project
-    // directory changes nothing it publishes — so letting it defeat the
-    // suppression would republish the local branch's head and foreclose the
-    // re-run for a reason unrelated to sessions. Before Slice 2 that pairing
-    // needed --force-workspace to reach; now that a routine pull merges a
-    // workspace automatically, it would be the common case. The index stays as
-    // it was for one pull and the next push/pull (or `hub reindex`) rewrites
-    // it — it is a derived file by design.
-    const appliedNothing =
-      importedSessions.length === 0 &&
-      skippedSessions.length === 0 &&
-      appended.length === 0;
-    if (!(skippedByDivergence && appliedNothing)) {
-      const sessionsNow = discoverSessions(opts.configDir, effectiveProjectPath).map((s) => ({
-        sessionId: s.sessionId,
-        slug: s.slug,
-        summary: s.slug,
-        headEntryUuid: readLastEntryUuid(s.jsonlPath) ?? "",
-        messageCount: s.messageCount,
-        lastActiveAt: s.lastActiveAt,
-      }));
-      const prior = await readMachineIndex(backend, local.projectId, machine.id);
-      await writeMachineIndex(
-        backend,
-        buildIndexFile({
-          projectId: local.projectId,
-          machineId: machine.id,
-          projectPath: effectiveProjectPath,
-          sessions: sessionsNow,
-          state: stateAfter,
-          priorIndex: prior,
-          newBundles: [],
-          now: new Date().toISOString(),
-        })
-      );
-    }
+    const recorded = await runRecordStage({
+      backend,
+      configDir: opts.configDir,
+      effectiveProjectPath,
+      projectId: local.projectId,
+      machineId: machine.id,
+      hubId: hub.hubId,
+      threadId,
+      sourceMachineId,
+      needed,
+      apply: st,
+    });
+    warnings.push(...recorded.reasons);
+    const localSessionId = recorded.value?.localSessionId ?? null;
 
     opts.onProgress?.({ phase: "hub-pull", percent: 100 });
     return {
       success: true,
       command: "pull",
-      threadId: target.threadId,
-      sourceMachineId: sourceCopy.machineId,
-      importedSessions,
-      skippedSessions,
+      threadId,
+      sourceMachineId,
+      importedSessions: st.importedSessions,
+      skippedSessions: st.skippedSessions,
       localSessionId,
-      workspaceUnpacked,
-      workspaceMerge,
-      workspaceRefused,
-      workspaceDeclaredMissing,
+      workspaceUnpacked: st.workspaceUnpacked,
+      workspaceMerge: st.workspaceMerge,
+      workspaceRefused: st.workspaceRefused,
+      workspaceDeclaredMissing: st.workspaceDeclaredMissing,
       carryAvailable,
       carryApplied,
-      appended: appended.length > 0 ? appended : undefined,
-      divergence: lastDivergence,
+      appended: st.appended.length > 0 ? st.appended : undefined,
+      divergence: st.lastDivergence,
       unfetchableBundles,
       warnings,
     };
