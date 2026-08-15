@@ -583,6 +583,66 @@ describe("hub hook-session-end (CLI)", () => {
     }
   });
 
+  it("records WHETHER THE PROJECT IS STILL LINKED when the auto-push fails, not just the error", async () => {
+    // The scenario issue #43 is about, and the reason the link state is
+    // structured rather than prose: this push fails while leaving the project
+    // linked, so the auto-push stays armed and will fail again at the next
+    // session end, unattended, forever. `recordAutoPushOutcome` is the ONLY
+    // surviving trace of it (stdout is closed to the hook and a clean exit
+    // hides its stderr) and it records `error` + `suggestion` — it never reads
+    // `details`, which is where that fact used to live.
+    const PID = "11111111-1111-4111-8111-111111111111";
+    const restore = overrideHome(home);
+    try {
+      const { hubInit } = await import("../src/hub/init.js");
+      await hubInit({ hubPath: hubDir, configScope: "user", cwd: home });
+    } finally {
+      restore.restore();
+    }
+    // Linked BEFORE this push — the committed-file case, which the push must
+    // not roll back and must disclose as "still linked".
+    linkProject(project, PID);
+    // A FILE where the bundle directory has to be mkdir'd: an ENOTDIR the push
+    // cannot route around, landing after the identity is resolved.
+    mkdirSync(join(hubDir, "projects", PID), { recursive: true });
+    writeFileSync(join(hubDir, "projects", PID, "bundles"), "not a directory\n");
+
+    // sync-state is keyed by the ENCODED project path, and a child process
+    // resolves its own cwd, so the hook and this test have to agree on which
+    // spelling they mean (on macOS /var is a symlink to /private/var).
+    const { realpathSync } = await import("node:fs");
+    const projectReal = realpathSync(project);
+    if (projectReal !== project) {
+      cpSync(
+        join(configDir, "projects", encodeProjectPath(project)),
+        join(configDir, "projects", encodeProjectPath(projectReal)),
+        { recursive: true }
+      );
+    }
+
+    const r = runHook(JSON.stringify({ cwd: projectReal, session_id: sessionId }));
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(""); // the hook contract holds even for a failure
+
+    const { peekSyncState } = await import("../src/sync-state.js");
+    const restore2 = overrideHome(home);
+    let recorded;
+    try {
+      recorded = peekSyncState(projectReal).hub?.lastAutoPush;
+    } finally {
+      restore2.restore();
+    }
+    expect(recorded).toBeDefined();
+    expect(recorded!.ok).toBe(false);
+    const notes = recorded!.notes.join(" ");
+    // The error itself, as before...
+    expect(notes).toMatch(/ENOTDIR|not a directory/);
+    // ...and the disclosure that only the structured fields carry.
+    expect(notes).toMatch(/IS still linked/);
+    expect(notes).toContain(PID);
+    expect(notes).toMatch(/hub unlink/);
+  });
+
   it("exits 0 with empty stdout but a stderr diagnostic when the push fails", () => {
     const notADir = join(tempDir, "hub-is-a-file");
     writeFileSync(notADir, "this is a file, not a hub directory\n");

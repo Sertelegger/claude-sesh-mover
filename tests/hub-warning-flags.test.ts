@@ -132,6 +132,25 @@ const REGISTRY: FlagUse[] = [
     klass: "future-only",
     why: "A push that failed AFTER committing the identity link now rolls the local link back and reports the orphaned hub project by id. That hub project cannot be removed (there is no backend.delete call anywhere in src/), so this push cannot be repaired in place — --project-id is how the NEXT push links to the orphan instead of minting a second one. The existing 'Pass --project-id <id> to link to an existing hub project, or --create-project' entry does not fit: this message has to name the specific orphaned id.",
   },
+  // ---- src/hub/unlink.ts ---------------------------------------------------
+  {
+    file: "unlink.ts",
+    match: "Re-link with a later push passing --project-id",
+    klass: "future-only",
+    why: "The unlink succeeded and removed the link; --project-id belongs to a LATER push, and there is nothing about THIS operation to re-run. It has to name the specific id because that is the whole reason the id is returned rather than discarded — the kept sync bookkeeping is only true for that one project.",
+  },
+  {
+    file: "unlink.ts",
+    match: "or pass --force to unlink without waiting for it",
+    klass: "retry-works",
+    why: "The lock-busy refusal happened before anything was read or removed, so both remedies genuinely reach the same operation: waiting, or the same invocation plus --force. This is the one command where waiting may not be an option — a wedged push holds the lock for ten minutes and the point of unlinking is often that push.",
+  },
+  {
+    file: "unlink.ts",
+    match: "The project lock was skipped (--force)",
+    klass: "descriptive",
+    why: "Names the flag as the cause of an outcome the caller already chose. Nothing is being asked of the user beyond checking afterwards.",
+  },
   // ---- everything else -----------------------------------------------------
   {
     file: "init.ts",

@@ -319,6 +319,52 @@ describe("cli", () => {
     });
   });
 
+  describe("hub unlink command", () => {
+    it("unlinks the cwd and reports the removed link as one JSON object", () => {
+      // Through the built CLI on purpose: `hub unlink` deliberately resolves no
+      // hub and no config dir, so the only thing standing between the user and
+      // the disarm path is this src/cli.ts wiring — and a mutation there is
+      // invisible to every test that calls hubUnlink directly. HOME is pointed
+      // at a temp dir because the project lock lives under it; see the guard
+      // rail on this suite's runCli wrapper for what a missed override costs.
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-unlink-home-"));
+      const projectPath = join(tempDir, "unlinkproj");
+      mkdirSync(projectPath, { recursive: true });
+      const linkPath = join(projectPath, ".sesh-mover-project.json");
+      const projectId = "11111111-1111-4111-8111-111111111111";
+      writeFileSync(
+        linkPath,
+        JSON.stringify(
+          { projectId, name: "unlinkproj", createdAt: "2026-07-21T00:00:00Z", createdByMachine: "m1" },
+          null,
+          2
+        ) + "\n"
+      );
+      try {
+        // The shared helper, not this suite's wrapper: `cwd` is an option there
+        // and would become an environment variable named "cwd" here.
+        const { stdout, status } = sharedRunCli(["hub", "unlink"], {
+          env: homeEnv(home),
+          cwd: projectPath,
+        });
+        expect(status).toBe(0);
+        const result = JSON.parse(stdout); // throws if stdout isn't exactly one JSON doc
+        expect(result.success).toBe(true);
+        expect(result.command).toBe("hub-unlink");
+        expect(result.wasLinked).toBe(true);
+        expect(result.projectId).toBe(projectId);
+        // Compared by suffix, not equality: the child reports its own cwd, and
+        // a temp dir is reached through a symlink on some platforms.
+        expect(result.removedPath.endsWith(join("unlinkproj", ".sesh-mover-project.json"))).toBe(
+          true
+        );
+        expect(existsSync(linkPath)).toBe(false);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("--progress", () => {
     it("emits NDJSON progress on stderr while stdout stays one JSON object", () => {
       const outputDir = join(tempDir, "cli-progress");

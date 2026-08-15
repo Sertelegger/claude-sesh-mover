@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, cpSync, existsSync, truncateSync,
-  chmodSync, readdirSync,
+  chmodSync, readdirSync, statSync,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -17,6 +17,7 @@ import { encodeProjectPath } from "../src/platform.js";
 import { extractArchive } from "../src/archiver.js";
 import { readSyncState } from "../src/sync-state.js";
 import { WORKSPACE_MAX_BYTES } from "../src/hub/workspace.js";
+import type { HubPushFailedResult } from "../src/types.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
@@ -781,26 +782,35 @@ describe("hub push — ignoredNotCarried discovery aid", () => {
 /**
  * The other half of "a failed push must not leave the project linked".
  *
- * Deferring the identity write past the export (see the exporter-failure test
- * above) only covers failures UP TO that point. Everything after
- * `commitIdentity()` — the archive, the bundle upload, the index write, an
- * unreadable file the workspace snapshot trips over — used to surface as a bare
- * thrown Error with `.sesh-mover-project.json` sitting in the project
+ * Deferring the identity write past the export only covers failures UP TO that
+ * point. Everything after it — the archive, the bundle upload, the index write,
+ * an unreadable file the workspace snapshot trips over — used to surface as a
+ * bare thrown Error with `.sesh-mover-project.json` sitting in the project
  * directory, which is precisely what arms the default-on SessionEnd auto-push:
  * the next session end then uploads the whole working tree of a push the user
  * watched fail.
  *
- * Reproduced before the fix, twice, exactly as these tests inject it: `ENOTDIR`
- * when the bundle's parent directory path on the hub is already a FILE, and
- * `EACCES` inside the workspace snapshot. Both threw; both left project.json
- * behind.
+ * Reproduced before that fix, twice, exactly as these tests inject it:
+ * `ENOTDIR` when the bundle's parent directory path on the hub is already a
+ * FILE, and `EACCES` inside the workspace snapshot. Both threw; both left
+ * project.json behind.
+ *
+ * The local link is now committed at only two points, both of them AFTER this
+ * push has delivered something: the up-to-date early return, and the moment the
+ * bundle lands on the hub. So the two shapes above no longer write a link at
+ * all — the strongest possible version of the guarantee — and the tests below
+ * split accordingly: a failure BEFORE the bundle lands must leave nothing, a
+ * failure AFTER it must roll the link back, and either way the result says
+ * which in FIELDS (`linked`, `linkRolledBack`, `orphanHubProjectId`,
+ * `orphanBundle`) rather than only in prose. The fields are what the unattended
+ * SessionEnd push records; `recordAutoPushOutcome` never reads `details`.
  *
  * The hub half is NOT closed here and cannot be: nothing in src/ deletes a hub
  * file, so a `--create-project` push that fails afterwards leaves a hub project
  * nothing can remove. That one is reported instead — with the flag that links
  * to it rather than minting a second.
  */
-describe("hub push — a failure after the link is committed", () => {
+describe("hub push — a failure after the identity is resolved", () => {
   const PROJECT_ID = "11111111-2222-3333-4444-555555555555";
 
   /** A hub project some other machine created, ready to be linked to. */
@@ -826,10 +836,30 @@ describe("hub push — a failure after the link is committed", () => {
     writeFileSync(join(hub, "projects", projectId, "bundles"), "not a directory\n");
   }
 
+  /**
+   * The same trick one step later: the bundle uploads fine and the INDEX write
+   * behind it is the ENOTDIR. This is the only injectable failure that lands
+   * past the link commit, so it is the arrangement every rollback assertion in
+   * this block is built on.
+   */
+  function blockIndexDir(hub: string, projectId = PROJECT_ID): void {
+    writeFileSync(join(hub, "projects", projectId, "index"), "not a directory\n");
+  }
+
   const linkPath = (projectPath: string): string =>
     join(projectPath, ".sesh-mover-project.json");
 
-  it("rolls the link back and reports the project as NOT linked", async () => {
+  /**
+   * Narrow to the structured failure, asserting the discriminator on the way —
+   * so a cast can never quietly pass over a result that lost its shape.
+   */
+  function asFailed(r: Awaited<ReturnType<typeof hubPush>>): HubPushFailedResult {
+    expect(r.success).toBe(false);
+    expect("reason" in r && r.reason).toBe("failed-after-link");
+    return r as HubPushFailedResult;
+  }
+
+  it("writes no link at all when the failure lands before the bundle does", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-push-rb-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-push-rb-hub-"));
     const base = mkdtempSync(join(tmpdir(), "sesh-push-rb-fix-"));
@@ -848,26 +878,31 @@ describe("hub push — a failure after the link is committed", () => {
       });
 
       // Typed refusal, not a thrown Error: the one thing the user has to be
-      // told — whether this project is linked now — is not in an exception.
-      expect(r.success).toBe(false);
-      if (r.success) return;
-      expect(r.command).toBe("push");
-      expect("error" in r && r.error).toMatch(/ENOTDIR|not a directory/);
-      expect("details" in r && r.details).toMatch(/NOT linked/);
+      // told — whether this project is linked now — is not in an exception,
+      // and a throw would also skip `recordAutoPushOutcome` entirely, so an
+      // unattended push's failure would leave no trace anywhere.
+      const f = asFailed(r);
+      expect(f.command).toBe("push");
+      expect(f.error).toMatch(/ENOTDIR|not a directory/);
+      expect(f.details).toMatch(/NOT linked/);
 
-      // The consent gate is closed again: no project.json, so the SessionEnd
-      // auto-push stays inert for this project.
+      // The consent gate was never opened: the bundle never landed, so the
+      // link was never written and there was nothing to roll back. This is
+      // stronger than the write-then-remove it replaced — an interrupted
+      // process (SIGKILL between the two) cannot leave a link behind either.
+      expect(f.linked).toBe(false);
+      expect(f.linkRolledBack).toBe(false);
+      expect(f.orphanBundle).toBe(false);
+      expect(f.orphanHubProjectId).toBeNull();
+      expect(f.projectId).toBe(PROJECT_ID);
       expect(existsSync(linkPath(projectPath))).toBe(false);
-      // ...and the directory the link write created goes with it, since
-      // nothing else of the user's lives in it.
-      expect(existsSync(join(projectPath, ".sesh-mover"))).toBe(false);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
     }
   });
 
-  it("leaves an ignore list in place while removing only the link it wrote", async () => {
+  it("removes only the link it wrote, leaving the user's own files beside it", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-push-rb2-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-push-rb2-hub-"));
     const base = mkdtempSync(join(tmpdir(), "sesh-push-rb2-fix-"));
@@ -875,20 +910,85 @@ describe("hub push — a failure after the link is committed", () => {
     try {
       const { configDir } = createFixtureTree(base);
       const projectPath = createRealProject(base, configDir);
-      // The user's own rules file, written long before this push.
+      // The user's own files, written long before this push. All four are
+      // siblings of the link file (0.8.0 root dotfiles), which is exactly why
+      // the rollback may only ever name ONE path.
       mkdirSync(join(projectPath, ".sesh-mover"), { recursive: true });
+      writeFileSync(join(projectPath, ".sesh-mover", "config.json"), "{}\n");
       writeFileSync(join(projectPath, ".sesh-mover-ignore"), "build/\n");
+      writeFileSync(join(projectPath, ".sesh-mover-include"), "docs/\n");
       await hubInit({ hubPath: hub, configScope: "user", cwd: home });
       seedHubProject(hub);
-      blockBundleDir(hub);
+      // Past the bundle upload, so a link really is written and really is
+      // rolled back — the pre-bundle shape above never writes one.
+      blockIndexDir(hub);
 
       const r = await hubPush({
         configDir, projectPath, hubPath: hub,
         projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
       });
-      expect(r.success).toBe(false);
+      const f = asFailed(r);
+      expect(f.linked).toBe(false);
+      expect(f.linkRolledBack).toBe(true);
       expect(existsSync(linkPath(projectPath))).toBe(false);
       expect(readFileSync(join(projectPath, ".sesh-mover-ignore"), "utf-8")).toBe("build/\n");
+      expect(readFileSync(join(projectPath, ".sesh-mover-include"), "utf-8")).toBe("docs/\n");
+      expect(readFileSync(join(projectPath, ".sesh-mover", "config.json"), "utf-8")).toBe("{}\n");
+      expect(existsSync(join(projectPath, "README.md"))).toBe(true);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * THE REGRESSION THIS BLOCK FAILED TO CATCH.
+   *
+   * The rollback used to `rmdirSync(dirname(link))` after removing the link,
+   * and that was safe on the day it was written: the link lived at
+   * `<project>/.claude-sesh-mover/project.json`, so the parent was a directory
+   * the plugin owned. Since 0.8.0 the link is the root dotfile
+   * `<project>/.sesh-mover-project.json` and the parent is THE USER'S PROJECT
+   * DIRECTORY. `rmdirSync` succeeds on an empty directory, so a failed push
+   * into a directory holding nothing else deleted the directory it was asked to
+   * push — reachable from `push --project-path <empty-dir>`, since push never
+   * requires the directory to exist and the link write mkdir's it.
+   *
+   * The assertion that should have caught it was vacuous: it checked that a
+   * `.sesh-mover` directory the fixture never created was absent. This one
+   * fails against the old code.
+   */
+  it("never removes the project directory itself, even when the link was its only file", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-rmdir-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-rmdir-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-rmdir-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      // Deliberately NOT createRealProject: that plants a README.md, which
+      // would keep the directory non-empty and make the rmdir fail on its own.
+      const projectPath = join(base, "emptyproj");
+      mkdirSync(projectPath, { recursive: true });
+      cpSync(
+        join(configDir, "projects", FIXTURE_ENCODED),
+        join(configDir, "projects", encodeProjectPath(projectPath)),
+        { recursive: true }
+      );
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      seedHubProject(hub);
+      blockIndexDir(hub);
+
+      const r = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+      });
+      const f = asFailed(r);
+      // The link was written (the bundle landed) and rolled back...
+      expect(f.linkRolledBack).toBe(true);
+      expect(existsSync(linkPath(projectPath))).toBe(false);
+      // ...and the now-empty directory it lived in is still there.
+      expect(existsSync(projectPath)).toBe(true);
+      expect(statSync(projectPath).isDirectory()).toBe(true);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
@@ -916,11 +1016,16 @@ describe("hub push — a failure after the link is committed", () => {
       blockBundleDir(hub);
 
       const r = await hubPush({ configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81" });
-      expect(r.success).toBe(false);
-      if (r.success) return;
-      expect(r.command).toBe("push");
-      expect("details" in r && r.details).toMatch(/already linked/);
-      expect("details" in r && r.details).toMatch(/stays linked/);
+      const f = asFailed(r);
+      expect(f.command).toBe("push");
+      expect(f.details).toMatch(/already linked/);
+      expect(f.details).toMatch(/stays linked/);
+      // The disclosure that matters: this directory is linked RIGHT NOW, so
+      // the SessionEnd auto-push is armed for it and will run again unattended.
+      // Nothing was rolled back, because nothing here was ours to undo.
+      expect(f.linked).toBe(true);
+      expect(f.linkRolledBack).toBe(false);
+      expect(f.projectId).toBe(PROJECT_ID);
       expect(readFileSync(linkPath(projectPath), "utf-8")).toBe(preExisting);
     } finally {
       restore.restore();
@@ -958,10 +1063,9 @@ describe("hub push — a failure after the link is committed", () => {
         chmodSync(locked, 0o644); // so the temp tree can be cleaned up
       }
 
-      expect(r.success).toBe(false);
-      if (r.success) return;
-      expect(r.command).toBe("push");
-      expect("error" in r && r.error).toMatch(/EACCES|permission denied/);
+      const f = asFailed(r);
+      expect(f.command).toBe("push");
+      expect(f.error).toMatch(/EACCES|permission denied/);
       expect(existsSync(linkPath(projectPath))).toBe(false);
 
       // The half that cannot be rolled back: the hub project exists and nothing
@@ -969,8 +1073,16 @@ describe("hub push — a failure after the link is committed", () => {
       // rather than minting a second on the next attempt.
       const orphans = readdirSync(join(hub, "projects"));
       expect(orphans).toHaveLength(1);
-      expect("suggestion" in r && r.suggestion).toContain(`--project-id ${orphans[0]}`);
-      expect("details" in r && r.details).toMatch(/NOT linked/);
+      expect(f.suggestion).toContain(`--project-id ${orphans[0]}`);
+      expect(f.details).toMatch(/NOT linked/);
+      // As a field, not just as prose: this is the one thing a caller has to be
+      // able to act on, and the id is unguessable. It is recorded the instant
+      // the HUB file lands — a throw between that write and the local one used
+      // to leave nothing recorded at all, so the orphan went unmentioned.
+      expect(f.orphanHubProjectId).toBe(orphans[0]);
+      expect(f.projectId).toBe(orphans[0]);
+      expect(f.linked).toBe(false);
+      expect(f.linkRolledBack).toBe(false);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
@@ -989,16 +1101,20 @@ describe("hub push — a failure after the link is committed", () => {
       seedHubProject(hub);
       // Bundle upload fine; the index write behind it is the ENOTDIR. The
       // bundle is atomic, so it really is on the hub when this throws.
-      writeFileSync(join(hub, "projects", PROJECT_ID, "index"), "not a directory\n");
+      blockIndexDir(hub);
 
       const r = await hubPush({
         configDir, projectPath, hubPath: hub,
         projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
       });
-      expect(r.success).toBe(false);
-      if (r.success) return;
+      const f = asFailed(r);
       expect(existsSync(linkPath(projectPath))).toBe(false);
-      expect("details" in r && r.details).toMatch(/did reach the hub/);
+      expect(f.details).toMatch(/did reach the hub/);
+      expect(f.orphanBundle).toBe(true);
+      // This is the one window where a link IS written before the failure, so
+      // it is also the only place the rollback itself is exercised.
+      expect(f.linked).toBe(false);
+      expect(f.linkRolledBack).toBe(true);
       // ...and it is really there, unreferenced by any index.
       expect(
         readdirSync(join(hub, "projects", PROJECT_ID, "bundles"), { recursive: true }).length
@@ -1010,10 +1126,12 @@ describe("hub push — a failure after the link is committed", () => {
   });
 
   it("the up-to-date no-op push still links the project", async () => {
-    // The deliberate exception the rollback must not swallow: `commitIdentity`
-    // runs BEFORE the "nothing new to send" early return, so a push that
-    // legitimately has nothing to do still leaves the project linked (its
-    // projectId is part of that result).
+    // The deliberate exception the deferral must not swallow, and the reason
+    // `commitLocalLink` has TWO call sites: this push has nothing to send, so
+    // it never reaches the bundle upload the other call site sits behind, yet
+    // it is a successful push whose projectId is part of the result. A user who
+    // lost the committed .sesh-mover-project.json gets it back from a no-op
+    // push, and deferring past this point would take that away.
     const home = mkdtempSync(join(tmpdir(), "sesh-push-utd-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-push-utd-hub-"));
     const base = mkdtempSync(join(tmpdir(), "sesh-push-utd-fix-"));
@@ -1042,6 +1160,79 @@ describe("hub push — a failure after the link is committed", () => {
       expect(second.upToDate).toBe(true);
       expect(existsSync(linkPath(projectPath))).toBe(true);
       expect(JSON.parse(readFileSync(linkPath(projectPath), "utf-8")).projectId).toBe(PROJECT_ID);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A rollback the push REFUSES to perform, and the only shape that reports
+   * `linked: true` after a link this push wrote.
+   *
+   * `rollbackLocalLink` re-reads the file before removing it: it is ours to
+   * delete only while it still names the project id we wrote. Anything else
+   * means something changed it underneath us — a concurrent pull, another push,
+   * the user — and a link someone else put there is not collateral for our
+   * failure. The user must then be told the truth, which is the uncomfortable
+   * one: this directory IS linked and the SessionEnd auto-push IS armed.
+   *
+   * Arranged with the caller's own progress callback because that is the only
+   * hook this module offers between the link write and a failure: on the
+   * up-to-date path the link is committed immediately before the final progress
+   * event, so a callback that rewrites the file and then throws reproduces the
+   * concurrent-modification race deterministically, with no mocks and no
+   * timing. It doubles as coverage that a throwing caller callback cannot leave
+   * the link state undisclosed.
+   */
+  it("refuses to remove a link that now names a different project, and says the project IS linked", async () => {
+    const OTHER_ID = "99999999-8888-7777-6666-555555555555";
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-refuse-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-refuse-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-refuse-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      seedHubProject(hub);
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      rmSync(linkPath(projectPath), { force: true }); // so the next push re-links
+
+      const stolen = JSON.stringify({
+        projectId: OTHER_ID, name: "someone else's link",
+        createdAt: "2026-07-02T00:00:00.000Z", createdByMachine: "another-machine",
+      }, null, 2) + "\n";
+      const r = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+        onProgress: (ev) => {
+          // The final hub-push event: emitted on the up-to-date path AFTER the
+          // link has been committed. Earlier events (percent 0, and the
+          // exporter's own phases) must not trigger this.
+          if (ev.phase !== "hub-push" || ev.percent !== 100) return;
+          expect(JSON.parse(readFileSync(linkPath(projectPath), "utf-8")).projectId).toBe(PROJECT_ID);
+          writeFileSync(linkPath(projectPath), stolen);
+          throw new Error("simulated failure after the link was committed");
+        },
+      });
+
+      const f = asFailed(r);
+      expect(f.error).toMatch(/simulated failure/);
+      expect(f.linked).toBe(true);
+      expect(f.linkRolledBack).toBe(false);
+      expect(f.details).toMatch(/could NOT be removed/);
+      expect(f.details).toMatch(/different hub project/);
+      // The remedy has to be reachable without a shell incantation now that
+      // there is a verb for it.
+      expect(f.details).toMatch(/hub unlink/);
+      // Untouched: the file the push found is the file the push left.
+      expect(readFileSync(linkPath(projectPath), "utf-8")).toBe(stolen);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
