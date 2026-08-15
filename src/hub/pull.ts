@@ -79,7 +79,8 @@ export { selectThreadBase, type ThreadBaseCandidate } from "./pull-apply-session
  * moved with the stage and calls it, so leaving it here would make the two
  * modules circular.
  */
-export { selectNeededBundles, describeUnfetchable } from "./pull-select.js";
+export { describeUnfetchable } from "./pull-select.js";
+export { selectNeededBundles } from "./threads.js";
 
 /**
  * How many entries the local base holds beyond the common anchor — the "your

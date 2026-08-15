@@ -1,7 +1,7 @@
 import type { HubBackend } from "./backend.js";
 import type { HubBundleRecord } from "./layout.js";
-import { type ResolvedThread, type ThreadCopy } from "./threads.js";
-import type { ErrorResult, NotYetSyncedResult, SyncState, UnfetchableBundleGroup, WhereisThread } from "../types.js";
+import { type ResolvedThread } from "./threads.js";
+import type { ErrorResult, NotYetSyncedResult, UnfetchableBundleGroup, WhereisThread } from "../types.js";
 /**
  * The half of a thread this pull cannot reach, in words.
  *
@@ -26,39 +26,6 @@ export declare function describeUnfetchable(threadId: string, groups: Unfetchabl
     machineId: string;
     machineName: string | null;
 }): string;
-export declare function selectNeededBundles(bundles: HubBundleRecord[], received: Record<string, {
-    localSessionId: string;
-}> | undefined, localSessionFileExists: (localSessionId: string) => boolean): HubBundleRecord[];
-/** Does this machine already hold the thread's newest head? */
-export declare function isCurrent(t: ResolvedThread, machineId: string): boolean;
-/**
- * A copy OTHER than this machine's that still lists bundles this machine
- * has never received — the answer to "the newest head is mine, so is there
- * anything left on the hub for me?", which is NOT the same question.
- *
- * The two come apart on the ordinary divergence flow, and the default-on
- * auto-push makes it routine. `/sesh-mover:pull` probes with
- * `--on-divergence skip` and re-runs with the user's answer; between the
- * two, one SessionEnd hook publishes this machine's own diverged branch,
- * which is more recently active than the hub's side. `target.latest` is
- * then local, and refusing outright ("the latest copy of this thread is
- * already local" / "all threads are current") drops the answer the user
- * just gave for a bundle that is still sitting on the hub, unreceived.
- *
- * Deliberately narrow. It only ever fires when `target.latest` is THIS
- * machine, so it cannot change which copy an ordinary pull resolves to, and
- * it never merges two machines' bundle records into one list (ledger: that
- * linearity is what Task 8's `basedOn` chain walk rests on). Assembling a
- * thread whose history is split across two OTHER machines is still a later
- * slice — `findUnfetchableBundles` remains the disclosure for that.
- *
- * `newerThreadCopy` for the preference so the choice is a strict total order over the
- * candidate set rather than index-file iteration order.
- */
-export declare function alternateSource(t: ResolvedThread, st: SyncState, ctx: {
-    machineId: string;
-    targetProjectDir: string;
-}): ThreadCopy | undefined;
 export interface SelectStageInput {
     backend: HubBackend;
     /** Every machine's view of this project's threads, as `resolve` produced it. */

@@ -7,6 +7,7 @@ import { overrideHome, homeEnv, type HomeOverrideHandle } from "./helpers/env.js
 import { runCli, cliPath } from "./helpers/run-cli.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
+import { FIXTURE_SESSION_ID } from "./helpers/hub-fixtures.js";
 
 // The hook endpoints are the ONE sanctioned exception to the "every command
 // prints exactly one JSON result" contract. `hub hook-session-end` prints
@@ -694,7 +695,28 @@ describe("hub hook-session-start (CLI)", () => {
               headEntryUuid: "h1",
               messageCount: 4,
               lastActiveAt: "2026-07-21T00:00:00Z",
-              bundles: [],
+              // A machine that pushed HAS a bundle record — `push.ts` writes one
+              // every time, and nothing prunes them. An entry advertising a head
+              // with `bundles: []` is not a state any machine can reach, and it
+              // stopped being harmless once `pullNeeded` became receipt-shaped
+              // (#44): with nothing listed there is genuinely nothing to fetch,
+              // so the notice correctly went silent and these tests read an
+              // empty stdout. The bundle below is unreceived — this machine's
+              // sync-state has no peer ledger at all — so the thread is stale
+              // here, which is what each of these tests is about.
+              bundles: [
+                {
+                  bundleId: "b1",
+                  file: `projects/${PROJECT_ID}/bundles/${machineId}/b1.tar.gz`,
+                  type: "full",
+                  sessionIdInBundle: "s-remote",
+                  fromEntryUuid: null,
+                  headEntryUuid: "h1",
+                  messageCount: 4,
+                  pushedAt: "2026-07-21T00:00:00Z",
+                  hasWorkspace: false,
+                },
+              ],
               ...over,
             },
           },
@@ -779,14 +801,42 @@ describe("hub hook-session-start (CLI)", () => {
     linkProject(project, PROJECT_ID);
     writeHubMachine(ME, "my-laptop");
     writeHubMachine(OTHER, "office-desktop");
-    // Same headEntryUuid on both copies: the remote is nominally "latest" by
-    // timestamp, but we are not behind it, so a notice would be a lie.
+    // The remote is nominally "latest" by timestamp, but we are not behind it,
+    // so a notice would be a lie.
+    //
+    // Since #44 that has to be expressed as a RECEIPT, not as a matching head.
+    // Head equality was exactly the assumption #44 removed: two copies can
+    // agree on a head while one of them still lists a bundle the other has
+    // never received. So we record having received the remote's bundle, mapped
+    // onto a session file that really exists in this project's config dir
+    // (createRealProject copies the fixture session tree in) — which is what
+    // `selectNeededBundles` actually checks.
     writeIndex(ME, "t-shared", { headEntryUuid: "same", lastActiveAt: "2026-07-20T00:00:00Z" });
     writeIndex(OTHER, "t-shared", {
       headEntryUuid: "same",
       lastActiveAt: "2026-07-21T00:00:00Z",
       localSessionId: "s-remote",
     });
+    const syncDir = join(home, ".sesh-mover", "sync-state");
+    mkdirSync(syncDir, { recursive: true });
+    writeFileSync(
+      join(syncDir, `${encodeProjectPath(project)}.json`),
+      JSON.stringify({
+        schemaVersion: 1,
+        projectPath: project,
+        lineage: {},
+        imported: {},
+        peers: {
+          [OTHER]: {
+            name: "office-desktop",
+            lastSentAt: null,
+            lastReceivedAt: "2026-07-21T00:00:00Z",
+            sent: {},
+            received: { "s-remote": { localSessionId: FIXTURE_SESSION_ID } },
+          },
+        },
+      }) + "\n"
+    );
 
     const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
     expect(r.stdout).toBe("");
@@ -849,12 +899,20 @@ describe("hub hook-session-start (CLI)", () => {
           "t-old": {
             localSessionId: "s1", slug: "older-thread", summary: "old",
             headEntryUuid: "h1", messageCount: 2,
-            lastActiveAt: "2026-01-01T00:00:00Z", bundles: [],
+            lastActiveAt: "2026-01-01T00:00:00Z",
+            // Unreceived bundles: since #44 "stale here" is a receipt question,
+            // and an entry advertising a head with none listed is unreachable.
+            bundles: [{ bundleId: "b-old", file: `projects/${PROJECT_ID}/bundles/${OTHER}/b-old.tar.gz`,
+              type: "full", sessionIdInBundle: "s1", fromEntryUuid: null, headEntryUuid: "h1",
+              messageCount: 2, pushedAt: "2026-01-01T00:00:00Z", hasWorkspace: false }],
           },
           "t-new": {
             localSessionId: "s2", slug: "newest-thread", summary: "new",
             headEntryUuid: "h2", messageCount: 9,
-            lastActiveAt: new Date(Date.now() - 5 * 60_000).toISOString(), bundles: [],
+            lastActiveAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+            bundles: [{ bundleId: "b-new", file: `projects/${PROJECT_ID}/bundles/${OTHER}/b-new.tar.gz`,
+              type: "full", sessionIdInBundle: "s2", fromEntryUuid: null, headEntryUuid: "h2",
+              messageCount: 9, pushedAt: "2026-07-21T00:00:00Z", hasWorkspace: false }],
           },
         },
       }, null, 2) + "\n"

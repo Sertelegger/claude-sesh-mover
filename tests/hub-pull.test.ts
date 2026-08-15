@@ -4182,8 +4182,12 @@ describe("hub pull: a thread split across two other machines", () => {
       });
       expect(pull.success).toBe(false);
       if (pull.success) return;
+      // #44 reworded this: the branch tests receipts, never head equality, so
+      // "all threads are current on this machine" claimed something the code
+      // no longer asks. The control property is unchanged — with only one
+      // other machine in play the sentence carries no split disclosure.
       expect("error" in pull && pull.error).toBe(
-        "Nothing to pull: all threads are current on this machine."
+        "Nothing to pull: every bundle the machine each thread resolves to lists has already been received here."
       );
     } finally {
       cleanupSplit(f);

@@ -1713,13 +1713,19 @@ describe("select stage", () => {
 
   /**
    * The arrangement that drives all four of the moved closures in one call:
-   * `isCurrent` says yes for every thread, `alternateSource` finds no other
-   * machine to fetch from, `discloseUnfetchable` has nothing to disclose, and
-   * `backfillThreadMappings` finds nothing to repair — so this is the one exit
-   * where "the state file is untouched" is a true statement rather than a
-   * convenient one.
+   * every thread's latest copy is this machine's OWN, `alternateSource` finds
+   * no other machine to fetch from, `discloseUnfetchable` has nothing to
+   * disclose, and `backfillThreadMappings` finds nothing to repair — so this is
+   * the one exit where "the state file is untouched" is a true statement rather
+   * than a convenient one.
+   *
+   * It is also the fixture that pins #44's local-machine branch. The sync-state
+   * here is EMPTY, so this machine has no receipt for its own pushed bundle: a
+   * `pullSourceFor` that re-gated unconditionally would call that bundle
+   * "needed" and start re-fetching this machine's own pushes. `alternateSource`
+   * excludes our own copy, which is why the branch delegates to it.
    */
-  it("--latest with every thread current stops with the exact reason and repairs nothing", async () => {
+  it("--latest with nothing left to fetch stops with the exact reason and repairs nothing", async () => {
     writeSyncState(emptySyncState(projectPath));
     const before = readFileSync(syncStatePath(projectPath), "utf-8");
 
@@ -1732,7 +1738,10 @@ describe("select stage", () => {
       command: "pull",
       // No repair fired, so `details` carries nothing.
       details: undefined,
-      error: "Nothing to pull: all threads are current on this machine.",
+      // RECEIPT-SHAPED since #44: the old "all threads are current on this
+      // machine" asserted head equality, which this branch no longer tests.
+      error:
+        "Nothing to pull: every bundle the machine each thread resolves to lists has already been received here.",
       suggestion: "Run whereis to double-check thread status.",
     });
     expect(readFileSync(syncStatePath(projectPath), "utf-8")).toBe(before);
@@ -1813,12 +1822,20 @@ describe("select stage", () => {
   });
 
   /**
-   * #28's crash window, on the exit an interrupted pull's re-run actually lands
-   * in: every bundle is already recorded as received, so `needed` is empty —
-   * and the mapping that says which thread the local session belongs to is
-   * missing. The repair WRITES, under a `success: false` result.
+   * #28's crash window, on the exit an interrupted `--latest` re-run actually
+   * lands in: every bundle is already recorded as received, and the mapping
+   * that says which thread the local session belongs to is missing. The repair
+   * WRITES, under a `success: false` result.
+   *
+   * #44 MOVED THIS EXIT, deliberately, and the repair is why it is safe: the
+   * same receipts that used to empty `needed` (exit 6, "Already up to date with
+   * the source machine") now make `pullSourceFor` yield no source, so `--latest`
+   * stops one branch earlier — and that branch backfills across every resolved
+   * thread rather than the single one, i.e. strictly more repair for the same
+   * arrangement. `--thread <id>` still reaches exit 6; see hub-pull.test.ts's
+   * split-fixture cases, which are threadId-driven.
    */
-  it("repairs an absent thread mapping on the already-up-to-date exit and reports it in details", async () => {
+  it("repairs an absent thread mapping on the nothing-to-pull exit and reports it in details", async () => {
     writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
     writeSyncState({
       ...emptySyncState(projectPath),
@@ -1838,8 +1855,10 @@ describe("select stage", () => {
     expect(out.kind).toBe("stop");
     if (out.kind !== "stop") return;
     const result = out.result as ErrorResult;
-    expect(result.error).toBe("Already up to date with the source machine.");
-    expect(result.suggestion).toBe("Run whereis to confirm.");
+    expect(result.error).toBe(
+      "Nothing to pull: every bundle the machine each thread resolves to lists has already been received here."
+    );
+    expect(result.suggestion).toBe("Run whereis to double-check thread status.");
     expect(result.details).toContain("the mapping has been restored");
     const after = readSyncState(projectPath);
     expect(getThreadId(after, "local-1")).toBe("t-1");
@@ -1912,5 +1931,48 @@ describe("select stage", () => {
     ]);
     expect(out.warnings).toHaveLength(1);
     expect(out.warnings[0]).toContain("Thread t-1 could not be pulled whole");
+  });
+
+  /**
+   * #44: ONE hub state, one answer. The two selectors used to gate on different
+   * questions — `--latest` on head equality, `--thread` on what was actually
+   * received — so this arrangement (the newest head is already here, and the
+   * machine the thread resolves to still lists a bundle that never arrived)
+   * answered "Nothing to pull: all threads are current on this machine" for one
+   * and fetched for the other.
+   *
+   * The assertion is AGREEMENT, not a literal, so it survives #35: chain
+   * assembly changes what `needed` may contain, not the rule that both
+   * selectors have to ask the same question of it.
+   *
+   * The older `lastActiveAt` on this machine's own entry is load-bearing.
+   * `newerThreadCopy`'s last key is machineId ascending, so on a total tie `m1`
+   * (this machine) wins resolution, `alternateSource` covers it, and the
+   * arrangement tests nothing.
+   */
+  it("--latest and --thread agree when the head is already here but a bundle never arrived", async () => {
+    writeBundleFile(PEER_BUNDLE.file);
+    writeSyncState(emptySyncState(projectPath)); // nothing received from m2
+    const indexes = [
+      idx(ME, {
+        "t-1": entry({
+          localSessionId: "local-1",
+          headEntryUuid: "head-b0", // the head m2's bundle carries: "current"
+          lastActiveAt: "2026-07-20T00:00:00Z", // ...but older, so m2 resolves
+          bundles: [],
+        }),
+      }),
+      peerIndex(),
+    ];
+
+    const viaLatest = await runSelectStage(input({ indexes, latest: true }));
+    const viaThread = await runSelectStage(input({ indexes, threadId: "t-1" }));
+
+    expect(viaLatest.kind).toBe(viaThread.kind);
+    expect(viaLatest.kind).toBe("proceed");
+    if (viaLatest.kind !== "proceed" || viaThread.kind !== "proceed") return;
+    expect(viaLatest.value).toEqual(viaThread.value);
+    expect(viaLatest.value.sourceMachineId).toBe("m2");
+    expect(viaLatest.value.needed).toEqual([PEER_BUNDLE]);
   });
 });
