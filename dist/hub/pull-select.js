@@ -15,6 +15,11 @@
  * field at all (so the synthesized `reasons: [terminal.error]` has nothing to
  * read).
  *
+ * The UNION has one kind more than the function has exits, on purpose: `report`
+ * has no producer here yet and is the exit chain assembly needs (see
+ * `SelectReport`). A count that disagrees with the union is the expected state
+ * until assembly lands, not a stale comment.
+ *
  * THE SYNC-STATE SPLIT IS LOAD-BEARING, so this stage takes a project PATH and
  * does its own I/O rather than accepting a `SyncState`. Only `readSyncState`
  * renames a corrupt file aside, and which branch has earned the right to do
@@ -298,7 +303,11 @@ export async function runSelectStage(input) {
     }
     const state = readSyncState(effectiveProjectPath);
     const received = state.peers[sourceCopy.machineId]?.received;
-    const needed = selectNeededBundles(sourceCopy.bundles, received, (localSessionId) => existsSync(join(targetProjectDir, `${localSessionId}.jsonl`)));
+    // Every record is stamped with the machine whose list it came from — one and
+    // the same machine here, because this selection is still ONE copy's bundle
+    // list. The stamp is what stops a later stage reaching for the resolved
+    // machine instead; see `SourcedBundle`.
+    const needed = selectNeededBundles(sourceCopy.bundles, received, (localSessionId) => existsSync(join(targetProjectDir, `${localSessionId}.jsonl`))).map((record) => ({ machineId: sourceCopy.machineId, record }));
     // DISCLOSURE ONLY — see findUnfetchableBundles. It reads no timestamp, it
     // merges nothing into the source's bundle list, and nothing below it
     // changes what this pull fetches, applies, records, orders or resolves to.
@@ -357,9 +366,10 @@ export async function runSelectStage(input) {
         };
     }
     const missing = [];
-    for (const record of needed)
+    for (const { record } of needed) {
         if (!(await backend.exists(record.file)))
             missing.push(record.file);
+    }
     if (missing.length > 0) {
         return {
             kind: "stop",

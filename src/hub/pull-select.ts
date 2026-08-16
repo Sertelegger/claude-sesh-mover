@@ -15,6 +15,11 @@
  * field at all (so the synthesized `reasons: [terminal.error]` has nothing to
  * read).
  *
+ * The UNION has one kind more than the function has exits, on purpose: `report`
+ * has no producer here yet and is the exit chain assembly needs (see
+ * `SelectReport`). A count that disagrees with the union is the expected state
+ * until assembly lands, not a stale comment.
+ *
  * THE SYNC-STATE SPLIT IS LOAD-BEARING, so this stage takes a project PATH and
  * does its own I/O rather than accepting a `SyncState`. Only `readSyncState`
  * renames a corrupt file aside, and which branch has earned the right to do
@@ -50,6 +55,7 @@ import {
 } from "../sync-state.js";
 import type {
   ErrorResult,
+  HubPullFindings,
   NotYetSyncedResult,
   SyncState,
   UnfetchableBundleGroup,
@@ -139,6 +145,39 @@ export interface SelectStageInput {
   targetProjectDir: string;
 }
 
+/**
+ * One bundle this pull will fetch, paired with the machine whose index listed
+ * it — the peer whose ledger that bundle's arrival credits.
+ *
+ * THE PAIRING LIVES HERE AND NOT ON THE RECORD, and that is a schema decision
+ * rather than a style one. `HubBundleRecord` is the ON-DISK index shape
+ * (`layout.ts`), so a machine id inside it would put one machine's claim about
+ * its own identity inside a file every other machine parses — the exact
+ * substitution `resolveThreads` already refuses by spreading the entry FIRST
+ * and the file-derived id SECOND. A fetch plan is a per-pull structure nobody
+ * stores, so it is free to carry what the schema may not.
+ *
+ * TODAY EVERY ELEMENT OF ONE PLAN CARRIES THE SAME `machineId`: `needed` is
+ * still drawn from a single `ThreadCopy`'s bundle list, so this pairing changes
+ * no behaviour and is asserted not to (see "per-record source machine" in
+ * tests/hub-pull-stages.test.ts). It exists because chain assembly (#35) is
+ * about to make that list span machines, and three sites downstream spend the
+ * plan's machine id on a peer ledger: a scalar that is right for the plan is
+ * wrong for a record the moment those two come apart, and the failure mode is
+ * a silently mis-credited `received`/`sent` ledger — which is `recordSentToPeer`'s
+ * own unreconstructable-thread invariant (src/sync-state.ts), i.e. the defect
+ * #35 exists to fix.
+ */
+export interface SourcedBundle {
+  /**
+   * The machine whose index lists this bundle. NOT "the machine this pull
+   * resolved to" — see `SelectStageResult.sourceMachineId`, which is that and
+   * stays that.
+   */
+  machineId: string;
+  record: HubBundleRecord;
+}
+
 export interface SelectStageResult {
   /**
    * NARROWED on purpose: the thread's id and the source machine's id, never the
@@ -147,18 +186,98 @@ export interface SelectStageResult {
    * carrying an iteration-order ban.
    */
   threadId: string;
+  /**
+   * The machine this pull RESOLVED to — what drives the source label on the
+   * result and the alternate-source warning above.
+   *
+   * Deliberately no longer the answer to "which peer supplied this record":
+   * that is per record, on `needed`. Keeping one scalar for both meanings is
+   * what mis-credits a ledger once a chain spans machines.
+   */
   sourceMachineId: string;
-  needed: HubBundleRecord[];
+  needed: SourcedBundle[];
   /** Read exactly once, at the caller's final `HubPullResult` assembly. */
   unfetchableBundles: UnfetchableBundleGroup[] | undefined;
 }
 
 /**
- * `warnings` rides on `proceed` ALONE, and that is the contract, not an
- * oversight: today's code pushes the unfetchable sentence before the
- * "already up to date" gate and the returns there carry no `warnings` field,
- * so the text is discarded. The caller reproduces that by dispatching on
- * `stop` BEFORE spreading `warnings`.
+ * THE FOURTH EXIT: this pull worked out a thread's history, found something it
+ * could not deliver, and correctly applied nothing.
+ *
+ * Under the pull's failure contract — truthfulness is the invariant,
+ * completeness is best-effort — that is a SUCCESS. The `needed.length === 0`
+ * branch below is the only other exit for an empty fetch plan and both of its
+ * variants are `success: false`, which is the nag loop this milestone exists to
+ * break, relocated one branch later: an error tells the caller to try again, and
+ * every try says the same thing forever.
+ *
+ * WHY A FOURTH ARM RATHER THAN THE CHEAPER FIX — recorded because the next
+ * reader will reach for the cheaper one. The alternative is to relax the gate:
+ * keep three arms, let `proceed` carry an EMPTY `needed`, and put the findings
+ * on `warnings`. It is not a type-level worry, it is a crash. `pull-record.ts`
+ * indexes the plan unconditionally and then dereferences the result:
+ *
+ *   - `const last = needed[…]` evaluates to `needed[-1]` for an empty plan:
+ *     every branch of that index expression is guarded on
+ *     `lastAppliedIndex >= 0` or `divergenceAborted`, which start at `-1` and
+ *     `false` (`pull-apply-state.ts`), so it falls through to
+ *     `needed.length - 1`. `last` is `undefined`.
+ *   - `stateAfter.peers[last.machineId]?.received?.[last.record.sessionIdInBundle]`
+ *     then throws a TypeError, on every arrangement rather than some of them.
+ *   - Both halves of that sentence moved with the per-record machine id, and
+ *     the move was in this argument's favour. While the plan was a bare record
+ *     list, the peer was a scalar and the entry was first dereferenced INSIDE
+ *     the computed key — so it only threw when `peers[sourceMachineId].received`
+ *     happened to exist for the optional chain to run through, which is the
+ *     ordinary state for an empty plan (the plan is empty BECAUSE those receipts
+ *     cover it) but not the only one. Now the entry is dereferenced to BUILD the
+ *     key, and nothing short-circuits past it.
+ *   - The design doc puts the throw one line earlier, at the dereference inside
+ *     the `find` predicate. It cannot fire there for an empty plan: that
+ *     predicate only runs when `lastBundleManifest` is non-null, and nothing
+ *     sets it when the bundle loop never iterates. The crash is real, and it is
+ *     the receipt lookup. `tests/hub-pull-stages.test.ts` pins it, so this
+ *     stays measured.
+ *
+ * This arm is also what the module doc's own argument already points at: two of
+ * the exits cannot be an `ErrorResult`, which is why this stage carries its own
+ * union instead of `StageOutcome`/`stageAbort`. A third exit that is
+ * `success: true` and has no `error` field for a synthesized
+ * `reasons: [terminal.error]` to read is that same argument a third time.
+ *
+ * NOTHING PRODUCES IT YET. It becomes reachable when chain assembly lands and an
+ * assembled plan can be legitimately empty; until then it is a typed,
+ * dispatched, tested exit with no producer, which is deliberate rather than
+ * dead code.
+ */
+export interface SelectReport {
+  threadId: string;
+  /** Still "the machine this pull resolved to", never "the machines it read". */
+  sourceMachineId: string;
+  /**
+   * Why nothing was applied. Non-empty; the caller puts it on the result's
+   * `nothingToApply`.
+   */
+  reason: string;
+  /**
+   * The typed disclosures, SPREAD verbatim into the result by the caller.
+   *
+   * It is the shared `HubPullFindings` rather than a list of fields restated
+   * here so that a disclosure added to the result type arrives on this exit with
+   * no edit at either end — the chain gaps and advertised-but-unshipped heads
+   * assembly will report are additions to that one interface, not to this arm.
+   */
+  findings: HubPullFindings;
+}
+
+/**
+ * `warnings` rides on `proceed` and on `report` — the two arms whose result the
+ * caller assembles with a `warnings` field to put them in — and on neither
+ * `stop` nor `pick-list`. That is the contract, not an oversight: today's code
+ * pushes the unfetchable sentence before the "already up to date" gate and the
+ * `stop` returns there carry no `warnings` field, so the text is discarded. The
+ * caller reproduces that by dispatching on `stop` BEFORE spreading `warnings`,
+ * and on `report` after.
  *
  * `pick-list` carries no warnings for the same reason in reverse — the caller
  * owns the list (it has the lock-steal warning and the resolve stage's reasons
@@ -167,6 +286,7 @@ export interface SelectStageResult {
 export type SelectOutcome =
   | { kind: "proceed"; value: SelectStageResult; warnings: string[] }
   | { kind: "pick-list"; threads: WhereisThread[] }
+  | { kind: "report"; value: SelectReport; warnings: string[] }
   | { kind: "stop"; result: ErrorResult | NotYetSyncedResult };
 
 export async function runSelectStage(input: SelectStageInput): Promise<SelectOutcome> {
@@ -389,11 +509,15 @@ export async function runSelectStage(input: SelectStageInput): Promise<SelectOut
 
   const state = readSyncState(effectiveProjectPath);
   const received = state.peers[sourceCopy.machineId]?.received;
-  const needed = selectNeededBundles(
+  // Every record is stamped with the machine whose list it came from — one and
+  // the same machine here, because this selection is still ONE copy's bundle
+  // list. The stamp is what stops a later stage reaching for the resolved
+  // machine instead; see `SourcedBundle`.
+  const needed: SourcedBundle[] = selectNeededBundles(
     sourceCopy.bundles,
     received,
     (localSessionId) => existsSync(join(targetProjectDir, `${localSessionId}.jsonl`))
-  );
+  ).map((record) => ({ machineId: sourceCopy.machineId, record }));
   // DISCLOSURE ONLY — see findUnfetchableBundles. It reads no timestamp, it
   // merges nothing into the source's bundle list, and nothing below it
   // changes what this pull fetches, applies, records, orders or resolves to.
@@ -457,7 +581,9 @@ export async function runSelectStage(input: SelectStageInput): Promise<SelectOut
   }
 
   const missing: string[] = [];
-  for (const record of needed) if (!(await backend.exists(record.file))) missing.push(record.file);
+  for (const { record } of needed) {
+    if (!(await backend.exists(record.file))) missing.push(record.file);
+  }
   if (missing.length > 0) {
     return {
       kind: "stop",

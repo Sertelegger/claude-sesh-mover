@@ -1,5 +1,5 @@
 import type { HubBackend } from "./backend.js";
-import type { HubBundleRecord } from "./layout.js";
+import type { SourcedBundle } from "./pull-select.js";
 import { type StageOutcome } from "./pull-stages.js";
 import type { ExportManifest, HubPullResult } from "../types.js";
 /**
@@ -31,8 +31,17 @@ export interface RecordStageInput {
     machineId: string;
     hubId: string;
     threadId: string;
-    sourceMachineId: string;
-    needed: HubBundleRecord[];
+    /**
+     * The fetch plan, each record paired with the machine whose index listed it.
+     *
+     * NO `sourceMachineId` SCALAR ALONGSIDE IT, deliberately. The one thing this
+     * stage did with the pull's resolved machine was look the last bundle up in
+     * its receipt ledger, and that is a question about the peer who supplied THAT
+     * record — the two are the same string only while a plan cannot span
+     * machines. Deleting the field is what stops the wrong one being reached for
+     * again; the resolved machine is still on the result, assembled by `pull.ts`.
+     */
+    needed: SourcedBundle[];
     apply: RecordApplyView;
 }
 export interface RecordStageResult {

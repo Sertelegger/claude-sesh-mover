@@ -6,7 +6,9 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-stages.js";
-import type { ErrorResult, ExportManifest, HubPullResult } from "../src/types.js";
+import type {
+  ErrorResult, ExportManifest, HubPullFindings, HubPullResult,
+} from "../src/types.js";
 import { initApplyState, type PulledCarry } from "../src/hub/pull-apply-state.js";
 import { runApplyCarryStage } from "../src/hub/pull-apply-carry.js";
 import { createFsBackend } from "../src/hub/backend.js";
@@ -21,7 +23,9 @@ import type { CarryMeta } from "../src/hub/carry.js";
 import { runFetchStage } from "../src/hub/pull-fetch.js";
 import { runRecordStage, type RecordApplyView } from "../src/hub/pull-record.js";
 import { runResolveStage } from "../src/hub/pull-resolve.js";
-import { runSelectStage } from "../src/hub/pull-select.js";
+import {
+  runSelectStage, type SelectOutcome, type SelectReport, type SourcedBundle,
+} from "../src/hub/pull-select.js";
 import { resolveThreads } from "../src/hub/threads.js";
 import { createArchive } from "../src/archiver.js";
 import { computeIntegrityHashFromFile, writeManifest } from "../src/manifest.js";
@@ -36,8 +40,9 @@ import {
   runApplySessionsStage, type RecordSpliceInput,
 } from "../src/hub/pull-apply-sessions.js";
 import { hubInit } from "../src/hub/init.js";
-import { hubPull } from "../src/hub/pull.js";
+import { hubPull, reportPullResult } from "../src/hub/pull.js";
 import { hubPush } from "../src/hub/push.js";
+import { loadOrCreateMachineId } from "../src/machine.js";
 import { readLastEntryUuid } from "../src/jsonl.js";
 import { setThreadId } from "../src/sync-state.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
@@ -279,7 +284,12 @@ describe("record stage", () => {
     writeFileSync(join(dir, `${sessionId}.jsonl`), entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
   }
 
-  function input(over: { needed?: ReturnType<typeof bundle>[]; apply?: RecordApplyView } = {}) {
+  /** A plan entry: the bundle, plus the machine whose index listed it. */
+  function sourced(machineId: string, over: Partial<HubBundleRecord> = {}): SourcedBundle {
+    return { machineId, record: bundle(over) };
+  }
+
+  function input(over: { needed?: SourcedBundle[]; apply?: RecordApplyView } = {}) {
     return {
       backend: createFsBackend(hubDir),
       configDir,
@@ -288,8 +298,7 @@ describe("record stage", () => {
       machineId: "m1",
       hubId: "h1",
       threadId: "t1",
-      sourceMachineId: "m2",
-      needed: over.needed ?? [bundle({ bundleId: "b0", sessionIdInBundle: "remote-a" })],
+      needed: over.needed ?? [sourced("m2", { bundleId: "b0", sessionIdInBundle: "remote-a" })],
       apply: over.apply ?? applyView(),
     };
   }
@@ -375,14 +384,73 @@ describe("record stage", () => {
     const out = await runRecordStage(
       input({
         needed: [
-          bundle({ bundleId: "b0", sessionIdInBundle: "remote-a" }),
-          bundle({ bundleId: "b1", sessionIdInBundle: "remote-b" }),
+          sourced("m2", { bundleId: "b0", sessionIdInBundle: "remote-a" }),
+          sourced("m2", { bundleId: "b1", sessionIdInBundle: "remote-b" }),
         ],
         apply: applyView({ lastAppliedIndex: 0, divergenceAborted: true, abortIndex: 1 }),
       })
     );
 
     expect(out.value?.localSessionId).toBe(SESSION_ID);
+  });
+
+  /**
+   * THE THIRD SITE OF THE `sourceMachineId` RIPPLE (#35 Task 3).
+   *
+   * This lookup recovers the thread's local session when nothing landed in this
+   * pull, and it has to ask the peer that SUPPLIED the last bundle. A plan drawn
+   * from one machine cannot tell the two apart — every record's machine is the
+   * pull's resolved machine — so the arrangement here is the one chain assembly
+   * produces: the last handled bundle came from `m3` while the pull resolved to
+   * `m2`, and `m2` holds a receipt for the SAME `sessionIdInBundle` pointing at
+   * a different local session.
+   *
+   * Reaching for the resolved machine is not a miss here, it is a wrong answer:
+   * the thread would be mapped onto `m2`'s session, and every later continuation
+   * would splice onto the wrong transcript.
+   */
+  it("asks the receipt ledger of the machine that supplied the bundle, not the pull's source", async () => {
+    writeLocalSession(SESSION_ID, HEAD_UUID);
+    writeLocalSession("decoy-session-id", "entry-decoy");
+    writeSyncState({
+      ...syncState({
+        m2: peer({
+          received: {
+            // Same key, wrong peer: the answer a scalar `sourceMachineId`
+            // would have produced.
+            "remote-b": {
+              localSessionId: "decoy-session-id", type: "continuation",
+              importedAt: "2026-08-01T09:00:00.000Z",
+            },
+          },
+        }),
+        m3: peer({
+          received: {
+            "remote-b": {
+              localSessionId: SESSION_ID, type: "continuation",
+              importedAt: "2026-08-01T09:30:00.000Z",
+            },
+          },
+        }),
+      }),
+      projectPath,
+    });
+
+    const out = await runRecordStage(
+      input({
+        needed: [
+          sourced("m2", { bundleId: "b0", sessionIdInBundle: "remote-a" }),
+          sourced("m3", { bundleId: "b1", sessionIdInBundle: "remote-b" }),
+        ],
+        // Nothing landed in this pull, so `threadLandedSessionId` is null and
+        // the receipt ledger is the branch that answers.
+        apply: applyView({ lastAppliedIndex: 1 }),
+      })
+    );
+
+    expect(out.value?.localSessionId).toBe(SESSION_ID);
+    expect(getThreadId(readSyncState(projectPath), SESSION_ID)).toBe("t1");
+    expect(getThreadId(readSyncState(projectPath), "decoy-session-id")).toBeNull();
   });
 
   /**
@@ -422,6 +490,69 @@ describe("record stage", () => {
     expect(out.value?.indexWritten).toBe(true);
     expect(out.reasons).toHaveLength(1);
     expect(out.reasons[0]).toContain("its session could not be identified");
+  });
+
+  /**
+   * THE REASON THE SELECT STAGE HAS A FOURTH EXIT INSTEAD OF AN EMPTY `proceed`.
+   *
+   * The cheap way to express "assembled the chain, found an anomaly, applied
+   * nothing" is to relax the empty-plan gate and let `proceed` carry an empty
+   * `needed`. Every stage below select tolerates a zero-length chain except this
+   * one: `pull-record.ts` indexes the plan unconditionally, and for an empty
+   * plan that index is `needed[-1]` (`lastAppliedIndex` starts at -1 and
+   * `divergenceAborted` at false, so the expression falls through to
+   * `needed.length - 1`).
+   *
+   * WHICH dereference throws, and the fact that it now throws UNCONDITIONALLY,
+   * both moved with #35 Task 3 and the change is in the guard's favour. The
+   * `undefined` plan entry used to be dereferenced first at its
+   * `sessionIdInBundle`, as the computed KEY of
+   * `peers[sourceMachineId]?.received?.[…]` — so it only threw when that peer
+   * ledger happened to exist for the optional chain to run through. Strip the
+   * receipts and the same empty plan sailed past, reporting a session it could
+   * not identify and republishing the index for a pull that fetched nothing.
+   *
+   * With the plan carrying its own machine per record, the lookup is
+   * `peers[last.machineId]`, so the entry is dereferenced to BUILD the key
+   * rather than inside it, and no arrangement can short-circuit past it. The
+   * `find` predicate above it still cannot fire — nothing sets
+   * `lastBundleManifest` when the bundle loop never iterates — so the crash is
+   * still this statement, one property earlier.
+   *
+   * Asserted, so the design note stays measured rather than remembered. If a
+   * future guard makes an empty plan safe here, this test is where that is
+   * discovered — it does not license removing the fourth arm, which also carries
+   * the `success: true` semantics the gate cannot express.
+   */
+  it("throws on an empty fetch plan, which is why select may never hand one to proceed", async () => {
+    writeLocalSession(SESSION_ID, HEAD_UUID);
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        m2: peer({
+          received: {
+            "remote-a": {
+              localSessionId: SESSION_ID, type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+            },
+          },
+        }),
+      },
+    });
+
+    // The message, not just the class: a bare `TypeError` would also be
+    // satisfied by a crash somewhere else entirely, and the point of this test
+    // is WHICH dereference fails.
+    await expect(runRecordStage(input({ needed: [] }))).rejects.toThrow(
+      /Cannot read properties of undefined \(reading 'machineId'\)/
+    );
+
+    // ...and with the peer ledger stripped it throws just the same, which is
+    // the half that changed. The crash is no longer arrangement-dependent, so
+    // an empty plan can no longer reach the index rewrite by accident.
+    writeSyncState(emptySyncState(projectPath));
+    await expect(runRecordStage(input({ needed: [] }))).rejects.toThrow(
+      /Cannot read properties of undefined \(reading 'machineId'\)/
+    );
   });
 });
 
@@ -1298,6 +1429,7 @@ describe("apply.sessions stage", () => {
     state: ReturnType<typeof initApplyState>;
     recordSplice?: (b: RecordSpliceInput) => void;
     noAppend?: boolean;
+    bundleMachineId?: string;
   }): Parameters<typeof runApplySessionsStage>[0] {
     return {
       extractDir,
@@ -1310,7 +1442,7 @@ describe("apply.sessions stage", () => {
       targetProjectDir,
       claudeVersion: "2.1.81",
       threadId: THREAD_ID,
-      sourceMachineId: SOURCE_MACHINE,
+      bundleMachineId: over.bundleMachineId ?? SOURCE_MACHINE,
       hubPeerId: HUB_PEER_ID,
       noAppend: over.noAppend ?? false,
       forceAppend: false,
@@ -1428,6 +1560,48 @@ describe("apply.sessions stage", () => {
     expect(lines.map((l) => l.uuid)).toEqual(["base-1", "base-2", "c-1", "c-2"]);
     expect(lines.slice(2).map((l) => l.cwd)).toEqual([projectPath, projectPath]);
     expect(lines.slice(2).map((l) => l.sessionId)).toEqual([a.baseSessionId, a.baseSessionId]);
+  });
+
+  /**
+   * SITES ONE AND TWO OF THE `sourceMachineId` RIPPLE (#35 Task 3).
+   *
+   * The splice credits `peers[peerId].received` and `peers[peerId].sent`, and
+   * the peer it must credit is the machine whose index listed THIS bundle. Two
+   * other ids are in the room and both are wrong: the pull's resolved machine
+   * (gone from this stage entirely now — there is no parameter left to reach
+   * for) and the bundle manifest's `sourceMachineId`, which is the ORIGINATING
+   * machine and is what `importSession` credits on the fragment path.
+   *
+   * So the arrangement makes them disagree: the plan says `m-holder`, the
+   * manifest says `m-source`. On a one-machine pull they are the same string
+   * and this assertion is untestable, which is exactly why it is written here
+   * rather than left to an end-to-end case.
+   *
+   * The `adopt-hub` site takes its value from the same destructured binding as
+   * this one, so the two cannot disagree by construction; hub-pull.test.ts
+   * exercises that path end to end.
+   */
+  it("credits the splice to the machine whose list carried the bundle, not the manifest's originator", async () => {
+    const a = await arrangeSpliceable();
+    expect(a.manifest.sourceMachineId, "the manifest's originator is the decoy").toBe(SOURCE_MACHINE);
+    const st = initApplyState({ needed: [a.record] });
+    const spliced: RecordSpliceInput[] = [];
+
+    const out = await runApplySessionsStage(
+      stageInput({
+        manifest: a.manifest, record: a.record, state: st,
+        bundleMachineId: "m-holder",
+        recordSplice: (b) => spliced.push(b),
+      })
+    );
+
+    expect(out.control).toEqual({ kind: "next" });
+    expect(spliced).toHaveLength(1);
+    expect(spliced[0].peerId).toBe("m-holder");
+    expect(spliced[0].peerId).not.toBe(SOURCE_MACHINE);
+    // The hub's own ledger is unaffected: it is not machine-derived, and the
+    // invariant doc on `recordSentToPeer` is about that one.
+    expect(spliced[0].hubPeerId).toBe(HUB_PEER_ID);
   });
 
   it("imports as a fragment instead of splicing when --no-append is set", async () => {
@@ -1793,7 +1967,10 @@ describe("select stage", () => {
     expect(out.value).toEqual({
       threadId: "t-1",
       sourceMachineId: "m2",
-      needed: [PEER_BUNDLE],
+      // Each record carries the machine whose list it came from. One copy's
+      // list, so one machine — but stamped per record, not inferred from the
+      // scalar above (see `SourcedBundle`).
+      needed: [{ machineId: "m2", record: PEER_BUNDLE }],
       unfetchableBundles: undefined,
     });
     expect(Object.keys(out.value).sort()).toEqual([
@@ -1973,6 +2150,328 @@ describe("select stage", () => {
     if (viaLatest.kind !== "proceed" || viaThread.kind !== "proceed") return;
     expect(viaLatest.value).toEqual(viaThread.value);
     expect(viaLatest.value.sourceMachineId).toBe("m2");
-    expect(viaLatest.value.needed).toEqual([PEER_BUNDLE]);
+    expect(viaLatest.value.needed).toEqual([{ machineId: "m2", record: PEER_BUNDLE }]);
+  });
+
+  /**
+   * The stamp is per record and comes from the copy the selection was drawn
+   * from — asserted on the branch where the resolved machine is NOT the source
+   * (our own copy is newest, so `alternateSource` switches to m2). Same machine
+   * in both roles today; the point is which one the records are stamped with,
+   * because that is the one three sites downstream credit.
+   */
+  it("stamps every needed record with the machine whose list it was drawn from", async () => {
+    writeBundleFile(PEER_BUNDLE.file);
+    const mine = idx(ME, {
+      "t-1": entry({
+        localSessionId: "local-mine",
+        headEntryUuid: "head-mine",
+        lastActiveAt: "2026-07-22T00:00:00Z",
+        bundles: [],
+      }),
+    });
+
+    const out = await runSelectStage(input({ indexes: [mine, peerIndex()], latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.machineId)).toEqual(["m2"]);
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0"]);
+    // ...and never this machine's own id, which is what `target.latest` is on
+    // this branch and what a "stamp with the resolved machine" shortcut would
+    // have produced.
+    expect(out.value.needed.every((n) => n.machineId !== ME)).toBe(true);
+  });
+});
+
+/**
+ * THE FOURTH EXIT, tested from the outcome inward.
+ *
+ * Nothing in the codebase produces a `report` outcome yet — it becomes reachable
+ * when chain assembly lands and an assembled plan can legitimately be empty. So
+ * these tests construct the outcome directly and assert the `HubPullResult` it
+ * yields, which is the only way an exit with no producer can be shown to be
+ * wired rather than merely declared. An unrendered arm is a claim that the
+ * result type can express "applied nothing, and here is why", not a fact.
+ *
+ * The complementary half is in the record stage's "throws on an empty fetch
+ * plan" case above: together they say the arm is necessary AND connected.
+ */
+describe("select report arm (the fourth exit)", () => {
+  const REASON =
+    "This thread's history was worked out in full and every bundle in it is already here.";
+
+  function report(over: Partial<SelectReport> = {}): SelectReport {
+    return { threadId: "t-1", sourceMachineId: "m2", reason: REASON, findings: {}, ...over };
+  }
+
+  it("renders a success result that applied nothing and says why", () => {
+    const outcome: SelectOutcome = {
+      kind: "report", value: report(), warnings: ["the stage's own sentence"],
+    };
+    expect(outcome.kind).toBe("report");
+    if (outcome.kind !== "report") return;
+
+    const result = reportPullResult(outcome.value, ["the caller's own", ...outcome.warnings]);
+
+    expect(result).toEqual({
+      success: true,
+      command: "pull",
+      threadId: "t-1",
+      // Still "the machine this pull resolved to" — the report says nothing
+      // about how many machines' lists were read to reach it.
+      sourceMachineId: "m2",
+      importedSessions: [],
+      skippedSessions: [],
+      // Nothing landed, so no thread mapping was written and none is claimed.
+      localSessionId: null,
+      workspaceUnpacked: null,
+      nothingToApply: { reason: REASON },
+      warnings: ["the caller's own", "the stage's own sentence"],
+    });
+    // Not a refusal wearing a success flag: no `error`, no `suggestion`, and no
+    // `reason` discriminator at the top level of the result.
+    expect(result.success).toBe(true);
+    expect("error" in result).toBe(false);
+    expect("suggestion" in result).toBe(false);
+    expect(Object.keys(result).sort()).toEqual([
+      "command", "importedSessions", "localSessionId", "nothingToApply", "skippedSessions",
+      "sourceMachineId", "success", "threadId", "warnings", "workspaceUnpacked",
+    ]);
+  });
+
+  /**
+   * `findings` is spread, not copied field by field, and that is the property
+   * the next task depends on: the chain gaps and advertised-but-unshipped heads
+   * assembly will report are additions to `HubPullFindings`, so they must reach
+   * the result with no edit to the arm or to its renderer. The second assertion
+   * proves that mechanically, with a field the type does not declare yet.
+   */
+  it("spreads the shared findings verbatim, including ones not declared yet", () => {
+    const unfetchableBundles = [{ machineId: "m3", machineName: "laptop", bundleIds: ["b9"] }];
+
+    const declared = reportPullResult(report({ findings: { unfetchableBundles } }), []);
+    expect(declared.unfetchableBundles).toEqual(unfetchableBundles);
+
+    const future = { unfetchableBundles, chainGaps: [{ afterUuid: "u-7", stranded: 2 }] };
+    const widened = reportPullResult(report({ findings: future as HubPullFindings }), []);
+    expect(widened).toMatchObject({
+      unfetchableBundles,
+      chainGaps: [{ afterUuid: "u-7", stranded: 2 }],
+    });
+  });
+
+  /**
+   * An empty `findings` is the ordinary case, and it must not leave the result
+   * carrying keys whose presence a caller reads as a disclosure.
+   */
+  it("adds no disclosure keys when there is nothing to disclose", () => {
+    const result = reportPullResult(report(), []);
+    expect("unfetchableBundles" in result).toBe(false);
+  });
+
+  /**
+   * The wiring, asserted against the sequencer's own source because no input
+   * reaches this branch yet. Two facts, and the second is the contract the
+   * select stage's union doc states: `stop` is dispatched BEFORE the stage's
+   * warnings are spread (its results have no `warnings` field to hold them),
+   * and `report` after (its result does, and a pull that changed nothing with
+   * no account of why is the outcome this exit exists to prevent).
+   */
+  it("is dispatched by hubPull, after the warnings spread and after every stop", () => {
+    const src = readFileSync(
+      join(import.meta.dirname, "..", "src", "hub", "pull.ts"),
+      "utf-8"
+    ).replace(/\r\n/g, "\n");
+    const start = src.indexOf("export async function hubPull(");
+    expect(start, "hubPull must exist in src/hub/pull.ts").toBeGreaterThan(-1);
+    const body = src.slice(start);
+
+    expect(body).toContain('sel.kind === "report"');
+    expect(body).toContain("reportPullResult(sel.value");
+
+    const stopAt = body.indexOf('if (sel.kind === "stop") return sel.result;');
+    const spreadAt = body.indexOf("warnings.push(...sel.warnings);");
+    const reportAt = body.indexOf('sel.kind === "report"');
+    expect(stopAt, "the stop dispatch must still be in hubPull").toBeGreaterThan(-1);
+    expect(spreadAt, "the select stage's warnings must be spread after the stop dispatch").toBeGreaterThan(stopAt);
+    expect(reportAt, "the report dispatch must come after that spread").toBeGreaterThan(spreadAt);
+  });
+});
+
+/**
+ * THE PER-RECORD SOURCE MACHINE, and the invariance proof that it changed
+ * nothing for the shape every hub actually has today.
+ *
+ * `needed` used to be `HubBundleRecord[]` drawn from exactly ONE machine's
+ * bundle list, so one `sourceMachineId` scalar described every record in it.
+ * Three sites downstream spend that scalar on a peer ledger, and the moment
+ * chain assembly lets `needed` span machines the scalar is wrong for some of
+ * the records — silently, with no type error and no throw.
+ *
+ * Why that is not cosmetic, in the invariant's own words:
+ *
+ * > Any future transfer path that moves sessions BETWEEN machines without
+ * > going through the hub must NOT credit the hub ledger here. Doing so would
+ * > make the next push ship only a delta, leaving a continuation chain on the
+ * > hub with no base bundle to anchor it — an unreconstructable thread for any
+ * > third machine.
+ * > — `recordSentToPeer`, src/sync-state.ts
+ *
+ * The doc is written about the hub's own peer id, but the mechanism is the
+ * same for a machine's: `peers[...].received` is `selectNeededBundles`'s dedup
+ * input and `peers[...].sent` is the incremental diff's baseline, so crediting
+ * machine X for content machine Y supplied makes the next push believe Y holds
+ * a base it does not. That is the unreconstructable-thread defect #35 exists to
+ * fix, reintroduced by its own fix.
+ *
+ * So this block is a RATCHET, not a feature test. The end-to-end case below
+ * asserts on the sync-state FILE, and it was written and run green against the
+ * scalar version of the code before the pairing existed — which is what makes
+ * "credits exactly the ledgers it credits today" a measurement rather than a
+ * hope. The two unit cases under it are the half a two-machine pull cannot
+ * reach: with one machine supplying every bundle, the record's machine and the
+ * pull's resolved machine are the same string, so only a plan whose record
+ * disagrees with the pull's source can tell which one a site spent.
+ */
+describe("per-record source machine (the sourceMachineId ripple)", () => {
+  const CLAUDE_VERSION = "2.1.81";
+
+  /**
+   * A -> hub -> B, twice: a full bundle B imports, then a continuation B
+   * SPLICES onto it. The splice matters — it is the only path that reaches
+   * `recordSplice`, i.e. the two `peerId:` sites, and a pull that only ever
+   * imports fragments would assert nothing about them.
+   */
+  it("credits exactly the ledgers a two-machine pull credits today", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sm-ledger-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sm-ledger-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sm-ledger-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sm-ledger-fix-"));
+    const projectB = mkdtempSync(join(tmpdir(), "sm-ledger-projB-"));
+    let restore = overrideHome(homeA);
+    try {
+      // --- A: a real, git-less project pushed once --------------------------
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = join(base, "projA-ledger");
+      mkdirSync(projectA, { recursive: true });
+      writeFileSync(join(projectA, "README.md"), "hello\n");
+      const encodedA = encodeProjectPath(projectA);
+      cpSync(join(configDirA, "projects", FIXTURE_ENCODED), join(configDirA, "projects", encodedA), {
+        recursive: true,
+      });
+      const aJsonl = join(configDirA, "projects", encodedA, `${FIXTURE_SESSION_ID}.jsonl`);
+
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      // Both peer ids the assertions below name, read from the real sources
+      // rather than guessed: the machine id is a randomUUID and the hub peer
+      // is `hub:<hubId>` (pull-resolve.ts).
+      const machineA = loadOrCreateMachineId().id;
+      const hubId = (JSON.parse(readFileSync(join(hub, HUB_JSON), "utf-8")) as { hubId: string }).hubId;
+      const hubPeerId = `hub:${hubId}`;
+
+      const push1 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push1.success).toBe(true);
+      if (!push1.success) return;
+
+      // --- B: links to the same hub project and bootstraps off push #1 ------
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      writeLocalProjectId(projectB, {
+        projectId: push1.projectId, name: "projA-ledger",
+        createdAt: "2026-08-01T00:00:00.000Z", createdByMachine: machineA,
+      });
+      const pull1 = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pull1.success).toBe(true);
+      if (!pull1.success) return;
+      const bSessionId = (pull1 as HubPullResult).localSessionId;
+      expect(bSessionId, "B's bootstrap must land a local session").toBeTruthy();
+      const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${bSessionId}.jsonl`);
+      // State the base's age explicitly rather than leaning on append.ts's
+      // self-write exemption (that exemption is a sub-ms clock coincidence,
+      // never a fixture) — without it the next pull declines the splice as
+      // "recently-active" and this case silently tests the fragment path.
+      const old = new Date(Date.now() - 60 * 60 * 1000);
+      utimesSync(bJsonl, old, old);
+
+      // --- A continues the same thread and pushes a continuation ------------
+      restore.restore();
+      restore = overrideHome(homeA);
+      const anchor = readLastEntryUuid(aJsonl);
+      expect(anchor, "A's session must have a head entry").toBeTruthy();
+      appendFileSync(
+        aJsonl,
+        JSON.stringify({
+          uuid: "a-ledger-1", parentUuid: anchor, timestamp: "2026-08-01T12:00:00.000Z",
+          sessionId: FIXTURE_SESSION_ID, cwd: projectA, version: CLAUDE_VERSION, type: "user",
+          message: { role: "user", content: "more work on A" },
+        }) + "\n",
+        "utf-8"
+      );
+      const push2 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push2.success).toBe(true);
+      if (!push2.success) return;
+
+      // --- The act: B pulls the continuation --------------------------------
+      restore.restore();
+      restore = overrideHome(homeB);
+      const pull2 = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pull2.success).toBe(true);
+      if (!pull2.success) return;
+      const p2 = pull2 as HubPullResult;
+      // Preconditions, so a fixture drift fails HERE rather than leaving the
+      // ledger assertions below vacuously true of some other code path.
+      expect(p2.appended, "the continuation must SPLICE, which is what runs recordSplice").toHaveLength(1);
+      expect(p2.localSessionId).toBe(bSessionId);
+      // The pull's resolved machine — still meaningful, and still A's, which is
+      // also why a two-machine pull cannot by itself distinguish the scalar
+      // from the per-record id. See the unit cases below.
+      expect(p2.sourceMachineId).toBe(machineA);
+
+      // --- The invariant, read off the state FILE ---------------------------
+      const stateB = readSyncState(projectB);
+      // Exactly two ledgers exist: the machine that supplied the bundles, and
+      // the hub that mediated them. A mis-credit shows up here as a third key
+      // or as a receipt sitting under the wrong one of these two.
+      expect(Object.keys(stateB.peers).sort()).toEqual([hubPeerId, machineA].sort());
+      const headNow = readLastEntryUuid(bJsonl);
+      expect(headNow, "the spliced base must still have a readable head").toBeTruthy();
+      // Every receipt A's ledger holds names B's own session — the mapping
+      // `selectNeededBundles` dedups the next pull against.
+      const receipts = Object.entries(stateB.peers[machineA].received);
+      expect(receipts.length).toBeGreaterThan(0);
+      for (const [sessionIdInBundle, rec] of receipts) {
+        expect(rec.localSessionId, `receipt for ${sessionIdInBundle} must credit B's session`).toBe(bSessionId);
+      }
+      // ...and both "already has it" ledgers are level with the spliced head.
+      // These two are `recordSplice`'s writes, i.e. the site that spends the
+      // per-bundle machine id.
+      expect(Object.keys(stateB.peers[machineA].sent)).toEqual([bSessionId]);
+      expect(stateB.peers[machineA].sent[bSessionId!]).toMatchObject({
+        headEntryUuid: headNow, sentAsType: "continuation",
+      });
+      expect(Object.keys(stateB.peers[hubPeerId].sent)).toEqual([bSessionId]);
+      expect(stateB.peers[hubPeerId].sent[bSessionId!]).toMatchObject({
+        headEntryUuid: headNow, sentAsType: "continuation",
+      });
+      expect(getThreadId(stateB, bSessionId!)).toBe(p2.threadId);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base, projectB]) {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
   });
 });

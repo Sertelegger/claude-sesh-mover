@@ -121,6 +121,44 @@ function recordSplice(b) {
         sentAsSessionId: b.record.sessionIdInBundle,
     });
 }
+/**
+ * The `HubPullResult` the select stage's `report` exit produces — the one
+ * success that applied nothing (see `SelectReport` in pull-select.ts for why
+ * that exit exists at all).
+ *
+ * A NAMED FUNCTION rather than an object literal at the dispatch site, for one
+ * reason: nothing produces the arm until chain assembly lands, so this is the
+ * only way the rendering can be exercised, and an unwired exit that has never
+ * been rendered is not a shape the result type can express — it is a claim that
+ * it can.
+ *
+ * The result is assembled HERE, in the sequencer, and not handed back by the
+ * stage — the same reason the pick list is: `warnings` is the caller's list
+ * (the stale-lock steal and the resolve stage's reasons are in it already), and
+ * passing it into the stage only to get it back is a detour.
+ *
+ * `findings` is SPREAD rather than copied field by field, which is the whole
+ * point of it being the shared `HubPullFindings`: a disclosure added to the
+ * result type arrives here with no edit. It may therefore never carry a key set
+ * explicitly below, which is why the spread sits between the two groups.
+ */
+export function reportPullResult(report, warnings) {
+    return {
+        success: true,
+        command: "pull",
+        threadId: report.threadId,
+        sourceMachineId: report.sourceMachineId,
+        // Nothing was fetched, so nothing landed, so nothing was mapped: naming a
+        // local session here would claim a thread mapping this run did not write.
+        importedSessions: [],
+        skippedSessions: [],
+        localSessionId: null,
+        workspaceUnpacked: null,
+        ...report.findings,
+        nothingToApply: { reason: report.reason },
+        warnings,
+    };
+}
 export async function hubPull(opts) {
     // Captured ONCE for the whole operation, never per bundle: append.ts treats
     // a base whose mtime is >= this as "written by us, not by a live Claude
@@ -210,16 +248,29 @@ export async function hubPull(opts) {
             return { success: true, command: "pull", pickRequired: true, threads: sel.threads, warnings };
         }
         warnings.push(...sel.warnings);
+        // ...and `report` is dispatched AFTER that spread, which is the other half
+        // of the same contract: it is the one exit that is `success: true` and
+        // applied nothing, its result has a `warnings` field to carry the stage's
+        // sentences, and losing them would leave a pull that changed nothing with
+        // no account of why. Nothing produces this arm yet — see `SelectReport`.
+        if (sel.kind === "report")
+            return reportPullResult(sel.value, warnings);
         // Narrowed on purpose — ids, not the ResolvedThread/ThreadCopy they came
         // from. Nothing below can re-derive the selection from `copies`, the field
         // carrying the iteration-order ban.
+        //
+        // `sourceMachineId` is the machine this pull RESOLVED to and is spent only
+        // on the result's source label; every ledger credit below comes from the
+        // per-record `machineId` on `needed` instead (see `SourcedBundle`).
         const { threadId, sourceMachineId, needed, unfetchableBundles } = sel.value;
         opts.onProgress?.({ phase: "hub-pull", percent: 0 });
         // Every accumulator this pull's per-bundle loop writes, in one MUTABLE
         // object passed by reference. Nothing here may be snapshotted or copied —
-        // see pull-apply-state.ts.
-        const st = initApplyState({ needed });
-        for (const [i, record] of needed.entries()) {
+        // see pull-apply-state.ts. It is handed the RECORDS alone: all it asks of
+        // them is which bundle carries the workspace generation, and who supplied
+        // a bundle is a ledger question no accumulator has any business answering.
+        const st = initApplyState({ needed: needed.map((n) => n.record) });
+        for (const [i, { machineId: bundleMachineId, record }] of needed.entries()) {
             // Download, unpack and read the manifest — and, on the way through,
             // write this bundle's workspace generation and carry into `st`. Both are
             // MUTATIONS rather than returned values on purpose (see pull-fetch.ts):
@@ -290,7 +341,9 @@ export async function hubPull(opts) {
                 targetProjectDir,
                 claudeVersion: opts.claudeVersion,
                 threadId,
-                sourceMachineId,
+                // This bundle's own machine, not the pull's resolved one — the ledger
+                // a splice credits has to be the peer that supplied THIS record.
+                bundleMachineId,
                 hubPeerId,
                 noAppend: !!opts.noAppend,
                 forceAppend: !!opts.forceAppend,
@@ -371,7 +424,9 @@ export async function hubPull(opts) {
             machineId: machine.id,
             hubId: hub.hubId,
             threadId,
-            sourceMachineId,
+            // No `sourceMachineId`: the stage's one use of it was a receipt lookup,
+            // which is a question about the peer that supplied the last bundle —
+            // carried on `needed` itself now.
             needed,
             apply: st,
         });

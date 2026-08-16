@@ -569,7 +569,52 @@ export interface HubLockBusyResult {
     error?: string;
     suggestion: string;
 }
-export interface HubPullResult {
+/**
+ * The chain-assembly disclosures a pull may attach to its result: what it worked
+ * out about a thread's history that it could not deliver. Every field is
+ * optional and absent on an ordinary pull, so "nothing to disclose" is the empty
+ * object rather than a flag.
+ *
+ * ONE DECLARATION, mixed into `HubPullResult` below and carried verbatim by the
+ * select stage's `report` outcome (`SelectReport.findings`, hub/pull-select.ts),
+ * which `hubPull` spreads into the result unchanged. A disclosure added here
+ * therefore reaches the ordinary pull and the applied-nothing report at the same
+ * moment; a second, hand-written copy on the stage side is exactly how a finding
+ * ends up reportable on one path and silently dropped on the other.
+ */
+export interface HubPullFindings {
+    /**
+     * Bundles for this thread that this pull could not fetch because they are
+     * listed only by a machine other than the one it resolved to. Absent on
+     * every ordinary pull — see `UnfetchableBundleGroup` and, for the reasoning,
+     * `findUnfetchableBundles` in hub/threads.ts.
+     *
+     * A field rather than warning prose because the skill layer has to branch on
+     * it: everything else this result reports (`importedSessions`, `appended`,
+     * an empty `warnings`) describes a pull that succeeded, and it did — it just
+     * did not deliver the whole thread. Warning text is not an interface (see
+     * `commands/pull.md`).
+     */
+    unfetchableBundles?: UnfetchableBundleGroup[];
+}
+/**
+ * Why a pull applied nothing, on the one exit where applying nothing is the
+ * whole and correct answer rather than a failure. See `HubPullResult`'s
+ * `nothingToApply`.
+ */
+export interface HubPullNothingToApply {
+    /**
+     * One or more sentences: what was worked out about this thread, and why none
+     * of it needed applying. Never empty — an exit with nothing to say is the
+     * ordinary "nothing to pull" refusal, not this.
+     *
+     * Prose, so it is deliberately not an interface. Anything a caller must
+     * branch on belongs in `HubPullFindings` instead (see `commands/pull.md` on
+     * why warning text is not a contract).
+     */
+    reason: string;
+}
+export interface HubPullResult extends HubPullFindings {
     success: true;
     command: "pull";
     threadId: string;
@@ -652,18 +697,27 @@ export interface HubPullResult {
     }>;
     divergence?: HubPullDivergence;
     /**
-     * Bundles for this thread that this pull could not fetch because they are
-     * listed only by a machine other than the one it resolved to. Absent on
-     * every ordinary pull — see `UnfetchableBundleGroup` and, for the reasoning,
-     * `findUnfetchableBundles` in hub/threads.ts.
+     * Present exactly when this pull resolved a thread, worked out that there was
+     * nothing left to fetch for it, and therefore applied nothing — and that is
+     * the complete, correct answer rather than a failure. Alongside it,
+     * `importedSessions`/`skippedSessions`/`appended` are empty and
+     * `localSessionId` is null, because this run landed nothing and so wrote no
+     * thread mapping.
      *
-     * A field rather than warning prose because the skill layer has to branch on
-     * it: everything else this result reports (`importedSessions`, `appended`,
-     * an empty `warnings`) describes a pull that succeeded, and it did — it just
-     * did not deliver the whole thread. Warning text is not an interface (see
-     * `commands/pull.md`).
+     * WHY IT IS A SUCCESS FIELD AND NOT AN ERROR. The pull's failure contract is
+     * apply-safe-and-name-the-gap: truthfulness is the invariant, completeness is
+     * best-effort. "Here is this thread's history, here is the part of it I cannot
+     * reach, and I correctly changed nothing" satisfies both. Returning it as
+     * `success: false` is the nag loop the disclosure fields exist to break, one
+     * branch later — an error tells the caller to try again, and every try says
+     * the same thing forever.
+     *
+     * NOT TO BE CONFUSED with `pull-record.ts`'s local `appliedNothing`, which
+     * asks a different question of a pull that DID fetch a chain (did any of its
+     * bundles land?) and is true on the divergence-skip path, where this field is
+     * absent.
      */
-    unfetchableBundles?: UnfetchableBundleGroup[];
+    nothingToApply?: HubPullNothingToApply;
     warnings: string[];
 }
 export interface HubPullDivergence {
