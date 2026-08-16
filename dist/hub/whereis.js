@@ -11,7 +11,7 @@ import { readAllIndexes } from "./index-file.js";
 // neither module calls the other while its own body is evaluating, so the ESM
 // cycle resolves before either is invoked. The alternative was a fourth copy
 // of a selection rule that has already disagreed with itself once.
-import { pullSourceFor } from "./threads.js";
+import { planThreadPull, pullSourceFor, sourcedKey } from "./threads.js";
 import { resolveThreads, findUnfetchableBundles } from "./threads.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { encodeProjectPath } from "../platform.js";
@@ -69,14 +69,33 @@ export async function shapeThreads(backend, resolved, meId, state, targetProject
         // (#44). It fed `pullNeeded` until this fix, which is how `whereis` came to
         // report `pullNeeded: false` for a thread `pull --thread <id>` fetched.
         const current = localEntry !== null && localEntry.headEntryUuid === t.latest.headEntryUuid;
-        // Asked of the copy a pull would actually resolve to (`latest`), so this
-        // answers the same question `pull` answers, before the user runs it.
+        // The pull's own selector, once, reused twice below — `pullNeeded` is
+        // whether it found a source at all, and the plan it implies is what keeps
+        // the disclosure beside it honest.
+        const source = pullSourceFor(t, state, { machineId: meId, targetProjectDir });
+        // MINUS WHAT A PULL WOULD ACTUALLY FETCH (#35). The heuristic answers "which
+        // bundles do other machines list that the RESOLVED machine's list does not
+        // offer", and chain assembly made most of those fetchable — so left
+        // unsubtracted this field would tell a user a bundle is out of reach that
+        // `pull` fetches on the next line. Same subtraction, same key builder, as
+        // the select stage's: `whereis` exists to answer `pull`'s question before
+        // the user runs it, so a second opinion here is a defect by construction.
+        const fetching = new Set(source
+            ? planThreadPull({
+                thread: t, source, state, machineId: meId, targetProjectDir,
+            }).needed.map((n) => sourcedKey(n.machineId, n.record.bundleId))
+            : []);
         const unfetchable = findUnfetchableBundles({
             copies: t.copies,
             sourceMachineId: t.latest.machineId,
             localMachineId: meId,
             state,
-        });
+        })
+            .map((u) => ({
+            machineId: u.machineId,
+            bundleIds: u.bundleIds.filter((id) => !fetching.has(sourcedKey(u.machineId, id))),
+        }))
+            .filter((u) => u.bundleIds.length > 0);
         threads.push({
             threadId: t.threadId,
             slug: t.slug,
@@ -103,8 +122,10 @@ export async function shapeThreads(backend, resolved, meId, state, targetProject
             // "run /sesh-mover:pull", so it has to be true exactly when a pull of
             // this thread would fetch a bundle. `pullSourceFor` covers the case where
             // the newest copy is ours too (a peer can still list something we never
-            // received), so no `machineId` test is needed alongside it.
-            pullNeeded: pullSourceFor(t, state, { machineId: meId, targetProjectDir }) !== undefined,
+            // received), and since #35 it asks the ASSEMBLED chain rather than one
+            // machine's list — so this field went cross-machine-correct with no edit
+            // here, which is the point of there being one selector.
+            pullNeeded: source !== undefined,
             unfetchableBundles: unfetchable.length > 0
                 ? await Promise.all(unfetchable.map(async (u) => ({
                     machineId: u.machineId,

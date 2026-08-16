@@ -59,16 +59,18 @@ export interface SelectStageInput {
  * and the file-derived id SECOND. A fetch plan is a per-pull structure nobody
  * stores, so it is free to carry what the schema may not.
  *
- * TODAY EVERY ELEMENT OF ONE PLAN CARRIES THE SAME `machineId`: `needed` is
- * still drawn from a single `ThreadCopy`'s bundle list, so this pairing changes
- * no behaviour and is asserted not to (see "per-record source machine" in
- * tests/hub-pull-stages.test.ts). It exists because chain assembly (#35) is
- * about to make that list span machines, and three sites downstream spend the
- * plan's machine id on a peer ledger: a scalar that is right for the plan is
- * wrong for a record the moment those two come apart, and the failure mode is
- * a silently mis-credited `received`/`sent` ledger — which is `recordSentToPeer`'s
- * own unreconstructable-thread invariant (src/sync-state.ts), i.e. the defect
- * #35 exists to fix.
+ * ELEMENTS OF ONE PLAN NOW DISAGREE, which is what the pairing was built for.
+ * Chain assembly (#35) draws `needed` from every machine's list, and three
+ * sites downstream spend a machine id on a peer ledger: a scalar that is right
+ * for the plan is wrong for a record the moment those two come apart, and the
+ * failure mode is a silently mis-credited `received`/`sent` ledger — which is
+ * `recordSentToPeer`'s own unreconstructable-thread invariant
+ * (src/sync-state.ts), i.e. the defect #35 exists to fix, reintroduced by its
+ * own fix. Asserted end to end on the sync-state FILE, in both resolution
+ * branches, by "cross-machine chain assembly, end to end" in
+ * tests/hub-pull-stages.test.ts; the two-machine invariance case beside it is
+ * the measurement that the pairing changed nothing for the shape every hub had
+ * before assembly.
  */
 export interface SourcedBundle {
     /**
@@ -145,10 +147,10 @@ export interface SelectStageResult {
  * `success: true` and has no `error` field for a synthesized
  * `reasons: [terminal.error]` to read is that same argument a third time.
  *
- * NOTHING PRODUCES IT YET. It becomes reachable when chain assembly lands and an
- * assembled plan can be legitimately empty; until then it is a typed,
- * dispatched, tested exit with no producer, which is deliberate rather than
- * dead code.
+ * ITS PRODUCER IS THE EMPTY-PLAN BRANCH, since chain assembly landed: an
+ * assembled plan is legitimately empty whenever every record the walk could
+ * place is already here, and the walk still has something to say about the
+ * records it could not place.
  */
 export interface SelectReport {
     threadId: string;

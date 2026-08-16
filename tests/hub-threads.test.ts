@@ -1,6 +1,13 @@
-import { describe, it, expect } from "vitest";
-import { assembleChain, resolveThreads, findUnfetchableBundles } from "../src/hub/threads.js";
-import type { AssembledChain } from "../src/hub/threads.js";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  alternateSource, assembleChain, planThreadPull, pullSourceFor, resolveThreads,
+  findUnfetchableBundles,
+} from "../src/hub/threads.js";
+import type { AssembledChain, ResolvedThread } from "../src/hub/threads.js";
+import type { SyncState } from "../src/types.js";
 import {
   idx, entry, bundle, copy, peer, syncState, chainHead, chainIndexes,
 } from "./helpers/hub-fixtures.js";
@@ -861,5 +868,190 @@ describe("assembleChain", () => {
       expect(a.rootChoice).toBe("bundle-id");
       expect(a.unreachableBundleIds).toEqual(["b1"]);
     });
+  });
+});
+
+/**
+ * THE SELECTORS, after chain assembly (#35).
+ *
+ * `planThreadPull` is what replaced "take the resolved machine's bundle list
+ * and slice it from its last full record onward". `pullSourceFor` is the one
+ * question every selector asks — `pull --latest`, `pull --thread` and
+ * `whereis`'s `pullNeeded` all call it — and #44 shipped it scoped to the
+ * same-machine half, saying so in as many words. These cases are that scope
+ * note coming off: the question is now asked of the ASSEMBLED chain, so all
+ * three selectors moved together with no edit at any call site.
+ */
+describe("planThreadPull / pullSourceFor", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sesh-plan-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const ME = "me";
+  const ctx = (): { machineId: string; targetProjectDir: string } => ({
+    machineId: ME,
+    targetProjectDir: dir,
+  });
+
+  /** One thread, built from a chain spec, with `mB` pinned as the latest copy. */
+  function thread(
+    spec: Record<string, ChainRecordInput[]>,
+    opts: ChainIndexesOptions = {}
+  ): ResolvedThread {
+    const resolved = resolveThreads(
+      chainIndexes(spec, {
+        advertise: { mB: { lastActiveAt: "2026-07-22T00:00:00Z" } },
+        ...opts,
+      })
+    );
+    expect(resolved).toHaveLength(1);
+    return resolved[0];
+  }
+
+  /** A receipt for one machine's bundles, with the local file it names present. */
+  function received(machineId: string, localSessionId = `local-${machineId}`): SyncState {
+    writeFileSync(join(dir, `${localSessionId}.jsonl`), "{}\n", "utf-8");
+    return syncState({
+      [machineId]: peer({
+        received: {
+          [`sess-${machineId}`]: {
+            localSessionId, type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+          },
+        },
+      }),
+    });
+  }
+
+  const plan = (t: ResolvedThread, st: SyncState) =>
+    planThreadPull({
+      thread: t, source: t.latest, state: st, machineId: ME, targetProjectDir: dir,
+    });
+
+  it("plans across every machine's list, root first, when one machine holds only part", () => {
+    const t = thread({ mA: ["b0"], mB: ["b1<-b0"] });
+    expect(t.latest.machineId).toBe("mB");
+
+    const p = plan(t, syncState());
+
+    expect(p.needed.map((s) => [s.machineId, s.record.bundleId])).toEqual([
+      ["mA", "b0"],
+      ["mB", "b1"],
+    ]);
+    expect(p.assembledCoversSource).toBe(true);
+    expect(p.outstanding).toEqual([]);
+  });
+
+  it("still finds work when the resolved machine's own list is fully received (the #35 nag)", () => {
+    // The shape that answered "Already up to date with the source machine"
+    // forever: everything mB lists is here, and the earlier half of the
+    // conversation — listed only by mA — is not.
+    const t = thread({ mA: ["b0"], mB: ["b1<-b0"] });
+    const st = received("mB");
+
+    expect(pullSourceFor(t, st, ctx())?.machineId).toBe("mB");
+    expect(plan(t, st).needed.map((s) => s.record.bundleId)).toEqual(["b0"]);
+  });
+
+  it("answers nothing-to-pull only when the whole assembled chain is here", () => {
+    const t = thread({ mA: ["b0"], mB: ["b1<-b0"] });
+    const st = received("mB");
+    st.peers.mA = peer({
+      received: {
+        "sess-mA": {
+          localSessionId: "local-mB", type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+        },
+      },
+    });
+
+    expect(pullSourceFor(t, st, ctx())).toBeUndefined();
+    expect(plan(t, st).needed).toEqual([]);
+  });
+
+  it("never re-fetches this machine's own pushes, though the walk must still cross them", () => {
+    // Our own record is the ROOT: dropping it from the walk would strand
+    // everything anchored on it, so it stays in the chain and leaves the plan.
+    const t = thread({ [ME]: ["b0"], mB: ["b1<-b0"] });
+
+    const p = plan(t, syncState());
+
+    expect(p.assembled.chain.map((s) => s.record.bundleId)).toEqual(["b0", "b1"]);
+    expect(p.needed.map((s) => [s.machineId, s.record.bundleId])).toEqual([["mB", "b1"]]);
+  });
+
+  it("orders by links, never by pushedAt — which descends in these fixtures", () => {
+    const stamps = plan(thread({ mA: ["b0"], mB: ["b1<-b0"] }), syncState()).needed.map(
+      (s) => s.record.pushedAt
+    );
+    expect([...stamps].sort()).toEqual([...stamps].reverse());
+  });
+
+  it("falls back to the resolved machine's own list when no link can cover it", () => {
+    // Every bundle on every hub today predates `anchorEntryUuid`, so assembly
+    // reduces this thread to its root. Narrowing the plan to that would stop
+    // this release fetching continuations it fetches today — assembly may widen
+    // a plan and may reorder it, never shrink it below one machine's list.
+    const t = thread({ mB: ["b0", "b1<-b0"] }, { linkStyle: "pre-assembly" });
+
+    const p = plan(t, syncState());
+
+    expect(p.assembled.chain.map((s) => s.record.bundleId)).toEqual(["b0"]);
+    expect(p.assembledCoversSource).toBe(false);
+    expect(p.needed.map((s) => [s.machineId, s.record.bundleId])).toEqual([
+      ["mB", "b0"],
+      ["mB", "b1"],
+    ]);
+    expect(pullSourceFor(t, syncState(), ctx())?.machineId).toBe("mB");
+  });
+
+  it("names what it is leaving behind, and never what is already here", () => {
+    // b2 predates the anchor field, so no walk can place it and no fallback
+    // reaches it (it is not on the resolved machine's list). b0/b1 are being
+    // fetched, so neither is outstanding.
+    const t = thread({
+      mA: ["b0", { id: "b2", from: "b0", preAssembly: true }],
+      mB: ["b1<-b0"],
+    });
+
+    const p = plan(t, syncState());
+
+    expect(p.needed.map((s) => s.record.bundleId)).toEqual(["b0", "b1"]);
+    expect(p.outstanding.map((s) => [s.machineId, s.record.bundleId])).toEqual([["mA", "b2"]]);
+    // Unlinkable, and specifically NOT a gap: a gap is a link naming an entry
+    // no bundle carries, which sends a user hunting for a missing bundle.
+    expect(p.assembled.unanchored).toEqual([
+      { machineId: "mA", bundleId: "b2", preAssembly: true },
+    ]);
+    expect(p.assembled.gaps).toEqual([]);
+  });
+
+  it("merges nothing back into any machine's stored bundle list (§4.4.2)", () => {
+    const t = thread({ mA: ["b0"], mB: ["b1<-b0"] });
+    const before = JSON.parse(JSON.stringify(t.copies)) as unknown;
+
+    plan(t, syncState());
+
+    expect(JSON.parse(JSON.stringify(t.copies))).toEqual(before);
+    expect(t.copies.map((c) => c.bundles.length)).toEqual([1, 1]);
+  });
+
+  it("delegates the local-latest case to alternateSource, chain or no chain", () => {
+    // Our copy is newest and lists nothing; mB still holds an unreceived
+    // bundle. Re-gating unconditionally here would run the receipt filter over
+    // OUR list, where a missing receipt is ordinary, and start re-fetching our
+    // own pushes.
+    const t = thread(
+      { mB: ["b0"], [ME]: [] },
+      { advertise: { [ME]: { lastActiveAt: "2026-07-23T00:00:00Z" } } }
+    );
+    expect(t.latest.machineId).toBe(ME);
+
+    expect(alternateSource(t, syncState(), ctx())?.machineId).toBe("mB");
+    expect(pullSourceFor(t, syncState(), ctx())?.machineId).toBe("mB");
+    expect(pullSourceFor(t, received("mB"), ctx())).toBeUndefined();
   });
 });

@@ -217,6 +217,108 @@ describe("hub whereis", () => {
     }
   });
 
+  /**
+   * #35, the whereis half — the shape the issue calls the indefinite nag.
+   *
+   * The conversation was started on remote-a and continued on remote-b, so half
+   * its bundles are in each machine's index and neither holds it whole. This
+   * machine has remote-b's half and, before chain assembly, that was the end of
+   * it: the thread resolves to remote-b, remote-b's list was fully received, so
+   * `pullNeeded` was FALSE forever while `unfetchableBundles` named remote-a's
+   * bundle as out of reach — and the head matched, so the row read "current"
+   * too. Three reassuring fields over half a conversation.
+   *
+   * `pullSourceFor` now asks the assembled chain, and `whereis` calls exactly
+   * that function, so both fields moved with it and neither was edited here.
+   */
+  it("the earlier half of a thread sits on a third machine -> pullNeeded true, nothing unfetchable (#35)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-whereis-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-whereis-hub-"));
+    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-proj-"));
+    const restore = overrideHome(home);
+    try {
+      const me = loadOrCreateMachineId();
+      writeLocalProjectId(projectDir, {
+        projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
+      });
+      const backend = createFsBackend(hub);
+      await writeMachineFile(backend, me.id, "my-laptop");
+      await writeMachineFile(backend, "remote-a", "the-first-machine");
+      await writeMachineFile(backend, "remote-b", "the-second-machine");
+
+      // remote-a started it...
+      await writeMachineIndex(backend, {
+        ...idx("remote-a", {
+          t1: entry({
+            localSessionId: "sA", lastActiveAt: "2026-07-20T00:00:00Z", headEntryUuid: "head-a1",
+            bundles: [
+              bundle({
+                bundleId: "a1", file: "projects/proj-1/bundles/remote-a/a1.tar.gz",
+                type: "full", sessionIdInBundle: "sA",
+                anchorEntryUuid: null, headEntryUuid: "head-a1",
+              }),
+            ],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      // ...and remote-b continued it, anchored on remote-a's head.
+      await writeMachineIndex(backend, {
+        ...idx("remote-b", {
+          t1: entry({
+            localSessionId: "sB", lastActiveAt: "2026-07-21T00:00:00Z", headEntryUuid: "head-b1",
+            bundles: [
+              bundle({
+                bundleId: "b1", file: "projects/proj-1/bundles/remote-b/b1.tar.gz",
+                type: "continuation", sessionIdInBundle: "sB",
+                anchorEntryUuid: "head-a1", headEntryUuid: "head-b1",
+              }),
+            ],
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      // This machine holds remote-b's half and advertises its head, so head
+      // equality says "current" — the trap #35 names.
+      await writeMachineIndex(backend, {
+        ...idx(me.id, {
+          t1: entry({
+            localSessionId: "sLocal", lastActiveAt: "2026-07-19T00:00:00Z",
+            headEntryUuid: "head-b1",
+          }),
+        }),
+        projectId: PROJECT_ID,
+      });
+      writeSyncState({
+        ...emptySyncState(projectDir),
+        peers: {
+          "remote-b": peer({
+            received: {
+              sB: { localSessionId: "sLocal", type: "continuation", importedAt: "2026-07-21T01:00:00Z" },
+            },
+          }),
+        },
+      });
+      const projectSessions = join(home, "projects", encodeProjectPath(projectDir));
+      mkdirSync(projectSessions, { recursive: true });
+      writeFileSync(join(projectSessions, "sLocal.jsonl"), "{}\n", "utf-8");
+
+      const result = await hubWhereis({ configDir: home, projectPath: projectDir, hubPath: hub });
+      const t = result.threads[0];
+      expect(t.latest.machineId).toBe("remote-b");
+      // The head still matches, and still says nothing about wholeness.
+      expect(t.localCopy!.current).toBe(true);
+      // A pull WOULD fetch remote-a's root by following b1's anchor, so:
+      expect(t.pullNeeded).toBe(true);
+      // ...and nothing is out of reach, so nothing says it is. Before the fix
+      // this named remote-a and its bundle a1.
+      expect(t.unfetchableBundles).toBeUndefined();
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, projectDir]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
   it("unlinked project -> linked false, candidates listed, threads empty", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-whereis-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-whereis-hub-"));

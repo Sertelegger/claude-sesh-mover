@@ -15,10 +15,8 @@
  * field at all (so the synthesized `reasons: [terminal.error]` has nothing to
  * read).
  *
- * The UNION has one kind more than the function has exits, on purpose: `report`
- * has no producer here yet and is the exit chain assembly needs (see
- * `SelectReport`). A count that disagrees with the union is the expected state
- * until assembly lands, not a stale comment.
+ * The UNION now has a producer for every kind: chain assembly landed and
+ * `report` is reached from the empty-plan branch (see `SelectReport`).
  *
  * THE SYNC-STATE SPLIT IS LOAD-BEARING, so this stage takes a project PATH and
  * does its own I/O rather than accepting a `SyncState`. Only `readSyncState`
@@ -29,25 +27,30 @@
  * `--latest` pull that finds nothing to do start renaming state files aside, on
  * the code path the SessionStart hook also runs.
  *
- * This is the seam #35 (chain assembly) lands in: `needed` being drawn from
- * ONE machine's bundle list, and `alternateSource` being the only widening of
- * that, are both stated here and nowhere else.
+ * #35 (CHAIN ASSEMBLY) LANDED HERE, and this is the seam it landed in: `needed`
+ * is no longer drawn from one machine's bundle list. `planThreadPull` assembles
+ * every machine's records for the thread into one link-ordered plan and the
+ * per-record receipt filter runs over that; `sourceCopy` survives as "the
+ * machine this pull resolved to", which is the source label and the fallback
+ * list for a hub whose bundles predate the link field, and is no longer the
+ * answer to "which peer supplied this record" (that is per record, on `needed`).
  *
- * #44 has landed, and it is HALF the fix. Every selector — `--thread`,
- * `--latest`, and `whereis`'s `pullNeeded` — now asks one question, through
- * `pullSourceFor`: are any of the bundles the resolved machine lists still
- * unreceived here? Head equality no longer decides anything; it survives only
- * as `WhereisThread.localCopy.current`, a display field. What did NOT change is
- * that the question is asked of one machine's list, so #35's cross-machine case
- * still answers "nothing to pull" — see `pullSourceFor`.
+ * #44 IS NOW WHOLE. Every selector — `--thread`, `--latest`, and `whereis`'s
+ * `pullNeeded` — asks one question, through `pullSourceFor`: is the assembled
+ * chain fully received here? #44 closed the same-machine half and said so; the
+ * cross-machine half closed when `pullSourceFor`'s body started asking the
+ * assembled plan instead of one machine's list, which is why all three
+ * selectors moved together with no edit at any call site. Head equality still
+ * decides nothing; it survives only as `WhereisThread.localCopy.current`, a
+ * display field.
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { HubBackend } from "./backend.js";
 import type { HubBundleRecord } from "./layout.js";
 import {
-  alternateSource, findUnfetchableBundles, newerThreadCopy, pullSourceFor, selectNeededBundles,
-  type ResolvedThread, type ThreadCopy,
+  alternateSource, findUnfetchableBundles, planThreadPull, pullSourceFor, sourcedKey,
+  type AssembledChain, type ResolvedThread, type ThreadCopy,
 } from "./threads.js";
 import { createMachineNameLookup, shapeThreads } from "./whereis.js";
 import {
@@ -115,13 +118,124 @@ export function describeUnfetchable(
   );
 }
 
-// Last full bundle + everything after it, minus records already received AND
-// still present locally (mirrors the importer's own dedup verification: a
-// registry/peer record can outlive the file it points at, e.g. after a
-// migrate deleted it, so "already received" is only trusted when the file is
-// still there).
+function count(n: number, one: string, many = `${one}s`): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
 
+/** At most three ids, so one sentence stays readable however wide the hub is. */
+function someIds(ids: string[]): string {
+  const NAMED = 3;
+  const rest = ids.length - NAMED;
+  return ids.slice(0, NAMED).join(", ") + (rest > 0 ? ` and ${rest} more` : "");
+}
 
+/**
+ * What chain assembly worked out about a thread and could NOT deliver, in
+ * words — one sentence per KIND of anomaly, never one per record.
+ *
+ * THE FOUR ARE DELIBERATELY FOUR SENTENCES, because they are four different
+ * facts with four different remedies, and spec §0b exists to keep the first two
+ * apart:
+ *
+ * - a GAP is a link naming an entry no bundle carries: something is missing;
+ * - a PRE-ASSEMBLY record is a bundle pushed before `anchorEntryUuid` existed:
+ *   nothing is missing, the link was never written, and a fresh push re-links
+ *   it. Reporting it as a gap would send a user hunting for a bundle that is
+ *   sitting right there;
+ * - a PARKED branch is a real fork on the hub — this pull followed one side;
+ * - an ADVERTISED-BUT-UNSHIPPED head is not on the hub at all, so no pull of
+ *   any kind reaches it. That one is `reportOnly`: on a pull that applied
+ *   something it is noise about another machine's local state, while on a pull
+ *   that applied nothing it is frequently the entire answer to "why".
+ *
+ * ONLY OUTSTANDING RECORDS ARE EVER NAMED — `outstanding` is `planThreadPull`'s
+ * own answer to "what is this pull leaving where it is", i.e. every record this
+ * machine neither already holds nor is about to fetch. The rule is not restated
+ * here on purpose: a hand-written second copy of the receipt test is how a
+ * disclosure comes to name a bundle the user received months ago. Our own
+ * advertised head is excluded for the analogous reason — it is local work we
+ * have not pushed yet, which is the ordinary state of every machine
+ * mid-session.
+ */
+async function describeAssembly(
+  threadId: string,
+  assembled: AssembledChain,
+  args: {
+    localMachineId: string;
+    outstanding: Set<string>;
+    machineName: (id: string) => Promise<string | null>;
+  }
+): Promise<{ notes: string[]; reportOnly: string[] }> {
+  const { localMachineId, outstanding, machineName } = args;
+  const left = (machineId: string, bundleId: string): boolean =>
+    outstanding.has(sourcedKey(machineId, bundleId));
+  const label = async (id: string): Promise<string> => (await machineName(id)) ?? id;
+
+  const notes: string[] = [];
+
+  const gaps = assembled.gaps.filter((g) => left(g.machineId, g.bundleId));
+  if (gaps.length > 0) {
+    const stranded = new Set(gaps.flatMap((g) => g.strandedBundleIds));
+    for (const g of gaps) stranded.delete(g.bundleId);
+    notes.push(
+      `Thread ${threadId} could not be assembled whole: ${count(gaps.length, "bundle")} ` +
+        `(${someIds(gaps.map((g) => g.bundleId))}) continue${gaps.length === 1 ? "s" : ""} an entry ` +
+        `no bundle on this hub carries` +
+        (stranded.size > 0 ? `, which strands ${count(stranded.size, "later bundle")} behind them` : "") +
+        `. The chain was applied up to that point and stopped there rather than resuming past it. ` +
+        `Nothing is lost: every bundle is still on the hub.`
+    );
+  }
+
+  const pre = assembled.unanchored.filter((u) => u.preAssembly && left(u.machineId, u.bundleId));
+  if (pre.length > 0) {
+    notes.push(
+      `${count(pre.length, "bundle")} for thread ${threadId} (${someIds(pre.map((u) => u.bundleId))}) ` +
+        `${pre.length === 1 ? "was" : "were"} pushed before sesh-mover recorded which entry a ` +
+        `continuation chains onto, so ${pre.length === 1 ? "it has" : "they have"} no place in this ` +
+        `thread's history to be put in. That is a bundle pushed before chain assembly existed, not a ` +
+        `missing one — nothing is lost, and the machine that still holds that session re-links ` +
+        `${pre.length === 1 ? "it" : "them"} the next time it pushes.`
+    );
+  }
+
+  const damaged = assembled.unanchored.filter((u) => !u.preAssembly && left(u.machineId, u.bundleId));
+  if (damaged.length > 0) {
+    notes.push(
+      `${count(damaged.length, "bundle")} for thread ${threadId} ` +
+        `(${someIds(damaged.map((u) => u.bundleId))}) ${damaged.length === 1 ? "declares" : "declare"} ` +
+        `itself a continuation of nothing, which no sesh-mover push can produce — that index is ` +
+        `damaged or hand-edited. ${damaged.length === 1 ? "It was" : "They were"} left alone.`
+    );
+  }
+
+  const parked = assembled.forks
+    .flatMap((f) => f.parked)
+    .filter((b) => left(b.machineId, b.bundleId));
+  if (parked.length > 0) {
+    notes.push(
+      `Thread ${threadId} forks on the hub. This pull followed one branch ` +
+        `(${someIds(assembled.forks.map((f) => f.followedBundleId))}) and left ` +
+        `${count(parked.length, "other branch", "other branches")} ` +
+        `(${someIds(parked.map((b) => b.bundleId))}) unfetched; ` +
+        `${parked.length === 1 ? "it is" : "they are"} still on the hub.`
+    );
+  }
+
+  const ads = assembled.advertisedUnshipped.filter((a) => a.machineId !== localMachineId);
+  const reportOnly: string[] = [];
+  if (ads.length > 0) {
+    const names = await Promise.all([...new Set(ads.map((a) => a.machineId))].map(label));
+    reportOnly.push(
+      `${someIds(names)} ${names.length === 1 ? "advertises" : "advertise"} newer work on thread ` +
+        `${threadId} than ${names.length === 1 ? "it has" : "they have"} pushed to the hub, so no ` +
+        `pull can fetch it yet. That work is not missing from this machine — it has not been ` +
+        `uploaded. It arrives once that machine pushes (its SessionEnd auto-push does this by default).`
+    );
+  }
+
+  return { notes, reportOnly };
+}
 
 export interface SelectStageInput {
   backend: HubBackend;
@@ -157,16 +271,18 @@ export interface SelectStageInput {
  * and the file-derived id SECOND. A fetch plan is a per-pull structure nobody
  * stores, so it is free to carry what the schema may not.
  *
- * TODAY EVERY ELEMENT OF ONE PLAN CARRIES THE SAME `machineId`: `needed` is
- * still drawn from a single `ThreadCopy`'s bundle list, so this pairing changes
- * no behaviour and is asserted not to (see "per-record source machine" in
- * tests/hub-pull-stages.test.ts). It exists because chain assembly (#35) is
- * about to make that list span machines, and three sites downstream spend the
- * plan's machine id on a peer ledger: a scalar that is right for the plan is
- * wrong for a record the moment those two come apart, and the failure mode is
- * a silently mis-credited `received`/`sent` ledger — which is `recordSentToPeer`'s
- * own unreconstructable-thread invariant (src/sync-state.ts), i.e. the defect
- * #35 exists to fix.
+ * ELEMENTS OF ONE PLAN NOW DISAGREE, which is what the pairing was built for.
+ * Chain assembly (#35) draws `needed` from every machine's list, and three
+ * sites downstream spend a machine id on a peer ledger: a scalar that is right
+ * for the plan is wrong for a record the moment those two come apart, and the
+ * failure mode is a silently mis-credited `received`/`sent` ledger — which is
+ * `recordSentToPeer`'s own unreconstructable-thread invariant
+ * (src/sync-state.ts), i.e. the defect #35 exists to fix, reintroduced by its
+ * own fix. Asserted end to end on the sync-state FILE, in both resolution
+ * branches, by "cross-machine chain assembly, end to end" in
+ * tests/hub-pull-stages.test.ts; the two-machine invariance case beside it is
+ * the measurement that the pairing changed nothing for the shape every hub had
+ * before assembly.
  */
 export interface SourcedBundle {
   /**
@@ -245,10 +361,10 @@ export interface SelectStageResult {
  * `success: true` and has no `error` field for a synthesized
  * `reasons: [terminal.error]` to read is that same argument a third time.
  *
- * NOTHING PRODUCES IT YET. It becomes reachable when chain assembly lands and an
- * assembled plan can be legitimately empty; until then it is a typed,
- * dispatched, tested exit with no producer, which is deliberate rather than
- * dead code.
+ * ITS PRODUCER IS THE EMPTY-PLAN BRANCH, since chain assembly landed: an
+ * assembled plan is legitimately empty whenever every record the walk could
+ * place is already here, and the walk still has something to say about the
+ * records it could not place.
  */
 export interface SelectReport {
   threadId: string;
@@ -508,31 +624,65 @@ export async function runSelectStage(input: SelectStageInput): Promise<SelectOut
   }
 
   const state = readSyncState(effectiveProjectPath);
-  const received = state.peers[sourceCopy.machineId]?.received;
-  // Every record is stamped with the machine whose list it came from — one and
-  // the same machine here, because this selection is still ONE copy's bundle
-  // list. The stamp is what stops a later stage reaching for the resolved
-  // machine instead; see `SourcedBundle`.
-  const needed: SourcedBundle[] = selectNeededBundles(
-    sourceCopy.bundles,
-    received,
-    (localSessionId) => existsSync(join(targetProjectDir, `${localSessionId}.jsonl`))
-  ).map((record) => ({ machineId: sourceCopy.machineId, record }));
+  /**
+   * THE #35 LANDING SITE. What stood here was
+   *
+   *   selectNeededBundles(sourceCopy.bundles, received, …)
+   *
+   * — ONE machine's bundle list, sliced from its last full record onward. That
+   * slice is array-position logic over one machine's push order and has no
+   * cross-machine analogue, so it is what assembly supersedes; the per-record
+   * receipt filter it also performed survives untouched and now runs over the
+   * assembled chain, asking each record's OWN machine's ledger (see
+   * `sourcedRecordIsHere`).
+   *
+   * `planThreadPull` orders by links and never by `pushedAt`, writes back into
+   * no machine's stored bundle list, and stamps every record with the machine
+   * that listed it — which is the whole reason `SourcedBundle` exists, because
+   * three sites downstream spend that id on a peer ledger.
+   *
+   * `sourceCopy` is still handed in, and still means "the machine this pull
+   * RESOLVED to". It is spent on two things and neither is a ledger: the plan's
+   * back-compat fallback (a hub whose bundles predate `anchorEntryUuid` cannot
+   * be assembled, and must not thereby stop being fetchable — see
+   * `assembledCoversSource`) and the source label on the result.
+   */
+  const plan = planThreadPull({
+    thread: target,
+    source: sourceCopy,
+    state,
+    machineId,
+    targetProjectDir,
+  });
+  const needed: SourcedBundle[] = plan.needed;
+  const fetching = new Set(needed.map((n) => sourcedKey(n.machineId, n.record.bundleId)));
   // DISCLOSURE ONLY — see findUnfetchableBundles. It reads no timestamp, it
   // merges nothing into the source's bundle list, and nothing below it
   // changes what this pull fetches, applies, records, orders or resolves to.
-  // A pull that gets half a cross-machine thread still gets exactly the same
-  // half it got before; it just no longer does so in silence.
+  //
+  // MINUS WHAT THIS PULL IS ACTUALLY FETCHING, which is new and is the half of
+  // the #35 fix that keeps the disclosure honest. The heuristic answers "which
+  // bundles do other machines list that the RESOLVED machine's list does not
+  // offer" — a question whose answer stopped being "unfetchable" the moment
+  // assembly started reaching across lists. Subtracting the plan leaves exactly
+  // the records this pull will not fetch, which is what the field has always
+  // claimed to be. The relation is spec §6's `assemblySet ⊆ heuristicSet`, in
+  // the one direction it holds.
   const unfetchableSets = findUnfetchableBundles({
     copies: target.copies,
     sourceMachineId: sourceCopy.machineId,
     localMachineId: machineId,
     state,
-  });
+  })
+    .map((u) => ({
+      machineId: u.machineId,
+      bundleIds: u.bundleIds.filter((id) => !fetching.has(sourcedKey(u.machineId, id))),
+    }))
+    .filter((u) => u.bundleIds.length > 0);
   let unfetchableBundles: UnfetchableBundleGroup[] | undefined;
   let unfetchableText: string | undefined;
+  const machineName = createMachineNameLookup(backend);
   if (unfetchableSets.length > 0) {
-    const machineName = createMachineNameLookup(backend);
     unfetchableBundles = await Promise.all(
       unfetchableSets.map(async (u) => ({
         machineId: u.machineId,
@@ -546,9 +696,18 @@ export async function runSelectStage(input: SelectStageInput): Promise<SelectOut
     });
     warnings.push(unfetchableText);
   }
+  // What assembly worked out and could not deliver. `notes` name records this
+  // pull is NOT fetching; `reportOnly` is the advertised-but-unshipped head,
+  // which is not a fetch failure at all and belongs only on the exit that
+  // applied nothing (see describeAssembly).
+  const assembly = await describeAssembly(target.threadId, plan.assembled, {
+    localMachineId: machineId,
+    outstanding: new Set(plan.outstanding.map((s) => sourcedKey(s.machineId, s.record.bundleId))),
+    machineName,
+  });
 
   if (needed.length === 0) {
-    // Both variants below return without reaching the mapping block — see
+    // Every variant below returns without reaching the mapping block — see
     // backfillThreadMappings. This is the branch an interrupted pull's re-run
     // actually lands in when this machine has no index entry for the thread:
     // every bundle is already recorded as received, so `needed` is empty.
@@ -569,6 +728,46 @@ export async function runSelectStage(input: SelectStageInput): Promise<SelectOut
         },
       };
     }
+    /**
+     * THE FOURTH EXIT, and its only producer (see `SelectReport`).
+     *
+     * Assembly worked this thread's history out, found something it could not
+     * deliver — a gap, a parked fork branch, a bundle pushed before chain
+     * assembly existed, a machine advertising work it never uploaded — and
+     * correctly applied nothing. Under the failure contract (§1.1) that is a
+     * SUCCESS: truthfulness is the invariant, completeness is best-effort, and
+     * answering it with `success: false` is the nag loop this milestone exists
+     * to break, relocated one branch later.
+     *
+     * IT SITS BELOW THE UNFETCHABLE STOP, deliberately. That stop fires when
+     * another machine still holds records this pull cannot reach, which is a
+     * strictly more specific statement about the same thread — and it is the
+     * shape `tests/hub-pull.test.ts` pins as `success: false`. Task 7 rewrites
+     * `describeUnfetchable`'s prose (it forecloses a remedy that now partly
+     * exists) and folds the two exits together; until then the more specific
+     * disclosure keeps precedence and this arm covers everything it cannot see
+     * — the source's own list, this machine's own copy, and heads, none of
+     * which `findUnfetchableBundles` looks at.
+     */
+    const said = [...assembly.notes, ...assembly.reportOnly];
+    if (said.length > 0) {
+      return {
+        kind: "report",
+        value: {
+          threadId: target.threadId,
+          sourceMachineId: sourceCopy.machineId,
+          reason: [
+            `Nothing to apply: every bundle this pull could place in thread ${target.threadId}'s history is already here.`,
+            ...said,
+            repaired,
+          ]
+            .filter((s): s is string => !!s)
+            .join(" "),
+          findings: unfetchableBundles ? { unfetchableBundles } : {},
+        },
+        warnings,
+      };
+    }
     return {
       kind: "stop",
       result: {
@@ -579,6 +778,12 @@ export async function runSelectStage(input: SelectStageInput): Promise<SelectOut
       },
     };
   }
+
+  // Only now, on the exit that applies something: these name records this pull
+  // is leaving where they are, which is a fact about the result the user is
+  // about to be told about. `reportOnly` stays out — a machine advertising
+  // unpushed work is not something THIS pull failed at.
+  warnings.push(...assembly.notes);
 
   const missing: string[] = [];
   for (const { record } of needed) {

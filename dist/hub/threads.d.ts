@@ -27,18 +27,23 @@ export interface UnfetchableBundleSet {
     bundleIds: string[];
 }
 /**
- * Bundles that OTHER machines list for this thread and that a pull resolving
- * to `sourceMachineId` cannot fetch.
+ * Bundles that OTHER machines list for this thread and that the RESOLVED
+ * machine's own list does not offer.
  *
- * WHAT THIS DISCLOSES. A pull fetches exactly ONE machine's bundle list
- * (`sourceCopy.bundles` in hub/pull.ts), and every machine's index lists only
- * the bundles IT pushed — a pull writes its own index with `newBundles: []`.
- * So a thread whose history was written on two other machines arrives on a
- * third in halves: no error, no fork, and — when it resolves to the machine
- * holding the newest half — a local copy that `whereis` then calls `current`.
- * This function is the only signal that says otherwise. Assembling such a
- * chain (a link walk over `fromEntryUuid`/`headEntryUuid`) is a later slice;
- * there is no flag for it today, so callers must not name one.
+ * WHAT IT USED TO DISCLOSE, AND WHAT IT NOW OVER-REPORTS. A pull used to fetch
+ * exactly ONE machine's bundle list, and every machine's index lists only the
+ * bundles IT pushed — a pull writes its own index with `newBundles: []` — so a
+ * thread whose history was written on two other machines arrived on a third in
+ * halves, and this was the only signal that said so. Chain assembly (#35)
+ * fetches across every machine's list, so most of what this function returns is
+ * now fetched: **both** callers subtract `planThreadPull`'s plan from it before
+ * showing anything (`pull-select.ts`, `whereis.ts`), which is spec §6's
+ * `assemblySet ⊆ heuristicSet` in the one direction it holds. What survives the
+ * subtraction is genuinely out of reach — a bundle behind a gap, on a parked
+ * branch, or pushed before links were recorded at all.
+ *
+ * It is kept for one release as the cross-check against the assembled path
+ * (§6), then removed. Do not add a third caller that reads it unsubtracted.
  *
  * IT IS A DIAGNOSTIC, NOT AN ORDERING, and deliberately stays away from the
  * two things this milestone has already been burned by:
@@ -76,6 +81,67 @@ export declare function selectNeededBundles(bundles: HubBundleRecord[], received
     localSessionId: string;
 }> | undefined, localSessionFileExists: (localSessionId: string) => boolean): HubBundleRecord[];
 /**
+ * Identity of a record within a pull plan: two machines may list one bundle id,
+ * so a bare bundle id is not an identity.
+ *
+ * Exported because BOTH disclosure sites subtract a plan from the
+ * `findUnfetchableBundles` heuristic — `pull`'s select stage and `whereis` —
+ * and two hand-written key spellings that drift apart is how one of them comes
+ * to report a bundle the other fetches.
+ */
+export declare function sourcedKey(machineId: string, bundleId: string): string;
+/** One thread's assembled view plus the ordered plan a pull of it would fetch. */
+export interface ThreadPullPlan {
+    /** Every machine's records for the thread, ordered by links — see `assembleChain`. */
+    assembled: AssembledChain;
+    /**
+     * The ordered fetch plan, receipts already applied. Empty means a pull of this
+     * thread would fetch nothing.
+     */
+    needed: SourcedBundle[];
+    /**
+     * False when the assembled chain does NOT contain everything the source
+     * machine's own list offers, in which case `needed` fell back to that list.
+     *
+     * THE FALLBACK IS BACK-COMPAT, not a hedge. Every bundle already sitting on
+     * every hub predates `anchorEntryUuid` and is therefore unlinkable by
+     * construction (spec §0b): assembly reduces such a thread to its root and
+     * nothing else. Narrowing a pull to the assembled chain alone would make this
+     * release stop fetching continuations it fetches today — a silent regression
+     * for exactly the users who have been on the hub longest. So assembly may
+     * WIDEN a plan and may reorder it; it may never shrink it below the one
+     * machine's list a pull already reads.
+     */
+    assembledCoversSource: boolean;
+    /**
+     * Every record any machine lists for this thread that this machine neither
+     * already holds nor is about to fetch — what the pull is leaving where it is.
+     *
+     * The disclosure layer's input, and the reason it is computed HERE rather
+     * than restated at the call site: "already holds" is the receipt rule, and a
+     * second hand-written copy of that rule is how a disclosure comes to name a
+     * bundle the user received months ago.
+     */
+    outstanding: SourcedBundle[];
+}
+/**
+ * The plan a pull of one thread would fetch from a named source copy.
+ *
+ * Ordering comes from `assembleChain` — links only, never `pushedAt` — and the
+ * plan may span machines, which is the whole of #35. What it never does is
+ * write back: `assembled.chain` is a separate structure and no machine's stored
+ * `bundles` array is touched (§4.4.2), because that list being one machine's own
+ * pushes in push order is what the `basedOn` merge-ancestor walk relies on.
+ */
+export declare function planThreadPull(args: {
+    thread: ResolvedThread;
+    /** The copy this pull RESOLVED to — the fallback's list, and nothing else. */
+    source: ThreadCopy;
+    state: SyncState;
+    machineId: string;
+    targetProjectDir: string;
+}): ThreadPullPlan;
+/**
  * A copy OTHER than this machine's that still lists bundles this machine
  * has never received — the answer to "the newest head is mine, so is there
  * anything left on the hub for me?", which is NOT the same question.
@@ -89,14 +155,18 @@ export declare function selectNeededBundles(bundles: HubBundleRecord[], received
  * already local", or a bare "nothing to pull") drops the answer the user
  * just gave for a bundle that is still sitting on the hub, unreceived.
  *
- * Deliberately narrow, and #44 did NOT widen it: `pullSourceFor` delegates the
- * whole local-machine case here rather than re-gating it, so this stays the
- * only widening of "one machine's bundle list". It only ever fires when
- * `t.latest` is THIS machine, so it cannot change which copy an ordinary pull
- * resolves to, and it never merges two machines' bundle records into one list
- * (ledger: that linearity is what Task 8's `basedOn` chain walk rests on).
- * Assembling a thread whose history is split across two OTHER machines is still
- * a later slice — `findUnfetchableBundles` remains the disclosure for that.
+ * It only ever fires when `t.latest` is THIS machine, so it cannot change which
+ * copy an ordinary pull resolves to, and it never merges two machines' bundle
+ * records into one list (that linearity is what the `basedOn` chain walk rests
+ * on).
+ *
+ * #35 WIDENED THE CANDIDATE TEST, not the rule. A copy qualifies when its own
+ * list still offers something unreceived (#44's test, kept verbatim so a
+ * pre-assembly hub behaves exactly as it does today) OR when the assembled
+ * chain reaches an unreceived record of that machine's — the case where the
+ * thread's history only becomes fetchable once the links are followed. `OR`
+ * rather than a replacement: dropping the first clause would stop this branch
+ * finding a machine whose bundles predate `anchorEntryUuid`.
  *
  * `newerThreadCopy` for the preference so the choice is a strict total order over the
  * candidate set rather than index-file iteration order.
@@ -119,18 +189,21 @@ export declare function alternateSource(t: ResolvedThread, st: SyncState, ctx: {
  * local file it points at still exists.
  *
  * THE LOCAL-MACHINE BRANCH IS LOAD-BEARING, not tidiness. Re-gating
- * unconditionally would run `selectNeededBundles` over THIS machine's own
- * bundle list, where a missing receipt is ordinary — a `--target-path` pull
- * keys its bookkeeping off the other path, and a corrupt state file is renamed
- * aside and starts empty — so `--latest` would start re-fetching this
- * machine's own pushes. `alternateSource` is the answer for that case and
- * already excludes our own copy by construction.
+ * unconditionally would run the receipt filter over THIS machine's own bundle
+ * list, where a missing receipt is ordinary — a `--target-path` pull keys its
+ * bookkeeping off the other path, and a corrupt state file is renamed aside and
+ * starts empty — so `--latest` would start re-fetching this machine's own
+ * pushes. `alternateSource` is the answer for that case and already excludes
+ * our own copy by construction; `selectNeededFromChain` drops our own records
+ * for the same reason, one level down.
  *
- * Scope, said plainly: this closes the SAME-MACHINE half only.
- * `selectNeededBundles` still reads exactly one machine's bundle list, so a
- * thread whose remaining bundles are listed by a machine this pull does not
- * resolve to still comes back `undefined` here (#35). `findUnfetchableBundles`
- * remains the disclosure for that.
+ * #35 CLOSED THE OTHER HALF, and it did so by changing this function's body
+ * rather than by adding a fifth selector. The question is now "is the ASSEMBLED
+ * chain fully received here?" instead of "is the resolved machine's own list
+ * fully received here?", so a thread whose remaining bundles are listed by a
+ * machine this pull does not resolve to answers `true` — and both `pull`
+ * selectors and `whereis`'s `pullNeeded` follow automatically, because all
+ * three call this. That was #44's stated scope note and this is it coming off.
  */
 export declare function pullSourceFor(t: ResolvedThread, st: SyncState, ctx: {
     machineId: string;
