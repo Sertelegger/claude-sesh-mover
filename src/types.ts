@@ -121,7 +121,35 @@ export interface SessionContinuation {
   continuesLocalSessionId: string;
   continuesPeerSessionId?: string;
   fromEntryIndex: number;
+  /**
+   * Uuid of the FIRST entry this delta ships — `entries[fromEntryIndex].uuid`,
+   * i.e. one PAST the head it was diffed against (`src/diff.ts`). Its consumer
+   * is the continuation header written by `continuation.ts`, which re-reads the
+   * entry at `fromEntryIndex` and refuses the slice if the uuid moved.
+   *
+   * It is NOT a link to the previous bundle and never was — see
+   * `anchorEntryUuid`. It is also routinely `""`: `readEntryUuids` maps every
+   * uuid-less or unparseable line to `""`, and the first unsent line of a live
+   * transcript is usually a uuid-less bookkeeping entry.
+   */
   fromEntryUuid: string;
+  /**
+   * The head this delta was built AGAINST: the `headEntryUuid` of the last
+   * bundle the peer is recorded as holding, i.e. the parent of the first entry
+   * shipped here. This is the field a chain walk links on — a bundle whose
+   * `headEntryUuid` equals it is this one's predecessor.
+   *
+   * Optional, and the absence is meaningful rather than a default: a manifest
+   * written before chain assembly existed carries no anchor and its bundle is
+   * therefore **unlinkable by construction**. Never substitute `fromEntryUuid`
+   * for a missing value — the two have never been equal, and mixing them in one
+   * map manufactures chains that look assembled and are not.
+   *
+   * When present it is a non-empty uuid: `computeIncrementalPlan` falls back to
+   * a full push whenever the recorded head is `""` or is no longer in the
+   * transcript, so no continuation is ever planned against an empty head.
+   */
+  anchorEntryUuid?: string;
 }
 
 export interface SessionLineage {

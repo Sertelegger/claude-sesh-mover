@@ -60,6 +60,11 @@ export function computeIncrementalPlan(localSessions, peerSent, readEntries) {
             session,
             fromEntryIndex,
             fromEntryUuid: entries[fromEntryIndex].uuid,
+            // `entries[headIndex]`, by construction — but taken from the RECORD, not
+            // re-read out of the array, so the value that travels is the peer's own
+            // spelling of the head rather than this machine's reading of the line
+            // that happens to sit at that index.
+            anchorEntryUuid: record.headEntryUuid,
         });
     }
     return plan;

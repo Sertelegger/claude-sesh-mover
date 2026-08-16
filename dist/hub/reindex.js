@@ -127,6 +127,15 @@ export async function hubReindex(opts) {
                         type: s.type === "continuation" ? "continuation" : "full",
                         sessionIdInBundle: s.sessionId,
                         fromEntryUuid: s.continuation?.fromEntryUuid ?? null,
+                        // Recovered from the bundle's OWN manifest, which is why a rebuild
+                        // does not silently unlink a hub: every bundle whose manifest
+                        // carries the anchor gets its link back. A bundle pushed before the
+                        // field existed carries none, so the rebuilt record carries none
+                        // either — `undefined`, not `null`. Reindex reproduces the hub as it
+                        // is; inventing a value here would be a repair tool fabricating the
+                        // one fact it cannot derive. Same `s.type` discriminator as the
+                        // record's `type`, for the reason push.ts states.
+                        anchorEntryUuid: s.type === "continuation" ? s.continuation?.anchorEntryUuid : null,
                         headEntryUuid,
                         messageCount: s.messageCount,
                         pushedAt: parsed.pushedAt,

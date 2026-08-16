@@ -153,11 +153,13 @@ export function currentThreadIndexes(
 
 // ---- Linked-chain index fixtures (#35) ----
 //
-// WHY THIS EXISTS. `bundle()` above hardcodes `fromEntryUuid: null` and no call
-// site in tests/ overrides it, so until this builder the LINKED shape — the
-// thing chain assembly walks — had zero coverage at the index level. That is
-// also why #35 could sit undetected: nothing ever asserted over a chain of
-// records. Everything below is pure; no filesystem, no hub, no push.
+// WHY THIS EXISTS. `bundle()` above hardcodes `fromEntryUuid: null`, declares no
+// `anchorEntryUuid` at all (so it is pre-assembly-shaped, deliberately: its call
+// sites are testing other things), and no call site in tests/ overrides either.
+// So until this builder the LINKED shape — the thing chain assembly walks — had
+// zero coverage at the index level. That is also why #35 could sit undetected:
+// nothing ever asserted over a chain of records. Everything below is pure; no
+// filesystem, no hub, no push.
 //
 // It builds ONE thread spread across N machines, which is the shape every
 // assembly case needs. A fixture wanting two threads composes two calls and
@@ -180,17 +182,24 @@ export function chainHead(bundleId: string): string {
 }
 
 /**
- * The `fromEntryUuid` `chainIndexes` gives a linked record under
- * `linkStyle: "push"` — the uuid of the FIRST line of that bundle's own delta.
+ * The `fromEntryUuid` `chainIndexes` gives a linked record under the `"push"`
+ * and `"pre-assembly"` styles — the uuid of the FIRST line of that bundle's own
+ * delta.
  *
- * MEASURED, AND IT CONTRADICTS THE SPEC. `src/diff.ts` sets
- * `fromEntryUuid: entries[headIndex + 1].uuid` — one PAST the recorded head —
- * and both index writers copy that value through unchanged
+ * MEASURED, AND IT IS NOT A LINK. `src/diff.ts` sets
+ * `fromEntryUuid: entries[headIndex + 1].uuid` — one PAST the head the delta was
+ * diffed against — and both index writers copy that value through unchanged
  * (`src/hub/push.ts`, `src/hub/reindex.ts`, both `s.continuation?.fromEntryUuid
- * ?? null`). So on a real hub a continuation's `fromEntryUuid` is the child of
- * the previous bundle's `headEntryUuid`, never equal to it, and a head-keyed
- * map (spec §4.2) links NOTHING. `arrangeThreeMachines` produces the real
- * thing, and the selfcheck pins the measurement.
+ * ?? null`). So on a real hub a continuation's `fromEntryUuid` is the CHILD of
+ * the previous bundle's `headEntryUuid`, never equal to it, and a map keyed on
+ * heads (the shape spec §4.2 originally described) links NOTHING through it.
+ *
+ * That is why `HubBundleRecord.anchorEntryUuid` exists (spec §0b): a separate,
+ * additive field carrying the head the delta was built against, which is the
+ * one value a walk can link on. `fromEntryUuid` keeps its meaning and its sole
+ * consumer, the continuation header. Every style below therefore renders BOTH,
+ * and they differ — a fixture that made them equal would delete the distinction
+ * the two fields exist to hold.
  *
  * A SECOND correction rides along, and it matters for the empty-head rule:
  * spec §4.3 says `""` is "representable in the type even though no current
@@ -200,12 +209,6 @@ export function chainHead(bundleId: string): string {
  * uuid-less bookkeeping entry — `continuation.ts`'s `boundaryUuid` doc says so
  * outright and exists because of it. So a real continuation record's
  * `fromEntryUuid` is `""` routinely, not never.
- *
- * `linkStyle: "anchor"` — the default — is the shape the spec assumed and the
- * only one in which "gap", "fork" and "advertised-but-unshipped" are index-level
- * conditions at all. Keep both: the anchor style is what an assembler needs, the
- * push style is what the writers currently emit, and the two must not be
- * silently conflated in a fixture.
  */
 export function chainDeltaStart(bundleId: string): string {
   return `delta-${bundleId}`;
@@ -217,23 +220,42 @@ export interface ChainRecordSpec {
   id: string;
   /**
    * Id of the record this one chains onto. Must name a record declared
-   * somewhere in the spec; how it becomes a `fromEntryUuid` is `linkStyle`.
+   * somewhere in the spec; it becomes this record's `anchorEntryUuid` (the
+   * anchor's `headEntryUuid`), and `linkStyle` decides what `fromEntryUuid`
+   * gets alongside it.
    *
-   * Under the default `"anchor"` style it is the anchor's head, and it is NOT
-   * repaired when that anchor ships an empty head: `b4<-b3` where b3 has
-   * `head: ""` yields `fromEntryUuid: ""`, which is precisely the shape the
-   * empty-head rule exists to reject ("two empty strings are not a match",
+   * It is NOT repaired when that anchor ships an empty head: `b4<-b3` where b3
+   * has `head: ""` yields `anchorEntryUuid: ""`, which is precisely the shape
+   * the empty-head rule exists to reject ("two empty strings are not a match",
    * src/hub/threads.ts). A builder that quietly fixed it would delete the case.
    */
   from?: string;
   /**
-   * Raw `fromEntryUuid`, used verbatim — the escape hatch `from` deliberately
-   * refuses. `null` is a root. Use with `chainHead("x")` for a gap.
+   * Raw `fromEntryUuid`, used verbatim — an override, not a link. Since #35's
+   * anchor field landed this decides nothing about the chain, which is exactly
+   * what makes it useful: a record can carry a nonsense `fromEntryUuid` and
+   * still assemble, and an assembler that regressed to linking on it fails.
    */
   fromUuid?: string | null;
+  /**
+   * Raw `anchorEntryUuid`, used verbatim — the escape hatch `from` deliberately
+   * refuses. `null` is a root. Use with `chainHead("x")` for a GAP: an anchor no
+   * declared record's head matches.
+   */
+  anchorUuid?: string | null;
+  /**
+   * Emit NO `anchorEntryUuid` key for this record — a bundle pushed before
+   * chain assembly existed, i.e. every bundle sitting on every hub today.
+   * Unlinkable by construction: a `full` one is still a root, a `continuation`
+   * one is an orphan, and neither may be repaired by reading `fromEntryUuid`.
+   *
+   * Per record so a MIXED hub is expressible, which is the realistic state
+   * after this ships. `linkStyle: "pre-assembly"` applies it to every record.
+   */
+  preAssembly?: boolean;
   /** This record's `headEntryUuid`. `""` is legal and is its own test case. */
   head?: string;
-  /** Defaults to "full" for a root and "continuation" for a linked record. */
+  /** Defaults to "full" for a root and "continuation" for an anchored record. */
   type?: HubBundleRecord["type"];
   /** `sessionIdInBundle`; defaults per MACHINE, since that is what a push writes. */
   sessionId?: string;
@@ -246,17 +268,29 @@ export interface ChainRecordSpec {
 export type ChainRecordInput = string | ChainRecordSpec;
 
 /**
- * How `from` is rendered into `fromEntryUuid`. See `chainDeltaStart` — the two
- * are different by MEASUREMENT, not by taste.
+ * How an anchored record's two link-ish fields are rendered. See
+ * `chainDeltaStart` — the difference is a MEASUREMENT, not taste.
  *
- * - `"anchor"` (default): the anchor record's `headEntryUuid`, i.e. what spec
- *   §4.2's head-keyed walk needs and what the plan's `b1<-b0` notation says.
- * - `"push"`: what `src/diff.ts` actually writes — the first uuid of this
- *   record's own delta, which equals no record's head. Every linked record in a
- *   `"push"`-style fixture therefore dangles, which is the defect, reproduced
- *   synthetically.
+ * Every style puts the anchor's head in `anchorEntryUuid` (that is the link)
+ * except `"pre-assembly"`, which omits the field entirely. What moves is
+ * `fromEntryUuid`:
+ *
+ * - `"push"` (default): what `src/diff.ts` writes — the first uuid of this
+ *   record's own delta, which equals no record's head. This is what a real
+ *   push and a real reindex emit today, and with the anchor beside it the
+ *   record LINKS. Default because a fixture's default should be the product's
+ *   actual shape.
+ * - `"anchor"`: `fromEntryUuid` is the anchor's head too, i.e. spec §4.2's
+ *   original (mistaken) reading of the field. Kept so a test can assert that
+ *   assembly is indifferent to it: the chain must come out the same either way,
+ *   because it is read off `anchorEntryUuid` in both.
+ * - `"pre-assembly"`: `fromEntryUuid` as `"push"`, and NO `anchorEntryUuid` at
+ *   all — every bundle already on every hub. Nothing links; a `full` record is
+ *   still a root and a `continuation` is an orphan. This is the honest
+ *   degradation §0b requires be reported as "pushed before chain assembly"
+ *   rather than as a missing bundle.
  */
-export type ChainLinkStyle = "anchor" | "push";
+export type ChainLinkStyle = "anchor" | "push" | "pre-assembly";
 
 export interface ChainIndexesOptions {
   threadId?: string;
@@ -313,15 +347,16 @@ function parseChainRecord(input: ChainRecordInput): ChainRecordSpec {
  * ```
  *
  * `b1<-b0` is "bundle b1 that chains onto b0", and a bare id is a root
- * (`fromEntryUuid: null`). The arrow is the whole point of the notation: the
- * link is the thing that has never been exercised, so it is the thing the call
- * site states.
+ * (`anchorEntryUuid: null`, `fromEntryUuid: null`). The arrow is the whole point
+ * of the notation: the link is the thing that has never been exercised, so it is
+ * the thing the call site states.
  *
- * **How the arrow becomes a field value is `linkStyle`, and the default is NOT
- * what the product writes today** — see `chainDeltaStart`. `"anchor"` (default)
- * renders b0's head into b1's `fromEntryUuid`, which is the spec's reading and
- * the only one under which gap/fork/unshipped are index-level conditions;
- * `"push"` renders what `src/diff.ts` emits.
+ * **The arrow becomes `anchorEntryUuid` — b0's `headEntryUuid` — in every style
+ * but `"pre-assembly"`, and `linkStyle` only decides what rides alongside it in
+ * `fromEntryUuid`.** See `chainDeltaStart`. The default is `"push"`, i.e. what
+ * `src/diff.ts` and both index writers actually emit; `"anchor"` is the old
+ * spec's reading of `fromEntryUuid`, kept as a control; `"pre-assembly"` omits
+ * the anchor entirely and is the shape of every bundle already on a hub.
  *
  * Deliberate properties, each of which a plainer builder would have lost:
  *
@@ -349,7 +384,7 @@ export function chainIndexes(
   const threadId = opts.threadId ?? "t1";
   const projectId = opts.projectId ?? "p";
   const projectPath = opts.projectPath ?? "/x";
-  const linkStyle = opts.linkStyle ?? "anchor";
+  const linkStyle = opts.linkStyle ?? "push";
 
   // Pass 1: normalize, and learn every declared record's head before any
   // anchor is resolved — a chain may legally be declared out of order (and a
@@ -375,36 +410,51 @@ export function chainIndexes(
   for (const machineId of machines) {
     const records = normalized.get(machineId) ?? [];
     const bundles: HubBundleRecord[] = records.map((r) => {
-      if (r.from !== undefined && r.fromUuid !== undefined) {
-        throw new Error(`chainIndexes: ${r.id} declares both "from" and "fromUuid"`);
+      if (r.from !== undefined && r.anchorUuid !== undefined) {
+        throw new Error(`chainIndexes: ${r.id} declares both "from" and "anchorUuid"`);
       }
-      let fromEntryUuid: string | null;
+      // The ANCHOR is resolved first and the link is read off it; `fromUuid` is
+      // an independent override of a field that no longer decides anything.
+      let anchor: string | null;
       if (r.from !== undefined) {
-        const anchor = headById.get(r.from);
-        if (anchor === undefined) {
+        const resolved = headById.get(r.from);
+        if (resolved === undefined) {
           throw new Error(
             `chainIndexes: ${r.id} anchors on undeclared record ${JSON.stringify(r.from)} — ` +
-              `for a deliberate gap write fromUuid: chainHead(${JSON.stringify(r.from)})`
+              `for a deliberate gap write anchorUuid: chainHead(${JSON.stringify(r.from)})`
           );
         }
-        fromEntryUuid = linkStyle === "anchor" ? anchor : chainDeltaStart(r.id);
+        anchor = resolved;
       } else {
-        fromEntryUuid = r.fromUuid ?? null;
+        anchor = r.anchorUuid ?? null;
       }
+      const isRoot = anchor === null;
+      let fromEntryUuid: string | null;
+      if (r.fromUuid !== undefined) fromEntryUuid = r.fromUuid;
+      else if (isRoot) fromEntryUuid = null;
+      else fromEntryUuid = linkStyle === "anchor" ? anchor : chainDeltaStart(r.id);
+
       const pushedAt =
         r.pushedAt ?? new Date(CHAIN_PUSHED_AT_BASE - declared * 60_000).toISOString();
       declared++;
-      return {
+      const record: HubBundleRecord = {
         bundleId: r.id,
         file: `${bundleDir(projectId, machineId)}/${bundleFileName(pushedAt, r.id)}`,
-        type: r.type ?? (fromEntryUuid === null ? "full" : "continuation"),
+        type: r.type ?? (isRoot ? "full" : "continuation"),
         sessionIdInBundle: r.sessionId ?? `sess-${machineId}`,
         fromEntryUuid,
+        anchorEntryUuid: anchor,
         headEntryUuid: r.head ?? chainHead(r.id),
         messageCount: r.messageCount ?? 1,
         pushedAt,
         hasWorkspace: r.hasWorkspace ?? false,
       };
+      // DELETED, not set to undefined: the record has to be shaped like one
+      // parsed back out of a pre-assembly index file, where the key is simply
+      // not there. `"anchorEntryUuid" in record` is the test an assembler makes,
+      // and `{ anchorEntryUuid: undefined }` would answer it wrong.
+      if (r.preAssembly ?? linkStyle === "pre-assembly") delete record.anchorEntryUuid;
+      return record;
     });
 
     const threadEntry: HubThreadEntry = {

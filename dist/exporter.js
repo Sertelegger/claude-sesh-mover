@@ -253,6 +253,11 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
                 continuesPeerSessionId: incremental?.peerSent[item.session.sessionId]?.sentAsSessionId,
                 fromEntryIndex: item.fromEntryIndex,
                 fromEntryUuid: item.fromEntryUuid,
+                // The head this delta was diffed against — the only field in this block
+                // that can link the bundle to its predecessor on a hub. `fromEntryUuid`
+                // above is its CHILD and links nothing; the two are carried side by
+                // side rather than one being derived from the other.
+                anchorEntryUuid: item.anchorEntryUuid,
             },
         });
     }

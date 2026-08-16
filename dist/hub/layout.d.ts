@@ -24,8 +24,33 @@ export interface HubBundleRecord {
     file: string;
     type: "full" | "continuation";
     sessionIdInBundle: string;
+    /**
+     * First entry this bundle's delta SHIPS (`null` on a full bundle) — one past
+     * the head it was diffed against. NOT a link: it is the anchor's child and
+     * equals no bundle's `headEntryUuid`, ever. Keep it for the continuation
+     * header's sake and link on `anchorEntryUuid` instead.
+     */
     fromEntryUuid: string | null;
     headEntryUuid: string;
+    /**
+     * The predecessor's head — the bundle this one chains onto. Three-valued, and
+     * the three values are three different facts:
+     *
+     * - **absent** (`undefined`, i.e. no such key in the JSON): written before
+     *   chain assembly existed. The anchor is UNKNOWN and unrecoverable from the
+     *   index; such a record is unlinkable by construction and a chain through it
+     *   must be reported as "pushed before chain assembly", never as a missing
+     *   bundle. A pre-assembly bundle whose MANIFEST is still on the hub can be
+     *   recovered by `hub reindex` only if that manifest carries the field.
+     * - **`null`**: a full/root bundle. No anchor exists, by definition.
+     * - **a string**: the `headEntryUuid` of this bundle's predecessor. `""` is
+     *   never a link — `threads.ts` states the rule for `findUnfetchableBundles`
+     *   and it transfers verbatim ("two empty strings are not a match"). No
+     *   current writer emits `""` here (an empty recorded head is a full push,
+     *   `src/diff.ts`), but a hostile or damaged index can, so the walk rejects it
+     *   rather than trusting the writer.
+     */
+    anchorEntryUuid?: string | null;
     messageCount: number;
     pushedAt: string;
     hasWorkspace: boolean;

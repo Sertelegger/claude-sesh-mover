@@ -187,14 +187,22 @@ describe("currentThreadIndexes", () => {
 // Every assertion below reads the LINK STRUCTURE back out of `resolveThreads`'s
 // output, never out of the spec that produced it. `chainView` is the head-keyed
 // walk an assembler has to build; it is written here, against the real resolver,
-// precisely so a builder that emitted the wrong `fromEntryUuid` cannot be
-// green-lit by a test that restates what the builder was asked for.
+// precisely so a builder that emitted the wrong anchor cannot be green-lit by a
+// test that restates what the builder was asked for.
+//
+// It links on `anchorEntryUuid` and NEVER on `fromEntryUuid` — the two are
+// different fields carrying different facts, and linking on the latter is the
+// #35 defect (see `chainDeltaStart`). A record with no `anchorEntryUuid` key at
+// all is pre-assembly: a root if it is `full`, an orphan if it is a
+// `continuation`, and unlinkable either way.
 
 interface ChainRecordView {
   machineId: string;
   bundleId: string;
   type: "full" | "continuation";
   from: string | null;
+  /** `undefined` = the key is absent = pre-assembly. `null` = a root. */
+  anchor: string | null | undefined;
   head: string;
 }
 
@@ -208,6 +216,8 @@ interface ChainView {
   headKeys: string[];
   /** Records whose anchor uuid matches no record's head: the gaps. */
   dangling: ChainRecordView[];
+  /** Continuations carrying no anchor at all: pushed before assembly existed. */
+  unanchored: ChainRecordView[];
   /** Anchors shared by more than one record: the forks. */
   forks: string[];
   /** Forward walk from each root, in order. */
@@ -226,6 +236,8 @@ function chainView(indexes: HubIndexJson[]): ChainView {
       bundleId: b.bundleId,
       type: b.type,
       from: b.fromEntryUuid,
+      // `in`, not `?? null`: absent and null are two different facts here.
+      anchor: "anchorEntryUuid" in b ? b.anchorEntryUuid : undefined,
       head: b.headEntryUuid,
     }))
   );
@@ -235,19 +247,23 @@ function chainView(indexes: HubIndexJson[]): ChainView {
   // (src/hub/threads.ts, "two empty strings are not a match").
   const byHead = new Map<string, ChainRecordView>();
   for (const r of records) if (r.head !== "") byHead.set(r.head, r);
-  const byFrom = new Map<string, ChainRecordView[]>();
+  const byAnchor = new Map<string, ChainRecordView[]>();
   for (const r of records) {
-    if (r.from === null || r.from === "") continue;
-    byFrom.set(r.from, [...(byFrom.get(r.from) ?? []), r]);
+    if (typeof r.anchor !== "string" || r.anchor === "") continue;
+    byAnchor.set(r.anchor, [...(byAnchor.get(r.anchor) ?? []), r]);
   }
 
-  const roots = records.filter((r) => r.from === null);
+  // A root is a record that starts a chain: one that declares no anchor
+  // (`null`), or a pre-assembly `full` bundle, whose type is the only thing
+  // left saying so. A pre-assembly CONTINUATION is not a root — it is an
+  // orphan, and calling it a root would invent a second starting point.
+  const roots = records.filter((r) => r.anchor === null || (r.anchor === undefined && r.type === "full"));
   const chains: ChainRecordView[][] = roots.map((root) => {
     const order = [root];
     let cur = root;
     for (;;) {
       if (cur.head === "") break; // unlinkable forward by construction: a gap
-      const next = byFrom.get(cur.head) ?? [];
+      const next = byAnchor.get(cur.head) ?? [];
       if (next.length !== 1) break; // 0 = end or gap, >1 = fork
       cur = next[0];
       order.push(cur);
@@ -262,8 +278,9 @@ function chainView(indexes: HubIndexJson[]): ChainView {
     records,
     roots,
     headKeys: [...byHead.keys()],
-    dangling: records.filter((r) => r.from !== null && !byHead.has(r.from)),
-    forks: [...byFrom.entries()].filter(([, rs]) => rs.length > 1).map(([uuid]) => uuid),
+    dangling: records.filter((r) => typeof r.anchor === "string" && !byHead.has(r.anchor)),
+    unanchored: records.filter((r) => r.anchor === undefined && r.type === "continuation"),
+    forks: [...byAnchor.entries()].filter(([, rs]) => rs.length > 1).map(([uuid]) => uuid),
     chains,
     unreachable: records.filter((r) => !reached.has(r.bundleId)),
   };
@@ -289,22 +306,45 @@ describe("chainIndexes", () => {
   it("gap: a record anchored on a head no machine's index ships stops the chain", () => {
     // b1 is deliberately absent from the spec — chainHead names its head so the
     // absence is stated rather than a typo's side effect.
-    const v = chainView(chainIndexes({ m1: ["b0"], m2: [{ id: "b2", fromUuid: chainHead("b1") }] }));
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: [{ id: "b2", anchorUuid: chainHead("b1") }] }));
 
     expect(v.records.map((r) => r.bundleId).sort()).toEqual(["b0", "b2"]);
     expect(v.dangling.map((r) => r.bundleId)).toEqual(["b2"]);
     expect(v.chains.map((c) => c.map((r) => r.bundleId))).toEqual([["b0"]]);
     expect(v.unreachable.map((r) => r.bundleId)).toEqual(["b2"]);
-    // A gap is not a fork and not a second root — three different conditions.
+    // A gap is not a fork, not a second root, and not a pre-assembly record —
+    // four different conditions, and only one of them is repairable.
     expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
     expect(v.forks).toEqual([]);
-    // fromUuid rides through verbatim: it is the raw uuid, not a bundle id.
-    expect(v.records.find((r) => r.bundleId === "b2")?.from).toBe("head-b1");
+    expect(v.unanchored).toEqual([]);
+    // anchorUuid rides through verbatim: it is the raw uuid, not a bundle id.
+    expect(v.records.find((r) => r.bundleId === "b2")?.anchor).toBe("head-b1");
+    // A declared anchor makes it a continuation even though it names nothing.
+    expect(v.records.find((r) => r.bundleId === "b2")?.type).toBe("continuation");
   });
 
   it("throws on an anchor naming an undeclared record, so a typo cannot become a gap", () => {
     expect(() => chainIndexes({ m1: ["b0"], m2: ["b1<-b_typo"] })).toThrow(/undeclared record/);
     expect(() => chainIndexes({ m1: ["b0"], m2: ["b0<-b0"] })).toThrow(/duplicate bundle id/);
+    expect(() =>
+      chainIndexes({ m1: ["b0"], m2: [{ id: "b1", from: "b0", anchorUuid: "x" }] })
+    ).toThrow(/both "from" and "anchorUuid"/);
+  });
+
+  it("a nonsense fromEntryUuid does not disturb the chain: the anchor is the link", () => {
+    // The regression guard for #35's actual defect. `fromEntryUuid` is the
+    // anchor's CHILD on a real hub and links nothing; an assembler that fell
+    // back to it would chain on this garbage instead.
+    const v = chainView(
+      chainIndexes({
+        m1: ["b0"],
+        m2: [{ id: "b1", from: "b0", fromUuid: chainHead("b0") }],
+        m3: [{ id: "b2", from: "b1", fromUuid: "not-a-uuid-at-all" }],
+      })
+    );
+    expect(v.chains.map((c) => c.map((r) => r.bundleId))).toEqual([["b0", "b1", "b2"]]);
+    expect(v.records.find((r) => r.bundleId === "b2")?.from).toBe("not-a-uuid-at-all");
+    expect(v.dangling).toEqual([]);
   });
 
   it("fork: two records share one anchor", () => {
@@ -345,10 +385,10 @@ describe("chainIndexes", () => {
     });
     const v = chainView(indexes);
 
-    // The builder does NOT repair `from` when the anchor ships an empty head:
-    // b2 and b4 anchor on "", which is exactly the shape the rule has to reject.
+    // The builder does NOT repair the anchor when the record it names ships an
+    // empty head: b2 and b4 anchor on "", exactly the shape the rule rejects.
     expect(v.records.filter((r) => r.head === "").map((r) => r.bundleId)).toEqual(["b1", "b3"]);
-    expect(v.records.filter((r) => r.from === "").map((r) => r.bundleId)).toEqual(["b2", "b4"]);
+    expect(v.records.filter((r) => r.anchor === "").map((r) => r.bundleId)).toEqual(["b2", "b4"]);
 
     // "" is never a KEY: two empty-headed records would otherwise collide and
     // one would vanish from the chain. Every other record contributes one key.
@@ -365,23 +405,66 @@ describe("chainIndexes", () => {
     expect(v.forks).toEqual([]);
   });
 
-  it("linkStyle 'push' reproduces what the writers emit: every linked record dangles", () => {
-    // MEASURED CONTRADICTION, kept as a fixture so it is pinned rather than
-    // argued: src/diff.ts sets fromEntryUuid to entries[headIndex + 1].uuid —
-    // one PAST the recorded head — and both index writers copy it through. So
-    // the value is the CHILD of the previous bundle's head, never equal to it,
-    // and spec §4.2's head-keyed walk links nothing.
-    const anchor = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }));
-    const push = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }, { linkStyle: "push" }));
+  it("'push' — the default, and what the writers emit — LINKS, and 'anchor' agrees with it", () => {
+    // The measurement this task moved. src/diff.ts still sets fromEntryUuid to
+    // entries[headIndex + 1].uuid — one PAST the head — and both index writers
+    // still copy that through unchanged. What changed is that they now also
+    // carry `anchorEntryUuid`, the head the delta WAS diffed against, and that
+    // is what the walk links on. So the two styles differ on fromEntryUuid and
+    // agree on the chain, which is the property assembly needs.
+    const push = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }));
+    const anchor = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }, { linkStyle: "anchor" }));
 
-    expect(anchor.records.find((r) => r.bundleId === "b1")?.from).toBe(chainHead("b0"));
     expect(push.records.find((r) => r.bundleId === "b1")?.from).toBe(chainDeltaStart("b1"));
+    expect(anchor.records.find((r) => r.bundleId === "b1")?.from).toBe(chainHead("b0"));
+    // ...and the anchor is the same value in both, regardless.
+    for (const v of [push, anchor]) {
+      expect(v.records.find((r) => r.bundleId === "b1")?.anchor).toBe(chainHead("b0"));
+      expect(v.chains.map((c) => c.map((r) => r.bundleId))).toEqual([["b0", "b1"]]);
+      expect(v.dangling).toEqual([]);
+      expect(v.unanchored).toEqual([]);
+      expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+      // A root declares an anchor too — an explicit null, "no anchor exists",
+      // which is a different fact from the absent key a pre-assembly record has.
+      expect(v.roots[0].anchor).toBeNull();
+    }
+  });
 
-    expect(anchor.chains.map((c) => c.map((r) => r.bundleId))).toEqual([["b0", "b1"]]);
-    expect(push.chains.map((c) => c.map((r) => r.bundleId))).toEqual([["b0"]]);
-    expect(push.dangling.map((r) => r.bundleId)).toEqual(["b1"]);
-    // Same roots either way — the two styles differ on the LINK and nothing else.
-    expect(push.roots.map((r) => r.bundleId)).toEqual(anchor.roots.map((r) => r.bundleId));
+  it("'pre-assembly' carries no anchor at all: the root stands, the continuation is an orphan", () => {
+    // Every bundle already on every hub. Nothing distinguishes such a record
+    // from a new one except the absence of the key, which is exactly why the
+    // field had to be additive rather than a redefinition of fromEntryUuid.
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }, { linkStyle: "pre-assembly" }));
+
+    expect(v.records.every((r) => r.anchor === undefined)).toBe(true);
+    expect(v.records.find((r) => r.bundleId === "b1")?.from).toBe(chainDeltaStart("b1"));
+    // The full bundle is still a root — its type says so. The continuation is
+    // unlinkable, and it is reported as pre-assembly, NOT as a gap: a gap names
+    // a bundle that should exist, and nothing here is missing.
+    expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+    expect(v.unanchored.map((r) => r.bundleId)).toEqual(["b1"]);
+    expect(v.dangling).toEqual([]);
+    expect(v.chains.map((c) => c.map((r) => r.bundleId))).toEqual([["b0"]]);
+    expect(v.unreachable.map((r) => r.bundleId)).toEqual(["b1"]);
+  });
+
+  it("per-record preAssembly builds a MIXED hub: old bundles beside new ones", () => {
+    // The realistic state right after this ships, and the one Task 4 has to
+    // survive: b1 was pushed by the old code and b2 by the new. b2's anchor is
+    // b1's head and is perfectly good — but b1 cannot be reached from b0, so
+    // the contiguous chain from the root stops at b0 and everything behind the
+    // pre-assembly record is stranded.
+    const v = chainView(
+      chainIndexes({ m1: ["b0"], m2: [{ id: "b1", from: "b0", preAssembly: true }], m3: ["b2<-b1"] })
+    );
+
+    expect(v.unanchored.map((r) => r.bundleId)).toEqual(["b1"]);
+    expect(v.records.find((r) => r.bundleId === "b2")?.anchor).toBe(chainHead("b1"));
+    expect(v.chains.map((c) => c.map((r) => r.bundleId))).toEqual([["b0"]]);
+    expect(v.unreachable.map((r) => r.bundleId).sort()).toEqual(["b1", "b2"]);
+    // b2's anchor names a head that IS on the hub, so it is not dangling — the
+    // break is b1's missing anchor, and the report must say which.
+    expect(v.dangling).toEqual([]);
   });
 
   it("advertised-but-unshipped: a machine's thread head matches no bundle record", () => {
@@ -521,28 +604,43 @@ describe("arrangeThreeMachines", () => {
     }
   });
 
-  // THE measurement this task exists to expose, on real pushed bundles rather
-  // than on a synthetic record. Spec §4.2 says to "build a map from head →
-  // bundle and walk forward from the root"; against the live writers that map
-  // links nothing, because src/diff.ts sets fromEntryUuid one PAST the recorded
-  // head. The adjacency is real — it is just in the TRANSCRIPT, not the index.
-  it("no index-level link exists between the real bundles: fromEntryUuid is the head's CHILD", async () => {
+  // THE property the whole walk rests on, measured on REAL pushed bundles
+  // rather than on a synthetic record — A pushes, B pulls and continues, B
+  // pushes, A pulls back and republishes. Before Task 3.5 this test asserted
+  // the opposite (`fromEntryUuid` is the head's child, so a head-keyed map
+  // links nothing); the fields it measures have not changed, the record simply
+  // now carries the anchor beside them.
+  it("the real bundles link on anchorEntryUuid, while fromEntryUuid stays the head's CHILD", async () => {
     const f = await arrangeThreeMachines({ resolvesTo: "A" });
     try {
       const { indexes } = await readAllIndexes(createFsBackend(f.hub), f.projectId);
       const v = chainView(indexes);
 
-      // Every linked record dangles, so the walk stops at the root and both
-      // later bundles are unreachable — on data a real push produced.
-      expect(v.chains.map((c) => c.map((r) => r.bundleId))).toEqual([[f.bundleIdsA[0]]]);
-      expect(v.dangling.map((r) => r.bundleId).sort()).toEqual(
-        [f.bundleIdsA[1], f.bundleIdsB[0]].sort()
-      );
+      const root = v.records.find((r) => r.bundleId === f.bundleIdsA[0])!;
+      const middle = v.records.find((r) => r.machineId === f.machineIdB)!;
+      const last = v.records.find((r) => r.bundleId === f.bundleIdsA[1])!;
+
+      // The assertion this task exists for: B's continuation record's anchor IS
+      // A's bundle's headEntryUuid. Nothing derives it — both sides are read
+      // back off the hub, written by two separate real pushes on two machines.
+      expect(root.head).toBe("entry-3");
+      expect(middle.anchor).toBe(root.head);
+      expect(last.anchor).toBe(middle.head);
+      expect(root.anchor).toBeNull(); // a full bundle: no anchor exists
+
+      // So the whole A -> B -> A chain assembles from the root, across three
+      // records that no single machine's index lists together.
+      expect(v.chains.map((c) => c.map((r) => r.bundleId))).toEqual([
+        [f.bundleIdsA[0], f.bundleIdsB[0], f.bundleIdsA[1]],
+      ]);
+      expect(v.dangling).toEqual([]);
+      expect(v.unanchored).toEqual([]);
+      expect(v.unreachable).toEqual([]);
       expect(v.forks).toEqual([]);
 
-      // The link IS derivable — from the entries, via parentUuid. A's full
-      // bundle ends at `entry-3`; B's continuation starts at `b-entry-4`, whose
-      // parent is `entry-3`. Adjacent, and not equal.
+      // fromEntryUuid is UNCHANGED and still not a link: it is the anchor's
+      // child in the transcript. Pinned so a later "simplification" that
+      // collapses the two fields into one reddens here.
       const parentOf = new Map<string, string | null>(
         readFileSync(f.basePath, "utf-8")
           .split("\n")
@@ -551,12 +649,8 @@ describe("arrangeThreeMachines", () => {
           .filter((e): e is { uuid: string; parentUuid?: string } => typeof e.uuid === "string")
           .map((e) => [e.uuid, e.parentUuid ?? null])
       );
-      const root = v.records.find((r) => r.bundleId === f.bundleIdsA[0])!;
-      const middle = v.records.find((r) => r.machineId === f.machineIdB)!;
-      const last = v.records.find((r) => r.bundleId === f.bundleIdsA[1])!;
-
-      expect(root.head).toBe("entry-3");
       expect(middle.from).toBe("b-entry-4");
+      expect(middle.from).not.toBe(middle.anchor);
       expect(parentOf.get(middle.from!)).toBe(root.head);
       expect(parentOf.get(last.from!)).toBe(middle.head);
     } finally {
