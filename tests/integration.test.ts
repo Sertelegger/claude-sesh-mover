@@ -128,6 +128,74 @@ describe("integration: full export/import cycle", () => {
     expect(history).toContain("/home/devuser/projects/testproject");
   });
 
+  it("keeps arriving memories reachable across an archive round-trip, with the bundle gone", async () => {
+    // The measured #49 case, end to end: the target already has its own
+    // MEMORY.md and its own copy of one memory, and the transfer arrives as an
+    // archive whose extract dir cli.ts deletes before it returns. What the
+    // import leaves on disk is all there will ever be.
+    const { exportSession } = await import("../src/exporter.js");
+    const { createArchive, extractArchive } = await import("../src/archiver.js");
+    const { importSession } = await import("../src/importer.js");
+
+    const exportResult = await exportSession({
+      configDir: sourceConfigDir,
+      projectPath: "/Users/testuser/Projects/testproject",
+      sessionId,
+      outputDir: join(tempDir, "exports-memory"),
+      name: "memory-test",
+      excludeLayers: [],
+      claudeVersion: "2.1.81",
+    });
+    expect(exportResult.success).toBe(true);
+
+    const archivePath = join(tempDir, "memory-test.tar.gz");
+    await createArchive((exportResult as ExportResult).exportPath, archivePath, "gzip");
+    const extractDir = join(tempDir, "extracted-memory");
+    mkdirSync(extractDir);
+    await extractArchive(archivePath, extractDir);
+
+    const targetConfigDir = join(tempDir, "memory-target-claude");
+    const targetMemDir = join(
+      targetConfigDir,
+      "projects",
+      "-home-devuser-projects-testproject",
+      "memory"
+    );
+    mkdirSync(targetMemDir, { recursive: true });
+    writeFileSync(
+      join(targetMemDir, "MEMORY.md"),
+      "# Memory Index\n\n- [Local only](local-only.md) — written here\n"
+    );
+    writeFileSync(join(targetMemDir, "local-only.md"), "local\n");
+    writeFileSync(join(targetMemDir, "test_memory.md"), "my own version\n");
+
+    const importResult = await importSession({
+      exportPath: extractDir,
+      targetConfigDir,
+      targetProjectPath: "/home/devuser/projects/testproject",
+      targetClaudeVersion: "2.1.81",
+      dryRun: false,
+    });
+    expect(importResult.success).toBe(true);
+    const result = importResult as ImportResult;
+
+    // The bundle is gone, exactly as it is by the time the skill layer runs.
+    rmSync(extractDir, { recursive: true, force: true });
+    rmSync(archivePath, { force: true });
+
+    const index = readFileSync(join(targetMemDir, "MEMORY.md"), "utf-8");
+    expect(index).toContain("- [Local only](local-only.md) — written here");
+    expect(index).toContain("(test_memory.incoming.md)");
+    expect(readFileSync(join(targetMemDir, "test_memory.md"), "utf-8")).toBe("my own version\n");
+    expect(readFileSync(join(targetMemDir, "test_memory.incoming.md"), "utf-8")).toContain(
+      "Use vitest for testing."
+    );
+    expect(result.memoryConflicts?.[0]).toMatchObject({
+      filename: "test_memory.md",
+      parkedAs: "test_memory.incoming.md",
+    });
+  });
+
   it("imports with correct path rewriting when source and target paths differ significantly", async () => {
     const { exportSession } = await import("../src/exporter.js");
     const { importSession } = await import("../src/importer.js");

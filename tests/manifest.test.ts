@@ -352,4 +352,87 @@ describe("manifest", () => {
       expect(verifySessionsDigest(m)).toMatch(/hashes to sha256:/);
     });
   });
+
+  /**
+   * #53 changed what `includedLayers` MEANS (policy → content) and added a
+   * bundle-level `memoryDigest`. Both are outside `computeSessionsDigest`,
+   * which covers `manifest.sessions` and nothing else — so no bundle written
+   * before either change can be retroactively invalidated. This is the pin on
+   * that, because "widening the digest would make every hub bundle fail its own
+   * check" is a mistake with no loud failure mode at the site that makes it.
+   */
+  describe("bundle-level layer fields are outside the sessions digest (#53)", () => {
+    it("a bundle written before the change still verifies against its own digest", async () => {
+      const { readManifest, verifySessionsDigest, computeSessionsDigest } = await import(
+        "../src/manifest.js"
+      );
+      // A pre-#53 hub bundle, verbatim in shape: `includedLayers` declaring the
+      // two whole-file layers the bundle demonstrably does not carry, and no
+      // `memoryDigest` field at all.
+      const sessions = [
+        {
+          sessionId: "s1",
+          slug: "s",
+          summary: "",
+          createdAt: "2026-07-21T00:00:00Z",
+          lastActiveAt: "2026-07-21T00:00:00Z",
+          messageCount: 3,
+          gitBranch: "main",
+          entrypoint: "cli",
+          integrityHash: "sha256:deadbeef",
+          type: "full" as const,
+        },
+      ];
+      writeFileSync(
+        join(tempDir, "manifest.json"),
+        JSON.stringify({
+          version: 1,
+          plugin: "sesh-mover",
+          exportedAt: "2026-07-21T00:00:00Z",
+          sourcePlatform: "linux",
+          sourceProjectPath: "/p",
+          sourceConfigDir: "/c",
+          sourceClaudeVersion: "2.1.114",
+          sessionScope: "all",
+          includedLayers: [
+            "jsonl",
+            "subagents",
+            "file-history",
+            "tool-results",
+            "memory",
+            "plans",
+          ],
+          sessions,
+          sessionsDigest: computeSessionsDigest(sessions),
+          incremental: true,
+        })
+      );
+      const m = readManifest(tempDir);
+      expect(m.includedLayers).toContain("memory");
+      expect(m.memoryDigest).toBeUndefined();
+      expect(verifySessionsDigest(m)).toBeNull();
+    });
+
+    it("neither field participates in the digest, however it is edited", async () => {
+      const { computeSessionsDigest, verifySessionsDigest, writeManifest, readManifest } =
+        await import("../src/manifest.js");
+      const m = makeTestManifest();
+      const before = computeSessionsDigest(m.sessions);
+
+      m.includedLayers = [];
+      m.memoryDigest = "sha256:" + "0".repeat(64);
+      expect(computeSessionsDigest(m.sessions)).toBe(before);
+
+      // ...and through the real write/read path, where the stamp happens.
+      writeManifest(tempDir, m);
+      const readBack = readManifest(tempDir);
+      expect(readBack.sessionsDigest).toBe(before);
+      expect(readBack.memoryDigest).toBe(m.memoryDigest);
+      expect(verifySessionsDigest(readBack)).toBeNull();
+
+      // A session-list edit still moves it — the digest is narrow, not inert.
+      readBack.sessions[0].messageCount = 11;
+      expect(verifySessionsDigest(readBack)).toMatch(/hashes to sha256:/);
+    });
+  });
 });

@@ -4,6 +4,8 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  readdirSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -420,4 +422,242 @@ describe("exporter", () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  // --- #53: the manifest must declare what the bundle carries, and memory
+  // --- must actually reach an incremental bundle.
+
+  describe("declared layers vs carried layers", () => {
+    it("plain export: includedLayers equals the layers on disk, and every layer is there", async () => {
+      const { exportSession } = await import("../src/exporter.js");
+      const { readManifest } = await import("../src/manifest.js");
+      const outputDir = join(tempDir, "layers-full");
+      const result = await exportSession({
+        configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        sessionId,
+        outputDir,
+        name: "full",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // The fixture populates all six, so this is also the "nothing silently
+      // went missing" assertion.
+      expect(layersOnDisk(result.exportPath)).toEqual([
+        "jsonl",
+        "subagents",
+        "file-history",
+        "tool-results",
+        "memory",
+        "plans",
+      ]);
+      expect(readManifest(result.exportPath).includedLayers).toEqual(
+        layersOnDisk(result.exportPath)
+      );
+      expect(result.sessions[0].exportedLayers).toEqual(layersOnDisk(result.exportPath));
+    });
+
+    it("--exclude: includedLayers equals the layers on disk, excluded ones in neither", async () => {
+      const { exportSession } = await import("../src/exporter.js");
+      const { readManifest } = await import("../src/manifest.js");
+      const outputDir = join(tempDir, "layers-excluded");
+      const result = await exportSession({
+        configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        sessionId,
+        outputDir,
+        name: "excluded",
+        excludeLayers: ["file-history", "plans", "memory"],
+        claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const onDisk = layersOnDisk(result.exportPath);
+      expect(onDisk).toEqual(["jsonl", "subagents", "tool-results"]);
+      const manifest = readManifest(result.exportPath);
+      expect(manifest.includedLayers).toEqual(onDisk);
+      expect(manifest.memoryDigest).toBeUndefined();
+      expect(result.sessions[0].exportedLayers).toEqual(onDisk);
+    });
+
+    it("a layer the source does not have is not declared either", async () => {
+      const { exportSession } = await import("../src/exporter.js");
+      const { readManifest } = await import("../src/manifest.js");
+      // Requested, but absent at the source: the old code declared it anyway,
+      // because the list was policy rather than content.
+      rmSync(join(configDir, "projects", ENCODED, sessionId, "subagents"), {
+        recursive: true,
+        force: true,
+      });
+      const outputDir = join(tempDir, "layers-missing-source");
+      const result = await exportSession({
+        configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        sessionId,
+        outputDir,
+        name: "missing-source",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const onDisk = layersOnDisk(result.exportPath);
+      expect(onDisk).not.toContain("subagents");
+      expect(readManifest(result.exportPath).includedLayers).toEqual(onDisk);
+    });
+  });
+
+  describe("incremental export and the whole-file layers", () => {
+    // The peerSent record the fixture's session is at the head of, so every
+    // test here produces an incremental bundle with NO new session content and
+    // the memory decision is the only thing under test.
+    const atHead = (id: string) => ({
+      [id]: {
+        headEntryUuid: "entry-3",
+        messageCount: 3,
+        sentAsType: "full" as const,
+        sentAsSessionId: id,
+      },
+    });
+
+    async function incrementalExport(
+      name: string,
+      peerMemoryDigest?: string | null
+    ) {
+      const { exportAllSessions } = await import("../src/exporter.js");
+      const outputDir = join(tempDir, name);
+      const result = await exportAllSessions({
+        configDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        outputDir,
+        name,
+        excludeLayers: [],
+        claudeVersion: "2.1.114",
+        incremental: {
+          sourceMachineId: "machine-A",
+          sourceMachineName: "A",
+          targetMachineId: "machine-B",
+          targetMachineName: "B",
+          peerSent: atHead(sessionId),
+          peerMemoryDigest,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("export failed");
+      return result;
+    }
+
+    it("nothing known about the peer: memory ships and is declared", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const result = await incrementalExport("inc-memory-first");
+
+      // The regression this whole issue is about: an incremental bundle used
+      // to carry no memory at all, on any push, ever.
+      expect(existsSync(join(result.exportPath, "memory", "MEMORY.md"))).toBe(true);
+      expect(existsSync(join(result.exportPath, "memory", "test_memory.md"))).toBe(true);
+
+      const manifest = readManifest(result.exportPath);
+      expect(manifest.includedLayers).toContain("memory");
+      expect(manifest.includedLayers).toEqual(layersOnDisk(result.exportPath));
+      expect(manifest.memoryDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    });
+
+    it("peer already holds this exact memory: skipped, and not declared", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const first = await incrementalExport("inc-memory-a");
+      const digest = readManifest(first.exportPath).memoryDigest!;
+
+      const second = await incrementalExport("inc-memory-b", digest);
+      expect(existsSync(join(second.exportPath, "memory"))).toBe(false);
+      const manifest = readManifest(second.exportPath);
+      expect(manifest.includedLayers).not.toContain("memory");
+      expect(manifest.includedLayers).toEqual(layersOnDisk(second.exportPath));
+      // Nothing was shipped, so nothing may be credited to the peer.
+      expect(manifest.memoryDigest).toBeUndefined();
+    });
+
+    it("memory changed since that digest: ships again, with a new digest", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const first = await incrementalExport("inc-memory-c");
+      const digest = readManifest(first.exportPath).memoryDigest!;
+
+      writeFileSync(
+        join(configDir, "projects", ENCODED, "memory", "test_memory.md"),
+        "---\nname: Test memory\n---\n\nSomething new was learned.\n"
+      );
+
+      const second = await incrementalExport("inc-memory-d", digest);
+      expect(existsSync(join(second.exportPath, "memory", "test_memory.md"))).toBe(true);
+      expect(
+        readFileSync(join(second.exportPath, "memory", "test_memory.md"), "utf-8")
+      ).toContain("Something new was learned.");
+      const manifest = readManifest(second.exportPath);
+      expect(manifest.includedLayers).toContain("memory");
+      expect(manifest.memoryDigest).toBeDefined();
+      expect(manifest.memoryDigest).not.toBe(digest);
+    });
+
+    it("memory digest describes the BUNDLE's copy, not the live source", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const { computeLayerDigest } = await import("../src/manifest.js");
+      const result = await incrementalExport("inc-memory-bundle-digest");
+      expect(readManifest(result.exportPath).memoryDigest).toBe(
+        await computeLayerDigest(join(result.exportPath, "memory"))
+      );
+    });
+
+    it("plans stay off the incremental path, and the manifest says so", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const result = await incrementalExport("inc-plans");
+      // Deliberate: <configDir>/plans is config-global with no project filter,
+      // so an incremental (hub) bundle would ship every plan on the machine to
+      // a shared directory via the unattended auto-push. Deferred until the
+      // payload is scoped — but no longer advertised.
+      expect(existsSync(join(result.exportPath, "plans"))).toBe(false);
+      const manifest = readManifest(result.exportPath);
+      expect(manifest.includedLayers).not.toContain("plans");
+      expect(manifest.includedLayers).toEqual(layersOnDisk(result.exportPath));
+    });
+  });
 });
+
+const ENCODED = "-Users-testuser-Projects-testproject";
+
+const ALL_LAYERS = [
+  "jsonl",
+  "subagents",
+  "file-history",
+  "tool-results",
+  "memory",
+  "plans",
+] as const;
+
+/**
+ * The layers a bundle ACTUALLY carries, read off the extracted/staged bundle
+ * directory rather than out of its manifest. Deliberately an independent
+ * re-derivation: asserting the manifest against itself would have passed
+ * throughout #53's entire lifetime.
+ */
+function layersOnDisk(exportPath: string): string[] {
+  const found = new Set<string>();
+  const sessionsDir = join(exportPath, "sessions");
+  if (existsSync(sessionsDir)) {
+    for (const name of readdirSync(sessionsDir)) {
+      const p = join(sessionsDir, name);
+      if (statSync(p).isFile()) {
+        if (name.endsWith(".jsonl")) found.add("jsonl");
+        continue;
+      }
+      if (existsSync(join(p, "subagents"))) found.add("subagents");
+      if (existsSync(join(p, "tool-results"))) found.add("tool-results");
+    }
+  }
+  const fileHistory = join(exportPath, "file-history");
+  if (existsSync(fileHistory) && readdirSync(fileHistory).length > 0) found.add("file-history");
+  if (existsSync(join(exportPath, "memory"))) found.add("memory");
+  if (existsSync(join(exportPath, "plans"))) found.add("plans");
+  return ALL_LAYERS.filter((l) => found.has(l));
+}

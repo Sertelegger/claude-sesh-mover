@@ -12,6 +12,7 @@ import {
   readIncludePatterns, type CarryDropReason, type CarryRules,
 } from "./workspace.js";
 import { gitChildEnv } from "./carry.js";
+import { MAX_SIDECAR_ATTEMPTS, copyToUniqueName } from "../sidecar.js";
 
 /** A file was left alone and the incoming copy parked beside it. */
 export type SidecarReason =
@@ -165,7 +166,6 @@ export class MergeAncestorRequiredError extends Error {
 const BINARY_SNIFF_BYTES = 8192;
 const MERGE_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 5_000;
-const MAX_SIDECAR_ATTEMPTS = 100;
 const MAX_TMP_ATTEMPTS = 10;
 /** Scratch-slot mode: readable and writable by us, and by nobody else. */
 const SCRATCH_MODE = 0o600;
@@ -397,6 +397,11 @@ function siblingRel(rel: string, name: string): string {
  * existing sidecar — from an earlier pull in the same second, or a user file
  * that happens to match — is never overwritten; the name is uniquified
  * instead.
+ *
+ * The loop itself lives in `src/sidecar.ts` because the memory step in
+ * `src/importer.ts` parks incoming files under the same rule; only the naming
+ * differs (`<name>.theirs-<stamp>` here, `<stem>.incoming.md` there — see the
+ * comment at that site for why a memory has to keep its `.md`).
  */
 function writeSidecar(
   targetDir: string,
@@ -405,17 +410,11 @@ function writeSidecar(
   stamp: string
 ): string | null {
   const stem = `${basename(rel)}.theirs-${stamp}`;
-  for (let n = 0; n < MAX_SIDECAR_ATTEMPTS; n++) {
-    const name = n === 0 ? stem : `${stem}-${n + 1}`;
-    const sidecarRel = siblingRel(rel, name);
-    try {
-      copyFileSync(incomingPath, join(targetDir, sidecarRel), fsConstants.COPYFILE_EXCL);
-      return sidecarRel;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-    }
-  }
-  return null;
+  return copyToUniqueName(
+    incomingPath,
+    (n) => siblingRel(rel, n === 0 ? stem : `${stem}-${n + 1}`),
+    (sidecarRel) => join(targetDir, sidecarRel)
+  );
 }
 
 /**

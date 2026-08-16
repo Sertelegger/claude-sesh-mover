@@ -80,29 +80,21 @@ export declare function computeLayerDigest(dir: string): Promise<string | null>;
  *   deliberately, because `hub/push.ts` patches three of those into the staged
  *   `manifest.json` in place, after the exporter wrote it. Widening the digest
  *   to the whole manifest would make every hub bundle fail its own check.
- * - **It does not enumerate `memory/` or `plans/`.** Those are merged rather
- *   than restored (the importer keeps the existing file on any difference and
- *   reports a `memoryConflicts` entry), so a damaged one cannot overwrite
- *   anything the user has.
+ * - **It does not enumerate `memory/` or `plans/`.** Those are the two
+ *   shared-namespace layers: they land in a directory the TARGET owns rather
+ *   than under a session id the import just minted. Since #49 the importer
+ *   RECONCILES them rather than restoring them: `MEMORY.md` is a line union
+ *   (local entries kept verbatim, incoming pointers appended, nothing
+ *   reordered or deleted), and a conflicting prose file is parked beside the
+ *   local one as `<stem>.incoming.md` and indexed — the local file is never
+ *   overwritten on any path. So a damaged payload still cannot overwrite
+ *   anything the user has, which is why these stay outside this digest.
  *
- * Optional on `ExportManifest`: bundles written before this field existed carry
- * no digest, and are verified exactly as they were before rather than refused.
- *
- * ## Adding a field to a session record is safe, and here is exactly why
- *
- * The digest is computed at WRITE time over whatever the manifest then holds,
- * and `verifySessionsDigest` recomputes it from the manifest's own list at read
- * time — there is no stored expectation anywhere to fall out of step with. So a
- * new optional field (`continuation.anchorEntryUuid` was the first) is hashed
- * into new manifests and simply absent from old ones, which keep verifying
- * against their own older digest. `canonicalize` needs no knowledge of the
- * field: it key-sorts recursively and drops `undefined`, so an absent optional
- * hashes identically to one that was never declared.
- *
- * What would NOT be safe is back-filling such a field on read, or defaulting it
- * anywhere between `readManifest` and `verifySessionsDigest` — that mutates the
- * list the digest is checked against and turns every pre-existing bundle into a
- * mismatch.
+ *   Two earlier versions of this bullet were wrong in opposite directions: it
+ *   first claimed the layers were "merged" (they were not, on either path),
+ *   then that the importer "keeps the existing file on any difference" (true
+ *   only until #49). If you are about to describe this behaviour again, read
+ *   `reconcileSharedLayers` rather than this comment.
  */
 export declare function computeSessionsDigest(sessions: SessionManifest[]): string;
 /**

@@ -26,6 +26,7 @@ import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import {
   readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace,
+  setPeerMemoryDigest,
 } from "../sync-state.js";
 import type {
   ErrorResult, HubLockBusyResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, ProgressEvent,
@@ -470,6 +471,12 @@ export async function hubPush(
         targetMachineId: hubPeerId,
         targetMachineName: "hub",
         peerSent: state.peers[hubPeerId]?.sent ?? {},
+        // The memory layer's "already has it" ledger, the whole-file
+        // counterpart of `peerSent`. Absent on a first push, which is exactly
+        // when the memory must travel — see the memory block in exporter.ts.
+        // The hub is the peer here, so this is per-hub bookkeeping like the
+        // rest of `state.peers[hubPeerId]`.
+        peerMemoryDigest: state.peers[hubPeerId]?.memoryDigest ?? null,
       },
       onProgress: opts.onProgress,
     });
@@ -698,9 +705,26 @@ export async function hubPush(
     //
     // Read AFTER recordSentFromBundle — that helper rewrites the same file, so
     // mutating a copy read before it would be silently discarded.
-    if (hasWorkspace) {
+    //
+    // `manifest.memoryDigest` rides along in the same read/write for the same
+    // reason and under the same rule: it is the digest of the `memory/`
+    // directory THIS bundle carries, and crediting the hub with it is only
+    // truthful once the bundle is on the hub. A push that failed above this
+    // line leaves the ledger untouched, so the next push ships the memory
+    // again — which is the direction an unknown must fail in (exporter.ts).
+    //
+    // Note what this does NOT cover: the `manifest.sessions.length === 0`
+    // early return above never reaches here, so changed memory with no new
+    // session content travels with the next push that has some. That matches
+    // the workspace and carry payloads, which the same early return skips.
+    if (hasWorkspace || manifest.memoryDigest) {
       const stateWs = readSyncState(opts.projectPath);
-      setLastWorkspace(stateWs, hub.hubId, { bundleId, file: hubFile, pushedAt });
+      if (hasWorkspace) {
+        setLastWorkspace(stateWs, hub.hubId, { bundleId, file: hubFile, pushedAt });
+      }
+      if (manifest.memoryDigest) {
+        setPeerMemoryDigest(stateWs, { id: hubPeerId, name: "hub" }, manifest.memoryDigest);
+      }
       writeSyncState(stateWs);
     }
 

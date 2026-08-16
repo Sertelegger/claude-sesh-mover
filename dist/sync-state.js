@@ -180,6 +180,39 @@ export function recordSentToPeer(projectPath, peer, localSessionId, sent) {
     state.peers[peer.id].sent[localSessionId] = sent;
     writeSyncState(state);
 }
+/**
+ * Credit a peer with the memory layer a bundle just delivered to it — the
+ * whole-file counterpart of `recordSentFromBundle`'s per-session ledger, and the
+ * input the next export reads back as `IncrementalExportOptions.peerMemoryDigest`.
+ *
+ * Two rules, both inherited from the ledgers beside it:
+ *
+ * - **Call it only once the bundle has actually reached the peer**, exactly as
+ *   `setLastWorkspace` is only called once the bundle is committed to the hub.
+ *   Recording a digest for a bundle that never arrived makes the next export skip
+ *   a directory the peer does not have, and nothing ever re-sends it.
+ * - **Pass the digest of the BUNDLE's copy** (`ExportManifest.memoryDigest`),
+ *   never a fresh hash of the live source directory. The live directory can have
+ *   changed since the export, and crediting the peer with bytes it was not sent
+ *   suppresses precisely the push that would have fixed it.
+ *
+ * Creates the peer entry if it does not exist yet, for the same reason its
+ * siblings do: a peer's first delivery is also the first time it is named.
+ * Purely additive — see `SyncStatePeer.memoryDigest` for why this does not
+ * promote the file to `schemaVersion` 2.
+ */
+export function setPeerMemoryDigest(state, peer, digest) {
+    if (!state.peers[peer.id]) {
+        state.peers[peer.id] = {
+            name: peer.name ?? peer.id,
+            lastSentAt: null,
+            lastReceivedAt: null,
+            sent: {},
+            received: {},
+        };
+    }
+    state.peers[peer.id].memoryDigest = digest;
+}
 export function getThreadId(state, localSessionId) {
     // `?.` after threadByLocalSession too: `parseSyncState` validates neither
     // the `hub` block's shape nor its sub-objects, and `hub` now carries four of
