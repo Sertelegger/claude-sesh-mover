@@ -5,6 +5,7 @@ import {
   existsSync,
   readFileSync,
   mkdirSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -152,36 +153,372 @@ describe("importer", () => {
       expect(result.importedSessions).toHaveLength(1);
     });
 
-    it("merges memory files without overwriting existing", async () => {
+    // --- Shared-namespace auxiliary layers: memory/ and plans/ (#49) ---
+    //
+    // The fixture bundle carries memory/MEMORY.md (one pointer line, target
+    // `test_memory.md`) and memory/test_memory.md, plus plans/test-plan.md.
+    //
+    // The predecessor of this block was titled "merges memory files without
+    // overwriting existing" and seeded `existing.md` — a name the bundle does
+    // NOT contain — so it only ever exercised copy-if-absent. The conflict
+    // branch had zero coverage, which is how a live import came to land ten
+    // memory files and strand every one of them.
+    const TARGET_PROJECT = "/Users/newuser/Projects/newproject";
+    const targetMemDir = () =>
+      join(targetConfigDir, "projects", "-Users-newuser-Projects-newproject", "memory");
+    const seedMemory = (name: string, content: string) => {
+      mkdirSync(targetMemDir(), { recursive: true });
+      writeFileSync(join(targetMemDir(), name), content);
+    };
+    const readMemory = (name: string) => readFileSync(join(targetMemDir(), name), "utf-8");
+    const runImport = async (opts?: { dryRun?: boolean; from?: string }) => {
       const { importSession } = await import("../src/importer.js");
-      const { writeFileSync } = await import("node:fs");
-
-      // Create pre-existing memory in target
-      const encoded = "-Users-newuser-Projects-newproject";
-      const targetMemDir = join(
+      return importSession({
+        exportPath: opts?.from ?? exportPath,
         targetConfigDir,
+        targetProjectPath: TARGET_PROJECT,
+        targetClaudeVersion: "2.1.81",
+        dryRun: opts?.dryRun ?? false,
+      });
+    };
+    /**
+     * Re-export the fixture session after planting extra files in the SOURCE
+     * memory directory, so a bundle with a different memory layer is produced
+     * by the real exporter rather than hand-assembled.
+     */
+    const exportWithMemory = async (
+      files: Record<string, string>,
+      name = "memory-export"
+    ): Promise<string> => {
+      const srcMem = join(
+        sourceConfigDir,
         "projects",
-        encoded,
+        "-Users-testuser-Projects-testproject",
         "memory"
       );
-      mkdirSync(targetMemDir, { recursive: true });
-      writeFileSync(
-        join(targetMemDir, "existing.md"),
-        "---\nname: existing\n---\nExisting memory\n"
-      );
+      for (const [file, content] of Object.entries(files)) {
+        writeFileSync(join(srcMem, file), content);
+      }
+      const { exportSession } = await import("../src/exporter.js");
+      const result = await exportSession({
+        configDir: sourceConfigDir,
+        projectPath: "/Users/testuser/Projects/testproject",
+        sessionId,
+        outputDir: join(tempDir, "exports-2"),
+        name,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+      });
+      if (!result.success) throw new Error("re-export failed in test setup");
+      return (result as ExportResult).exportPath;
+    };
 
-      const result = await importSession({
-        exportPath,
-        targetConfigDir,
-        targetProjectPath: "/Users/newuser/Projects/newproject",
-        targetClaudeVersion: "2.1.81",
-        dryRun: false,
+    it("unions a conflicting MEMORY.md instead of stranding what arrived", async () => {
+      const local = "# Memory Index\n\n- [Local note](local-note.md) — mine\n";
+      seedMemory("MEMORY.md", local);
+      seedMemory("local-note.md", "local\n");
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      const index = readMemory("MEMORY.md");
+      // Local content survives verbatim, in its original order…
+      expect(index.startsWith(local)).toBe(true);
+      // …and the entry that makes the arriving file reachable is appended.
+      expect(index).toContain("- [Test memory](test_memory.md) — remembering test patterns");
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+
+      expect(result.memoryIndex).toEqual({
+        added: ["test_memory.md"],
+        alreadyPresent: 0,
+        droppedProse: false,
+        unindexed: [],
+      });
+      // The index is an outcome, not a conflict.
+      expect(result.memoryConflicts).toBeUndefined();
+      expect(result.warnings.some((w) => w.includes("added 1 entry"))).toBe(true);
+    });
+
+    it("dedups the union by link target and keeps the local line byte-for-byte", async () => {
+      // Same memory, retitled and re-described on this machine.
+      const local = "- [Renamed by me](test_memory.md) — my own words\n";
+      seedMemory("MEMORY.md", local);
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      expect(readMemory("MEMORY.md")).toBe(local);
+      expect(result.memoryIndex?.added).toEqual([]);
+      expect(result.memoryIndex?.alreadyPresent).toBe(1);
+    });
+
+    it("preserves a header, trailing prose and CRLF, appending after the last pointer", async () => {
+      const local =
+        "# Memory Index\r\n\r\n- [Local note](local-note.md) — mine\r\n\r\nRead these before starting.\r\n";
+      seedMemory("MEMORY.md", local);
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+
+      const index = readMemory("MEMORY.md");
+      const lines = index.split("\r\n");
+      // Every line ends CRLF: no line was rewritten with a bare \n.
+      expect(index.split("\n").length - 1).toBe(index.split("\r\n").length - 1);
+      expect(lines[0]).toBe("# Memory Index");
+      // Appended after the last POINTER line, not at end of file — otherwise
+      // the new entry lands below the prose and reads as commentary.
+      const appendedAt = lines.findIndex((l) => l.includes("(test_memory.md)"));
+      const proseAt = lines.findIndex((l) => l === "Read these before starting.");
+      expect(appendedAt).toBeGreaterThan(0);
+      expect(appendedAt).toBeLessThan(proseAt);
+    });
+
+    it("appends an incoming pointer whose target is not in the bundle, and never deletes a local one", async () => {
+      // Local index points at a memory that no longer exists on disk.
+      seedMemory("MEMORY.md", "- [Gone](gone.md) — deleted long ago\n");
+      const from = await exportWithMemory({
+        "MEMORY.md":
+          "- [Test memory](test_memory.md) — remembering test patterns\n" +
+          "- [Elsewhere](arrived-earlier.md) — not in this bundle\n",
       });
 
+      const result = await runImport({ from });
       expect(result.success).toBe(true);
-      // Both existing and imported memory files should be present
-      expect(existsSync(join(targetMemDir, "existing.md"))).toBe(true);
-      expect(existsSync(join(targetMemDir, "MEMORY.md"))).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      const index = readMemory("MEMORY.md");
+      expect(index).toContain("- [Gone](gone.md) — deleted long ago");
+      expect(index).toContain("(arrived-earlier.md)");
+      expect(result.memoryIndex?.added).toEqual(["test_memory.md", "arrived-earlier.md"]);
+    });
+
+    it("parks a conflicting prose memory, indexes it, and reports it", async () => {
+      seedMemory("MEMORY.md", "- [Test memory](test_memory.md) — my version\n");
+      seedMemory("test_memory.md", "---\nname: Test memory\n---\n\nMine, not theirs.\n");
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryConflicts" in result)) return;
+
+      // The local file is never touched.
+      expect(readMemory("test_memory.md")).toContain("Mine, not theirs.");
+      // The incoming text is on disk…
+      expect(readMemory("test_memory.incoming.md")).toContain("Use vitest for testing.");
+      // …and reachable.
+      expect(readMemory("MEMORY.md")).toContain("(test_memory.incoming.md)");
+
+      // The skill layer is told where to read both texts, rather than having
+      // to re-derive the project-path encoding in markdown.
+      expect(result.memoryDir).toBe(targetMemDir());
+      expect(result.memoryConflicts).toHaveLength(1);
+      const conflict = result.memoryConflicts![0];
+      expect(conflict.filename).toBe("test_memory.md");
+      expect(conflict.parkedAs).toBe("test_memory.incoming.md");
+      expect(conflict.existingHash).not.toBe(conflict.incomingHash);
+
+      // Tier 3's precondition: once the bundle is gone (cli.ts deletes an
+      // archive's extract dir before returning), both texts must still be
+      // readable from the target, or the skill layer has nothing to merge.
+      rmSync(exportPath, { recursive: true, force: true });
+      expect(readMemory("test_memory.md")).toContain("Mine, not theirs.");
+      expect(readMemory("test_memory.incoming.md")).toContain("Use vitest for testing.");
+    });
+
+    it("indexes a parked copy even when the index never mentioned the original", async () => {
+      // The local index knows nothing about test_memory.md, and neither the
+      // union nor the copy branch would add a line for the parked copy.
+      seedMemory("MEMORY.md", "# Memory Index\n\n- [Local note](local-note.md) — mine\n");
+      seedMemory("test_memory.md", "different\n");
+      const from = await exportWithMemory({ "MEMORY.md": "# Memory Index\n" }, "no-pointer-export");
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      expect(result.memoryIndex?.added).toEqual([]);
+      expect(readMemory("MEMORY.md")).toContain("(test_memory.incoming.md)");
+      expect(existsSync(join(targetMemDir(), "test_memory.incoming.md"))).toBe(true);
+    });
+
+    it("uniquifies a second parked copy instead of eating the first", async () => {
+      seedMemory("test_memory.md", "mine, and staying mine\n");
+      const first = await runImport();
+      expect(first.success).toBe(true);
+      const parkedOnce = readMemory("test_memory.incoming.md");
+
+      // The same memory, changed again on the other machine, still conflicting.
+      const from = await exportWithMemory({ "test_memory.md": "theirs, round two\n" });
+      const second = await runImport({ from });
+      expect(second.success).toBe(true);
+      if (!second.success || !("memoryConflicts" in second)) return;
+
+      // The first parked copy is not eaten, and the second gets its own name.
+      expect(readMemory("test_memory.incoming.md")).toBe(parkedOnce);
+      expect(readMemory("test_memory.incoming-2.md")).toBe("theirs, round two\n");
+      expect(second.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming-2.md");
+      const index = readMemory("MEMORY.md");
+      expect(index).toContain("(test_memory.incoming.md)");
+      expect(index).toContain("(test_memory.incoming-2.md)");
+    });
+
+    it("reuses an identical parked copy instead of planting one per bundle", async () => {
+      // A hub pull applies a CHAIN of bundles, one importSession call each. If
+      // every one parked its own copy of an unchanged memory, a five-bundle
+      // pull would leave five identical files and five index lines.
+      seedMemory("test_memory.md", "mine\n");
+      const first = await runImport();
+      expect(first.success).toBe(true);
+
+      const second = await runImport();
+      expect(second.success).toBe(true);
+      if (!second.success || !("memoryConflicts" in second)) return;
+
+      expect(second.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming.md");
+      expect(existsSync(join(targetMemDir(), "test_memory.incoming-2.md"))).toBe(false);
+      // …and exactly one index line for it.
+      const lines = readMemory("MEMORY.md").split("\n");
+      expect(lines.filter((l) => l.includes("(test_memory.incoming.md)"))).toHaveLength(1);
+    });
+
+    it("reconciles memory on a re-import where every session is a duplicate", async () => {
+      const first = await runImport();
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      expect(first.importedSessions).toHaveLength(1);
+
+      // The memories go missing (a stray delete, a half-restored machine) and
+      // the user's instinct is to re-run the import.
+      rmSync(join(targetMemDir(), "test_memory.md"), { force: true });
+      seedMemory("MEMORY.md", "- [Local note](local-note.md) — mine\n");
+
+      const second = await runImport();
+      expect(second.success).toBe(true);
+      if (!second.success || !("memoryIndex" in second)) return;
+
+      expect(second.importedSessions).toEqual([]);
+      expect(second.skippedSessions).toHaveLength(1);
+      // …and this time the re-run actually does something.
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+      expect(second.memoryIndex?.added).toEqual(["test_memory.md"]);
+    });
+
+    it("is idempotent: a third import changes no byte of the index", async () => {
+      seedMemory("MEMORY.md", "# Memory Index\n\n- [Local note](local-note.md) — mine\n");
+      await runImport();
+      const afterFirst = readMemory("MEMORY.md");
+      await runImport();
+      await runImport();
+      expect(readMemory("MEMORY.md")).toBe(afterFirst);
+    });
+
+    it("reports bundle memories that no index lists, without inventing a pointer", async () => {
+      const from = await exportWithMemory({ "orphan.md": "# Orphan\n\nNobody points here.\n" });
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      // It lands (it is content the user asked for) and it is named as
+      // unreachable — adopting it would mean guessing a title and writing it
+      // into the file that decides what future sessions read, to repair a
+      // condition that predates the transfer.
+      expect(existsSync(join(targetMemDir(), "orphan.md"))).toBe(true);
+      expect(result.memoryIndex?.unindexed).toEqual(["orphan.md"]);
+      expect(readMemory("MEMORY.md")).not.toContain("orphan.md");
+      expect(result.warnings.some((w) => w.includes("listed in no index"))).toBe(true);
+    });
+
+    it("drops incoming prose from the index and says so", async () => {
+      seedMemory("MEMORY.md", "- [Local note](local-note.md) — mine\n");
+      const from = await exportWithMemory({
+        "MEMORY.md":
+          "# Memory Index\n\nRead the machine notes first.\n\n- [Test memory](test_memory.md) — theirs\n",
+      });
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      expect(result.memoryIndex?.droppedProse).toBe(true);
+      expect(readMemory("MEMORY.md")).not.toContain("Read the machine notes first.");
+      expect(readMemory("MEMORY.md")).toContain("(test_memory.md)");
+      expect(result.warnings.some((w) => w.includes("not an index entry"))).toBe(true);
+    });
+
+    it("never fails the import when the memory index cannot be read", async () => {
+      // A directory where MEMORY.md should be: readFileSync raises EISDIR.
+      mkdirSync(join(targetMemDir(), "MEMORY.md"), { recursive: true });
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.importedSessions).toHaveLength(1);
+      expect(
+        result.warnings.some((w) => w.includes("Could not read the existing memory index"))
+      ).toBe(true);
+    });
+
+    it("previews the memory step with the function that performs it", async () => {
+      seedMemory("MEMORY.md", "- [Local note](local-note.md) — mine\n");
+      seedMemory("test_memory.md", "mine\n");
+
+      const preview = await runImport({ dryRun: true });
+      expect(preview.success).toBe(true);
+      if (!preview.success || !("memoryPlan" in preview)) return;
+      expect(preview.memoryPlan).toEqual([
+        {
+          filename: "MEMORY.md",
+          verdict: "index-union",
+          added: ["test_memory.md"],
+          alreadyPresent: 0,
+        },
+        { filename: "test_memory.md", verdict: "park", parkedAs: "test_memory.incoming.md" },
+      ]);
+      // A dry run writes nothing.
+      expect(existsSync(join(targetMemDir(), "test_memory.incoming.md"))).toBe(false);
+      expect(readMemory("MEMORY.md")).toBe("- [Local note](local-note.md) — mine\n");
+
+      // The real run then does exactly what the preview said.
+      const real = await runImport();
+      expect(real.success).toBe(true);
+      if (!real.success || !("memoryIndex" in real)) return;
+      expect(real.memoryIndex?.added).toEqual(["test_memory.md"]);
+      expect(real.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming.md");
+    });
+
+    it("reports a colliding plan instead of discarding it in silence", async () => {
+      const plansDir = join(targetConfigDir, "plans");
+      mkdirSync(plansDir, { recursive: true });
+      writeFileSync(join(plansDir, "test-plan.md"), "# My own plan\n");
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("planConflicts" in result)) return;
+
+      expect(readFileSync(join(plansDir, "test-plan.md"), "utf-8")).toBe("# My own plan\n");
+      expect(result.planConflicts).toHaveLength(1);
+      expect(result.planConflicts![0].filename).toBe("test-plan.md");
+      expect(result.planConflicts![0].existingHash).not.toBe(
+        result.planConflicts![0].incomingHash
+      );
+      expect(result.warnings.some((w) => w.includes('Plan "test-plan.md"'))).toBe(true);
+    });
+
+    it("still copies memory and plans that do not collide", async () => {
+      seedMemory("existing.md", "---\nname: existing\n---\nExisting memory\n");
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("planConflicts" in result)) return;
+
+      expect(existsSync(join(targetMemDir(), "existing.md"))).toBe(true);
+      expect(existsSync(join(targetMemDir(), "MEMORY.md"))).toBe(true);
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+      expect(existsSync(join(targetConfigDir, "plans", "test-plan.md"))).toBe(true);
+      expect(result.memoryConflicts).toBeUndefined();
+      expect(result.planConflicts).toBeUndefined();
     });
 
     it("refuses a bundle whose manifest sessionId escapes the bundle (no file read outside)", async () => {

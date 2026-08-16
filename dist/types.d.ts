@@ -153,6 +153,26 @@ export interface ExportManifest {
     sourceConfigDir: string;
     sourceClaudeVersion: string;
     sessionScope: SessionScope;
+    /**
+     * The layers this bundle ACTUALLY CARRIES — content, never policy.
+     *
+     * A layer is listed iff its payload is on disk in the bundle: `jsonl` iff at
+     * least one session file was written, the three per-session layers iff at
+     * least one session directory for them exists (which is exactly when that
+     * session declares a `layerDigests` key for it), `memory`/`plans` iff their
+     * bundle-root directory exists. Nothing is listed because it was merely
+     * *requested*.
+     *
+     * It used to be `getAllLayers()` minus `--exclude`, computed once and stamped
+     * regardless of what the export then did — so every hub bundle declared
+     * `memory` and `plans` while carrying neither (#53), and any export from a
+     * source with no subagents declared `subagents`. `commands/browse.md` offers
+     * this field to a human as the answer to "what is in this export", so the
+     * distance between the two readings was a lie with a reader.
+     *
+     * It is OUTSIDE `sessionsDigest` (that digest covers `sessions` only), so
+     * changing what is declared here can never invalidate an existing bundle.
+     */
     includedLayers: ExportLayer[];
     sessions: SessionManifest[];
     /**
@@ -162,6 +182,22 @@ export interface ExportManifest {
      * and are verified as they always were.
      */
     sessionsDigest?: string;
+    /**
+     * `computeLayerDigest` over the bundle's own `memory/` directory — present
+     * iff the bundle carries one, so it is the machine-readable twin of
+     * `includedLayers` containing `"memory"`.
+     *
+     * Its job is the incremental skip: a push records this value against the peer
+     * it sent to (`SyncStatePeer.memoryDigest`), and the next export to that peer
+     * ships `memory/` again only when the source directory no longer hashes to
+     * it. Taken over the BUNDLE's copies rather than the source tree, for the same
+     * reason `computeSessionLayerDigests` is — the recorded value has to describe
+     * the bytes that actually travelled, or a truncated copy would suppress the
+     * re-send that repairs it.
+     *
+     * Outside `sessionsDigest`, like `workspace`/`carry`/`projectId`.
+     */
+    memoryDigest?: string;
     sourceMachineId?: string;
     sourceMachineName?: string;
     incremental?: boolean;
@@ -253,6 +289,13 @@ export interface ExportResult {
         slug: string;
         summary: string;
         messageCount: number;
+        /**
+         * What the bundle carries FOR THIS SESSION, plus the bundle-level layers
+         * (`memory`/`plans`) it carries at all. Content, never policy — same rule as
+         * `ExportManifest.includedLayers`, of which this is the per-session slice,
+         * so two sessions in one bundle can legitimately differ (one had subagents,
+         * the other did not).
+         */
         exportedLayers: ExportLayer[];
     }>;
     warnings: string[];
@@ -260,6 +303,64 @@ export interface ExportResult {
     actualFormat?: ExportFormat;
     collision: boolean;
     existingPath?: string;
+}
+/**
+ * A shared-namespace auxiliary file that exists on both sides with different
+ * content. This is tier 3's entry point as well as tier 2's report: it gives
+ * the skill layer the FACT of the conflict and two hashes, never the contents —
+ * the contents come from disk, which is what `parkedAs` is for. By the time a
+ * caller reads this the bundle may be gone (`cli.ts` deletes an archive's
+ * extract dir before returning), so a reader that goes back to the bundle for
+ * the incoming text is reading a directory that no longer exists.
+ */
+export interface AuxiliaryConflict {
+    filename: string;
+    existingHash: string;
+    incomingHash: string;
+}
+export interface MemoryConflict extends AuxiliaryConflict {
+    /**
+     * Tier 2: the file the incoming copy was parked as, relative to the memory
+     * directory (`<stem>.incoming.md`, uniquified). Absent only when parking was
+     * impossible, in which case the incoming text is NOT on this machine.
+     */
+    parkedAs?: string;
+}
+/** What the `MEMORY.md` union did. `MEMORY.md` is an outcome, not a conflict. */
+export interface MemoryIndexReport {
+    /** Link targets appended to the local index, in incoming order. */
+    added: string[];
+    /** Incoming pointers deduped away because the local index already had them. */
+    alreadyPresent: number;
+    /** Incoming headings/prose discarded — the union merges entries, not documents. */
+    droppedProse: boolean;
+    /**
+     * Memory files the bundle carried that no index line points at after the
+     * union. These landed on disk unreachable — usually because they were already
+     * orphaned on the SOURCE machine, which the union cannot fix: it is a union
+     * over index lines, and a file no line points at contributes no line.
+     */
+    unindexed: string[];
+}
+/** One line of the dry run's memory preview. Same function as the real run. */
+export interface MemoryPlanEntry {
+    filename: string;
+    /**
+     * - `copy` — absent locally, will be written verbatim
+     * - `identical` — present, bytes equal, no write
+     * - `index-union` — this is `MEMORY.md` and it differs; entries will be appended
+     * - `park` — prose conflict; local kept, incoming parked as `parkedAs`
+     * - `keep-local` — conflict that could not be parked or read; local kept
+     * - `skip` — not a regular file, ignored
+     */
+    verdict: "copy" | "identical" | "index-union" | "park" | "keep-local" | "skip";
+    /** `index-union`: the link targets that would be appended. */
+    added?: string[];
+    /** `index-union`: incoming pointers that would be deduped away. */
+    alreadyPresent?: number;
+    /** `park`: the name that would be used, absent an unresolved earlier copy. */
+    parkedAs?: string;
+    note?: string;
 }
 export interface ImportResult {
     success: true;
@@ -278,11 +379,27 @@ export interface ImportResult {
     warnings: string[];
     resumable: boolean;
     versionAdaptations?: string[];
-    memoryConflicts?: Array<{
-        filename: string;
-        existingHash: string;
-        incomingHash: string;
-    }>;
+    /**
+     * Prose memory files that differ on both sides. Never `MEMORY.md` — the index
+     * is unioned, so it is reported in `memoryIndex` instead.
+     */
+    memoryConflicts?: MemoryConflict[];
+    memoryIndex?: MemoryIndexReport;
+    /**
+     * Absolute path of the target project's memory directory, present whenever
+     * the bundle carried a `memory/` layer. Every `filename`/`parkedAs` above is
+     * relative to it. It is reported rather than left to be derived because
+     * deriving it means re-implementing `encodeProjectPath` in markdown — a
+     * second copy of an encoding whose own module refuses to invert it.
+     */
+    memoryDir?: string;
+    /**
+     * Plans that differ on both sides. Reported only: a plan is a document with
+     * no index and no union, and `plans/` is config-dir-global, so nothing is
+     * written beside it. The local plan is kept and the incoming one stays in the
+     * bundle.
+     */
+    planConflicts?: AuxiliaryConflict[];
 }
 export interface DryRunResult {
     success: true;
@@ -294,6 +411,10 @@ export interface DryRunResult {
     resumable: boolean;
     rewriteReport?: RewriteReport;
     versionAdaptations?: string[];
+    /** What the memory step would do, computed by the function that does it. */
+    memoryPlan?: MemoryPlanEntry[];
+    memoryDir?: string;
+    planConflicts?: AuxiliaryConflict[];
 }
 export interface MigrateResult {
     success: true;
@@ -1001,6 +1122,28 @@ export interface SyncStatePeer {
     lastReceivedAt: string | null;
     sent: Record<string, SyncStateSessionSent>;
     received: Record<string, SyncStateSessionReceived>;
+    /**
+     * The `memoryDigest` of the last bundle this machine successfully delivered
+     * to this peer — the whole-file counterpart of `sent`, which tracks the same
+     * "already has it" question per session.
+     *
+     * `memory/` has no delta representation, so "incremental" for it can only mean
+     * "do not re-send an identical copy". This is that ledger, and it obeys the
+     * same rule as `sent`: written only once the bundle has actually reached the
+     * peer, never at export time. Recording it early would make the next export
+     * skip a directory the peer never received.
+     *
+     * Absent means "nothing known" and therefore "ship it" — which is what makes
+     * the first push to a peer carry memory, and what makes a lost or reset state
+     * file fail toward re-sending rather than toward silence.
+     *
+     * Additive and version-neutral on purpose: it lives on the peer entry rather
+     * than in the `hub` block (where the workspace ledger lives) so that a plain
+     * `export --incremental --to <peer>` user gains it without their state file
+     * being promoted to `schemaVersion` 2 — see `setThreadId` for why that
+     * promotion is not free.
+     */
+    memoryDigest?: string;
 }
 export interface SyncStateLineage {
     sourceMachineId: string;

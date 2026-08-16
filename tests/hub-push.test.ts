@@ -1333,4 +1333,212 @@ describe("hub push — a failure after the identity is resolved", () => {
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
     }
   });
+
+  // --- #53: memory on the hub path -------------------------------------
+  //
+  // Every assertion here is on the EXTRACTED ARCHIVE, never on the manifest
+  // alone. The whole defect was a manifest that described a bundle it did not
+  // match, so a test that trusts the manifest is the test that missed it.
+
+  /** Fetch the Nth bundle this project has on the hub and extract it. */
+  async function extractNthBundle(
+    hub: string,
+    projectId: string,
+    base: string,
+    tag: string,
+    n: number
+  ): Promise<string> {
+    const backend = createFsBackend(hub);
+    const { indexes } = await readAllIndexes(backend, projectId);
+    const bundles = Object.values(indexes[0].threads).flatMap((t) => t.bundles);
+    const archiveTmp = join(base, `${tag}.tar.gz`);
+    writeFileSync(archiveTmp, await backend.read(bundles[n].file));
+    const dir = join(base, `${tag}-extracted`);
+    mkdirSync(dir, { recursive: true });
+    await extractArchive(archiveTmp, dir);
+    return dir;
+  }
+
+  /**
+   * The layers a bundle ACTUALLY carries, re-derived from the extracted tree.
+   * Independent of the manifest on purpose — a mirror of the same helper in
+   * tests/exporter.test.ts, which asserts the same invariant on the plain
+   * export path.
+   */
+  function layersOnDisk(dir: string): string[] {
+    const found = new Set<string>();
+    const sessionsDir = join(dir, "sessions");
+    if (existsSync(sessionsDir)) {
+      for (const name of readdirSync(sessionsDir)) {
+        const p = join(sessionsDir, name);
+        if (statSync(p).isFile()) {
+          if (name.endsWith(".jsonl")) found.add("jsonl");
+          continue;
+        }
+        if (existsSync(join(p, "subagents"))) found.add("subagents");
+        if (existsSync(join(p, "tool-results"))) found.add("tool-results");
+      }
+    }
+    const fileHistory = join(dir, "file-history");
+    if (existsSync(fileHistory) && readdirSync(fileHistory).length > 0) found.add("file-history");
+    if (existsSync(join(dir, "memory"))) found.add("memory");
+    if (existsSync(join(dir, "plans"))) found.add("plans");
+    return ["jsonl", "subagents", "file-history", "tool-results", "memory", "plans"].filter((l) =>
+      found.has(l)
+    );
+  }
+
+  /** Append two entries to a session so the next push has something to send. */
+  function carryOn(configDir: string, projectPath: string, sessionId: string, tag: string): void {
+    const jsonlPath = join(
+      configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+    );
+    const existing = readFileSync(jsonlPath, "utf-8");
+    const lines = existing.split("\n").filter((l) => l !== "");
+    const anchorUuid = (JSON.parse(lines[lines.length - 1]) as { uuid: string }).uuid;
+    writeFileSync(
+      jsonlPath,
+      existing +
+        [
+          {
+            uuid: `${tag}-1`, parentUuid: anchorUuid, timestamp: "2026-04-11T09:00:00Z",
+            sessionId, cwd: projectPath, version: "2.1.81", type: "user",
+            message: { role: "user", content: "more" },
+          },
+          {
+            uuid: `${tag}-2`, parentUuid: `${tag}-1`, timestamp: "2026-04-11T09:00:05Z",
+            sessionId, cwd: projectPath, version: "2.1.81", type: "assistant",
+            message: {
+              model: "claude-opus-4-6", id: `msg_${tag}`,
+              content: [{ type: "text", text: "ok" }],
+            },
+          },
+        ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+      "utf-8"
+    );
+  }
+
+  it("a pushed bundle really carries memory/, and its manifest declares exactly what it carries", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const push = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(push.success).toBe(true);
+      if (!push.success) return;
+
+      const dir = await extractNthBundle(hub, push.projectId, base, "mem", 0);
+
+      // THE regression. Before #53 this directory did not exist in any bundle
+      // any hub has ever held, on any push, ever — because hub push always
+      // passes a truthy `incremental` and both whole-file layers sat behind
+      // `if (!incremental)`.
+      expect(existsSync(join(dir, "memory"))).toBe(true);
+      expect(readFileSync(join(dir, "memory", "MEMORY.md"), "utf-8")).toBe(
+        "- [Test memory](test_memory.md) — remembering test patterns\n"
+      );
+      expect(readFileSync(join(dir, "memory", "test_memory.md"), "utf-8")).toContain(
+        "Use vitest for testing."
+      );
+
+      const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf-8"));
+      const onDisk = layersOnDisk(dir);
+      expect(onDisk).toContain("memory");
+      // plans is the deliberate other half: config-global with no project
+      // filter, so it stays off the hub until it is scoped — and is no longer
+      // advertised. It used to be declared by every hub bundle ever written.
+      expect(onDisk).not.toContain("plans");
+      expect(manifest.includedLayers).toEqual(onDisk);
+      expect(manifest.memoryDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+      // The ledger the next push reads back, credited only now that the bundle
+      // is genuinely on the hub.
+      const hubPeer = Object.entries(readSyncState(projectPath).peers).find(([id]) =>
+        id.startsWith("hub:")
+      )![1];
+      expect(hubPeer.memoryDigest).toBe(manifest.memoryDigest);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("memory re-ships only when it changed: unchanged is skipped, changed travels again", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      const memoryDir = join(configDir, "projects", encodeProjectPath(projectPath), "memory");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      const firstDir = await extractNthBundle(hub, first.projectId, base, "arm-1", 0);
+      expect(layersOnDisk(firstDir)).toContain("memory");
+      const firstDigest = JSON.parse(
+        readFileSync(join(firstDir, "manifest.json"), "utf-8")
+      ).memoryDigest as string;
+
+      // ARM A — memory untouched. New session content, so there IS a bundle;
+      // it just carries no second copy of a directory the hub already holds.
+      carryOn(configDir, projectPath, sessionId, "same");
+      const second = await hubPush({
+        configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81",
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      const secondDir = await extractNthBundle(hub, first.projectId, base, "arm-2", 1);
+      expect(existsSync(join(secondDir, "memory"))).toBe(false);
+      const secondManifest = JSON.parse(readFileSync(join(secondDir, "manifest.json"), "utf-8"));
+      expect(secondManifest.includedLayers).toEqual(layersOnDisk(secondDir));
+      expect(secondManifest.includedLayers).not.toContain("memory");
+      expect(secondManifest.memoryDigest).toBeUndefined();
+      // A skip must not disturb the ledger — the hub still holds what it held.
+      const afterSkip = Object.entries(readSyncState(projectPath).peers).find(([id]) =>
+        id.startsWith("hub:")
+      )![1];
+      expect(afterSkip.memoryDigest).toBe(firstDigest);
+
+      // ARM B — memory changed. It travels again, with its new content.
+      writeFileSync(join(memoryDir, "MEMORY.md"),
+        "- [Test memory](test_memory.md) — remembering test patterns\n" +
+        "- [Second memory](second.md) — learned on this machine\n");
+      writeFileSync(join(memoryDir, "second.md"), "Prefer real temp dirs.\n");
+      carryOn(configDir, projectPath, sessionId, "changed");
+      const third = await hubPush({
+        configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81",
+      });
+      expect(third.success).toBe(true);
+      if (!third.success) return;
+      const thirdDir = await extractNthBundle(hub, first.projectId, base, "arm-3", 2);
+      expect(existsSync(join(thirdDir, "memory"))).toBe(true);
+      expect(readFileSync(join(thirdDir, "memory", "second.md"), "utf-8")).toBe(
+        "Prefer real temp dirs.\n"
+      );
+      const thirdManifest = JSON.parse(readFileSync(join(thirdDir, "manifest.json"), "utf-8"));
+      expect(thirdManifest.includedLayers).toEqual(layersOnDisk(thirdDir));
+      expect(thirdManifest.includedLayers).toContain("memory");
+      expect(thirdManifest.memoryDigest).not.toBe(firstDigest);
+      const afterChange = Object.entries(readSyncState(projectPath).peers).find(([id]) =>
+        id.startsWith("hub:")
+      )![1];
+      expect(afterChange.memoryDigest).toBe(thirdManifest.memoryDigest);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
 });

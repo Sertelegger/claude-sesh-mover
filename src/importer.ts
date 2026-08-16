@@ -7,6 +7,7 @@ import {
   appendFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -28,10 +29,22 @@ import { readSyncState, writeSyncState } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
 import { readLocalProjectId, writeLocalProjectId } from "./hub/identity.js";
+import {
+  MEMORY_INDEX_NAME,
+  appendIndexLines,
+  formatMemoryPointer,
+  memoryIndexTargets,
+  unionMemoryIndex,
+} from "./memory-index.js";
+import { MAX_SIDECAR_ATTEMPTS, copyToUniqueName } from "./sidecar.js";
 import type {
+  AuxiliaryConflict,
   ImportResult,
   DryRunResult,
   ErrorResult,
+  MemoryConflict,
+  MemoryIndexReport,
+  MemoryPlanEntry,
   RewriteReport,
   SyncStatePeer,
   SyncStateSessionReceived,
@@ -55,6 +68,415 @@ function layerDirsFor(
     ["tool-results", join(exportPath, "sessions", bundleSessionId, "tool-results")],
     ["file-history", join(exportPath, "file-history", bundleSessionId)],
   ];
+}
+
+/** Everything the two shared-namespace layers produced, for one import. */
+interface SharedLayerReport {
+  warnings: string[];
+  memoryConflicts: MemoryConflict[];
+  memoryIndex?: MemoryIndexReport;
+  /** Plan mode only. */
+  memoryPlan?: MemoryPlanEntry[];
+  /** The target memory directory, when the bundle carried a memory layer. */
+  memoryDir?: string;
+  planConflicts: AuxiliaryConflict[];
+}
+
+function readTextFile(path: string): string | null {
+  try {
+    return readFileSync(path, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+function isRegularFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** `notes.md` -> `notes`; `notes.txt` -> `notes.txt` (a parked copy is always `.md`). */
+function memoryStem(filename: string): string {
+  return filename.toLowerCase().endsWith(".md") ? filename.slice(0, -3) : filename;
+}
+
+/**
+ * Reconcile the two **shared-namespace** auxiliary layers: `memory/` (into the
+ * target project dir) and `plans/` (into the target config dir).
+ *
+ * The other four layers — jsonl, subagents, tool-results, file-history — need
+ * no rule at all: they are written under a session id this import minted
+ * seconds earlier, so a collision is structurally impossible. These two are
+ * written into directories the target already owns, where filenames are MEANT
+ * to collide, and until #49 their rule was "copy if absent, otherwise keep
+ * local" — which landed ten memory files and withheld the one edit
+ * (`MEMORY.md`) that made them reachable, while reporting complete success.
+ *
+ * Three tiers, of which this function is the first two:
+ *  1. `MEMORY.md` is an INDEX, not prose: it has a well-defined union, so it is
+ *     unioned, unconditionally and with no confirmation. See `memory-index.ts`.
+ *  2. A conflicting prose memory keeps the local file and parks the incoming
+ *     copy beside it as `<stem>.incoming.md`, which tier 1 then indexes. That
+ *     is lossless and deterministic, and it is the behaviour whenever nothing
+ *     interactive is attached (a hook-driven `hub pull`, a scripted run) — not
+ *     a fallback that "shouldn't normally happen".
+ *  3. A semantic merge of the two texts lives in `commands/import.md`, in a
+ *     session that already has a model attached, on the user's confirmation.
+ *     It is built ON tier 2: `cli.ts` deletes an archive's extract dir before
+ *     returning, so the parked file is the only place the incoming text still
+ *     exists once this process exits.
+ *
+ * Nothing here is path-rewritten, deliberately. A memory is prose a model
+ * wrote, and the rewriter's standing rule is that user and assistant text are
+ * never rewritten: a memory saying "the config dir is /Users/x/.claude-nv" is a
+ * statement ABOUT a machine, and rewriting it to the target's path would make
+ * it false rather than portable.
+ *
+ * It must never fail the import. Every read, write and copy degrades to
+ * "keep local, say so" — this step sits outside the session-write rollback, so
+ * a throw here lands after the transcripts are written and before they are
+ * registered.
+ */
+function reconcileSharedLayers(opts: {
+  exportPath: string;
+  targetProjectDir: string;
+  targetConfigDir: string;
+  sourceMachineName?: string;
+  /** Plan only: compute every verdict, write nothing. */
+  plan: boolean;
+}): SharedLayerReport {
+  const { exportPath, targetProjectDir, targetConfigDir, plan } = opts;
+  const sourceName = opts.sourceMachineName ?? "another machine";
+  const warnings: string[] = [];
+  const memoryConflicts: MemoryConflict[] = [];
+  const planConflicts: AuxiliaryConflict[] = [];
+  const memoryPlan: MemoryPlanEntry[] = [];
+  let memoryIndex: MemoryIndexReport | undefined;
+  let reportedMemoryDir: string | undefined;
+
+  const memoryDir = join(exportPath, "memory");
+  if (existsSync(memoryDir)) {
+    try {
+      const targetMemDir = join(targetProjectDir, "memory");
+      reportedMemoryDir = targetMemDir;
+      const indexPath = join(targetMemDir, MEMORY_INDEX_NAME);
+      if (!plan) mkdirSync(targetMemDir, { recursive: true });
+
+      const files = readdirSync(memoryDir).sort();
+
+      // The local index, and whether we may write it at all. An index that
+      // exists but cannot be read (a directory in its place, a permission
+      // problem) is left alone: overwriting it would be the destructive move
+      // this whole step exists to avoid.
+      let indexText: string | null = null;
+      let indexUsable = true;
+      const indexExists = existsSync(indexPath);
+      if (indexExists) {
+        indexText = readTextFile(indexPath);
+        if (indexText === null) {
+          indexUsable = false;
+          warnings.push(
+            `Could not read the existing memory index (${MEMORY_INDEX_NAME}) — left it untouched, so memories from this bundle may not be listed in it.`
+          );
+        }
+      }
+      let indexChanged = false;
+      const added: string[] = [];
+      let alreadyPresent = 0;
+      let droppedProse = false;
+
+      // Tier 1 runs FIRST: it decides what the parked copies below can be
+      // appended to, so there is exactly one write of the index at the end.
+      const incomingIndexPath = join(memoryDir, MEMORY_INDEX_NAME);
+      if (files.includes(MEMORY_INDEX_NAME) && isRegularFile(incomingIndexPath)) {
+        const incomingText = readTextFile(incomingIndexPath);
+        if (incomingText === null) {
+          memoryPlan.push({
+            filename: MEMORY_INDEX_NAME,
+            verdict: "keep-local",
+            note: "the bundle's index could not be read",
+          });
+          warnings.push(
+            `Could not read "${MEMORY_INDEX_NAME}" from the bundle — the memory index was left as it is.`
+          );
+        } else if (!indexExists) {
+          // Copied rather than written back from the decoded string, so the
+          // bytes land exactly as they were sent.
+          if (!plan) copyFileSync(incomingIndexPath, indexPath);
+          indexText = incomingText;
+          memoryPlan.push({ filename: MEMORY_INDEX_NAME, verdict: "copy" });
+        } else if (!indexUsable) {
+          memoryPlan.push({
+            filename: MEMORY_INDEX_NAME,
+            verdict: "keep-local",
+            note: "the local index could not be read",
+          });
+        } else if (indexText === incomingText) {
+          memoryPlan.push({ filename: MEMORY_INDEX_NAME, verdict: "identical" });
+        } else {
+          const union = unionMemoryIndex(indexText!, incomingText);
+          added.push(...union.added);
+          alreadyPresent = union.alreadyPresent;
+          droppedProse = union.droppedProse;
+          if (union.added.length > 0) {
+            indexText = union.text;
+            indexChanged = true;
+          }
+          memoryPlan.push({
+            filename: MEMORY_INDEX_NAME,
+            verdict: "index-union",
+            added: union.added,
+            alreadyPresent: union.alreadyPresent,
+          });
+        }
+      }
+
+      for (const file of files) {
+        if (file === MEMORY_INDEX_NAME) continue;
+        const src = join(memoryDir, file);
+        if (!isRegularFile(src)) {
+          memoryPlan.push({ filename: file, verdict: "skip", note: "not a regular file" });
+          warnings.push(
+            `Ignored "${file}" in the bundle's memory folder — it is not a regular file.`
+          );
+          continue;
+        }
+        const dst = join(targetMemDir, file);
+        if (!existsSync(dst)) {
+          memoryPlan.push({ filename: file, verdict: "copy" });
+          if (!plan) copyFileSync(src, dst);
+          continue;
+        }
+
+        const existingContent = readTextFile(dst);
+        const newContent = readTextFile(src);
+        if (existingContent === null || newContent === null) {
+          memoryPlan.push({
+            filename: file,
+            verdict: "keep-local",
+            note: "one of the two copies could not be read",
+          });
+          warnings.push(
+            `Memory file "${file}" could not be compared with the incoming copy — kept the existing version.`
+          );
+          continue;
+        }
+        if (existingContent === newContent) {
+          memoryPlan.push({ filename: file, verdict: "identical" });
+          continue;
+        }
+
+        // Tier 2. The local file is never touched; the incoming copy is parked
+        // beside it and indexed, so it is reachable AND still on disk for the
+        // skill layer's semantic merge once the bundle is gone.
+        //
+        // The name diverges from `merge.ts`'s `<name>.theirs-<stamp>` sidecar
+        // on purpose: `notes.md.theirs-2026-…Z` is not a `.md` file and so is
+        // not read as a memory at all, and this copy is user-facing and
+        // transient (shown in a confirmation within seconds, retired on
+        // acceptance) rather than an archaeological artifact. The
+        // uniquification is NOT re-derived — `copyToUniqueName` is the one copy
+        // of that rule, shared with `writeSidecar`, so a second import of a
+        // still-conflicting memory can never eat the first parked copy.
+        const stem = memoryStem(file);
+        const nameFor = (n: number) =>
+          n === 0 ? `${stem}.incoming.md` : `${stem}.incoming-${n + 1}.md`;
+        const existingHash = computeIntegrityHash([existingContent]);
+        const incomingHash = computeIntegrityHash([newContent]);
+
+        // An already-parked copy of exactly this text is this text. A hub pull
+        // applies a CHAIN of bundles through one importSession call each, so
+        // without this a five-bundle pull of a thread whose memory never
+        // changed plants five identical `.incoming-N.md` files and five index
+        // lines — degrading the index this fix exists to protect. Reuse is only
+        // ever byte-identical, so nothing is lost by it; a genuinely different
+        // incoming version still gets its own copy.
+        //
+        // (This is the one deviation from the design's §9 case 9b, which
+        // expects a second import of the SAME bundle to produce
+        // `.incoming-2.md`. The guarantee that case exists to pin — a later
+        // parked copy never eats an earlier one — is unaffected and tested.)
+        let parkedAs: string | null = null;
+        let reusedParked = false;
+        for (let n = 0; n < MAX_SIDECAR_ATTEMPTS; n++) {
+          const candidate = join(targetMemDir, nameFor(n));
+          if (!existsSync(candidate)) break;
+          if (readTextFile(candidate) === newContent) {
+            parkedAs = nameFor(n);
+            reusedParked = true;
+            break;
+          }
+        }
+
+        if (parkedAs === null) {
+          if (plan) {
+            for (let n = 0; n < MAX_SIDECAR_ATTEMPTS; n++) {
+              if (!existsSync(join(targetMemDir, nameFor(n)))) {
+                parkedAs = nameFor(n);
+                break;
+              }
+            }
+          } else {
+            try {
+              parkedAs = copyToUniqueName(src, nameFor, (name) => join(targetMemDir, name));
+            } catch (e) {
+              warnings.push(
+                `Could not park the incoming copy of "${file}" (${(e as Error).message}).`
+              );
+              parkedAs = null;
+            }
+          }
+        }
+
+        if (parkedAs === null) {
+          memoryPlan.push({
+            filename: file,
+            verdict: "keep-local",
+            note: "the incoming copy could not be parked",
+          });
+          memoryConflicts.push({ filename: file, existingHash, incomingHash });
+          warnings.push(
+            `Memory file "${file}" differs from the incoming copy — kept yours, and the incoming copy could NOT be saved beside it. It is only in the bundle.`
+          );
+          continue;
+        }
+
+        memoryPlan.push({ filename: file, verdict: "park", parkedAs });
+        memoryConflicts.push({ filename: file, existingHash, incomingHash, parkedAs });
+        warnings.push(
+          reusedParked
+            ? `Memory file "${file}" differs from the copy in this bundle — kept yours; theirs was already saved here as "${parkedAs}".`
+            : `Memory file "${file}" differs from the copy in this bundle — kept yours and saved theirs as "${parkedAs}" (listed in ${MEMORY_INDEX_NAME}). Nothing was overwritten.`
+        );
+
+        // One pointer per parked file, ever: keyed off the index's own targets,
+        // so a reused copy adds no second line and a user who deleted the line
+        // by hand gets it back rather than a duplicate.
+        const base = indexText ?? "";
+        if (indexUsable && !memoryIndexTargets(base).includes(parkedAs)) {
+          const pointer = formatMemoryPointer(
+            `${stem} (incoming copy)`,
+            parkedAs,
+            `incoming version of ${file} from ${sourceName} — differs from your copy, not merged`
+          );
+          const next = appendIndexLines(base, [pointer]);
+          if (next !== base) {
+            indexText = next;
+            indexChanged = true;
+          }
+        }
+      }
+
+      if (!plan && indexUsable && indexChanged && indexText !== null) {
+        try {
+          writeFileSync(indexPath, indexText, "utf-8");
+        } catch (e) {
+          warnings.push(
+            `Could not update the memory index (${(e as Error).message}) — memories from this bundle are on disk but may not be listed in ${MEMORY_INDEX_NAME}.`
+          );
+        }
+      }
+
+      // A memory file the bundle carried that no index line points at is on
+      // disk and unreachable. The union cannot fix this — it is a union over
+      // index LINES, and a file no line points at contributes no line — and it
+      // usually predates the transfer (the file was already orphaned on the
+      // source machine). Adopting it would mean inventing an index entry whose
+      // title has to be guessed, in the file that decides what future sessions
+      // read, to repair someone else's housekeeping. So: report, don't adopt.
+      const indexed = new Set(memoryIndexTargets(indexText ?? ""));
+      const parked = new Set(memoryConflicts.map((c) => c.parkedAs));
+      // With an unreadable index there is no reading of it to be had, so claim
+      // nothing: every file would look unindexed for a reason that is about us.
+      const unindexed = indexUsable
+        ? files.filter(
+            (f) =>
+              f !== MEMORY_INDEX_NAME &&
+              !parked.has(f) &&
+              !indexed.has(f) &&
+              isRegularFile(join(memoryDir, f))
+          )
+        : [];
+
+      memoryIndex = { added, alreadyPresent, droppedProse, unindexed };
+
+      if (added.length > 0) {
+        warnings.push(
+          `Memory index: added ${added.length} ${added.length === 1 ? "entry" : "entries"} from this bundle to ${MEMORY_INDEX_NAME}${
+            alreadyPresent > 0 ? ` (${alreadyPresent} already listed)` : ""
+          }. Your existing entries and their order were kept.`
+        );
+      }
+      if (droppedProse) {
+        warnings.push(
+          `The bundle's ${MEMORY_INDEX_NAME} carried text that is not an index entry (a heading or prose) — only its entries were merged, that text was not copied.`
+        );
+      }
+      if (unindexed.length > 0) {
+        warnings.push(
+          `${unindexed.length} memory file(s) in this bundle are listed in no index and landed unreferenced: ${unindexed.join(", ")}.`
+        );
+      }
+    } catch (e) {
+      warnings.push(
+        `Memory files could not be reconciled (${(e as Error).message}) — nothing in your memory folder was changed by this import.`
+      );
+    }
+  }
+
+  // `plans/` is config-dir-GLOBAL on both ends (the exporter applies no project
+  // filter), so an import writes into a directory every project on this machine
+  // shares. It gets the report half of the memory treatment and not the parking
+  // half, deliberately: a plan is a document with no index, so a parked copy
+  // there is unreachable clutter rather than a reachable alternative — the
+  // mechanism that makes parking safe for a memory (tier 1 indexes it) does not
+  // exist here. Until `plans/` is re-scoped, writing MORE files into a shared
+  // directory is the wrong direction. The incoming plan stays in the bundle.
+  const plansDir = join(exportPath, "plans");
+  if (existsSync(plansDir)) {
+    try {
+      const targetPlansDir = join(targetConfigDir, "plans");
+      if (!plan) mkdirSync(targetPlansDir, { recursive: true });
+      for (const file of readdirSync(plansDir).sort()) {
+        const src = join(plansDir, file);
+        if (!isRegularFile(src)) continue;
+        const dst = join(targetPlansDir, file);
+        if (!existsSync(dst)) {
+          if (!plan) copyFileSync(src, dst);
+          continue;
+        }
+        const existingContent = readTextFile(dst);
+        const newContent = readTextFile(src);
+        if (existingContent === null || newContent === null || existingContent === newContent) {
+          continue;
+        }
+        planConflicts.push({
+          filename: file,
+          existingHash: computeIntegrityHash([existingContent]),
+          incomingHash: computeIntegrityHash([newContent]),
+        });
+        warnings.push(
+          `Plan "${file}" already exists here with different content — kept yours. The incoming plan was not written and is only in the bundle (see planConflicts).`
+        );
+      }
+    } catch (e) {
+      warnings.push(
+        `Plans could not be reconciled (${(e as Error).message}) — nothing in your plans folder was changed by this import.`
+      );
+    }
+  }
+
+  return {
+    warnings,
+    memoryConflicts,
+    memoryIndex,
+    memoryPlan: plan ? memoryPlan : undefined,
+    memoryDir: reportedMemoryDir,
+    planConflicts,
+  };
 }
 
 export interface ImportOptions {
@@ -239,6 +661,23 @@ export async function importSession(
   }
 
   if (targetSessions.length === 0) {
+    // Every session in the bundle is already here — but the shared layers are
+    // not session-scoped and may still be missing. This used to return above
+    // the memory step, which is what made the measured defect unrecoverable:
+    // the user who read the warning, understood it, and re-ran the import got
+    // `importedSessions: []` and no memory work at all. The union is idempotent
+    // by construction, so running it on a duplicate import is free and safe,
+    // and the memories are content the user wants whether or not the
+    // transcripts were new. The one contract change: a fully-duplicate import
+    // now means "no new sessions", not "nothing happened".
+    const shared = reconcileSharedLayers({
+      exportPath,
+      targetProjectDir,
+      targetConfigDir,
+      sourceMachineName: manifest.sourceMachineName,
+      plan: dryRun,
+    });
+    warnings.push(...shared.warnings);
     if (dryRun) {
       return {
         success: true,
@@ -248,6 +687,9 @@ export async function importSession(
         skippedSessions,
         warnings,
         resumable: true,
+        memoryPlan: shared.memoryPlan,
+        memoryDir: shared.memoryDir,
+        planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
       } satisfies DryRunResult;
     }
     return {
@@ -257,6 +699,11 @@ export async function importSession(
       skippedSessions,
       warnings,
       resumable: true,
+      memoryConflicts:
+        shared.memoryConflicts.length > 0 ? shared.memoryConflicts : undefined,
+      memoryIndex: shared.memoryIndex,
+      memoryDir: shared.memoryDir,
+      planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
     } satisfies ImportResult;
   }
 
@@ -375,16 +822,31 @@ export async function importSession(
       );
     }
 
+    // The preview is produced by the SAME function the real run executes,
+    // called in plan mode — never by a parallel preview implementation. That is
+    // exactly how `rewriteReport` drifted (it previews one session and the doc
+    // says "path rewrites", plural).
+    const shared = reconcileSharedLayers({
+      exportPath,
+      targetProjectDir,
+      targetConfigDir,
+      sourceMachineName: manifest.sourceMachineName,
+      plan: true,
+    });
+
     return {
       success: true,
       command: "import",
       dryRun: true,
       importedSessions,
       skippedSessions,
-      warnings,
+      warnings: [...warnings, ...shared.warnings],
       resumable: true,
       rewriteReport,
       versionAdaptations: adapters.map((a) => a.description),
+      memoryPlan: shared.memoryPlan,
+      memoryDir: shared.memoryDir,
+      planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
     } satisfies DryRunResult;
   }
 
@@ -572,48 +1034,17 @@ export async function importSession(
     }
   }
 
-  // Step 5: Merge memory files, tracking conflicts for user resolution
-  const memoryConflicts: Array<{
-    filename: string;
-    existingHash: string;
-    incomingHash: string;
-  }> = [];
-  const memoryDir = join(exportPath, "memory");
-  if (existsSync(memoryDir)) {
-    const targetMemDir = join(targetProjectDir, "memory");
-    mkdirSync(targetMemDir, { recursive: true });
-    for (const file of readdirSync(memoryDir)) {
-      const targetFile = join(targetMemDir, file);
-      if (existsSync(targetFile)) {
-        const existingContent = readFileSync(targetFile, "utf-8");
-        const newContent = readFileSync(join(memoryDir, file), "utf-8");
-        if (existingContent !== newContent) {
-          const existingHash = computeIntegrityHash([existingContent]);
-          const incomingHash = computeIntegrityHash([newContent]);
-          memoryConflicts.push({ filename: file, existingHash, incomingHash });
-          warnings.push(
-            `Memory file "${file}" exists with different content — kept existing version. Use memoryConflicts in result to resolve.`
-          );
-        }
-        // Skip — keep existing (skill can overwrite if user chooses incoming)
-      } else {
-        copyFileSync(join(memoryDir, file), targetFile);
-      }
-    }
-  }
-
-  // Copy plans
-  const plansDir = join(exportPath, "plans");
-  if (existsSync(plansDir)) {
-    const targetPlansDir = join(targetConfigDir, "plans");
-    mkdirSync(targetPlansDir, { recursive: true });
-    for (const file of readdirSync(plansDir)) {
-      const targetFile = join(targetPlansDir, file);
-      if (!existsSync(targetFile)) {
-        copyFileSync(join(plansDir, file), targetFile);
-      }
-    }
-  }
+  // Step 5: Reconcile the shared-namespace layers (memory, plans). Stays here,
+  // after the session writes and their rollback, so a failed import leaves the
+  // user's memory folder untouched.
+  const shared = reconcileSharedLayers({
+    exportPath,
+    targetProjectDir,
+    targetConfigDir,
+    sourceMachineName: manifest.sourceMachineName,
+    plan: false,
+  });
+  warnings.push(...shared.warnings);
 
   // Step 7: Register in indexes (only after successful validation)
   if (!noRegister) {
@@ -702,6 +1133,10 @@ export async function importSession(
     warnings,
     resumable: !noRegister,
     versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
-    memoryConflicts: memoryConflicts.length > 0 ? memoryConflicts : undefined,
+    memoryConflicts:
+      shared.memoryConflicts.length > 0 ? shared.memoryConflicts : undefined,
+    memoryIndex: shared.memoryIndex,
+    memoryDir: shared.memoryDir,
+    planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
   } satisfies ImportResult;
 }
