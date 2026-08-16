@@ -581,6 +581,17 @@ export async function hubPush(opts) {
                     type: s.type === "continuation" ? "continuation" : "full",
                     sessionIdInBundle: s.sessionId,
                     fromEntryUuid: s.continuation?.fromEntryUuid ?? null,
+                    // Three-valued on purpose (see HubBundleRecord): `null` for a full
+                    // bundle, the manifest's anchor for a continuation, and `undefined`
+                    // — which JSON.stringify drops — for a continuation whose manifest
+                    // predates the field. `?? null` here would flatten "unknown" into
+                    // "root" and manufacture a second root for the thread.
+                    //
+                    // Keyed on the same `s.type` test as the record's own `type` two
+                    // lines up, so `type: "full"` and `anchorEntryUuid: null` can never
+                    // disagree: only a bundle that really is full claims "no anchor
+                    // exists". A continuation missing its block is unknown, not a root.
+                    anchorEntryUuid: s.type === "continuation" ? s.continuation?.anchorEntryUuid : null,
                     headEntryUuid: readLastEntryUuid(join(bundleStaging, "sessions", `${s.sessionId}.jsonl`)) ?? "",
                     messageCount: s.messageCount, pushedAt, hasWorkspace,
                 },

@@ -183,7 +183,7 @@ async function copyLayerDirs(extractDir, bundleSessionId, targetProjectDir, base
  * from machines with different source paths.
  */
 export async function runApplySessionsStage(input) {
-    const { extractDir, bundleManifest, record, chainLength, projectPath, configDir, targetProjectDir, claudeVersion, threadId, sourceMachineId, hubPeerId, noAppend, forceAppend, onDivergence, opNowMs, ageNowMs, historyNowDate, historyNowMs, recordSplice, countEntriesAfterOffset, } = input;
+    const { extractDir, bundleManifest, record, chainLength, projectPath, configDir, targetProjectDir, claudeVersion, threadId, bundleMachineId, hubPeerId, noAppend, forceAppend, onDivergence, opNowMs, ageNowMs, historyNowDate, historyNowMs, recordSplice, countEntriesAfterOffset, } = input;
     // Short local names for the two the moved warning strings interpolate, so
     // their text stays byte-identical (tests/hub-warning-flags.test.ts scans
     // src/hub/*.ts line by line).
@@ -243,7 +243,7 @@ export async function runApplySessionsStage(input) {
                     st.rememberOurWrite(basePath, baseSizeBeforeAppend);
                     recordSplice({
                         projectPath, basePath, baseSessionId,
-                        peerId: sourceMachineId, hubPeerId, manifest: bundleManifest,
+                        peerId: bundleMachineId, hubPeerId, manifest: bundleManifest,
                         record, bundleSession, newHeadUuid: outcome.newHeadUuid,
                     });
                     // Best effort by design: layers are auxiliary artifacts
@@ -392,7 +392,7 @@ export async function runApplySessionsStage(input) {
                             // nuisance rather than a correctness problem.
                             recordSplice({
                                 projectPath, basePath, baseSessionId,
-                                peerId: sourceMachineId, hubPeerId, manifest: bundleManifest,
+                                peerId: bundleMachineId, hubPeerId, manifest: bundleManifest,
                                 record, bundleSession, newHeadUuid: adopt.newHeadUuid,
                             });
                             // Register the preserved branch so it is resumable and

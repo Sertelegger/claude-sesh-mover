@@ -19,14 +19,22 @@ import {
   readManifest,
   verifySessionsDigest,
 } from "../../src/manifest.js";
-import { resolveThreads } from "../../src/hub/threads.js";
+import { assembleChain, resolveThreads } from "../../src/hub/threads.js";
+import type { AssembledChain } from "../../src/hub/threads.js";
+import { readAllIndexes } from "../../src/hub/index-file.js";
 import { getThreadId } from "../../src/sync-state.js";
 import {
+  arrangeThreeMachines,
+  chainDeltaStart,
+  chainHead,
+  chainIndexes,
   currentThreadIndexes,
   emptySyncState,
   writeCorruptBundle,
+  CHAIN_LAST_ACTIVE_AT,
   CORRUPT_BUNDLE_HEAD_UUID,
 } from "./hub-fixtures.js";
+import type { HubBundleRecord, HubIndexJson } from "../../src/hub/layout.js";
 
 /** Pull the bundle back off the hub and unpack it, the way hub/pull.ts does. */
 async function fetchAndExtract(hubPath: string, file: string, into: string): Promise<void> {
@@ -172,6 +180,515 @@ describe("currentThreadIndexes", () => {
     expect(indexes[0].projectId).toBe("proj-9");
     expect(Object.keys(indexes[0].threads)).toEqual(["only-thread"]);
     expect(indexes[0].threads["only-thread"].bundles[0].file).toContain("/bundles/laptop/");
+  });
+});
+
+// ---- chainIndexes ----
+//
+// Every assertion below reads the LINK STRUCTURE back out of the REAL walk —
+// `assembleChain` in src/hub/threads.ts — never out of the spec that produced
+// the fixture. That is this file's whole rule ("measured against the real
+// verifier it is meant to trip or the real resolver it is meant to feed"), and
+// it is why `chainView` no longer carries a walk of its own.
+//
+// IT USED TO. `chainView` was written here first, while the fixtures were being
+// built and no production assembler existed, and it was a genuine head-keyed
+// walk. Keeping it once `assembleChain` landed would have left the repo with
+// TWO implementations of one link rule, free to drift apart in exactly the
+// place where a drift is invisible: a fixture measured against a stale copy of
+// the rule reports the shape the copy expects. So it was promoted — the walk is
+// production code now and this is a projection of its output (the same move the
+// carry header oracle made in #38). What stays local is only what is NOT a link
+// rule: `records` and `advertised`, two flat reads of `resolveThreads`'s own
+// output, which is what a fixture assertion is entitled to restate.
+//
+// The rule it measures: link on `anchorEntryUuid`, NEVER on `fromEntryUuid` —
+// different fields carrying different facts, and linking on the latter is the
+// #35 defect (see `chainDeltaStart`). A record with no `anchorEntryUuid` key at
+// all is pre-assembly: a root if it is `full`, an orphan if it is a
+// `continuation`, and unlinkable either way.
+
+interface ChainRecordView {
+  machineId: string;
+  bundleId: string;
+  type: "full" | "continuation";
+  from: string | null;
+  /** `undefined` = the key is absent = pre-assembly. `null` = a root. */
+  anchor: string | null | undefined;
+  head: string;
+}
+
+interface ChainView {
+  threadId: string;
+  /** The thread head each machine ADVERTISES — the other half of the projection. */
+  advertised: Record<string, string>;
+  /** Every record, flat. A read of `resolveThreads`, not of the walk. */
+  records: ChainRecordView[];
+  /** The production answer, unmodified — everything below is a view of it. */
+  assembled: AssembledChain;
+  /** The ordered plan it produced, as record views. */
+  chain: ChainRecordView[];
+  roots: AssembledChain["roots"];
+  /** Records whose anchor uuid matches no record's head: the gaps. */
+  dangling: AssembledChain["gaps"];
+  /** Continuations carrying no anchor at all: pushed before assembly existed. */
+  unanchored: AssembledChain["unanchored"];
+  /** Anchors shared by more than one record: the forks it met. */
+  forks: string[];
+  /** Bundle ids the walk did not reach. */
+  unreachable: string[];
+}
+
+function chainView(indexes: HubIndexJson[]): ChainView {
+  const threads = resolveThreads(indexes);
+  expect(threads).toHaveLength(1);
+  const t = threads[0];
+  const view = (b: HubBundleRecord, machineId: string): ChainRecordView => ({
+    machineId,
+    bundleId: b.bundleId,
+    type: b.type,
+    from: b.fromEntryUuid,
+    // `in`, not `?? null`: absent and null are two different facts here.
+    anchor: "anchorEntryUuid" in b ? b.anchorEntryUuid : undefined,
+    head: b.headEntryUuid,
+  });
+  const records = t.copies.flatMap((c) => c.bundles.map((b) => view(b, c.machineId)));
+  // No `localHeadEntryUuid`: a fixture has no local transcript, so every fork
+  // and every multi-root choice here is decided by the no-local-base rule.
+  const assembled = assembleChain({ copies: t.copies });
+
+  return {
+    threadId: t.threadId,
+    advertised: Object.fromEntries(t.copies.map((c) => [c.machineId, c.headEntryUuid])),
+    records,
+    assembled,
+    chain: assembled.chain.map((s) => view(s.record, s.machineId)),
+    roots: assembled.roots,
+    dangling: assembled.gaps,
+    unanchored: assembled.unanchored,
+    forks: assembled.forks.map((f) => f.anchorEntryUuid),
+    unreachable: assembled.unreachableBundleIds,
+  };
+}
+
+describe("chainIndexes", () => {
+  it("linear across three machines: one root, one chain, three machines, no gap or fork", () => {
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"], m3: ["b2<-b1"] }));
+
+    expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0", "b1", "b2"]);
+    // The point of the fixture: no ONE machine's index holds the chain.
+    expect(v.chain.map((r) => r.machineId)).toEqual(["m1", "m2", "m3"]);
+    expect(v.assembled.stoppedBecause).toBe("end");
+    expect(v.dangling).toEqual([]);
+    expect(v.forks).toEqual([]);
+    expect(v.unreachable).toEqual([]);
+    // A root is a full bundle and a linked record is a continuation, as both
+    // writers spell it — nothing here has to say so at the call site.
+    expect(v.records.map((r) => r.type)).toEqual(["full", "continuation", "continuation"]);
+  });
+
+  it("gap: a record anchored on a head no machine's index ships stops the chain", () => {
+    // b1 is deliberately absent from the spec — chainHead names its head so the
+    // absence is stated rather than a typo's side effect.
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: [{ id: "b2", anchorUuid: chainHead("b1") }] }));
+
+    expect(v.records.map((r) => r.bundleId).sort()).toEqual(["b0", "b2"]);
+    expect(v.dangling.map((r) => r.bundleId)).toEqual(["b2"]);
+    expect(v.dangling[0].anchorEntryUuid).toBe(chainHead("b1"));
+    expect(v.dangling[0].strandedBundleIds).toEqual(["b2"]);
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0"]);
+    expect(v.unreachable).toEqual(["b2"]);
+    // A gap is not a fork, not a second root, and not a pre-assembly record —
+    // four different conditions, and only one of them is repairable.
+    expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+    expect(v.forks).toEqual([]);
+    expect(v.unanchored).toEqual([]);
+    // anchorUuid rides through verbatim: it is the raw uuid, not a bundle id.
+    expect(v.records.find((r) => r.bundleId === "b2")?.anchor).toBe("head-b1");
+    // A declared anchor makes it a continuation even though it names nothing.
+    expect(v.records.find((r) => r.bundleId === "b2")?.type).toBe("continuation");
+  });
+
+  it("throws on an anchor naming an undeclared record, so a typo cannot become a gap", () => {
+    expect(() => chainIndexes({ m1: ["b0"], m2: ["b1<-b_typo"] })).toThrow(/undeclared record/);
+    expect(() => chainIndexes({ m1: ["b0"], m2: ["b0<-b0"] })).toThrow(/duplicate bundle id/);
+    expect(() =>
+      chainIndexes({ m1: ["b0"], m2: [{ id: "b1", from: "b0", anchorUuid: "x" }] })
+    ).toThrow(/both "from" and "anchorUuid"/);
+  });
+
+  it("a nonsense fromEntryUuid does not disturb the chain: the anchor is the link", () => {
+    // The regression guard for #35's actual defect. `fromEntryUuid` is the
+    // anchor's CHILD on a real hub and links nothing; an assembler that fell
+    // back to it would chain on this garbage instead.
+    const v = chainView(
+      chainIndexes({
+        m1: ["b0"],
+        m2: [{ id: "b1", from: "b0", fromUuid: chainHead("b0") }],
+        m3: [{ id: "b2", from: "b1", fromUuid: "not-a-uuid-at-all" }],
+      })
+    );
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0", "b1", "b2"]);
+    expect(v.records.find((r) => r.bundleId === "b2")?.from).toBe("not-a-uuid-at-all");
+    expect(v.dangling).toEqual([]);
+  });
+
+  it("fork: two records share one anchor", () => {
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"], m3: ["b2<-b0"] }));
+
+    expect(v.forks).toEqual([chainHead("b0")]);
+    expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+    // Both branches are one bundle long and the fixture has no local base, so
+    // the pick falls to the last tiebreak — bundle id ascending, arbitrary and
+    // stable. The OTHER branch is parked, never dropped.
+    expect(v.assembled.forks[0].reason).toBe("bundle-id");
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0", "b1"]);
+    expect(v.assembled.forks[0].parked.map((p) => p.bundleId)).toEqual(["b2"]);
+    expect(v.assembled.forks[0].parked[0].bundleIds).toEqual(["b2"]);
+    expect(v.unreachable).toEqual(["b2"]);
+    expect(v.dangling).toEqual([]);
+  });
+
+  it("multiple roots in ONE thread resolve without throwing — ordinary, not anomalous", () => {
+    // src/diff.ts re-sends a session whole whenever the recorded head is empty
+    // or is no longer present (compaction, truncation, rollback), and
+    // src/hub/push.ts files that record under the SAME thread id — it mints a
+    // new one only for a session that has none. Two roots, one thread.
+    const indexes = chainIndexes({ m1: ["b0", "b2"], m2: ["b1<-b0"] });
+    expect(() => resolveThreads(indexes)).not.toThrow();
+
+    const v = chainView(indexes);
+    expect(v.roots.map((r) => r.bundleId)).toEqual(["b0", "b2"]);
+    expect(v.records.filter((r) => ["b0", "b2"].includes(r.bundleId)).every((r) => r.type === "full"))
+      .toBe(true);
+    // One thread, two independent linked lists — never merged into one list.
+    // The plan follows the longer starting point and reports the other.
+    expect(v.assembled.rootChoice).toBe("longest");
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0", "b1"]);
+    expect(v.roots.map((r) => [r.bundleId, r.followed, r.bundleIds])).toEqual([
+      ["b0", true, ["b0", "b1"]],
+      ["b2", false, ["b2"]],
+    ]);
+    expect(v.unreachable).toEqual(["b2"]);
+    expect(v.dangling).toEqual([]);
+  });
+
+  it("an empty head terminates its chain, and two empty heads do not link to each other", () => {
+    // b0 -> b1(head "") ; b2 anchors on b1, so its own anchor is "" ;
+    // b3 chains onto b2 and also ships an empty head ; b4 anchors on b3.
+    const indexes = chainIndexes({
+      m1: ["b0", { id: "b1", from: "b0", head: "" }],
+      m2: [{ id: "b2", from: "b1" }, { id: "b3", from: "b2", head: "" }, { id: "b4", from: "b3" }],
+    });
+    const v = chainView(indexes);
+
+    // The builder does NOT repair the anchor when the record it names ships an
+    // empty head: b2 and b4 anchor on "", exactly the shape the rule rejects.
+    expect(v.records.filter((r) => r.head === "").map((r) => r.bundleId)).toEqual(["b1", "b3"]);
+    expect(v.records.filter((r) => r.anchor === "").map((r) => r.bundleId)).toEqual(["b2", "b4"]);
+
+    // The heads the fixture ships, `""` aside — every one of them distinct, so
+    // no two records could collide on a head even in a walk that keyed on them.
+    const shipped = v.records.map((r) => r.head).filter((h) => h !== "");
+    expect(shipped.sort()).toEqual([chainHead("b0"), chainHead("b2"), chainHead("b4")]);
+
+    // Two empty strings are not a match: b2 does not chain onto b1, b4 does not
+    // chain onto b3, and neither anchors onto the other's empty head either.
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0", "b1"]);
+    // ...and the walk says so rather than calling b1 a clean end.
+    expect(v.assembled.stoppedBecause).toBe("empty-head");
+    expect(v.unreachable).toEqual(["b2", "b3", "b4"]);
+    // An anchor of "" matches nothing, ever — so it is a gap, not a root.
+    expect(v.dangling.map((r) => r.bundleId)).toEqual(["b2", "b4"]);
+    expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+    expect(v.forks).toEqual([]);
+  });
+
+  it("'push' — the default, and what the writers emit — LINKS, and 'anchor' agrees with it", () => {
+    // The measurement this task moved. src/diff.ts still sets fromEntryUuid to
+    // entries[headIndex + 1].uuid — one PAST the head — and both index writers
+    // still copy that through unchanged. What changed is that they now also
+    // carry `anchorEntryUuid`, the head the delta WAS diffed against, and that
+    // is what the walk links on. So the two styles differ on fromEntryUuid and
+    // agree on the chain, which is the property assembly needs.
+    const push = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }));
+    const anchor = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }, { linkStyle: "anchor" }));
+
+    expect(push.records.find((r) => r.bundleId === "b1")?.from).toBe(chainDeltaStart("b1"));
+    expect(anchor.records.find((r) => r.bundleId === "b1")?.from).toBe(chainHead("b0"));
+    // ...and the anchor is the same value in both, regardless.
+    for (const v of [push, anchor]) {
+      expect(v.records.find((r) => r.bundleId === "b1")?.anchor).toBe(chainHead("b0"));
+      expect(v.chain.map((r) => r.bundleId)).toEqual(["b0", "b1"]);
+      expect(v.dangling).toEqual([]);
+      expect(v.unanchored).toEqual([]);
+      expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+      // A root declares an anchor too — an explicit null, "no anchor exists",
+      // which is a different fact from the absent key a pre-assembly record has,
+      // and the walk keeps them apart (`preAssembly` is false for this one).
+      expect(v.records.find((r) => r.bundleId === "b0")?.anchor).toBeNull();
+      expect(v.roots[0].preAssembly).toBe(false);
+    }
+  });
+
+  it("'pre-assembly' carries no anchor at all: the root stands, the continuation is an orphan", () => {
+    // Every bundle already on every hub. Nothing distinguishes such a record
+    // from a new one except the absence of the key, which is exactly why the
+    // field had to be additive rather than a redefinition of fromEntryUuid.
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }, { linkStyle: "pre-assembly" }));
+
+    expect(v.records.every((r) => r.anchor === undefined)).toBe(true);
+    expect(v.records.find((r) => r.bundleId === "b1")?.from).toBe(chainDeltaStart("b1"));
+    // The full bundle is still a root — its type says so. The continuation is
+    // unlinkable, and it is reported as pre-assembly, NOT as a gap: a gap names
+    // a bundle that should exist, and nothing here is missing.
+    expect(v.roots.map((r) => r.bundleId)).toEqual(["b0"]);
+    // ...and it says WHY it is a root a walk can trust no further: the anchor
+    // key is absent, so the record predates assembly.
+    expect(v.roots[0].preAssembly).toBe(true);
+    expect(v.unanchored.map((r) => r.bundleId)).toEqual(["b1"]);
+    expect(v.dangling).toEqual([]);
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0"]);
+    expect(v.unreachable).toEqual(["b1"]);
+  });
+
+  it("per-record preAssembly builds a MIXED hub: old bundles beside new ones", () => {
+    // The realistic state right after this ships, and the one Task 4 has to
+    // survive: b1 was pushed by the old code and b2 by the new. b2's anchor is
+    // b1's head and is perfectly good — but b1 cannot be reached from b0, so
+    // the contiguous chain from the root stops at b0 and everything behind the
+    // pre-assembly record is stranded.
+    const v = chainView(
+      chainIndexes({ m1: ["b0"], m2: [{ id: "b1", from: "b0", preAssembly: true }], m3: ["b2<-b1"] })
+    );
+
+    expect(v.unanchored.map((r) => r.bundleId)).toEqual(["b1"]);
+    expect(v.records.find((r) => r.bundleId === "b2")?.anchor).toBe(chainHead("b1"));
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0"]);
+    expect(v.unreachable).toEqual(["b1", "b2"]);
+    // b2's anchor names a head that IS on the hub, so it is not dangling — the
+    // break is b1's missing anchor, and the report must say which.
+    expect(v.dangling).toEqual([]);
+  });
+
+  it("advertised-but-unshipped: a machine's thread head matches no bundle record", () => {
+    const indexes = chainIndexes(
+      { m1: ["b0"], m2: ["b1<-b0"] },
+      { advertise: { m2: { headEntryUuid: "local-work-never-pushed" } } }
+    );
+    const v = chainView(indexes);
+
+    const shippedHeads = new Set(v.records.map((r) => r.head));
+    expect(shippedHeads.has(v.advertised.m2)).toBe(false);
+    // ...which is what the walk reports: m2 advertises work it never pushed.
+    expect(v.assembled.advertisedUnshipped).toEqual([
+      { machineId: "m2", headEntryUuid: "local-work-never-pushed" },
+    ]);
+    // m1 by contrast advertises exactly what it shipped — the default, and the
+    // control that keeps the assertion above from passing vacuously.
+    expect(v.advertised.m1).toBe(chainHead("b0"));
+    expect(shippedHeads.has(v.advertised.m1)).toBe(true);
+    // The bundle list is untouched by an advertise override.
+    expect(v.chain.map((r) => r.bundleId)).toEqual(["b0", "b1"]);
+  });
+
+  it("a machine that lists no bundles advertises nothing, rather than borrowing a head", () => {
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: [] }));
+    expect(v.advertised.m2).toBe("");
+    expect(v.records.map((r) => r.machineId)).toEqual(["m1"]);
+    // An empty head advertises NOTHING, so it is never reported as unshipped
+    // work — the empty-head rule on the thread-entry side of the projection.
+    expect(v.assembled.advertisedUnshipped).toEqual([]);
+  });
+
+  it("ties on every resolver key by default, so nothing is pinned by accident", () => {
+    const indexes = chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] });
+    const copies = resolveThreads(indexes)[0].copies;
+    expect(copies.map((c) => c.lastActiveAt)).toEqual([CHAIN_LAST_ACTIVE_AT, CHAIN_LAST_ACTIVE_AT]);
+    expect(new Set(copies.map((c) => c.messageCount)).size).toBe(1);
+  });
+
+  it("advertise pins the resolution on lastActiveAt, the resolver's first key", () => {
+    const spec = { m1: ["b0"], m2: ["b1<-b0"] };
+    const pin = { lastActiveAt: "2026-07-22T00:00:00.000Z" };
+
+    expect(resolveThreads(chainIndexes(spec, { advertise: { m2: pin } }))[0].latest.machineId)
+      .toBe("m2");
+    expect(resolveThreads(chainIndexes(spec, { advertise: { m1: pin } }))[0].latest.machineId)
+      .toBe("m1");
+  });
+
+  it("resolution does not move when the spec's machine keys are written in the other order", () => {
+    const pin = { m2: { lastActiveAt: "2026-07-22T00:00:00.000Z" } };
+    const forward = chainIndexes({ m1: ["b0"], m2: ["b1<-b0"] }, { advertise: pin });
+    const reverse = chainIndexes({ m2: ["b1<-b0"], m1: ["b0"] }, { advertise: pin });
+
+    // Declaration order is preserved in the array — the fixture does NOT sort,
+    // because sorting would hide any index-iteration-order dependence in the
+    // code under test rather than exposing it.
+    expect(forward.map((i) => i.machineId)).toEqual(["m1", "m2"]);
+    expect(reverse.map((i) => i.machineId)).toEqual(["m2", "m1"]);
+    expect(resolveThreads(reverse)[0].latest.machineId).toBe(
+      resolveThreads(forward)[0].latest.machineId
+    );
+  });
+
+  it("stamps pushedAt AGAINST link order, so an implementation that sorts by it fails", () => {
+    const v = chainView(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"], m3: ["b2<-b1"] }));
+    const stampOf = (id: string): string => {
+      const rec = resolveThreads(chainIndexes({ m1: ["b0"], m2: ["b1<-b0"], m3: ["b2<-b1"] }))[0]
+        .copies.flatMap((c) => c.bundles)
+        .find((b) => b.bundleId === id);
+      return rec!.pushedAt;
+    };
+    const linkOrder = v.chain.map((r) => r.bundleId);
+    const byPushedAt = [...linkOrder].sort((a, b) => (stampOf(a) < stampOf(b) ? -1 : 1));
+    expect(linkOrder).toEqual(["b0", "b1", "b2"]);
+    expect(byPushedAt).toEqual(["b2", "b1", "b0"]);
+  });
+
+  it("builds every bundle path through the real layout builders", () => {
+    const v = chainIndexes({ laptop: ["b0"] }, { projectId: "proj-9" });
+    const record = v[0].threads.t1.bundles[0];
+    expect(record.file.startsWith("projects/proj-9/bundles/laptop/")).toBe(true);
+    expect(record.file.endsWith("-b0.tar.gz")).toBe(true);
+    // ':' is illegal in a Windows filename — bundleFileName sanitizes it.
+    expect(record.file).not.toContain(":");
+    expect(v[0].projectId).toBe("proj-9");
+    expect(v[0].schemaVersion).toBe(1);
+  });
+});
+
+describe("arrangeThreeMachines", () => {
+  it("resolvesTo B: the chain is A's root plus B's continuation, and C resolves to B", async () => {
+    const f = await arrangeThreeMachines();
+    try {
+      expect(f.resolvesTo).toBe("B");
+      expect(f.latestMachineId).toBe(f.machineIdB);
+      expect(f.machineIdC).not.toBe(f.machineIdA);
+      expect(f.machineIdC).not.toBe(f.machineIdB);
+
+      const { indexes } = await readAllIndexes(createFsBackend(f.hub), f.projectId);
+      const v = chainView(indexes);
+      expect(v.threadId).toBe(f.threadId);
+      // A holds the only root; B holds the continuation. One conversation, two
+      // machines, and neither index lists it whole — the #35 shape.
+      expect(v.roots).toHaveLength(1);
+      expect(v.roots[0].machineId).toBe(f.machineIdA);
+      expect(v.records.find((r) => r.bundleId === v.roots[0].bundleId)?.type).toBe("full");
+      expect(v.roots[0].preAssembly).toBe(false);
+      expect(f.bundleIdsA).toHaveLength(1);
+      expect(f.bundleIdsB).toHaveLength(1);
+      expect(v.records.find((r) => r.machineId === f.machineIdB)?.type).toBe("continuation");
+
+      // C has joined and linked, and has pulled nothing: no index, no session.
+      expect(indexes.some((i) => i.machineId === f.machineIdC)).toBe(false);
+      expect(existsSync(f.projectDirC)).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("resolvesTo A: A republishes after pulling B back, and C resolves to A", async () => {
+    const f = await arrangeThreeMachines({ resolvesTo: "A" });
+    try {
+      expect(f.resolvesTo).toBe("A");
+      expect(f.latestMachineId).toBe(f.machineIdA);
+
+      const { indexes } = await readAllIndexes(createFsBackend(f.hub), f.projectId);
+      const v = chainView(indexes);
+      // A: root + republished continuation. B: the middle link. So the true
+      // order is A -> B -> A and NO machine's list is contiguous on its own —
+      // the branch where a pull resolving to A finds a hole in the middle.
+      expect(f.bundleIdsA).toHaveLength(2);
+      expect(f.bundleIdsB).toHaveLength(1);
+      expect(v.roots.map((r) => r.machineId)).toEqual([f.machineIdA]);
+
+      // The pin is lastActiveAt, and it is A's republished entry's own
+      // timestamp — the first key, decided through the production path.
+      const copies = resolveThreads(indexes)[0].copies;
+      const at = (machineId: string): string =>
+        copies.find((c) => c.machineId === machineId)!.lastActiveAt;
+      expect(at(f.machineIdA) > at(f.machineIdB)).toBe(true);
+      expect(at(f.machineIdA)).toBe("2026-04-12T08:00:05Z");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  // THE property the whole walk rests on, measured on REAL pushed bundles
+  // rather than on a synthetic record — A pushes, B pulls and continues, B
+  // pushes, A pulls back and republishes. Before Task 3.5 this test asserted
+  // the opposite (`fromEntryUuid` is the head's child, so a head-keyed map
+  // links nothing); the fields it measures have not changed, the record simply
+  // now carries the anchor beside them.
+  it("the real bundles link on anchorEntryUuid, while fromEntryUuid stays the head's CHILD", async () => {
+    const f = await arrangeThreeMachines({ resolvesTo: "A" });
+    try {
+      const { indexes } = await readAllIndexes(createFsBackend(f.hub), f.projectId);
+      const v = chainView(indexes);
+
+      const root = v.records.find((r) => r.bundleId === f.bundleIdsA[0])!;
+      const middle = v.records.find((r) => r.machineId === f.machineIdB)!;
+      const last = v.records.find((r) => r.bundleId === f.bundleIdsA[1])!;
+
+      // The assertion this task exists for: B's continuation record's anchor IS
+      // A's bundle's headEntryUuid. Nothing derives it — both sides are read
+      // back off the hub, written by two separate real pushes on two machines.
+      expect(root.head).toBe("entry-3");
+      expect(middle.anchor).toBe(root.head);
+      expect(last.anchor).toBe(middle.head);
+      expect(root.anchor).toBeNull(); // a full bundle: no anchor exists
+
+      // So the whole A -> B -> A chain assembles from the root, across three
+      // records that no single machine's index lists together.
+      expect(v.chain.map((r) => r.bundleId)).toEqual([
+        f.bundleIdsA[0],
+        f.bundleIdsB[0],
+        f.bundleIdsA[1],
+      ]);
+      expect(v.dangling).toEqual([]);
+      expect(v.unanchored).toEqual([]);
+      expect(v.unreachable).toEqual([]);
+      expect(v.forks).toEqual([]);
+
+      // fromEntryUuid is UNCHANGED and still not a link: it is the anchor's
+      // child in the transcript. Pinned so a later "simplification" that
+      // collapses the two fields into one reddens here.
+      const parentOf = new Map<string, string | null>(
+        readFileSync(f.basePath, "utf-8")
+          .split("\n")
+          .filter((l) => l !== "")
+          .map((l) => JSON.parse(l) as { uuid?: string; parentUuid?: string })
+          .filter((e): e is { uuid: string; parentUuid?: string } => typeof e.uuid === "string")
+          .map((e) => [e.uuid, e.parentUuid ?? null])
+      );
+      expect(middle.from).toBe("b-entry-4");
+      expect(middle.from).not.toBe(middle.anchor);
+      expect(parentOf.get(middle.from!)).toBe(root.head);
+      expect(parentOf.get(last.from!)).toBe(middle.head);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("its C helpers run under C's HOME and put it back", async () => {
+    const f = await arrangeThreeMachines();
+    const homeBefore = process.env.HOME;
+    try {
+      const seen = await f.onC(async () => process.env.HOME);
+      expect(seen).toBe(f.homeC);
+      expect(process.env.HOME).toBe(homeBefore);
+
+      const whereis = await f.whereisC();
+      expect(whereis.linked).toBe(true);
+      expect(whereis.projectId).toBe(f.projectId);
+      expect(whereis.threads.map((t) => t.threadId)).toEqual([f.threadId]);
+      expect(process.env.HOME).toBe(homeBefore);
+    } finally {
+      f.cleanup();
+    }
   });
 });
 

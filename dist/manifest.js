@@ -207,6 +207,22 @@ function canonicalize(value) {
  *
  * Optional on `ExportManifest`: bundles written before this field existed carry
  * no digest, and are verified exactly as they were before rather than refused.
+ *
+ * ## Adding a field to a session record is safe, and here is exactly why
+ *
+ * The digest is computed at WRITE time over whatever the manifest then holds,
+ * and `verifySessionsDigest` recomputes it from the manifest's own list at read
+ * time — there is no stored expectation anywhere to fall out of step with. So a
+ * new optional field (`continuation.anchorEntryUuid` was the first) is hashed
+ * into new manifests and simply absent from old ones, which keep verifying
+ * against their own older digest. `canonicalize` needs no knowledge of the
+ * field: it key-sorts recursively and drops `undefined`, so an absent optional
+ * hashes identically to one that was never declared.
+ *
+ * What would NOT be safe is back-filling such a field on read, or defaulting it
+ * anywhere between `readManifest` and `verifySessionsDigest` — that mutates the
+ * list the digest is checked against and turns every pre-existing bundle into a
+ * mismatch.
  */
 export function computeSessionsDigest(sessions) {
     const hash = createHash("sha256");

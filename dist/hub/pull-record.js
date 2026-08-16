@@ -19,7 +19,7 @@ import { readSyncState, setThreadId, writeSyncState } from "../sync-state.js";
  * handed to `buildIndexFile` must be the same one `setThreadId` just mutated.
  */
 export async function runRecordStage(input) {
-    const { backend, configDir, effectiveProjectPath, projectId, machineId, hubId, threadId, sourceMachineId, needed, apply: st, } = input;
+    const { backend, configDir, effectiveProjectPath, projectId, machineId, hubId, threadId, needed, apply: st, } = input;
     const reasons = [];
     // Thread mapping: prefer the session this pull actually landed content
     // in (an imported fragment or an appended base); if every bundle in the
@@ -38,14 +38,22 @@ export async function runRecordStage(input) {
     // written by an import that did happen), but it is a landmine if the keying
     // changes — so ask about a bundle that was really handled, and fall back to
     // the diverged one when the abort landed at the head of the chain.
-    const lastRecord = needed[st.lastAppliedIndex >= 0 ? st.lastAppliedIndex : st.divergenceAborted ? st.abortIndex : needed.length - 1];
+    //
+    // ASKED OF `last.machineId`, NEVER OF THE PULL'S RESOLVED MACHINE. The
+    // receipt was written by whoever supplied that bundle, so on a chain that
+    // spans machines the resolved machine's ledger simply does not hold it: the
+    // lookup misses, falls through to the hash registry or to null, and a pull
+    // that DID land content reports "its session could not be identified" and
+    // writes no thread mapping — which is the interrupted-pull state
+    // `backfillThreadMappings` exists to repair, manufactured on a healthy pull.
+    const last = needed[st.lastAppliedIndex >= 0 ? st.lastAppliedIndex : st.divergenceAborted ? st.abortIndex : needed.length - 1];
     const stateAfter = readSyncState(effectiveProjectPath);
-    const lastSessionManifest = st.lastBundleManifest?.sessions.find((s) => s.sessionId === lastRecord.sessionIdInBundle) ?? null;
+    const lastSessionManifest = st.lastBundleManifest?.sessions.find((s) => s.sessionId === last.record.sessionIdInBundle) ?? null;
     const hashRegistryFallback = lastSessionManifest
         ? stateAfter.imported[lastSessionManifest.integrityHash]?.localSessionId
         : undefined;
     const localSessionId = st.threadLandedSessionId ??
-        stateAfter.peers[sourceMachineId]?.received?.[lastRecord.sessionIdInBundle]?.localSessionId ??
+        stateAfter.peers[last.machineId]?.received?.[last.record.sessionIdInBundle]?.localSessionId ??
         hashRegistryFallback ??
         null;
     if (localSessionId !== null) {

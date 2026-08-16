@@ -288,7 +288,21 @@ describe("exporter", () => {
       expect(s.type).toBe("continuation");
       expect(s.continuation?.fromEntryIndex).toBe(2);
       expect(s.continuation?.fromEntryUuid).toBe("entry-3");
+      // The anchor is the head this delta was diffed AGAINST — the peerSent
+      // record's own headEntryUuid, and the parent of the first entry shipped.
+      // It is what the hub's index record links on; fromEntryUuid above is its
+      // child and links nothing (#35 / spec §0b).
+      expect(s.continuation?.anchorEntryUuid).toBe("entry-2");
       expect(s.continuation?.continuesLocalSessionId).toBe(fx.sessionId);
+
+      // The manifest is stamped by writeManifest, which recomputes
+      // sessionsDigest over whatever the session list then holds — so the new
+      // field is INSIDE the digest and the manifest still verifies against
+      // itself. A back-filled or defaulted anchor between read and verify would
+      // break exactly this.
+      const { verifySessionsDigest } = await import("../src/manifest.js");
+      expect(manifest.sessionsDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(verifySessionsDigest(manifest)).toBeNull();
 
       const jsonlPath = join(
         (result as { exportPath: string }).exportPath,

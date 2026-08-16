@@ -6,12 +6,14 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-stages.js";
-import type { ErrorResult, ExportManifest, HubPullResult } from "../src/types.js";
+import type {
+  ErrorResult, ExportManifest, HubPullFindings, HubPullResult,
+} from "../src/types.js";
 import { initApplyState, type PulledCarry } from "../src/hub/pull-apply-state.js";
 import { runApplyCarryStage } from "../src/hub/pull-apply-carry.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import type { HubBackend } from "../src/hub/backend.js";
-import { readMachineIndex } from "../src/hub/index-file.js";
+import { readAllIndexes, readMachineIndex } from "../src/hub/index-file.js";
 import { localProjectIdPath, writeLocalProjectId } from "../src/hub/identity.js";
 import {
   HUB_JSON, bundleDir, bundleFileName, indexPath, machinePath, projectJsonPath,
@@ -21,8 +23,12 @@ import type { CarryMeta } from "../src/hub/carry.js";
 import { runFetchStage } from "../src/hub/pull-fetch.js";
 import { runRecordStage, type RecordApplyView } from "../src/hub/pull-record.js";
 import { runResolveStage } from "../src/hub/pull-resolve.js";
-import { runSelectStage } from "../src/hub/pull-select.js";
-import { resolveThreads } from "../src/hub/threads.js";
+import {
+  runSelectStage, type SelectOutcome, type SelectReport, type SourcedBundle,
+} from "../src/hub/pull-select.js";
+import {
+  findUnfetchableBundles, planThreadPull, resolveThreads, sourcedKey,
+} from "../src/hub/threads.js";
 import { createArchive } from "../src/archiver.js";
 import { computeIntegrityHashFromFile, writeManifest } from "../src/manifest.js";
 import { encodeProjectPath } from "../src/platform.js";
@@ -36,15 +42,16 @@ import {
   runApplySessionsStage, type RecordSpliceInput,
 } from "../src/hub/pull-apply-sessions.js";
 import { hubInit } from "../src/hub/init.js";
-import { hubPull } from "../src/hub/pull.js";
+import { hubPull, reportPullResult } from "../src/hub/pull.js";
 import { hubPush } from "../src/hub/push.js";
+import { loadOrCreateMachineId } from "../src/machine.js";
 import { readLastEntryUuid } from "../src/jsonl.js";
 import { setThreadId } from "../src/sync-state.js";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import {
   FIXTURE_ENCODED, FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID,
-  arrangeDivergence, bundle, currentThreadIndexes, emptySyncState, entry, idx, makeLookLive, peer,
-  syncState, writeCorruptBundle,
+  arrangeDivergence, arrangeThreeMachines, bundle, chainHead, chainIndexes, currentThreadIndexes,
+  emptySyncState, entry, idx, makeLookLive, peer, syncState, writeCorruptBundle,
 } from "./helpers/hub-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 
@@ -279,7 +286,12 @@ describe("record stage", () => {
     writeFileSync(join(dir, `${sessionId}.jsonl`), entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
   }
 
-  function input(over: { needed?: ReturnType<typeof bundle>[]; apply?: RecordApplyView } = {}) {
+  /** A plan entry: the bundle, plus the machine whose index listed it. */
+  function sourced(machineId: string, over: Partial<HubBundleRecord> = {}): SourcedBundle {
+    return { machineId, record: bundle(over) };
+  }
+
+  function input(over: { needed?: SourcedBundle[]; apply?: RecordApplyView } = {}) {
     return {
       backend: createFsBackend(hubDir),
       configDir,
@@ -288,8 +300,7 @@ describe("record stage", () => {
       machineId: "m1",
       hubId: "h1",
       threadId: "t1",
-      sourceMachineId: "m2",
-      needed: over.needed ?? [bundle({ bundleId: "b0", sessionIdInBundle: "remote-a" })],
+      needed: over.needed ?? [sourced("m2", { bundleId: "b0", sessionIdInBundle: "remote-a" })],
       apply: over.apply ?? applyView(),
     };
   }
@@ -375,14 +386,73 @@ describe("record stage", () => {
     const out = await runRecordStage(
       input({
         needed: [
-          bundle({ bundleId: "b0", sessionIdInBundle: "remote-a" }),
-          bundle({ bundleId: "b1", sessionIdInBundle: "remote-b" }),
+          sourced("m2", { bundleId: "b0", sessionIdInBundle: "remote-a" }),
+          sourced("m2", { bundleId: "b1", sessionIdInBundle: "remote-b" }),
         ],
         apply: applyView({ lastAppliedIndex: 0, divergenceAborted: true, abortIndex: 1 }),
       })
     );
 
     expect(out.value?.localSessionId).toBe(SESSION_ID);
+  });
+
+  /**
+   * THE THIRD SITE OF THE `sourceMachineId` RIPPLE (#35 Task 3).
+   *
+   * This lookup recovers the thread's local session when nothing landed in this
+   * pull, and it has to ask the peer that SUPPLIED the last bundle. A plan drawn
+   * from one machine cannot tell the two apart — every record's machine is the
+   * pull's resolved machine — so the arrangement here is the one chain assembly
+   * produces: the last handled bundle came from `m3` while the pull resolved to
+   * `m2`, and `m2` holds a receipt for the SAME `sessionIdInBundle` pointing at
+   * a different local session.
+   *
+   * Reaching for the resolved machine is not a miss here, it is a wrong answer:
+   * the thread would be mapped onto `m2`'s session, and every later continuation
+   * would splice onto the wrong transcript.
+   */
+  it("asks the receipt ledger of the machine that supplied the bundle, not the pull's source", async () => {
+    writeLocalSession(SESSION_ID, HEAD_UUID);
+    writeLocalSession("decoy-session-id", "entry-decoy");
+    writeSyncState({
+      ...syncState({
+        m2: peer({
+          received: {
+            // Same key, wrong peer: the answer a scalar `sourceMachineId`
+            // would have produced.
+            "remote-b": {
+              localSessionId: "decoy-session-id", type: "continuation",
+              importedAt: "2026-08-01T09:00:00.000Z",
+            },
+          },
+        }),
+        m3: peer({
+          received: {
+            "remote-b": {
+              localSessionId: SESSION_ID, type: "continuation",
+              importedAt: "2026-08-01T09:30:00.000Z",
+            },
+          },
+        }),
+      }),
+      projectPath,
+    });
+
+    const out = await runRecordStage(
+      input({
+        needed: [
+          sourced("m2", { bundleId: "b0", sessionIdInBundle: "remote-a" }),
+          sourced("m3", { bundleId: "b1", sessionIdInBundle: "remote-b" }),
+        ],
+        // Nothing landed in this pull, so `threadLandedSessionId` is null and
+        // the receipt ledger is the branch that answers.
+        apply: applyView({ lastAppliedIndex: 1 }),
+      })
+    );
+
+    expect(out.value?.localSessionId).toBe(SESSION_ID);
+    expect(getThreadId(readSyncState(projectPath), SESSION_ID)).toBe("t1");
+    expect(getThreadId(readSyncState(projectPath), "decoy-session-id")).toBeNull();
   });
 
   /**
@@ -422,6 +492,69 @@ describe("record stage", () => {
     expect(out.value?.indexWritten).toBe(true);
     expect(out.reasons).toHaveLength(1);
     expect(out.reasons[0]).toContain("its session could not be identified");
+  });
+
+  /**
+   * THE REASON THE SELECT STAGE HAS A FOURTH EXIT INSTEAD OF AN EMPTY `proceed`.
+   *
+   * The cheap way to express "assembled the chain, found an anomaly, applied
+   * nothing" is to relax the empty-plan gate and let `proceed` carry an empty
+   * `needed`. Every stage below select tolerates a zero-length chain except this
+   * one: `pull-record.ts` indexes the plan unconditionally, and for an empty
+   * plan that index is `needed[-1]` (`lastAppliedIndex` starts at -1 and
+   * `divergenceAborted` at false, so the expression falls through to
+   * `needed.length - 1`).
+   *
+   * WHICH dereference throws, and the fact that it now throws UNCONDITIONALLY,
+   * both moved with #35 Task 3 and the change is in the guard's favour. The
+   * `undefined` plan entry used to be dereferenced first at its
+   * `sessionIdInBundle`, as the computed KEY of
+   * `peers[sourceMachineId]?.received?.[…]` — so it only threw when that peer
+   * ledger happened to exist for the optional chain to run through. Strip the
+   * receipts and the same empty plan sailed past, reporting a session it could
+   * not identify and republishing the index for a pull that fetched nothing.
+   *
+   * With the plan carrying its own machine per record, the lookup is
+   * `peers[last.machineId]`, so the entry is dereferenced to BUILD the key
+   * rather than inside it, and no arrangement can short-circuit past it. The
+   * `find` predicate above it still cannot fire — nothing sets
+   * `lastBundleManifest` when the bundle loop never iterates — so the crash is
+   * still this statement, one property earlier.
+   *
+   * Asserted, so the design note stays measured rather than remembered. If a
+   * future guard makes an empty plan safe here, this test is where that is
+   * discovered — it does not license removing the fourth arm, which also carries
+   * the `success: true` semantics the gate cannot express.
+   */
+  it("throws on an empty fetch plan, which is why select may never hand one to proceed", async () => {
+    writeLocalSession(SESSION_ID, HEAD_UUID);
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        m2: peer({
+          received: {
+            "remote-a": {
+              localSessionId: SESSION_ID, type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+            },
+          },
+        }),
+      },
+    });
+
+    // The message, not just the class: a bare `TypeError` would also be
+    // satisfied by a crash somewhere else entirely, and the point of this test
+    // is WHICH dereference fails.
+    await expect(runRecordStage(input({ needed: [] }))).rejects.toThrow(
+      /Cannot read properties of undefined \(reading 'machineId'\)/
+    );
+
+    // ...and with the peer ledger stripped it throws just the same, which is
+    // the half that changed. The crash is no longer arrangement-dependent, so
+    // an empty plan can no longer reach the index rewrite by accident.
+    writeSyncState(emptySyncState(projectPath));
+    await expect(runRecordStage(input({ needed: [] }))).rejects.toThrow(
+      /Cannot read properties of undefined \(reading 'machineId'\)/
+    );
   });
 });
 
@@ -1298,6 +1431,7 @@ describe("apply.sessions stage", () => {
     state: ReturnType<typeof initApplyState>;
     recordSplice?: (b: RecordSpliceInput) => void;
     noAppend?: boolean;
+    bundleMachineId?: string;
   }): Parameters<typeof runApplySessionsStage>[0] {
     return {
       extractDir,
@@ -1310,7 +1444,7 @@ describe("apply.sessions stage", () => {
       targetProjectDir,
       claudeVersion: "2.1.81",
       threadId: THREAD_ID,
-      sourceMachineId: SOURCE_MACHINE,
+      bundleMachineId: over.bundleMachineId ?? SOURCE_MACHINE,
       hubPeerId: HUB_PEER_ID,
       noAppend: over.noAppend ?? false,
       forceAppend: false,
@@ -1428,6 +1562,48 @@ describe("apply.sessions stage", () => {
     expect(lines.map((l) => l.uuid)).toEqual(["base-1", "base-2", "c-1", "c-2"]);
     expect(lines.slice(2).map((l) => l.cwd)).toEqual([projectPath, projectPath]);
     expect(lines.slice(2).map((l) => l.sessionId)).toEqual([a.baseSessionId, a.baseSessionId]);
+  });
+
+  /**
+   * SITES ONE AND TWO OF THE `sourceMachineId` RIPPLE (#35 Task 3).
+   *
+   * The splice credits `peers[peerId].received` and `peers[peerId].sent`, and
+   * the peer it must credit is the machine whose index listed THIS bundle. Two
+   * other ids are in the room and both are wrong: the pull's resolved machine
+   * (gone from this stage entirely now — there is no parameter left to reach
+   * for) and the bundle manifest's `sourceMachineId`, which is the ORIGINATING
+   * machine and is what `importSession` credits on the fragment path.
+   *
+   * So the arrangement makes them disagree: the plan says `m-holder`, the
+   * manifest says `m-source`. On a one-machine pull they are the same string
+   * and this assertion is untestable, which is exactly why it is written here
+   * rather than left to an end-to-end case.
+   *
+   * The `adopt-hub` site takes its value from the same destructured binding as
+   * this one, so the two cannot disagree by construction; hub-pull.test.ts
+   * exercises that path end to end.
+   */
+  it("credits the splice to the machine whose list carried the bundle, not the manifest's originator", async () => {
+    const a = await arrangeSpliceable();
+    expect(a.manifest.sourceMachineId, "the manifest's originator is the decoy").toBe(SOURCE_MACHINE);
+    const st = initApplyState({ needed: [a.record] });
+    const spliced: RecordSpliceInput[] = [];
+
+    const out = await runApplySessionsStage(
+      stageInput({
+        manifest: a.manifest, record: a.record, state: st,
+        bundleMachineId: "m-holder",
+        recordSplice: (b) => spliced.push(b),
+      })
+    );
+
+    expect(out.control).toEqual({ kind: "next" });
+    expect(spliced).toHaveLength(1);
+    expect(spliced[0].peerId).toBe("m-holder");
+    expect(spliced[0].peerId).not.toBe(SOURCE_MACHINE);
+    // The hub's own ledger is unaffected: it is not machine-derived, and the
+    // invariant doc on `recordSentToPeer` is about that one.
+    expect(spliced[0].hubPeerId).toBe(HUB_PEER_ID);
   });
 
   it("imports as a fragment instead of splicing when --no-append is set", async () => {
@@ -1793,11 +1969,17 @@ describe("select stage", () => {
     expect(out.value).toEqual({
       threadId: "t-1",
       sourceMachineId: "m2",
-      needed: [PEER_BUNDLE],
-      unfetchableBundles: undefined,
+      // Each record carries the machine whose list it came from. One copy's
+      // list, so one machine — but stamped per record, not inferred from the
+      // scalar above (see `SourcedBundle`).
+      needed: [{ machineId: "m2", record: PEER_BUNDLE }],
+      // The shared `HubPullFindings`, empty because there is nothing to
+      // disclose — the same interface and the same spread the `report` arm
+      // carries, so a disclosure added to it reaches BOTH exits at once.
+      findings: {},
     });
     expect(Object.keys(out.value).sort()).toEqual([
-      "needed", "sourceMachineId", "threadId", "unfetchableBundles",
+      "findings", "needed", "sourceMachineId", "threadId",
     ]);
   });
 
@@ -1900,10 +2082,18 @@ describe("select stage", () => {
 
   /**
    * Warning push #2, plus the typed field the skill layer branches on. A third
-   * machine lists a bundle the resolved source does not, and a pull only ever
-   * reads one machine's list.
+   * machine lists a bundle the resolved source does not — and, since #35, one
+   * that chain assembly could not place either, because `bundle()` builds the
+   * PRE-ASSEMBLY shape (no `anchorEntryUuid` key at all, which is every bundle
+   * already sitting on every hub).
+   *
+   * That is why there are now TWO sentences and not one: the disclosure says
+   * which machine holds what this pull did not fetch, and the assembly note
+   * says WHY it could not be placed — "pushed before chain assembly existed" is
+   * a different fact from "a bundle is missing", and spec §0b exists to keep
+   * them apart. Neither one is the other's restatement.
    */
-  it("discloses a third machine's unreachable bundles as both a typed field and a warning", async () => {
+  it("discloses a third machine's unreachable bundles as a typed field, a warning, and why assembly could not place them", async () => {
     writeBundleFile(PEER_BUNDLE.file);
     const third = idx("m3", {
       "t-1": entry({
@@ -1926,11 +2116,24 @@ describe("select stage", () => {
     expect(out.kind).toBe("proceed");
     if (out.kind !== "proceed") return;
     expect(out.value.sourceMachineId).toBe("m2");
-    expect(out.value.unfetchableBundles).toEqual([
+    expect(out.value.findings.unfetchableBundles).toEqual([
       { machineId: "m3", machineName: null, bundleIds: ["b9"] },
     ]);
-    expect(out.warnings).toHaveLength(1);
+    // The PRESENCE RULE, at the one site where both halves are visible: the
+    // machine-naming field and the condition field are emitted together, and
+    // each has its sentence below. A field with no sentence leaves a caller
+    // guessing; a sentence with no field forces it to branch on wording.
+    expect(out.value.findings.unplaceableBundles).toEqual([
+      { machineId: "m3", machineName: null, bundleId: "b9", preAssembly: true },
+    ]);
+    expect(out.value.findings.chainGaps).toBeUndefined();
+    expect(out.warnings).toHaveLength(2);
     expect(out.warnings[0]).toContain("Thread t-1 could not be pulled whole");
+    expect(out.warnings[1]).toContain("b9");
+    expect(out.warnings[1]).toContain("pushed before sesh-mover recorded which entry");
+    // ...and it is emphatically NOT called a gap: a gap sends a user looking
+    // for a bundle that is sitting right there.
+    expect(out.warnings[1]).not.toContain("no bundle on this hub carries");
   });
 
   /**
@@ -1973,6 +2176,970 @@ describe("select stage", () => {
     if (viaLatest.kind !== "proceed" || viaThread.kind !== "proceed") return;
     expect(viaLatest.value).toEqual(viaThread.value);
     expect(viaLatest.value.sourceMachineId).toBe("m2");
-    expect(viaLatest.value.needed).toEqual([PEER_BUNDLE]);
+    expect(viaLatest.value.needed).toEqual([{ machineId: "m2", record: PEER_BUNDLE }]);
   });
+
+  /**
+   * The stamp is per record and comes from the copy the selection was drawn
+   * from — asserted on the branch where the resolved machine is NOT the source
+   * (our own copy is newest, so `alternateSource` switches to m2). Same machine
+   * in both roles today; the point is which one the records are stamped with,
+   * because that is the one three sites downstream credit.
+   */
+  it("stamps every needed record with the machine whose list it was drawn from", async () => {
+    writeBundleFile(PEER_BUNDLE.file);
+    const mine = idx(ME, {
+      "t-1": entry({
+        localSessionId: "local-mine",
+        headEntryUuid: "head-mine",
+        lastActiveAt: "2026-07-22T00:00:00Z",
+        bundles: [],
+      }),
+    });
+
+    const out = await runSelectStage(input({ indexes: [mine, peerIndex()], latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.machineId)).toEqual(["m2"]);
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0"]);
+    // ...and never this machine's own id, which is what `target.latest` is on
+    // this branch and what a "stamp with the resolved machine" shortcut would
+    // have produced.
+    expect(out.value.needed.every((n) => n.machineId !== ME)).toBe(true);
+  });
+
+  /** Every record in an index, so `backend.exists` finds what the plan wants. */
+  function writeEveryBundleFile(indexes: HubIndexJson[]): void {
+    for (const index of indexes) {
+      for (const thread of Object.values(index.threads)) {
+        for (const record of thread.bundles) writeBundleFile(record.file);
+      }
+    }
+  }
+
+  /**
+   * THE #35 LANDING SITE, at the seam: the plan spans machines.
+   *
+   * `b1` is listed only by m2 and `b0` only by m1, and the pull resolves to m2
+   * — so before assembly `needed` was `[b1]` and `b0` was disclosed as
+   * unreachable. It is now one link-ordered plan across both lists, root first,
+   * with each record stamped with the machine that listed it.
+   */
+  it("draws the plan from every machine's list, in link order, not from the resolved machine's", async () => {
+    const indexes = chainIndexes(
+      { mA: ["b0"], mB: ["b1<-b0"] },
+      {
+        threadId: "t-1",
+        // m2 resolves, so m1's root is reachable only by following the link.
+        advertise: { mB: { lastActiveAt: "2026-07-22T00:00:00Z" } },
+      }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    // "The machine this pull resolved to" — unchanged in meaning, and NOT the
+    // answer to "which peer supplied this record".
+    expect(out.value.sourceMachineId).toBe("mB");
+    expect(out.value.needed.map((n) => [n.machineId, n.record.bundleId])).toEqual([
+      ["mA", "b0"],
+      ["mB", "b1"],
+    ]);
+    // pushedAt DESCENDS in link order in these fixtures, so a plan that had
+    // been sorted by the clock would come back reversed.
+    const stamps = out.value.needed.map((n) => n.record.pushedAt);
+    expect([...stamps].sort()).toEqual([...stamps].reverse());
+    // Nothing was left behind, so NO disclosure key is set at all — an empty
+    // object rather than a set of `undefined`s, which is what makes the
+    // presence of any one of them meaningful to a caller.
+    expect(out.value.findings).toEqual({});
+    expect(out.warnings).toEqual([]);
+  });
+
+  /**
+   * A MIXED HUB — the realistic state the moment this ships, since every bundle
+   * already on every hub predates `anchorEntryUuid`.
+   *
+   * mA's `b2` carries no anchor key at all. Two things follow and both are
+   * asserted, because getting either wrong is a defect this milestone is about:
+   * the linked half still assembles across machines (no silent truncation back
+   * to the resolved machine's list), and `b2` is reported as a bundle pushed
+   * BEFORE chain assembly rather than as a gap. "A link was never written" and
+   * "a bundle is missing" have different remedies, and only one of them sends a
+   * user hunting for something that is sitting right there (spec §0b).
+   */
+  it("assembles the linked half of a mixed hub and calls the rest unlinkable, never a gap", async () => {
+    const indexes = chainIndexes(
+      { mA: ["b0", { id: "b2", from: "b0", preAssembly: true }], mB: ["b1<-b0"] },
+      { threadId: "t-1", advertise: { mB: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    // Not truncated: both machines' linked records are in the plan.
+    expect(out.value.needed.map((n) => [n.machineId, n.record.bundleId])).toEqual([
+      ["mA", "b0"],
+      ["mB", "b1"],
+    ]);
+    // The one record no walk can place is named, once, as what it is — in the
+    // prose AND in the field the skill layer branches on, which is the half a
+    // caller can act on without reading English.
+    expect(out.value.findings.unfetchableBundles).toEqual([
+      { machineId: "mA", machineName: null, bundleIds: ["b2"] },
+    ]);
+    expect(out.value.findings.unplaceableBundles).toEqual([
+      { machineId: "mA", machineName: null, bundleId: "b2", preAssembly: true },
+    ]);
+    // ...and emphatically NOT as a gap, in the typed half either.
+    expect(out.value.findings.chainGaps).toBeUndefined();
+    const note = out.warnings.find((w) => w.includes("pushed before sesh-mover recorded"));
+    expect(note, "the pre-assembly bundle must be explained, not just listed").toBeDefined();
+    expect(note!).toContain("b2");
+    expect(note!).toContain("not a missing one");
+    // ...and nothing anywhere calls it a gap.
+    expect(out.warnings.join(" ")).not.toContain("no bundle on this hub carries");
+  });
+
+  /**
+   * THE FOURTH EXIT'S PRODUCER, and the shape that produced the indefinite
+   * SessionStart nag: mB's index advertises a head no bundle record ships —
+   * `headEntryUuid` is a projection of LOCAL state while `bundles` is a
+   * projection of PUSHED state, so a machine can advertise work it never
+   * uploaded (#35's own notes).
+   *
+   * Every bundle that exists is already here, so there is nothing to fetch and
+   * nothing another machine holds that this one cannot reach. The old answer
+   * was `success: false` ("Already up to date with the source machine"), which
+   * is true and useless: it says nothing about the newer work `whereis` and the
+   * session-start notice keep pointing at. This is a success that applied
+   * nothing and says exactly where that work is — on mB, not on the hub.
+   */
+  it("reports, as a success, a thread whose only missing half was never pushed at all", async () => {
+    const indexes = chainIndexes(
+      { mB: ["b0"] },
+      {
+        threadId: "t-1",
+        advertise: { mB: { headEntryUuid: "head-of-work-mB-never-pushed" } },
+      }
+    );
+    writeEveryBundleFile(indexes);
+    writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        mB: peer({
+          received: {
+            "sess-mB": {
+              localSessionId: "local-1", type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+            },
+          },
+        }),
+      },
+    });
+
+    const out = await runSelectStage(input({ indexes, threadId: "t-1" }));
+
+    expect(out.kind).toBe("report");
+    if (out.kind !== "report") return;
+    expect(out.value.threadId).toBe("t-1");
+    // Still "the machine this pull resolved to".
+    expect(out.value.sourceMachineId).toBe("mB");
+    expect(out.value.reason).toContain("Nothing to apply");
+    expect(out.value.reason).toContain("advertises newer work");
+    expect(out.value.reason).toContain("has not been uploaded");
+    // Nothing is unfetchable — the work is not on the hub to be fetched — and
+    // the one condition that DID fire is typed, on the exit where it is
+    // frequently the entire answer to "why did this pull do nothing".
+    expect(out.value.findings).toEqual({
+      advertisedUnshipped: [
+        { machineId: "mB", machineName: null, headEntryUuid: "head-of-work-mB-never-pushed" },
+      ],
+    });
+    // ...and it is not the refusal wearing a different hat: `report` renders a
+    // `success: true` result (see the report-arm block below).
+    expect(out).not.toHaveProperty("result");
+  });
+
+  /**
+   * The control for the exit above, and the reason it is not just a reworded
+   * refusal: with nothing to say, the plain "already up to date" answer is
+   * unchanged, error and suggestion verbatim.
+   */
+  it("keeps the plain already-up-to-date refusal when assembly has nothing to add", async () => {
+    const indexes = chainIndexes({ mB: ["b0"] }, { threadId: "t-1" });
+    writeEveryBundleFile(indexes);
+    writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        mB: peer({
+          received: {
+            "sess-mB": {
+              localSessionId: "local-1", type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+            },
+          },
+        }),
+      },
+    });
+
+    const out = await runSelectStage(input({ indexes, threadId: "t-1" }));
+
+    expect(out.kind).toBe("stop");
+    if (out.kind !== "stop") return;
+    expect((out.result as ErrorResult).error).toBe("Already up to date with the source machine.");
+    expect((out.result as ErrorResult).suggestion).toBe("Run whereis to confirm.");
+  });
+
+  /**
+   * BACK-COMPAT, and it is the reason the plan is not simply the assembled
+   * chain. Every bundle already sitting on every hub was pushed before
+   * `anchorEntryUuid` existed, so assembly reduces such a thread to its root
+   * and nothing else. Narrowing a pull to the assembled chain alone would
+   * therefore stop this release fetching continuations it fetches today — a
+   * silent regression aimed squarely at whoever has been on the hub longest.
+   * Assembly may WIDEN a plan and may reorder it; it may never shrink it below
+   * the one machine's list a pull already reads.
+   */
+  it("still fetches a wholly pre-assembly thread, which no walk can link", async () => {
+    const indexes = chainIndexes(
+      { mB: ["b0", "b1<-b0"] },
+      { threadId: "t-1", linkStyle: "pre-assembly" }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => [n.machineId, n.record.bundleId])).toEqual([
+      ["mB", "b0"],
+      ["mB", "b1"],
+    ]);
+    // ...and the pull says nothing about it: b1 is being fetched, so it is not
+    // a bundle this pull left behind, whatever assembly thinks of its links.
+    expect(out.warnings).toEqual([]);
+  });
+
+  /**
+   * THE DISCLOSURE FIELDS (Task 7), one condition per case.
+   *
+   * `assembleChain` has always distinguished six conditions; before this task
+   * only some of them reached a user, and none of them reached a user as
+   * anything a caller could branch on. The rule these cases pin is the presence
+   * rule from `HubPullFindings`: **a field is present exactly when the sentence
+   * describing it was emitted**, so each case asserts both halves and asserts
+   * that the OTHER conditions' fields stayed absent. A disclosure that fires on
+   * every pull trains users to ignore it, and a field that is set without a
+   * sentence leaves a caller guessing at what it means.
+   */
+  it("names a gap as a gap — in the warning and in the typed field", async () => {
+    // b1 anchors on a head no record on this hub ships, which strands b2 behind
+    // it. The chain is applied up to b0 and stops there rather than resuming
+    // past the gap: a non-contiguous transcript is what `tryAppendContinuation`
+    // would refuse anyway.
+    const indexes = chainIndexes(
+      { mA: ["b0"], mB: [{ id: "b1", anchorUuid: chainHead("gone") }, "b2<-b1"] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0"]);
+    expect(out.value.findings.chainGaps).toEqual([
+      {
+        anchorEntryUuid: chainHead("gone"),
+        machineId: "mB",
+        machineName: null,
+        bundleId: "b1",
+        strandedBundleIds: ["b1", "b2"],
+      },
+    ]);
+    expect(out.value.findings.unplaceableBundles).toBeUndefined();
+    const note = out.warnings.find((w) => w.includes("no bundle on this hub carries"));
+    expect(note, "a gap must be explained, not just listed").toBeDefined();
+    expect(note!).toContain("strands 1 later bundle");
+  });
+
+  it("names the branch of a fork it did not follow", async () => {
+    // b1 and b2 both continue b0's head. The walk follows one (bundle id
+    // ascending, with no local base to prefer) and parks the other whole —
+    // branch-vs-branch on the hub, which is NOT `hub.onDivergence`: that policy
+    // is per bundle, resolves a hub bundle against a LOCAL transcript, and is
+    // not an input to this stage at all.
+    const indexes = chainIndexes(
+      { mA: ["b0", "b1<-b0"], mB: ["b2<-b0"] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0", "b1"]);
+    expect(out.value.findings.parkedBranches).toEqual([
+      {
+        anchorEntryUuid: chainHead("b0"),
+        followedBundleId: "b1",
+        machineId: "mB",
+        machineName: null,
+        bundleId: "b2",
+        bundleIds: ["b2"],
+      },
+    ]);
+    expect(out.value.findings.chainGaps).toBeUndefined();
+    expect(out.warnings.some((w) => w.includes("forks on the hub"))).toBe(true);
+  });
+
+  /**
+   * MULTIPLE ROOTS ARE ORDINARY, and that is exactly why the silence was wrong.
+   * `computeIncrementalPlan` re-sends a session whole whenever the recorded head
+   * is empty or gone (compaction, truncation, a rollback) and `push.ts` files
+   * that `full` record under the SAME thread id — so a second starting point is
+   * a routine product of the ordinary flow, and a pull that walks one of them
+   * and says nothing about the other hands the user half a conversation with an
+   * empty `warnings` array. Two roots cannot be joined: a compaction rewrites
+   * the very entry uuids a link would need.
+   */
+  it("names a second starting point it did not walk", async () => {
+    const indexes = chainIndexes(
+      { mA: ["b0"], mB: ["b1"] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0"]);
+    expect(out.value.findings.unwalkedRoots).toEqual([
+      { machineId: "mB", machineName: null, bundleId: "b1", bundleIds: ["b1"] },
+    ]);
+    const note = out.warnings.find((w) => w.includes("independent starting point"));
+    expect(note, "an unwalked root must be explained, not just listed").toBeDefined();
+    expect(note!).toContain("ordinary rather than damage");
+  });
+
+  /**
+   * THE FOLD. This arrangement reaches BOTH the unfetchable stop and the report
+   * arm, and Task 7 settled which wins: a pull that can NAME the condition
+   * succeeds; a pull that can only name the machines fails.
+   *
+   * mB's bundle is a pre-assembly record, so assembly can say precisely what it
+   * is ("pushed before chain assembly existed, not a missing one") and that a
+   * fresh push from mB re-links it. That is a complete, truthful, actionable
+   * answer, and `success: false` on it is the nag loop this milestone exists to
+   * break — an error tells the caller to retry, and every retry says the same
+   * thing forever.
+   */
+  it("succeeds, rather than stopping, when it can name why the rest is out of reach", async () => {
+    const indexes = chainIndexes(
+      { mA: ["b0"], mB: [{ id: "b1", from: "b0", preAssembly: true }] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+    writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        mA: peer({
+          received: {
+            "sess-mA": {
+              localSessionId: "local-1", type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+            },
+          },
+        }),
+      },
+    });
+
+    const out = await runSelectStage(input({ indexes, threadId: "t-1" }));
+
+    expect(out.kind).toBe("report");
+    if (out.kind !== "report") return;
+    expect(out.value.reason).toContain("pushed before sesh-mover recorded which entry");
+    // Both halves ride together: the machines, and the condition.
+    expect(out.value.findings.unfetchableBundles).toEqual([
+      { machineId: "mB", machineName: null, bundleIds: ["b1"] },
+    ]);
+    expect(out.value.findings.unplaceableBundles).toEqual([
+      { machineId: "mB", machineName: null, bundleId: "b1", preAssembly: true },
+    ]);
+    // The machine-naming sentence is still emitted — on `warnings`, which the
+    // report result has a field for and the stop result does not.
+    expect(out.warnings.some((w) => w.includes("could not be pulled whole"))).toBe(true);
+    // ...and the retired foreclosure is in none of it.
+    const said = [out.value.reason, ...out.warnings].join(" ");
+    expect(said).not.toContain("split across machines");
+    expect(said).not.toContain("cannot be assembled here yet");
+  });
+
+  /**
+   * THE RESIDUAL CLASS, i.e. the half of the fold that stays an error — proof
+   * that the stop below the report arm is not dead code.
+   *
+   * b2 continues b1's head, so it is not a gap; b1 is already here, so it is not
+   * an outstanding pre-assembly bundle; there is no fork and one root. Nothing
+   * in the walk accounts for b2, and the heuristic can still see it. This pull
+   * does not know what it is missing, which is a different answer from "here is
+   * what I am missing and why" — and an error is the honest shape for it.
+   */
+  it("stays an error when another machine's bundles are out of reach for no reason it can name", async () => {
+    const indexes = chainIndexes(
+      {
+        mA: ["b0"],
+        mB: [{ id: "b1", from: "b0", preAssembly: true }],
+        mC: ["b2<-b1"],
+      },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+    writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
+    const rec = (sessionId: string) => ({
+      [sessionId]: {
+        localSessionId: "local-1", type: "full" as const, importedAt: "2026-08-01T00:00:00.000Z",
+      },
+    });
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        mA: peer({ received: rec("sess-mA") }),
+        mB: peer({ received: rec("sess-mB") }),
+      },
+    });
+
+    const out = await runSelectStage(input({ indexes, threadId: "t-1" }));
+
+    expect(out.kind).toBe("stop");
+    if (out.kind !== "stop") return;
+    const result = out.result as ErrorResult;
+    expect(result.error).toContain("Already up to date with the source machine, but this thread is not whole here");
+    // It names the MACHINE holding what it cannot reach, and nothing more —
+    // which is the whole of why this exit is an error rather than a report: a
+    // `stop` result carries no `findings` field for a condition to ride on,
+    // because there is no condition to put in one.
+    expect(result.error).toContain("mC (1 bundle)");
+    expect(result.error).not.toContain("pushed before sesh-mover recorded");
+    // The rewritten suggestion, shared by all three sites that used to hold a
+    // hand-copied copy of the retired claim.
+    expect(result.suggestion).toContain("Nothing is left for this machine to fetch");
+    expect(result.suggestion).toContain("assembles a thread across every machine's bundle list");
+    expect(`${result.error} ${result.suggestion}`).not.toContain("cannot be assembled here yet");
+    expect(`${result.error} ${result.suggestion}`).not.toContain("no flag or re-run fetches them");
+    expect(`${result.error} ${result.suggestion}`).not.toMatch(/--[a-z]/);
+  });
+});
+
+/**
+ * THE FOURTH EXIT, tested from the outcome inward.
+ *
+ * These tests construct the outcome directly and assert the `HubPullResult` it
+ * yields — the rendering, in isolation from whatever reaches it. Chain assembly
+ * has since given the arm a real producer (see "reports, as a success, a thread
+ * whose only missing half was never pushed at all" in the select-stage block
+ * above), so the two halves now meet: that case proves the arm is REACHED,
+ * these prove what it renders when it is.
+ *
+ * The complementary half is in the record stage's "throws on an empty fetch
+ * plan" case above: together they say the arm is necessary AND connected.
+ */
+describe("select report arm (the fourth exit)", () => {
+  const REASON =
+    "This thread's history was worked out in full and every bundle in it is already here.";
+
+  function report(over: Partial<SelectReport> = {}): SelectReport {
+    return { threadId: "t-1", sourceMachineId: "m2", reason: REASON, findings: {}, ...over };
+  }
+
+  it("renders a success result that applied nothing and says why", () => {
+    const outcome: SelectOutcome = {
+      kind: "report", value: report(), warnings: ["the stage's own sentence"],
+    };
+    expect(outcome.kind).toBe("report");
+    if (outcome.kind !== "report") return;
+
+    const result = reportPullResult(outcome.value, ["the caller's own", ...outcome.warnings]);
+
+    expect(result).toEqual({
+      success: true,
+      command: "pull",
+      threadId: "t-1",
+      // Still "the machine this pull resolved to" — the report says nothing
+      // about how many machines' lists were read to reach it.
+      sourceMachineId: "m2",
+      importedSessions: [],
+      skippedSessions: [],
+      // Nothing landed, so no thread mapping was written and none is claimed.
+      localSessionId: null,
+      workspaceUnpacked: null,
+      nothingToApply: { reason: REASON },
+      warnings: ["the caller's own", "the stage's own sentence"],
+    });
+    // Not a refusal wearing a success flag: no `error`, no `suggestion`, and no
+    // `reason` discriminator at the top level of the result.
+    expect(result.success).toBe(true);
+    expect("error" in result).toBe(false);
+    expect("suggestion" in result).toBe(false);
+    expect(Object.keys(result).sort()).toEqual([
+      "command", "importedSessions", "localSessionId", "nothingToApply", "skippedSessions",
+      "sourceMachineId", "success", "threadId", "warnings", "workspaceUnpacked",
+    ]);
+  });
+
+  /**
+   * `findings` is spread, not copied field by field, and the room that left was
+   * used: `chainGaps`, `parkedBranches`, `unplaceableBundles`, `unwalkedRoots`
+   * and `advertisedUnshipped` all landed as additions to `HubPullFindings`, and
+   * neither this arm nor `reportPullResult` nor `hubPull`'s dispatch needed a
+   * line changed. The undeclared-field assertion stays, with a name the type
+   * genuinely does not declare, because the property is about the NEXT
+   * disclosure as much as the last one.
+   */
+  it("spreads the shared findings verbatim, including ones not declared yet", () => {
+    const unfetchableBundles = [{ machineId: "m3", machineName: "laptop", bundleIds: ["b9"] }];
+    const chainGaps = [
+      {
+        anchorEntryUuid: "u-7",
+        machineId: "m3",
+        machineName: "laptop",
+        bundleId: "b9",
+        strandedBundleIds: ["b9", "b10"],
+      },
+    ];
+
+    const declared = reportPullResult(report({ findings: { unfetchableBundles, chainGaps } }), []);
+    expect(declared.unfetchableBundles).toEqual(unfetchableBundles);
+    expect(declared.chainGaps).toEqual(chainGaps);
+
+    const future = { unfetchableBundles, retiredBundles: [{ bundleId: "b11" }] };
+    const widened = reportPullResult(report({ findings: future as HubPullFindings }), []);
+    expect(widened).toMatchObject({
+      unfetchableBundles,
+      retiredBundles: [{ bundleId: "b11" }],
+    });
+  });
+
+  /**
+   * An empty `findings` is the ordinary case, and it must not leave the result
+   * carrying keys whose presence a caller reads as a disclosure.
+   */
+  it("adds no disclosure keys when there is nothing to disclose", () => {
+    const result = reportPullResult(report(), []);
+    expect("unfetchableBundles" in result).toBe(false);
+  });
+
+  /**
+   * The wiring, asserted against the sequencer's own source because no input
+   * reaches this branch yet. Two facts, and the second is the contract the
+   * select stage's union doc states: `stop` is dispatched BEFORE the stage's
+   * warnings are spread (its results have no `warnings` field to hold them),
+   * and `report` after (its result does, and a pull that changed nothing with
+   * no account of why is the outcome this exit exists to prevent).
+   */
+  it("is dispatched by hubPull, after the warnings spread and after every stop", () => {
+    const src = readFileSync(
+      join(import.meta.dirname, "..", "src", "hub", "pull.ts"),
+      "utf-8"
+    ).replace(/\r\n/g, "\n");
+    const start = src.indexOf("export async function hubPull(");
+    expect(start, "hubPull must exist in src/hub/pull.ts").toBeGreaterThan(-1);
+    const body = src.slice(start);
+
+    expect(body).toContain('sel.kind === "report"');
+    expect(body).toContain("reportPullResult(sel.value");
+
+    const stopAt = body.indexOf('if (sel.kind === "stop") return sel.result;');
+    const spreadAt = body.indexOf("warnings.push(...sel.warnings);");
+    const reportAt = body.indexOf('sel.kind === "report"');
+    expect(stopAt, "the stop dispatch must still be in hubPull").toBeGreaterThan(-1);
+    expect(spreadAt, "the select stage's warnings must be spread after the stop dispatch").toBeGreaterThan(stopAt);
+    expect(reportAt, "the report dispatch must come after that spread").toBeGreaterThan(spreadAt);
+  });
+
+  /**
+   * ...and the SAME spread on the exit that applied something, which is the
+   * other half of "one declaration" being worth anything.
+   *
+   * `SelectStageResult` used to hand back a bare `unfetchableBundles` while the
+   * report arm handed back a spread `findings`, so a disclosure added to
+   * `HubPullFindings` reached the pull that applied NOTHING and silently missed
+   * the pull that applied something — backwards, since a pull that fetched half
+   * a chain and left a parked branch behind is precisely the run whose caller
+   * has to be told. Asserted against the sequencer's own source because the
+   * behavioural half is the select-stage block above: it is the field's presence
+   * on `sel.value` that these two lines carry into the result.
+   */
+  it("spreads the same findings into the result of a pull that applied something", () => {
+    const src = readFileSync(
+      join(import.meta.dirname, "..", "src", "hub", "pull.ts"),
+      "utf-8"
+    ).replace(/\r\n/g, "\n");
+    const body = src.slice(src.indexOf("export async function hubPull("));
+
+    expect(body).toContain("needed, findings } = sel.value");
+    expect(body).toContain("...findings,");
+    // The bare field it replaced must not come back alongside it: two ways to
+    // put a disclosure on a result is how one of them stops being updated.
+    expect(body).not.toContain("unfetchableBundles,");
+  });
+});
+
+/**
+ * THE PER-RECORD SOURCE MACHINE, and the invariance proof that it changed
+ * nothing for the shape every hub actually has today.
+ *
+ * `needed` used to be `HubBundleRecord[]` drawn from exactly ONE machine's
+ * bundle list, so one `sourceMachineId` scalar described every record in it.
+ * Three sites downstream spend that scalar on a peer ledger, and the moment
+ * chain assembly lets `needed` span machines the scalar is wrong for some of
+ * the records — silently, with no type error and no throw.
+ *
+ * Why that is not cosmetic, in the invariant's own words:
+ *
+ * > Any future transfer path that moves sessions BETWEEN machines without
+ * > going through the hub must NOT credit the hub ledger here. Doing so would
+ * > make the next push ship only a delta, leaving a continuation chain on the
+ * > hub with no base bundle to anchor it — an unreconstructable thread for any
+ * > third machine.
+ * > — `recordSentToPeer`, src/sync-state.ts
+ *
+ * The doc is written about the hub's own peer id, but the mechanism is the
+ * same for a machine's: `peers[...].received` is `selectNeededBundles`'s dedup
+ * input and `peers[...].sent` is the incremental diff's baseline, so crediting
+ * machine X for content machine Y supplied makes the next push believe Y holds
+ * a base it does not. That is the unreconstructable-thread defect #35 exists to
+ * fix, reintroduced by its own fix.
+ *
+ * So this block is a RATCHET, not a feature test. The end-to-end case below
+ * asserts on the sync-state FILE, and it was written and run green against the
+ * scalar version of the code before the pairing existed — which is what makes
+ * "credits exactly the ledgers it credits today" a measurement rather than a
+ * hope. The two unit cases under it are the half a two-machine pull cannot
+ * reach: with one machine supplying every bundle, the record's machine and the
+ * pull's resolved machine are the same string, so only a plan whose record
+ * disagrees with the pull's source can tell which one a site spent.
+ */
+describe("per-record source machine (the sourceMachineId ripple)", () => {
+  const CLAUDE_VERSION = "2.1.81";
+
+  /**
+   * A -> hub -> B, twice: a full bundle B imports, then a continuation B
+   * SPLICES onto it. The splice matters — it is the only path that reaches
+   * `recordSplice`, i.e. the two `peerId:` sites, and a pull that only ever
+   * imports fragments would assert nothing about them.
+   */
+  it("credits exactly the ledgers a two-machine pull credits today", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sm-ledger-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sm-ledger-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sm-ledger-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sm-ledger-fix-"));
+    const projectB = mkdtempSync(join(tmpdir(), "sm-ledger-projB-"));
+    let restore = overrideHome(homeA);
+    try {
+      // --- A: a real, git-less project pushed once --------------------------
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = join(base, "projA-ledger");
+      mkdirSync(projectA, { recursive: true });
+      writeFileSync(join(projectA, "README.md"), "hello\n");
+      const encodedA = encodeProjectPath(projectA);
+      cpSync(join(configDirA, "projects", FIXTURE_ENCODED), join(configDirA, "projects", encodedA), {
+        recursive: true,
+      });
+      const aJsonl = join(configDirA, "projects", encodedA, `${FIXTURE_SESSION_ID}.jsonl`);
+
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      // Both peer ids the assertions below name, read from the real sources
+      // rather than guessed: the machine id is a randomUUID and the hub peer
+      // is `hub:<hubId>` (pull-resolve.ts).
+      const machineA = loadOrCreateMachineId().id;
+      const hubId = (JSON.parse(readFileSync(join(hub, HUB_JSON), "utf-8")) as { hubId: string }).hubId;
+      const hubPeerId = `hub:${hubId}`;
+
+      const push1 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push1.success).toBe(true);
+      if (!push1.success) return;
+
+      // --- B: links to the same hub project and bootstraps off push #1 ------
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      writeLocalProjectId(projectB, {
+        projectId: push1.projectId, name: "projA-ledger",
+        createdAt: "2026-08-01T00:00:00.000Z", createdByMachine: machineA,
+      });
+      const pull1 = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pull1.success).toBe(true);
+      if (!pull1.success) return;
+      const bSessionId = (pull1 as HubPullResult).localSessionId;
+      expect(bSessionId, "B's bootstrap must land a local session").toBeTruthy();
+      const bJsonl = join(configDirB, "projects", encodeProjectPath(projectB), `${bSessionId}.jsonl`);
+      // State the base's age explicitly rather than leaning on append.ts's
+      // self-write exemption (that exemption is a sub-ms clock coincidence,
+      // never a fixture) — without it the next pull declines the splice as
+      // "recently-active" and this case silently tests the fragment path.
+      const old = new Date(Date.now() - 60 * 60 * 1000);
+      utimesSync(bJsonl, old, old);
+
+      // --- A continues the same thread and pushes a continuation ------------
+      restore.restore();
+      restore = overrideHome(homeA);
+      const anchor = readLastEntryUuid(aJsonl);
+      expect(anchor, "A's session must have a head entry").toBeTruthy();
+      appendFileSync(
+        aJsonl,
+        JSON.stringify({
+          uuid: "a-ledger-1", parentUuid: anchor, timestamp: "2026-08-01T12:00:00.000Z",
+          sessionId: FIXTURE_SESSION_ID, cwd: projectA, version: CLAUDE_VERSION, type: "user",
+          message: { role: "user", content: "more work on A" },
+        }) + "\n",
+        "utf-8"
+      );
+      const push2 = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(push2.success).toBe(true);
+      if (!push2.success) return;
+
+      // --- The act: B pulls the continuation --------------------------------
+      restore.restore();
+      restore = overrideHome(homeB);
+      const pull2 = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pull2.success).toBe(true);
+      if (!pull2.success) return;
+      const p2 = pull2 as HubPullResult;
+      // Preconditions, so a fixture drift fails HERE rather than leaving the
+      // ledger assertions below vacuously true of some other code path.
+      expect(p2.appended, "the continuation must SPLICE, which is what runs recordSplice").toHaveLength(1);
+      expect(p2.localSessionId).toBe(bSessionId);
+      // The pull's resolved machine — still meaningful, and still A's, which is
+      // also why a two-machine pull cannot by itself distinguish the scalar
+      // from the per-record id. See the unit cases below.
+      expect(p2.sourceMachineId).toBe(machineA);
+
+      // --- The invariant, read off the state FILE ---------------------------
+      const stateB = readSyncState(projectB);
+      // Exactly two ledgers exist: the machine that supplied the bundles, and
+      // the hub that mediated them. A mis-credit shows up here as a third key
+      // or as a receipt sitting under the wrong one of these two.
+      expect(Object.keys(stateB.peers).sort()).toEqual([hubPeerId, machineA].sort());
+      const headNow = readLastEntryUuid(bJsonl);
+      expect(headNow, "the spliced base must still have a readable head").toBeTruthy();
+      // Every receipt A's ledger holds names B's own session — the mapping
+      // `selectNeededBundles` dedups the next pull against.
+      const receipts = Object.entries(stateB.peers[machineA].received);
+      expect(receipts.length).toBeGreaterThan(0);
+      for (const [sessionIdInBundle, rec] of receipts) {
+        expect(rec.localSessionId, `receipt for ${sessionIdInBundle} must credit B's session`).toBe(bSessionId);
+      }
+      // ...and both "already has it" ledgers are level with the spliced head.
+      // These two are `recordSplice`'s writes, i.e. the site that spends the
+      // per-bundle machine id.
+      expect(Object.keys(stateB.peers[machineA].sent)).toEqual([bSessionId]);
+      expect(stateB.peers[machineA].sent[bSessionId!]).toMatchObject({
+        headEntryUuid: headNow, sentAsType: "continuation",
+      });
+      expect(Object.keys(stateB.peers[hubPeerId].sent)).toEqual([bSessionId]);
+      expect(stateB.peers[hubPeerId].sent[bSessionId!]).toMatchObject({
+        headEntryUuid: headNow, sentAsType: "continuation",
+      });
+      expect(getThreadId(stateB, bSessionId!)).toBe(p2.threadId);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base, projectB]) {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+/**
+ * #35's ACCEPTANCE GATE: a thread whose history spans two machines, pulled by a
+ * third, in BOTH resolution branches — and asserted on the transcript C ends up
+ * with, not only on result fields, because "you have the whole conversation" is
+ * the user-visible claim and a result field is not it.
+ *
+ * What each branch did before the fix, from the issue:
+ *
+ *   resolves to B — a silent truncation. C got B's half, `warnings` was `[]`
+ *     and `whereis` reported `current: true`, because the truncated copy's head
+ *     EQUALS the latest head. A's half of the conversation was simply missing
+ *     and nothing said so. (v0.6.0 added a disclosure for it; this is the fix.)
+ *   resolves to A — C got the older half, `pullNeeded` stayed true forever, and
+ *     every subsequent pull answered "Already up to date with the source
+ *     machine" while the SessionStart notice nagged indefinitely.
+ *
+ * `arrangeThreeMachines` PINS which copy C resolves to (on `lastActiveAt`,
+ * `newerThreadCopy`'s first key, through the same path production uses) and
+ * verifies the pin against the real resolver before handing the fixture back —
+ * so a branch that silently arranged the other one fails at arrange time rather
+ * than passing here for the wrong reason.
+ */
+describe("cross-machine chain assembly, end to end (#35)", () => {
+  /** Entry uuids of a transcript, in file order, bookkeeping lines skipped. */
+  function uuidsIn(path: string): string[] {
+    return readFileSync(path, "utf-8")
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => (JSON.parse(l) as { uuid?: string }).uuid)
+      .filter((u): u is string => typeof u === "string");
+  }
+
+  function jsonlIn(dir: string): string[] {
+    return (existsSync(dir) ? readdirSync(dir) : []).filter((n) => n.endsWith(".jsonl"));
+  }
+
+  const CASES = [
+    {
+      resolvesTo: "B" as const,
+      // A's own transcript, then B's continuation. Nothing of A's is on B's
+      // bundle list, which is the whole defect.
+      expected: [FIXTURE_HEAD_UUID, "b-entry-4", "b-entry-5"],
+    },
+    {
+      resolvesTo: "A" as const,
+      // ...plus A's republish, which is anchored on B's head, so the middle of
+      // this conversation is on a machine C does not resolve to.
+      expected: [FIXTURE_HEAD_UUID, "b-entry-4", "b-entry-5", "a-republish-1", "a-republish-2"],
+    },
+  ];
+
+  for (const { resolvesTo, expected } of CASES) {
+    it(`delivers the whole thread to a third machine when it resolves to ${resolvesTo}`, async () => {
+      const f = await arrangeThreeMachines({ resolvesTo });
+      try {
+        // The premise, restated as an assertion: neither index holds it whole.
+        expect(f.bundleIdsA.length).toBeGreaterThan(0);
+        expect(f.bundleIdsB.length).toBeGreaterThan(0);
+        expect(f.latestMachineId).toBe(resolvesTo === "A" ? f.machineIdA : f.machineIdB);
+
+        const before = await f.whereisC();
+        const beforeThread = before.threads.find((t) => t.threadId === f.threadId);
+        expect(beforeThread?.pullNeeded, "C must be told there is something to pull").toBe(true);
+        expect(beforeThread?.localCopy).toBeNull();
+
+        /**
+         * SPEC §6'S CROSS-CHECK, on the real hub rather than on a builder, and
+         * measured at the one moment it is interesting: C has pulled nothing,
+         * so the whole thread is still ahead of it.
+         *
+         * `assemblySet ⊆ heuristicSet`, never equality — equality fails on
+         * exactly this case. `findUnfetchableBundles` is kept for one release to
+         * BE this check (see its doc); the pure half of it, over `chainIndexes`
+         * fixtures, is in tests/hub-threads.test.ts.
+         */
+        {
+          const { indexes: idxs } = await readAllIndexes(createFsBackend(f.hub), f.projectId);
+          const t = resolveThreads(idxs).find((x) => x.threadId === f.threadId)!;
+          const st = await f.onC(async () => readSyncState(f.projectC));
+          const p = planThreadPull({
+            thread: t, source: t.latest, state: st,
+            machineId: f.machineIdC, targetProjectDir: f.projectDirC,
+          });
+          const fetching = new Set(p.needed.map((s) => sourcedKey(s.machineId, s.record.bundleId)));
+          const heuristic = findUnfetchableBundles({
+            copies: t.copies,
+            sourceMachineId: t.latest.machineId,
+            localMachineId: f.machineIdC,
+            state: st,
+          });
+          const heuristicSet = new Set(heuristic.flatMap((u) => u.bundleIds));
+          const assemblySet = new Set(
+            heuristic.flatMap((u) =>
+              u.bundleIds.filter((id) => !fetching.has(sourcedKey(u.machineId, id)))
+            )
+          );
+          // (1) assembly invents no unfetchable bundle the heuristic did not see.
+          for (const id of assemblySet) expect([...heuristicSet]).toContain(id);
+          // (2) the difference is non-empty — otherwise assembly changed nothing
+          // and the fix did not land on the arrangement it exists for.
+          const difference = [...heuristicSet].filter((id) => !assemblySet.has(id));
+          expect(difference.length, "assembly reclassified nothing on the #35 shape").toBeGreaterThan(0);
+          // (3) every id that left the set is FETCHED, not merely reclassified —
+          // the assertion an assembly bug that quietly discards a bundle would
+          // fail while passing 1 and 2 both.
+          const plannedIds = new Set(p.needed.map((s) => s.record.bundleId));
+          for (const id of difference) expect([...plannedIds]).toContain(id);
+        }
+
+        const pull = await f.pullC();
+        expect(pull.success).toBe(true);
+        if (!pull.success) return;
+        const p = pull as HubPullResult;
+
+        // ONE transcript, holding BOTH machines' entries, in order. This is the
+        // claim; everything below is corroboration.
+        const files = jsonlIn(f.projectDirC);
+        expect(files).toHaveLength(1);
+        const uuids = uuidsIn(join(f.projectDirC, files[0]));
+        expect(uuids.filter((u) => expected.includes(u))).toEqual(expected);
+        expect(p.appended ?? [], "the continuations must SPLICE, not fragment").not.toHaveLength(0);
+        expect(p.localSessionId).toBe(files[0].replace(/\.jsonl$/, ""));
+
+        // Nothing was left behind, and nothing claims otherwise.
+        expect(p.unfetchableBundles).toBeUndefined();
+        expect(p.warnings.filter((w) => w.includes("could not be pulled whole"))).toEqual([]);
+
+        // THE §4.6 RIPPLE, read off the state FILE: every bundle's arrival is
+        // credited to the machine that LISTED it. A plan that spanned machines
+        // while carrying one `sourceMachineId` scalar would put A's receipts
+        // under B (or B's under A) — a mis-credited ledger makes the next push
+        // ship a delta against a base the peer does not hold, which is the
+        // unreconstructable thread this issue exists to fix, reintroduced by
+        // its own fix.
+        const { indexes } = await readAllIndexes(createFsBackend(f.hub), f.projectId);
+        const sessionsOf = (machineId: string): string[] => [
+          ...new Set(
+            (indexes.find((i) => i.machineId === machineId)?.threads[f.threadId]?.bundles ?? [])
+              .map((b) => b.sessionIdInBundle)
+          ),
+        ];
+        const state = await f.onC(async () => readSyncState(f.projectC));
+        for (const machineId of [f.machineIdA, f.machineIdB]) {
+          const sessions = sessionsOf(machineId);
+          expect(sessions.length).toBeGreaterThan(0);
+          for (const s of sessions) {
+            expect(
+              Object.keys(state.peers[machineId]?.received ?? {}),
+              `${machineId} listed ${s} and must be the ledger credited for it`
+            ).toContain(s);
+          }
+        }
+
+        // ...and the nag stops, in both directions: whereis no longer asks for
+        // a pull, and the next pull is a plain refusal rather than "already up
+        // to date" over half a conversation.
+        const after = await f.whereisC();
+        const t = after.threads.find((x) => x.threadId === f.threadId);
+        expect(t?.pullNeeded).toBe(false);
+        expect(t?.unfetchableBundles).toBeUndefined();
+        expect(t?.localCopy?.current).toBe(true);
+
+        const again = await f.pullC();
+        expect(again.success).toBe(false);
+        const err = "error" in again ? again.error : "";
+        expect(err).not.toContain("not whole here");
+        expect(err).not.toContain("could not be pulled whole");
+      } finally {
+        f.cleanup();
+      }
+    });
+  }
 });

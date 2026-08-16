@@ -78,7 +78,35 @@ export interface SessionContinuation {
     continuesLocalSessionId: string;
     continuesPeerSessionId?: string;
     fromEntryIndex: number;
+    /**
+     * Uuid of the FIRST entry this delta ships — `entries[fromEntryIndex].uuid`,
+     * i.e. one PAST the head it was diffed against (`src/diff.ts`). Its consumer
+     * is the continuation header written by `continuation.ts`, which re-reads the
+     * entry at `fromEntryIndex` and refuses the slice if the uuid moved.
+     *
+     * It is NOT a link to the previous bundle and never was — see
+     * `anchorEntryUuid`. It is also routinely `""`: `readEntryUuids` maps every
+     * uuid-less or unparseable line to `""`, and the first unsent line of a live
+     * transcript is usually a uuid-less bookkeeping entry.
+     */
     fromEntryUuid: string;
+    /**
+     * The head this delta was built AGAINST: the `headEntryUuid` of the last
+     * bundle the peer is recorded as holding, i.e. the parent of the first entry
+     * shipped here. This is the field a chain walk links on — a bundle whose
+     * `headEntryUuid` equals it is this one's predecessor.
+     *
+     * Optional, and the absence is meaningful rather than a default: a manifest
+     * written before chain assembly existed carries no anchor and its bundle is
+     * therefore **unlinkable by construction**. Never substitute `fromEntryUuid`
+     * for a missing value — the two have never been equal, and mixing them in one
+     * map manufactures chains that look assembled and are not.
+     *
+     * When present it is a non-empty uuid: `computeIncrementalPlan` falls back to
+     * a full push whenever the recorded head is `""` or is no longer in the
+     * transcript, so no continuation is ever planned against an empty head.
+     */
+    anchorEntryUuid?: string;
 }
 export interface SessionLineage {
     sourceMachineId: string;
@@ -569,7 +597,156 @@ export interface HubLockBusyResult {
     error?: string;
     suggestion: string;
 }
-export interface HubPullResult {
+/**
+ * A link in a thread's assembled history naming an entry no bundle on the hub
+ * carries — something between two bundles is genuinely missing.
+ *
+ * Deliberately NOT the same condition as `HubPullUnplaceableBundle`: a gap is a
+ * bundle that says which entry it continues and names one nobody ships, while an
+ * unplaceable bundle never said. Only the first can be repaired by finding
+ * something (spec §0b).
+ */
+export interface HubPullChainGap {
+    /**
+     * The entry the stranded bundle declares itself a continuation of. `""` is
+     * one of them — an empty uuid can never match a head, so a bundle carrying it
+     * is stranded exactly as if its predecessor were missing.
+     */
+    anchorEntryUuid: string;
+    machineId: string;
+    /** null when the hub has no readable `machines/<id>.json` record. */
+    machineName: string | null;
+    /** The bundle at the boundary: the first one the walk could not place. */
+    bundleId: string;
+    /** That bundle and every bundle chaining onto it — what this gap strands. */
+    strandedBundleIds: string[];
+}
+/**
+ * A branch of a forked thread this pull did not follow. Nothing is lost: it is
+ * still on the hub, and this pull applied the other side of the fork.
+ */
+export interface HubPullParkedBranch {
+    /** The entry both branches continue. Never `""` — that is a gap, not a fork. */
+    anchorEntryUuid: string;
+    /** The branch this pull DID follow, by its first bundle id. */
+    followedBundleId: string;
+    machineId: string;
+    machineName: string | null;
+    /** This branch's first bundle. */
+    bundleId: string;
+    /** That bundle and everything reachable from it. */
+    bundleIds: string[];
+}
+/** A bundle that cannot be placed in a thread's history at all. */
+export interface HubPullUnplaceableBundle {
+    machineId: string;
+    machineName: string | null;
+    bundleId: string;
+    /**
+     * `true` — pushed before sesh-mover recorded which entry a continuation
+     * chains onto, so the link was never written. That bundle is **not missing**,
+     * and the machine still holding that session re-links it the next time it
+     * pushes. `false` — the index declares a continuation of nothing, which no
+     * sesh-mover push can produce: a damaged or hand-edited index.
+     */
+    preAssembly: boolean;
+}
+/**
+ * A starting point of this thread that the pull did not walk. More than one
+ * starting point is ORDINARY rather than damage — a session that was compacted,
+ * truncated or rolled back is re-pushed whole under the same thread id — and two
+ * of them can never be joined, because a compaction rewrites the very entry
+ * uuids a link would need.
+ */
+export interface HubPullUnwalkedRoot {
+    machineId: string;
+    machineName: string | null;
+    /** The root bundle itself. */
+    bundleId: string;
+    /** That bundle and everything reachable from it. */
+    bundleIds: string[];
+}
+/**
+ * A machine whose index advertises a thread head no bundle record ships — it has
+ * work it never pushed.
+ *
+ * Not a fetch failure: that work is not on the hub at all, so no pull of any
+ * kind reaches it. It arrives once that machine pushes, which its SessionEnd
+ * auto-push does by default. Present only on a pull that applied nothing, where
+ * it is frequently the entire answer to "why"; on a pull that applied something
+ * it would be noise about another machine's local state.
+ */
+export interface HubPullAdvertisedHead {
+    machineId: string;
+    machineName: string | null;
+    headEntryUuid: string;
+}
+/**
+ * The chain-assembly disclosures a pull may attach to its result: what it worked
+ * out about a thread's history that it could not deliver. Every field is
+ * optional and absent on an ordinary pull, so "nothing to disclose" is the empty
+ * object rather than a flag.
+ *
+ * ONE DECLARATION, mixed into `HubPullResult` below and carried verbatim by the
+ * select stage's two applying-something/applied-nothing outcomes
+ * (`SelectStageResult.findings` and `SelectReport.findings`, hub/pull-select.ts),
+ * which `hubPull` spreads into the result unchanged. A disclosure added here
+ * therefore reaches the ordinary pull and the applied-nothing report at the same
+ * moment; a second, hand-written copy on the stage side is exactly how a finding
+ * ends up reportable on one path and silently dropped on the other.
+ *
+ * THE PRESENCE RULE, and it is what makes these fields a contract rather than a
+ * dump: **a field is present exactly when the warning that describes it was
+ * emitted.** The two are computed together in `describeAssembly` for that reason
+ * — a field with no sentence leaves a caller guessing at what it means, and a
+ * sentence with no field forces the skill layer to branch on wording, which this
+ * file's other docs spend a lot of words forbidding.
+ */
+export interface HubPullFindings {
+    /**
+     * Bundles for this thread that this pull did not fetch because the assembled
+     * chain does not reach them. Absent on every ordinary pull — see
+     * `UnfetchableBundleGroup` and, for the reasoning, `findUnfetchableBundles` in
+     * hub/threads.ts.
+     *
+     * It names the MACHINES; which condition put those bundles out of reach is
+     * one of the four fields below, and both are always emitted together. A field
+     * rather than warning prose because the skill layer has to branch on it:
+     * everything else this result reports (`importedSessions`, `appended`, an
+     * empty `warnings`) describes a pull that succeeded, and it did — it just did
+     * not deliver the whole thread. Warning text is not an interface (see
+     * `commands/pull.md`).
+     */
+    unfetchableBundles?: UnfetchableBundleGroup[];
+    /** Links naming an entry no bundle on the hub carries. */
+    chainGaps?: HubPullChainGap[];
+    /** Branches of a forked thread this pull did not follow. */
+    parkedBranches?: HubPullParkedBranch[];
+    /** Bundles that can be placed in no chain at all. */
+    unplaceableBundles?: HubPullUnplaceableBundle[];
+    /** Starting points of this thread this pull did not walk. */
+    unwalkedRoots?: HubPullUnwalkedRoot[];
+    /** Machines advertising a thread head they never pushed. */
+    advertisedUnshipped?: HubPullAdvertisedHead[];
+}
+/**
+ * Why a pull applied nothing, on the one exit where applying nothing is the
+ * whole and correct answer rather than a failure. See `HubPullResult`'s
+ * `nothingToApply`.
+ */
+export interface HubPullNothingToApply {
+    /**
+     * One or more sentences: what was worked out about this thread, and why none
+     * of it needed applying. Never empty — an exit with nothing to say is the
+     * ordinary "nothing to pull" refusal, not this.
+     *
+     * Prose, so it is deliberately not an interface. Anything a caller must
+     * branch on belongs in `HubPullFindings` instead (see `commands/pull.md` on
+     * why warning text is not a contract).
+     */
+    reason: string;
+}
+export interface HubPullResult extends HubPullFindings {
     success: true;
     command: "pull";
     threadId: string;
@@ -652,18 +829,27 @@ export interface HubPullResult {
     }>;
     divergence?: HubPullDivergence;
     /**
-     * Bundles for this thread that this pull could not fetch because they are
-     * listed only by a machine other than the one it resolved to. Absent on
-     * every ordinary pull — see `UnfetchableBundleGroup` and, for the reasoning,
-     * `findUnfetchableBundles` in hub/threads.ts.
+     * Present exactly when this pull resolved a thread, worked out that there was
+     * nothing left to fetch for it, and therefore applied nothing — and that is
+     * the complete, correct answer rather than a failure. Alongside it,
+     * `importedSessions`/`skippedSessions`/`appended` are empty and
+     * `localSessionId` is null, because this run landed nothing and so wrote no
+     * thread mapping.
      *
-     * A field rather than warning prose because the skill layer has to branch on
-     * it: everything else this result reports (`importedSessions`, `appended`,
-     * an empty `warnings`) describes a pull that succeeded, and it did — it just
-     * did not deliver the whole thread. Warning text is not an interface (see
-     * `commands/pull.md`).
+     * WHY IT IS A SUCCESS FIELD AND NOT AN ERROR. The pull's failure contract is
+     * apply-safe-and-name-the-gap: truthfulness is the invariant, completeness is
+     * best-effort. "Here is this thread's history, here is the part of it I cannot
+     * reach, and I correctly changed nothing" satisfies both. Returning it as
+     * `success: false` is the nag loop the disclosure fields exist to break, one
+     * branch later — an error tells the caller to try again, and every try says
+     * the same thing forever.
+     *
+     * NOT TO BE CONFUSED with `pull-record.ts`'s local `appliedNothing`, which
+     * asks a different question of a pull that DID fetch a chain (did any of its
+     * bundles land?) and is true on the divergence-skip path, where this field is
+     * absent.
      */
-    unfetchableBundles?: UnfetchableBundleGroup[];
+    nothingToApply?: HubPullNothingToApply;
     warnings: string[];
 }
 export interface HubPullDivergence {

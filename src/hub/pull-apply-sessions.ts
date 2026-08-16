@@ -197,6 +197,11 @@ export interface RecordSpliceInput {
   projectPath: string;
   basePath: string;
   baseSessionId: string;
+  /**
+   * The peer whose ledger this splice credits: the machine that supplied
+   * `record`, i.e. `bundleMachineId`. Never the pull's resolved machine — see
+   * that field.
+   */
   peerId: string;
   hubPeerId: string;
   manifest: ExportManifest;
@@ -264,8 +269,22 @@ export interface ApplySessionsStageInput {
   targetProjectDir: string;
   claudeVersion: string;
   threadId: string;
-  /** The machine whose bundle list this pull resolved to. */
-  sourceMachineId: string;
+  /**
+   * The machine whose index lists THIS bundle — the peer a splice credits.
+   *
+   * PER BUNDLE, never the pull's resolved source, and the two are different
+   * questions the moment a chain spans machines. `recordSplice` writes
+   * `peers[peerId].received` and `peers[peerId].sent`; the first is
+   * `selectNeededBundles`'s dedup input and the second is the incremental
+   * diff's baseline, so crediting the resolved machine for a bundle another
+   * machine supplied makes the next push ship a delta against a base that peer
+   * does not hold — `recordSentToPeer`'s unreconstructable-thread invariant
+   * (src/sync-state.ts), reached by the other ledger.
+   *
+   * It would typecheck either way and throw either way: nothing but the name
+   * distinguishes them at the call site, which is why the name is this one.
+   */
+  bundleMachineId: string;
   /** This hub's synthetic peer id, for the hub-side ledger. */
   hubPeerId: string;
   noAppend: boolean;
@@ -364,7 +383,7 @@ export async function runApplySessionsStage(
 ): Promise<ApplySessionsOutcome> {
   const {
     extractDir, bundleManifest, record, chainLength, projectPath, configDir,
-    targetProjectDir, claudeVersion, threadId, sourceMachineId, hubPeerId,
+    targetProjectDir, claudeVersion, threadId, bundleMachineId, hubPeerId,
     noAppend, forceAppend, onDivergence, opNowMs, ageNowMs, historyNowDate,
     historyNowMs, recordSplice, countEntriesAfterOffset,
   } = input;
@@ -446,7 +465,7 @@ export async function runApplySessionsStage(
           st.rememberOurWrite(basePath, baseSizeBeforeAppend);
           recordSplice({
             projectPath, basePath, baseSessionId,
-            peerId: sourceMachineId, hubPeerId, manifest: bundleManifest,
+            peerId: bundleMachineId, hubPeerId, manifest: bundleManifest,
             record, bundleSession, newHeadUuid: outcome.newHeadUuid,
           });
 
@@ -619,7 +638,7 @@ export async function runApplySessionsStage(
               // nuisance rather than a correctness problem.
               recordSplice({
                 projectPath, basePath, baseSessionId,
-                peerId: sourceMachineId, hubPeerId, manifest: bundleManifest,
+                peerId: bundleMachineId, hubPeerId, manifest: bundleManifest,
                 record, bundleSession, newHeadUuid: adopt.newHeadUuid,
               });
               // Register the preserved branch so it is resumable and

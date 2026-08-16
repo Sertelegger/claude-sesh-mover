@@ -90,6 +90,101 @@ describe("hub push", () => {
   });
 
   /**
+   * The index-record half of #35's anchor (spec §0b). A continuation record's
+   * `anchorEntryUuid` must equal the `headEntryUuid` of the bundle it continues
+   * — that equality is the ONLY thing a cross-machine chain walk can link on,
+   * and `fromEntryUuid` cannot serve: it is the anchor's child in the
+   * transcript, so a head-keyed map over it finds zero links on any real hub.
+   *
+   * Asserted on the record as it lands on the hub, not on the manifest, because
+   * the record is what another machine reads.
+   */
+  it("a continuation record's anchor IS the previous bundle's head; a full record's is null", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+
+      // Carry on in the same session, then push the delta.
+      const jsonlPath = join(
+        configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+      );
+      const head = readFileSync(jsonlPath, "utf-8").split("\n").filter((l) => l !== "");
+      const anchorUuid = (JSON.parse(head[head.length - 1]) as { uuid: string }).uuid;
+      writeFileSync(
+        jsonlPath,
+        readFileSync(jsonlPath, "utf-8") +
+          [
+            {
+              uuid: "x-entry-4", parentUuid: anchorUuid, timestamp: "2026-04-11T09:00:00Z",
+              sessionId, cwd: projectPath, version: "2.1.81", type: "user",
+              message: { role: "user", content: "one more thing" },
+            },
+            {
+              uuid: "x-entry-5", parentUuid: "x-entry-4", timestamp: "2026-04-11T09:00:05Z",
+              sessionId, cwd: projectPath, version: "2.1.81", type: "assistant",
+              message: {
+                model: "claude-opus-4-6", id: "msg_x",
+                content: [{ type: "text", text: "Done." }],
+              },
+            },
+          ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+        "utf-8"
+      );
+
+      const second = await hubPush({ configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81" });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect(second.pushedSessions[0].type).toBe("continuation");
+
+      const { indexes } = await readAllIndexes(createFsBackend(hub), first.projectId);
+      const bundles = Object.values(indexes[0].threads)[0].bundles;
+      expect(bundles.map((b) => b.type)).toEqual(["full", "continuation"]);
+
+      // The link.
+      expect(bundles[0].headEntryUuid).toBe(anchorUuid);
+      expect(bundles[1].anchorEntryUuid).toBe(bundles[0].headEntryUuid);
+
+      // A full bundle has no anchor, and says so EXPLICITLY — `null` present,
+      // not the key missing. The missing key means "written before assembly
+      // existed", which is a different fact and must stay distinguishable.
+      expect(bundles[0].anchorEntryUuid).toBeNull();
+      expect("anchorEntryUuid" in bundles[0]).toBe(true);
+      expect("anchorEntryUuid" in bundles[1]).toBe(true);
+
+      // fromEntryUuid keeps its own meaning: the first entry SHIPPED, one past
+      // the anchor. Never equal, so the two fields cannot be conflated.
+      expect(bundles[1].fromEntryUuid).toBe("x-entry-4");
+      expect(bundles[1].fromEntryUuid).not.toBe(bundles[1].anchorEntryUuid);
+
+      // And it survives the JSON round trip through the real index file, which
+      // is where an `undefined` would silently disappear.
+      const raw = JSON.parse(
+        readFileSync(
+          join(hub, "projects", first.projectId, "index", `${loadOrCreateMachineId().id}.json`),
+          "utf-8"
+        )
+      ) as { threads: Record<string, { bundles: Array<Record<string, unknown>> }> };
+      const rawBundles = Object.values(raw.threads)[0].bundles;
+      expect(rawBundles[0].anchorEntryUuid).toBeNull();
+      expect(rawBundles[1].anchorEntryUuid).toBe(anchorUuid);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
    * Linking IS the consent gate for the default-on automation: once
    * `.sesh-mover-project.json` exists, `evaluateHookGate` lets the
    * SessionEnd auto-push run, and for a git-less project that push uploads the

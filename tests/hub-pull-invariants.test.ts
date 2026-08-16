@@ -256,7 +256,12 @@ describe("hubPull is sequencing", () => {
 
   it("spreads each in-loop stage's reasons inside the loop, not after it", () => {
     const body = hubPullBody();
-    const loopAt = body.indexOf("for (const [i, record] of needed.entries())");
+    // Matched on the ITERABLE, not on the loop variable: `needed`'s element is
+    // a `{machineId, record}` pair as of #35's per-record machine id, so the
+    // binding is a destructuring pattern and will change shape again as chain
+    // assembly lands. What this block is about — the reasons being spread
+    // inside the loop rather than after it — does not depend on the name.
+    const loopAt = body.indexOf("of needed.entries()) {");
     expect(loopAt, "the per-bundle loop must still be in hubPull").toBeGreaterThan(-1);
     // The loop's closing brace: the first line that is exactly four spaces
     // and a brace after the header.

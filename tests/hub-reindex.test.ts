@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, cpSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome } from "./helpers/env.js";
@@ -9,9 +9,11 @@ import { hubPush } from "../src/hub/push.js";
 import { hubReindex } from "../src/hub/reindex.js";
 import { readMachineIndex } from "../src/hub/index-file.js";
 import { createFsBackend } from "../src/hub/backend.js";
+import { createArchive, extractArchive } from "../src/archiver.js";
+import { readManifest, writeManifest } from "../src/manifest.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { encodeProjectPath } from "../src/platform.js";
-import type { HubIndexJson } from "../src/hub/layout.js";
+import { indexPath, type HubIndexJson } from "../src/hub/layout.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
@@ -34,6 +36,58 @@ function createRealProject(base: string, configDir: string): string {
 function withoutUpdatedAt(index: HubIndexJson): Omit<HubIndexJson, "updatedAt"> {
   const { updatedAt: _updatedAt, ...rest } = index;
   return rest;
+}
+
+/** Extend a session in place, so the next push ships a continuation. */
+function continueSession(jsonlPath: string, sessionId: string, projectPath: string): string {
+  const lines = readFileSync(jsonlPath, "utf-8").split("\n").filter((l) => l !== "");
+  const anchorUuid = (JSON.parse(lines[lines.length - 1]) as { uuid: string }).uuid;
+  const added = [
+    {
+      uuid: "x-entry-4", parentUuid: anchorUuid, timestamp: "2026-04-11T09:00:00Z",
+      sessionId, cwd: projectPath, version: "2.1.81", type: "user",
+      message: { role: "user", content: "one more thing" },
+    },
+    {
+      uuid: "x-entry-5", parentUuid: "x-entry-4", timestamp: "2026-04-11T09:00:05Z",
+      sessionId, cwd: projectPath, version: "2.1.81", type: "assistant",
+      message: { model: "claude-opus-4-6", id: "msg_x", content: [{ type: "text", text: "Done." }] },
+    },
+  ];
+  writeFileSync(
+    jsonlPath,
+    readFileSync(jsonlPath, "utf-8") + added.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    "utf-8"
+  );
+  return anchorUuid;
+}
+
+/**
+ * Rewrite a bundle already on the hub through `mutate`, restamping the manifest
+ * with the REAL writer so the result is indistinguishable from a bundle that was
+ * always shaped that way (`writeManifest` recomputes `sessionsDigest`, which is
+ * the point: a hand-edited digest would fail verification for the wrong reason).
+ */
+async function rewriteBundleManifest(
+  hub: string,
+  file: string,
+  work: string,
+  mutate: (m: ReturnType<typeof readManifest>) => void
+): Promise<void> {
+  const backend = createFsBackend(hub);
+  const staging = join(work, "bundle");
+  mkdirSync(staging, { recursive: true });
+  const tarIn = join(work, "in.tar.gz");
+  writeFileSync(tarIn, await backend.read(file));
+  await extractArchive(tarIn, staging);
+
+  const manifest = readManifest(staging);
+  mutate(manifest);
+  writeManifest(staging, manifest);
+
+  const tarOut = join(work, "out.tar.gz");
+  await createArchive(staging, tarOut, "gzip");
+  await backend.writeAtomic(file, readFileSync(tarOut));
 }
 
 describe("hub reindex", () => {
@@ -83,6 +137,139 @@ describe("hub reindex", () => {
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The "derivable indexes" invariant, extended to the LINK (spec §0b). Reindex
+   * rebuilds bundle records from the bundles' own manifests, so it recovers
+   * `anchorEntryUuid` for free — a rebuild does not silently unlink a hub.
+   */
+  it("recovers a continuation's anchor from the bundle manifest, so a rebuild keeps the chain", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+
+      const jsonlPath = join(
+        configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+      );
+      const anchorUuid = continueSession(jsonlPath, sessionId, projectPath);
+      const second = await hubPush({ configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81" });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect(second.pushedSessions[0].type).toBe("continuation");
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const original = await readMachineIndex(backend, first.projectId, machine.id);
+      expect(original).not.toBeNull();
+      if (!original) return;
+      expect(Object.values(original.threads)[0].bundles[1].anchorEntryUuid).toBe(anchorUuid);
+
+      await backend.delete(indexPath(first.projectId, machine.id));
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.warnings).toEqual([]);
+
+      const rebuilt = await readMachineIndex(backend, first.projectId, machine.id);
+      expect(rebuilt).not.toBeNull();
+      if (!rebuilt) return;
+      // Byte-for-byte the same index, links included — the invariant's own test.
+      expect(withoutUpdatedAt(rebuilt)).toEqual(withoutUpdatedAt(original));
+      const bundles = Object.values(rebuilt.threads)[0].bundles;
+      expect(bundles.map((b) => b.type)).toEqual(["full", "continuation"]);
+      expect(bundles[1].anchorEntryUuid).toBe(bundles[0].headEntryUuid);
+      expect(bundles[0].anchorEntryUuid).toBeNull();
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The other half, and the one that decides whether the field could be a
+   * redefinition of `fromEntryUuid` rather than an addition: reindex CANNOT
+   * recover an anchor the manifest never carried. A bundle pushed before chain
+   * assembly existed rebuilds with the key absent — "unknown", not "root" and
+   * not "gap". Inventing a value here (say, copying `fromEntryUuid`, which is
+   * right there in the same block) is what would manufacture a chain that looks
+   * assembled and is not.
+   */
+  it("cannot invent an anchor a pre-assembly manifest never carried, and leaves the key absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const work = mkdtempSync(join(tmpdir(), "sesh-reindex-work-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      const jsonlPath = join(
+        configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+      );
+      continueSession(jsonlPath, sessionId, projectPath);
+      const second = await hubPush({ configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81" });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const original = await readMachineIndex(backend, first.projectId, machine.id);
+      if (!original) throw new Error("no index after push");
+      const contFile = Object.values(original.threads)[0].bundles[1].file;
+
+      // Age the bundle: strip the anchor from its manifest, exactly as a
+      // pre-0.9 exporter would have written it.
+      let sawAnchor = false;
+      await rewriteBundleManifest(hub, contFile, work, (m) => {
+        for (const s of m.sessions) {
+          if (s.continuation?.anchorEntryUuid !== undefined) sawAnchor = true;
+          delete s.continuation?.anchorEntryUuid;
+        }
+      });
+      expect(sawAnchor).toBe(true); // the mutation is real, not a no-op
+
+      await backend.delete(indexPath(first.projectId, machine.id));
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const rebuilt = await readMachineIndex(backend, first.projectId, machine.id);
+      if (!rebuilt) throw new Error("no index after reindex");
+      const bundles = Object.values(rebuilt.threads)[0].bundles;
+      expect(bundles).toHaveLength(2);
+
+      // The full bundle is unaffected — its anchor is null because there is no
+      // anchor, which reindex derives from the manifest carrying no
+      // continuation block at all.
+      expect(bundles[0].anchorEntryUuid).toBeNull();
+      // The aged continuation is UNLINKABLE, and says so by absence.
+      expect("anchorEntryUuid" in bundles[1]).toBe(false);
+      // ...and specifically was NOT healed from fromEntryUuid, which is still
+      // sitting in the same manifest block.
+      expect(bundles[1].fromEntryUuid).toBe("x-entry-4");
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base, work]) rmSync(d, { recursive: true, force: true });
     }
   });
 
