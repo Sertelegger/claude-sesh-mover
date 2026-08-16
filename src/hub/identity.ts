@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -84,21 +84,68 @@ export type GitRemoteScan =
   | { kind: "unknown"; reason: "git-missing" | "git-failed"; detail: string };
 
 /**
- * Is there a git repository at or above `projectPath`?
+ * Is `<dir>/.git` a repository marker? Returns its path, or null.
+ *
+ * `existsSync` is NOT this test, and the gap is not theoretical (#50): an EMPTY
+ * `.git` directory satisfies existence and git itself would not recognize it —
+ * a real `.git` directory always carries `HEAD`. One stray zero-entry
+ * `/tmp/.git`, created months earlier by something unrelated, made every
+ * mkdtemp fixture on the machine look like it was inside a repository: 38 tests
+ * across 4 files red, and in production the workspace payload of every git-less
+ * project under it silently declined while the warning talked about git.
+ *
+ * - a FILE → marker. Worktrees and submodules legitimately use one, and its
+ *   `gitdir:` target is not ours to validate.
+ * - a DIRECTORY → marker only with `HEAD` in it.
+ * - anything else (an empty directory, a stray one with unrelated contents, a
+ *   socket) → not a marker; keep walking up.
+ *
+ * Unreadable is not absent, and the asymmetry is deliberate: a `.git` we cannot
+ * stat counts as a marker, because "there is no repository here" is the answer
+ * that authorizes an unfiltered whole-tree snapshot, and a permission-refused
+ * or root-owned repository is precisely a case where git cannot answer either.
+ * `throwIfNoEntry: false` is what keeps that distinct from a genuine ENOENT,
+ * which returns undefined rather than throwing.
+ */
+function gitMarkerAt(dir: string): string | null {
+  const marker = join(dir, ".git");
+  let stat;
+  try {
+    stat = statSync(marker, { throwIfNoEntry: false });
+  } catch {
+    return marker;
+  }
+  if (!stat) return null;
+  if (!stat.isDirectory()) return stat.isFile() ? marker : null;
+  try {
+    return statSync(join(marker, "HEAD"), { throwIfNoEntry: false }) ? marker : null;
+  } catch {
+    return marker;
+  }
+}
+
+/**
+ * The git repository marker at or above `projectPath`, or null if there is none.
  *
  * A filesystem fact, deliberately — it is the one thing still knowable when
  * `git` itself cannot be run, which is exactly the case that must not be read
  * as "no remotes". Walks up because git's own discovery does: a monorepo
  * package has no `.git` of its own but is inside a repository, and its remotes
  * belong to it. `.git` may be a directory or a file (worktrees, submodules).
+ *
+ * Returns the path rather than a boolean because the caller reports it: "git
+ * could not answer" is only actionable next to the marker that made this path
+ * count as a repository, which is routinely a directory well outside the
+ * project the user is looking at.
  */
-function hasGitRepoMarker(projectPath: string): boolean {
+function findGitRepoMarker(projectPath: string): string | null {
   let dir = resolve(projectPath);
   // Bounded by construction: dirname() reaches a fixed point at the root.
   for (;;) {
-    if (existsSync(join(dir, ".git"))) return true;
+    const marker = gitMarkerAt(dir);
+    if (marker) return marker;
     const parent = dirname(dir);
-    if (parent === dir) return false;
+    if (parent === dir) return null;
     dir = parent;
   }
 }
@@ -142,17 +189,23 @@ export function scanGitRemotes(projectPath: string): GitRemoteScan {
     // cannot tell those apart with stderr suppressed, and stderr text is
     // localized, so the discriminator is the filesystem: no `.git` anywhere
     // above us means there is no repository to have remotes.
-    if (!hasGitRepoMarker(projectPath)) return { kind: "none" };
+    const marker = findGitRepoMarker(projectPath);
+    if (!marker) return { kind: "none" };
     const err = e as { code?: string; signal?: string };
+    const why =
+      err.code === "ENOENT"
+        ? "`git` was not found on PATH"
+        : err.signal
+          ? `\`git remote\` timed out (${err.signal})`
+          : "`git remote` failed in this repository (a dubious-ownership refusal looks like this — try `git status` there)";
     return {
       kind: "unknown",
       reason: err.code === "ENOENT" ? "git-missing" : "git-failed",
-      detail:
-        err.code === "ENOENT"
-          ? "`git` was not found on PATH"
-          : err.signal
-            ? `\`git remote\` timed out (${err.signal})`
-            : "`git remote` failed in this repository (a dubious-ownership refusal looks like this — try `git status` there)",
+      // The marker path is half the message, not decoration. Without it the
+      // warning names git as the problem while the actual cause is a `.git`
+      // the user never thinks about — frequently in an ancestor OUTSIDE the
+      // project, which is unfindable from any wording that omits the path.
+      detail: `${why}; the \`.git\` at ${marker} is what puts this path inside a repository`,
     };
   }
   // The KIND comes from the names, never from the url lines.

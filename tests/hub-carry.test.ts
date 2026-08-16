@@ -2840,6 +2840,178 @@ describe("applyCarry", () => {
     }
   });
 
+  // --- Issue #38: git's own parse is the single floor source ----------------
+
+  it("refuses a rename whose DESTINATION splits git's own description of it", async () => {
+    // The crafted disagreement, and the reason `parseApplyPaths` reads git's
+    // `--summary` output through a CLOSED grammar rather than skipping lines it
+    // does not recognise.
+    //
+    // `--summary` is the only source for a rename's SOURCE (`--numstat` prints
+    // the destination and nothing else), and it interpolates BOTH paths raw with
+    // no escaping — while the DESTINATION is entirely attacker-chosen. A
+    // destination holding a newline therefore splits the one line carrying the
+    // source across two physical lines, neither of which is a rename line any
+    // more. Measured against bare `git apply` (2.43.0):
+    //
+    //     0<TAB>0<TAB>moved\nX => Y (1%)\0 rename .sesh-mover-include => moved
+    //     X => Y (1%) (100%)
+    //
+    // — `applied ok`, and the receiver's `.sesh-mover-include` DELETED, with the
+    // numstat half naming only the innocent destination. A reader that skipped
+    // the unrecognised lines would learn nothing and let it through; the closed
+    // grammar cannot account for either line, so the payload is refused whole.
+    //
+    // This is the case that keeps the single-source floor honest. It is invisible
+    // to `--numstat`, and after #38 the byte scan does not vote when git has
+    // answered — so the ONLY thing standing here is the grammar.
+    if (process.platform === "win32") return; // a filename holding \n is POSIX-only
+    for (const [label, dest] of [
+      ["newline in the destination", 'moved\\nX => Y (1%)'],
+      // The same trick without the arrow: any newline splits the line.
+      ["bare newline in the destination", 'a\\nb.txt'],
+    ] as const) {
+      const { repo, project, head } = layoutRepo("apply-summary-split", "root");
+      let dir: string | undefined;
+      try {
+        const payload = handPayload(
+          `diff --git a/decoy b/moved.txt\nsimilarity index 100%\n` +
+            `rename from .sesh-mover-include\nrename to "${dest}"\n`,
+          { baseCommit: head }
+        );
+        dir = payload.dir;
+        const r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+        expect(r.applied, label).toBe(false);
+        if (r.applied) return;
+        expect(r.reason, label).toBe("unsafe-payload");
+        expect(r.savedCommands, label).toBe(false);
+        // The prize is intact, and the rename's destination was never created.
+        expect(readFileSync(join(project, ".sesh-mover-include"), "utf-8"), label)
+          .toBe("docs/\n");
+        expect(listFiles(project).some((f) => f.includes("\n")), label).toBe(false);
+      } finally {
+        cleanup(repo, dir ?? "");
+      }
+    }
+  });
+
+  it("never applies a patch git could not describe, even with a working repository", async () => {
+    // THE gate that makes a single floor source safe. `git apply --numstat -z
+    // --summary` is the only place the floor is decided, and it is allowed to
+    // fail without returning — a receiver whose git cannot read its own
+    // repository must be diagnosed in git's own words rather than accused of a
+    // hostile payload, and a timeout or an over-budget buffer is this machine
+    // failing to ask rather than git answering.
+    //
+    // Those fell THROUGH to `git apply`. `rev-parse --verify HEAD` succeeding was
+    // being read as "git has answered about the patch"; it had answered about the
+    // DIRECTORY. Before this gate the byte scan happened to cover the gap, so
+    // removing it as the floor without adding this would have opened a real hole.
+    //
+    // The stub is a real git for every question except the floor one, where it
+    // dies on a signal — which is exactly what a timeout leaves behind
+    // (`status === null`), and the branch that has no `else`.
+    if (process.platform === "win32") return; // PATH override + shell stub
+    const realGit = execFileSync("which", ["git"], { encoding: "utf-8" }).trim();
+    const { repo, project, head } = layoutRepo("apply-numstat-null", "root");
+    let stubDir: string | undefined;
+    let dir: string | undefined;
+    try {
+      stubDir = mkdtempSync(join(tmpdir(), "sesh-gitstub-"));
+      const stub = join(stubDir, "git");
+      writeFileSync(
+        stub,
+        // `--summary` only ever appears on the floor call, so `--check`, the
+        // apply itself and every rev-parse/status still reach the real git.
+        `#!/bin/sh\nfor a in "$@"; do [ "$a" = "--summary" ] && kill -9 $$; done\nexec ${realGit} "$@"\n`,
+        { mode: 0o755 }
+      );
+      const payload = handPayload(BENIGN_PATCH, { baseCommit: head });
+      dir = payload.dir;
+      const restore = overridePath(stubDir);
+      let r;
+      try {
+        r = await applyCarry({ carryDir: dir, targetPath: project, meta: payload.meta });
+      } finally {
+        restore.restore();
+      }
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("apply-failed");
+      expect(r.detail).toMatch(/could not describe the carried patch/);
+      // A perfectly innocent patch, so no accusation — but no command either:
+      // the paths it writes were never checked.
+      expect(r.savedCommands).toBe(false);
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      expect(readme).not.toContain("git -c apply.ignoreWhitespace=no apply");
+      expect(readme).not.toContain("refused, not merely deferred");
+      // The working tree is untouched: the patch never reached `--check`.
+      expect(readFileSync(join(project, "f.txt"), "utf-8")).toBe("v1\n");
+    } finally {
+      cleanup(repo, dir ?? "", stubDir ?? "");
+    }
+  });
+
+  it("still applies a rename whose source and destination share a directory prefix", async () => {
+    // The non-vacuity half of the rename-source recovery: `--summary` compacts a
+    // common prefix (` rename docs/{a.txt => b.txt} (100%)`), and a reader that
+    // could not expand that shape would either miss every prefixed rename's
+    // source or refuse every one of them. Both directions are wrong, and this
+    // pins the second.
+    const repo = gitRepo("apply-rename-compacted");
+    let twin: string | undefined;
+    try {
+      twin = cleanTwin(repo);
+      mkdirSync(join(twin, "docs"), { recursive: true });
+      writeFileSync(join(twin, "docs", "a.txt"), "v1\n");
+      git(twin, ["add", "-A"]);
+      git(twin, ["commit", "-q", "-m", "docs"]);
+      const head = git(twin, ["rev-parse", "HEAD"]).trim();
+      const payload = handPayload(
+        "diff --git a/docs/a.txt b/docs/b.txt\nsimilarity index 100%\n" +
+          "rename from docs/a.txt\nrename to docs/b.txt\n",
+        { baseCommit: head }
+      );
+      const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+      expect(r.applied).toBe(true);
+      expect(existsSync(join(twin, "docs", "b.txt"))).toBe(true);
+      rmSync(payload.dir, { recursive: true, force: true });
+    } finally {
+      cleanup(repo, twin ?? "");
+    }
+  });
+
+  it("still applies a spelling git discards at -p1, which the byte scan over-refused", async () => {
+    // The dividend of making git the single source, and a behaviour CHANGE
+    // pinned so it cannot regress silently. `diff --git .sesh-mover/x
+    // .sesh-mover/x` has no `a/`/`b/` prefix, so `-p1` strips the first
+    // component and git writes `x` — an ordinary file. The byte scan judged the
+    // spelling and refused; git judges what it will actually write, so this now
+    // applies. Over-refusal is the safe direction, but it is still a peer's
+    // ordinary edit reported to the user as a security refusal naming them.
+    const repo = gitRepo("apply-p1-strip");
+    let twin: string | undefined;
+    try {
+      twin = cleanTwin(repo);
+      const head = git(twin, ["rev-parse", "HEAD"]).trim();
+      const payload = handPayload(
+        "diff --git .sesh-mover/x.txt .sesh-mover/x.txt\n" +
+          "new file mode 100644\nindex 0000000..2222222\n" +
+          "--- /dev/null\n+++ b/x.txt\n@@ -0,0 +1 @@\n+hi\n",
+        { baseCommit: head }
+      );
+      const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta: payload.meta });
+      expect(r.applied).toBe(true);
+      // What git actually wrote: `x.txt` at the project root, nothing under the
+      // plugin directory.
+      expect(readTextLf(join(twin, "x.txt"))).toBe("hi\n");
+      expect(existsSync(join(twin, ".sesh-mover", "x.txt"))).toBe(false);
+      rmSync(payload.dir, { recursive: true, force: true });
+    } finally {
+      cleanup(repo, twin ?? "");
+    }
+  });
+
   it("still applies a tracked file whose name begins with the plugin directory's", async () => {
     // The non-vacuity half of trying every separator position, and the reason
     // the halves must still AGREE. `docs/.sesh-mover notes.md` contains
