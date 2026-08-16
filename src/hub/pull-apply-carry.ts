@@ -91,7 +91,7 @@ function describeCarryApply(
       // not accuse the sender. An older sesh-mover, on a case-insensitive
       // filesystem, legitimately produced payloads this guard now refuses.
       out.push(
-        "That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-include, which decides what this machine's NEXT push uploads) or to create a symbolic link. It was refused whole rather than partly applied. Read the saved copy before doing anything with it."
+        "That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-include, which decides what this machine's NEXT push uploads), or to create a symbolic link, or it described its own changes in a way git's output could not be read back unambiguously. It was refused whole rather than partly applied. Read the saved copy before doing anything with it."
       );
     }
     return out;

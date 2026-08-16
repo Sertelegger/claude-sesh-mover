@@ -170,6 +170,84 @@ describe("scanGitRemotes", () => {
     }
   });
 
+  // #50. The ancestor walk is right; `existsSync(<dir>/.git)` is not the test
+  // for "there is a repository here". An EMPTY `.git` directory satisfies it and
+  // git itself would not — a real `.git` always carries HEAD. Measured: one
+  // stray, months-old, zero-entry `/tmp/.git` turned 38 tests across 4 files red
+  // (every fixture is built under mkdtempSync, i.e. under it), and in production
+  // it silently declined the workspace payload of every git-less project on the
+  // machine while the warning pointed at git rather than at the directory.
+  describe("what counts as a .git marker", () => {
+    it("an EMPTY .git directory in an ancestor leaves a plain directory at none", () => {
+      const root = tmp("sesh-scan-emptymarker-");
+      const proj = join(root, "project");
+      try {
+        mkdirSync(join(root, ".git"));
+        mkdirSync(proj);
+        expect(scanGitRemotes(proj)).toEqual({ kind: "none" });
+        // And for the same reason with no git to ask at all: the predicate
+        // decides this, not git's exit code.
+        const path = overridePath(tmp("sesh-scan-emptybin4-"));
+        try {
+          expect(scanGitRemotes(proj)).toEqual({ kind: "none" });
+        } finally {
+          path.restore();
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("a directory named .git with unrelated contents and no HEAD is not a marker", () => {
+      const root = tmp("sesh-scan-fakemarker-");
+      const proj = join(root, "project");
+      try {
+        mkdirSync(join(root, ".git"));
+        writeFileSync(join(root, ".git", "notes.txt"), "not a repository\n");
+        mkdirSync(proj);
+        expect(scanGitRemotes(proj)).toEqual({ kind: "none" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("a .git FILE is still a marker — worktrees and submodules use one", () => {
+      const dir = tmp("sesh-scan-gitfile-");
+      writeFileSync(join(dir, ".git"), "gitdir: /nonexistent/worktrees/x\n");
+      const path = overridePath(tmp("sesh-scan-emptybin5-"));
+      try {
+        const scan = scanGitRemotes(dir);
+        expect(scan.kind).toBe("unknown");
+        if (scan.kind !== "unknown") return;
+        expect(scan.reason).toBe("git-missing");
+        // The disclosure that makes the warning actionable: WHICH marker put
+        // this path inside a repository.
+        expect(scan.detail).toContain(join(dir, ".git"));
+      } finally {
+        path.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("a .git directory containing HEAD is a marker", () => {
+      const root = tmp("sesh-scan-headmarker-");
+      const proj = join(root, "project");
+      mkdirSync(join(root, ".git"));
+      writeFileSync(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+      mkdirSync(proj);
+      const path = overridePath(tmp("sesh-scan-emptybin6-"));
+      try {
+        const scan = scanGitRemotes(proj);
+        expect(scan.kind).toBe("unknown");
+        if (scan.kind !== "unknown") return;
+        expect(scan.detail).toContain(join(root, ".git"));
+      } finally {
+        path.restore();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("a project inside a repository (no .git of its own) is not mistaken for a bare directory", () => {
     const repo = tmp("sesh-scan-monorepo-");
     const pkg = join(repo, "packages", "app");

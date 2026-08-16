@@ -194,6 +194,59 @@ export interface CaptureCarryOptions {
  * failure as a reason to fall back.
  */
 export declare function captureCarry(projectPath: string, destDir: string, opts?: CaptureCarryOptions): Promise<CaptureResult>;
+/** Git's own answer to "what does this patch touch", split by how it was learned. */
+interface GitPatchPaths {
+    /** One per patch entry, from `--numstat`: the path git writes, deletes or chmods. */
+    destinations: string[];
+    /** Rename and copy SOURCES, from `--summary` — the half `--numstat` never prints. */
+    sources: string[];
+    /**
+     * `--summary` lines this parser could not account for. Non-empty means git's
+     * description of the patch was not read in full, so the floor cannot answer
+     * for every path and the caller must refuse the payload whole.
+     */
+    unreadable: string[];
+}
+/**
+ * Read `git apply --numstat -z --summary` output into the set of paths the
+ * patch touches — the SINGLE authoritative source for the apply-side floor
+ * (issue #38).
+ *
+ * The two halves and why both are needed (all measured on git 2.43.0):
+ *
+ * - **`--numstat -z`** prints one record per patch entry, `<added>\t<deleted>\t
+ *   <path>`, NUL-terminated. The path is the one git will really write: already
+ *   C-unquoted, already `-p`-stripped, and already composed with `--directory=`
+ *   (measured: `--directory=sub/` turns `docs/notes.txt` into
+ *   `sub/docs/notes.txt` in this output). `-z` also means it is never re-quoted,
+ *   whatever `core.quotePath` says. It covers every entry shape the byte scan
+ *   was written for — a mode-only change, a binary entry, an empty-file
+ *   creation, a deletion — because those all have an entry, and every entry has
+ *   a record. A path may itself hold TABs (`rename to X<TAB>sub/…` is a name git
+ *   accepts), so the third field onward is re-joined rather than taken as one.
+ * - **`--summary`** supplies the ONE path `--numstat` structurally omits: a
+ *   rename's or copy's SOURCE. `--numstat` prints only the destination for
+ *   both, which is what let `copy from .sesh-mover-include` / `copy to
+ *   stolen.txt` materialise the RECEIVER's own plugin internals at an ordinary
+ *   path. `--summary` prints ` copy .sesh-mover-include => stolen.txt (100%)`,
+ *   including for `rename old`/`rename new`, git's legacy spelling — so git's
+ *   own parse now answers the keyword family that had to be hand-listed before.
+ *   Its lines follow the NUL-terminated records and are `\n`-separated even
+ *   under `-z`, hence the `pop()`.
+ *
+ * Together they name every path the apply can touch, because both are printed
+ * from the same in-memory patch list the apply walks (see `applyInvocation`).
+ * There is no third half to miss: a delete's `old_name`, a mode change's and a
+ * rewrite's name are each what `--numstat` already prints for that entry.
+ */
+declare function parseApplyPaths(stdout: string): GitPatchPaths;
+/**
+ * Git's own parse of a patch, exposed for `tests/hub-carry-header.test.ts` —
+ * which uses it as the ORACLE it cross-checks the byte scan against, so the
+ * harness measures the code that actually enforces the floor rather than a
+ * second copy of it. Named `__`-first like the module's other test seams.
+ */
+export { parseApplyPaths as __parseApplyPathsForTests };
 /** Why a carry payload was not applied to the working tree. */
 export type CarryApplyDeclineReason = 
 /** `--apply-carry` was not passed. The payload is saved, never applied. */
@@ -333,22 +386,41 @@ export interface ApplyCarryOptions {
  * partially applied patch is worse than none, and `git apply --exclude` would
  * leave exactly that.
  *
- * Two sources, because neither is complete alone:
+ * **What this function is FOR, since issue #38 (read this before extending it).**
+ * It is no longer the floor. `parseApplyPaths` is — git's own description of the
+ * patch, printed from the same in-memory list the apply walks — and it answers
+ * at every point where anything can be written. This scan keeps exactly two
+ * jobs, and both of them were measured rather than assumed:
  *
- * - `git apply --numstat -z` is git's own parse — authoritative and unquoted.
- *   But for a RENAME **or a COPY** it prints only the DESTINATION (measured
- *   both), so the source path is invisible to it: `copy from
- *   .sesh-mover-include` / `copy to stolen.txt` materialises the
- *   RECEIVER's own plugin internals at an ordinary path, from where the next
- *   auto-push carries them to the hub. It also cannot run at all on a machine
- *   with no `git`, or on one whose `git` cannot read this repository.
- * - A raw scan of the patch bytes covers every path git can name in a header:
- *   `---`/`+++`, `rename from`/`to`, **`rename old`/`new`**, `copy from`/`to`,
- *   the `diff --git` line itself (the only reference a mode-only change or a
- *   binary entry has), and the `index … 120000` line of a re-pointed symlink —
- *   which `--summary` does NOT print (measured: nothing at all for that shape).
- *   It needs no `git`, so it is the whole floor on a machine where the other
- *   source cannot run, and the saved README's recommendation rests on it there.
+ * 1. **SYMLINK entries, unconditionally.** This is enforcement and it is the
+ *    one thing git's own output cannot supply. `--summary` names three of the
+ *    four shapes (` create mode 120000 …`, ` delete mode 120000 …`, ` mode
+ *    change 100644 => 120000 …`) but prints NOTHING AT ALL for a re-pointed
+ *    symlink — an `index <a>..<b> 120000` entry whose mode does not change
+ *    (measured: the whole output is the one numstat record). The `120000`
+ *    matches below carry no path semantics — no quoting, no termination rule,
+ *    no separator class — so none of the parsing hazards that made the path
+ *    half a liability apply to them.
+ * 2. **The path half, as a LAST RESORT where git could not parse the patch** —
+ *    no runnable `git`, a `git` that cannot read this repository, a `git` that
+ *    refused these bytes. Nothing is ever applied on any of those paths (see the
+ *    `gitFloorAnswered` gate in `applyCarry`), so what it decides there is the
+ *    saved README's wording: whether the copy the user is told to apply by hand
+ *    may carry a command at all. That is a human-facing recommendation, and it
+ *    is why the four areas issue #38 names as unswept — `--directory=`
+ *    composition, CRLF per keyword, `GIT binary patch` bodies, Unicode folding —
+ *    stopped being security questions. They are not gone; they cost a README
+ *    that fails to warn on a machine with no git, not a file on disk.
+ *
+ * Where git DID parse the patch this scan's path half says nothing, which also
+ * ends its over-refusals: `diff --git .sesh-mover/x .sesh-mover/x` resolves to
+ * `x` for git (the `-p1` strip), and a payload git will write as `x` is no
+ * longer refused for a spelling git discarded.
+ *
+ * The two readings it covers, for the last-resort case: every path git can name
+ * in a header — `---`/`+++`, `rename from`/`to`, **`rename old`/`new`**,
+ * `copy from`/`to`, and the `diff --git` line itself (the only reference a
+ * mode-only change or a binary entry has) — plus the `120000` mode lines above.
  *
  * The list of spellings is not a guess and not "what `git diff` emits" — it is
  * git's own `parse_git_header` keyword table, read out of the shipped binary
@@ -379,9 +451,11 @@ export interface ApplyCarryOptions {
  * spellings are now generated mechanically over the axes that produced the
  * holes (separator bytes, quoting symmetry, escape spelling, prefix pairs,
  * trailing bytes, every path-bearing keyword) and each one is cross-checked
- * against real `git apply --numstat -z --summary` on a scratch repo. The
- * invariant it enforces is exactly the one this function owes its caller: **if
- * git resolves a spelling to a path the floor forbids, this scan produces a
+ * against real `git apply --numstat -z --summary` on a scratch repo, read by
+ * `parseApplyPaths` — the production parser, so the harness measures the code
+ * that enforces the floor rather than a second copy of it. The invariant it
+ * enforces is the one this function still owes its last-resort caller: **if git
+ * resolves a spelling to a path the floor forbids, this scan produces a
  * candidate the floor forbids.** Add an axis value there when a new spelling
  * shows up; do not add a case to a list here.
  */

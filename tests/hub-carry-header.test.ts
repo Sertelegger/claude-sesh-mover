@@ -5,7 +5,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { __scanPatchBytesForTests as scanPatchBytes } from "../src/hub/carry.js";
+import {
+  __parseApplyPathsForTests as parseApplyPaths,
+  __scanPatchBytesForTests as scanPatchBytes,
+} from "../src/hub/carry.js";
 import { isNeverIncludable } from "../src/hub/workspace.js";
 import { readTextLf } from "./helpers/eol.js";
 import { copyTreeSync } from "./helpers/copy-tree.js";
@@ -19,15 +22,44 @@ import { copyTreeSync } from "./helpers/copy-tree.js";
  * transcribing them: it GENERATES them over the axes that have actually
  * produced holes and asks **git itself** what each one means.
  *
- * The property under test is the only one the scan owes `applyCarry`:
+ * ## What this file is FOR since issue #38 — read this before adding to it
  *
- * > If `git apply` resolves a header spelling to a path the `NEVER_INCLUDABLE`
- * > floor forbids, the byte scan produces a candidate the floor forbids.
+ * The byte scan is no longer the floor. `git apply --numstat -z --summary`,
+ * read by `parseApplyPaths`, is: it names every path the apply will touch, and
+ * `applyCarry` refuses to write anything until it has answered (the
+ * `gitFloorAnswered` gate). The scan's path half now speaks only where git could
+ * not parse the patch at all — no runnable `git`, a `git` that cannot read this
+ * repository, a `git` that refused these bytes — and **nothing is ever applied
+ * on any of those paths**. What it decides there is whether the saved README may
+ * recommend applying the payload by hand.
  *
- * and its counterweight, without which the property is satisfiable by refusing
- * everything:
+ * So this file tests **two different things at two different stakes**, and
+ * conflating them is how it would be misread:
  *
- * > If a patch's text names no forbidden path at all, the scan flags nothing.
+ * - **The oracle half is a SECURITY test.** `oracle()` calls the production
+ *   `parseApplyPaths`, so the 247 pinned floor resolutions, the rename-source
+ *   recovery and the `--summary` grammar below all measure the code that
+ *   actually enforces the floor. A second copy of that reader here would mean
+ *   this file passing while the shipped one had the hole.
+ * - **The scan half is an HONESTY test.** Its property is unchanged —
+ *
+ *   > If `git apply` resolves a header spelling to a path the `NEVER_INCLUDABLE`
+ *   > floor forbids, the byte scan produces a candidate the floor forbids.
+ *
+ *   and its counterweight, without which that is satisfiable by refusing
+ *   everything:
+ *
+ *   > If a patch's text names no forbidden path at all, the scan flags nothing.
+ *
+ *   — but the cost of failing it is now a README that recommends a patch on a
+ *   machine with no git to apply it with, not a file written to disk. That is
+ *   why issue #38's four unswept areas (`--directory=` composition, CRLF per
+ *   keyword, `GIT binary patch` bodies, Unicode folding) stopped being security
+ *   questions. They are narrower, not gone.
+ *
+ * The scan's SYMLINK half is the exception and stays enforcement on every
+ * receiver: `--summary` prints nothing at all for a re-pointed symlink
+ * (`index <a>..<b> 120000`, measured), so git's own output cannot supply it.
  *
  * The scan is deliberately an OVER-approximation of `git_header_name`, so an
  * exact set comparison would be wrong. Three places where git and the scan
@@ -40,18 +72,21 @@ import { copyTreeSync } from "./helpers/copy-tree.js";
  * 2. **`--numstat` is blind to a rename's or copy's SOURCE.** For those
  *    keywords the oracle reads `--summary` instead, and the test ASSERTS the
  *    blindness (no floor path among the `--numstat` records) rather than
- *    quietly working around it — that blindness is the whole reason the byte
- *    scan exists beside git's own parse.
+ *    quietly working around it — that blindness is why `parseApplyPaths` asks
+ *    for `--summary` at all, and it is the one path class where a `--numstat`-
+ *    only floor would be silently incomplete.
  * 3. **`-p1` can strip the forbidden component away.** `diff --git
  *    .sesh-mover/x .sesh-mover/x` resolves to `x` for git, while
- *    the scan still sees the spelling and refuses. Counted as an over-refusal,
- *    which is the safe direction, and excluded from the false-refusal rule.
+ *    the scan still sees the spelling and refuses. Counted as an over-refusal.
+ *    Since #38 those over-refusals no longer reach the user where git can run
+ *    (git judges what it will WRITE, not the spelling), so this rule now
+ *    measures the scan's last-resort conservatism rather than a live refusal.
  *
  * Rule 3 is the only branch that asserts nothing, so it is where a weakened
  * ORACLE would silently drain the corpus — measured: an oracle that stops
  * reading `--summary` moves 60 floor resolutions into it. `FLOOR_RESOLVED` is
- * therefore pinned exactly and rule 3 bounded, and a `--summary` line that
- * cannot be read back to exactly one source is a FAILURE rather than a guess.
+ * therefore pinned exactly and rule 3 bounded, and a `--summary` line
+ * `parseApplyPaths` cannot account for is a FAILURE rather than a guess.
  *
  * Runtime is dominated by one `git apply` per DISTINCT generated spelling: 834
  * cases, 800 spawns, **2.8 s in isolation and 43 s under full-suite load**
@@ -481,82 +516,39 @@ interface Oracle {
   paths: string[];
   /** Only the `--numstat` records — used to assert the documented blindness. */
   numstatPaths: string[];
-  /** Summary bodies this file could not read back to exactly one source. */
+  /** `--summary` lines the production parser could not account for. */
   ambiguous: string[];
-}
-
-/**
- * ` rename docs/{a.txt => b.txt} (100%)` → the rename's SOURCE, `docs/a.txt`.
- *
- * `git apply --summary` is `show_rename_copy` in apply.c, **not** `git diff
- * --summary`'s `pprint_rename` — measured, and the difference matters: it
- * compacts only a common PREFIX (never a suffix) and it never C-quotes, so
- * every byte of both paths is present raw. What it does not do is escape `{`,
- * `}` or ` => `, which makes the line ambiguous on its face: a rename of
- * `d/.sesh-mover/{f.txt` to `d/out.txt` prints
- * ` rename d/{.sesh-mover/{f.txt => out.txt} (100%)`, and reading that
- * with a `(.*)\{(.*) => (.*)\}(.*)` regex yields `d/{.sesh-mover/f.txt`
- * — whose first segment is `{.sesh-mover`, so a genuine floor resolution
- * scores as an ordinary one and the case drains into rule 3 unnoticed.
- *
- * It is not ambiguous once the DESTINATION is known, and `--numstat` reports
- * that exactly. Both shapes are then anchored:
- *
- * - plain: `body === <src> " => " <dest>`;
- * - compacted: `body === <pfx> "{" <srcRest> " => " <dstRest> "}"`, where
- *   `<pfx>` ends in `/` and `<pfx><dstRest> === <dest>` — so every `/` in the
- *   destination is one candidate split and at most one of them can fit.
- *
- * A body that yields no reading, or more than one, is reported as AMBIGUOUS
- * rather than guessed at: the caller fails the suite on it, because a silently
- * mis-expanded source is exactly the failure this replaces.
- */
-function renameSummarySource(body: string, dests: readonly string[]): string[] {
-  const found = new Set<string>();
-  for (const dest of dests) {
-    const plain = ` => ${dest}`;
-    if (body.length > plain.length && body.endsWith(plain)) {
-      found.add(body.slice(0, body.length - plain.length));
-    }
-    for (let i = 0; i < dest.length; i++) {
-      if (dest[i] !== "/") continue;
-      const open = `${dest.slice(0, i + 1)}{`;
-      const close = ` => ${dest.slice(i + 1)}}`;
-      if (body.length < open.length + close.length) continue;
-      if (!body.startsWith(open) || !body.endsWith(close)) continue;
-      found.add(dest.slice(0, i + 1) + body.slice(open.length, body.length - close.length));
-    }
-  }
-  return [...found];
 }
 
 /**
  * What git says this patch means. `--numstat -z` and `--summary` in ONE
  * invocation: the NUL-terminated numstat records come first, the summary lines
  * after the last NUL. `core.quotePath=false` so the answer is raw UTF-8 rather
- * than re-quoted.
+ * than re-quoted — belt and braces, since `-z` already suppresses numstat
+ * quoting and `apply.c`'s summary `printf`s never quote at all (both measured).
+ *
+ * **The reader is `parseApplyPaths`, the PRODUCTION one** (issue #38). Since git
+ * became the apply side's single floor source, "how the oracle reads git" and
+ * "how the floor reads git" are the same question, and a second copy here would
+ * mean the harness passing while the shipped parser had the hole. Everything
+ * below — the 247 pinned floor resolutions, the rename-source recovery, the
+ * `--summary` shapes — therefore measures shipped code.
+ *
+ * The argv differs from production's on purpose: no `--directory=`, no
+ * `apply.ignoreWhitespace`/`--whitespace` pinning. Those decide WHICH strings
+ * git prints (measured: `--directory=sub/` composes them); this file is about
+ * reading whatever it prints.
  */
 function oracle(repo: string, patchFile: string): Oracle {
   const r = git(repo, ["-c", "core.quotePath=false", "apply", "--numstat", "-z", "--summary", patchFile]);
   if (!r.ok) return { accepted: false, paths: [], numstatPaths: [], ambiguous: [] };
-  const records = r.stdout.split("\0");
-  const summary = records.pop() ?? "";
-  const numstatPaths = records
-    .filter((rec) => rec.length > 0)
-    // A numstat record is `<added>\t<deleted>\t<path>`, and the path may itself
-    // hold TABs (`rename to X<TAB>sub/…` is a name git accepts), so the tail is
-    // rejoined rather than taken as one field.
-    .map((rec) => rec.split("\t").slice(2).join("\t"));
-  const paths = [...numstatPaths];
-  const ambiguous: string[] = [];
-  for (const line of summary.split("\n")) {
-    const m = /^ (?:rename|copy) (.*) \(\d+%\)$/.exec(line);
-    if (!m) continue;
-    const sources = renameSummarySource(m[1]!, numstatPaths);
-    if (sources.length === 1) paths.push(sources[0]!);
-    else ambiguous.push(`${line} [readings=${JSON.stringify(sources)} dests=${JSON.stringify(numstatPaths)}]`);
-  }
-  return { accepted: true, paths, numstatPaths, ambiguous };
+  const described = parseApplyPaths(r.stdout);
+  return {
+    accepted: true,
+    paths: [...described.destinations, ...described.sources],
+    numstatPaths: described.destinations,
+    ambiguous: described.unreadable,
+  };
 }
 
 /** Exactly what `applyCarry` computes as `scanUnsafe`, for one patch file. */
@@ -886,9 +878,10 @@ describe("carry patch header scan — differential against real `git apply`", ()
   });
 
   it("reads a rename's SOURCE back out of every shape `git apply --summary` prints", () => {
-    // The oracle above learns a rename/copy source from `--summary` alone, so a
-    // mis-read there does not fail — it quietly scores a floor resolution as an
-    // ordinary one and the case drains into rule 3. These are real renames, made
+    // Since #38 this is the SECURITY half of the file: `parseApplyPaths` learns a
+    // rename/copy source from `--summary` alone and nothing else on the apply
+    // side reads that line, so a mis-read here is a floor path scored as innocent
+    // — not just a case draining into rule 3. These are real renames, made
     // with `git mv` and rendered by git itself, chosen so that every branch of
     // `show_rename_copy` and every character that makes its output ambiguous is
     // present: the `{…}` prefix compaction, a name holding ` => `, names holding
@@ -963,6 +956,49 @@ describe("carry patch header scan — differential against real `git apply`", ()
       // The corpus really did exercise the compaction rather than nine plain
       // `<src> => <dst>` lines.
       expect(diff.stdout).toContain("rename from ");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      slot.dispose();
+    }
+  });
+
+  it("refuses to read a `--summary` block a hostile DESTINATION split in two", () => {
+    // The one shape that decides whether a single source can hold the floor.
+    //
+    // `--summary` interpolates BOTH paths of a rename raw, with no escaping, and
+    // the DESTINATION is entirely attacker-chosen. A destination holding a
+    // newline splits the only line carrying the SOURCE, so git prints
+    //
+    //     0<TAB>0<TAB>moved\nX => Y (1%)<NUL> rename .sesh-mover-include => moved
+    //     X => Y (1%) (100%)
+    //
+    // where the numstat half names only the innocent destination and neither
+    // physical line is a rename line any more. Measured against bare `git apply`
+    // (2.43.0): applied, with the receiver's `.sesh-mover-include` deleted.
+    //
+    // `parseApplyPaths` must therefore account for EVERY summary line against a
+    // closed grammar and report what it cannot, rather than skipping it. The
+    // whole file's `oracleAmbiguous` assertion is the same check run over the
+    // 834-case corpus; this pins the adversarial direction of it.
+    const repo = oracleRepo("hdrsplit");
+    const slot = patchSlot("hdrsplit");
+    try {
+      writeFileSync(
+        slot.file,
+        "diff --git a/decoy.txt b/moved.txt\nsimilarity index 100%\n" +
+          `rename from ${ROOT_DOTFILE_FLOOR}\nrename to "moved\\nX => Y (1%)"\n`,
+        "latin1"
+      );
+      const o = oracle(repo, slot.file);
+      // git accepts the spelling and would apply it…
+      expect(o.accepted).toBe(true);
+      // …and its `--numstat` half is honestly blind: no forbidden path there.
+      expect(o.numstatPaths.filter((p) => isNeverIncludable(p))).toEqual([]);
+      // …so the ONLY safe answer is to refuse to read the block at all.
+      expect(o.ambiguous.length, "the split summary block must be reported")
+        .toBeGreaterThan(0);
+      // And it must not have guessed a source out of the wreckage.
+      expect(o.paths.filter((p) => isNeverIncludable(p))).toEqual([]);
     } finally {
       rmSync(repo, { recursive: true, force: true });
       slot.dispose();
