@@ -4043,32 +4043,60 @@ describe("hub pull: a thread split across two other machines", () => {
     for (const d of [f.home, f.hub, f.base]) rmSync(d, { recursive: true, force: true });
   }
 
-  it('"already up to date" says WHICH machine holds the part it cannot fetch', async () => {
+  /**
+   * THE FOLD, from the outside. This case used to be `success: false` with the
+   * disclosure in `error`, and the exit moved for a reason worth stating: the
+   * bundle B holds here is a PRE-ASSEMBLY record (the shared `bundle()` builder
+   * emits no `anchorEntryUuid`, which is every bundle already sitting on every
+   * hub), so assembly can say exactly what it is and why no pull reaches it.
+   *
+   * The rule the select stage now writes down: a pull that can NAME the
+   * condition succeeds; a pull that can only name the machines fails. This pull
+   * named it, changed nothing, and said so — under the failure contract
+   * (truthfulness is the invariant, completeness is best-effort) that is a
+   * complete and correct answer, and returning it as an error is the nag loop
+   * the milestone exists to break, since an error tells the caller to retry and
+   * every retry says the same thing forever.
+   */
+  it('"already up to date" succeeds and says WHICH machine holds the part it cannot fetch', async () => {
     const f = await setupSplit("sesh-pull-split", { withB: true });
     try {
       const pull = await hubPull({
         configDir: f.configDir, projectPath: f.project, hubPath: f.hub,
         threadId: THREAD, claudeVersion: "2.1.81",
       });
-      expect(pull.success).toBe(false);
-      if (pull.success) return;
-      const err = "error" in pull ? pull.error : "";
-      const sug = "suggestion" in pull ? (pull.suggestion ?? "") : "";
-      // Still truthful about the source machine...
-      expect(err).toContain("Already up to date with the source machine");
-      // ...and no longer silent about the half of the thread that is not here.
-      expect(err).toContain("could not be pulled whole");
-      expect(err).toContain("beta-desktop");
-      expect(err).toContain("alpha-laptop"); // the machine it did resolve to
-      expect(err).toContain("split across machines");
-      // No invented remedy: this branch offers no flag.
-      expect(`${err} ${sug}`).not.toMatch(/--[a-z]/);
-      // ...and the claim it DOES make is the narrow one. "No flag pulls a
-      // thread whose bundles are split across machines" was over-broad the
-      // moment `alternateSource` landed — that is the sentence a model
-      // generalizes to the shape a plain pull now reaches.
-      expect(sug).toContain("cannot be assembled here yet");
-      expect(sug).not.toContain("nothing to re-run");
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      const reason = p.nothingToApply?.reason ?? "";
+      const warned = p.warnings.join(" ");
+      // Nothing landed, and nothing claims otherwise.
+      expect(p.importedSessions).toEqual([]);
+      expect(p.appended ?? []).toEqual([]);
+      expect(reason).toContain("Nothing to apply");
+      // Not silent about the half of the thread that is not here.
+      expect(warned).toContain("could not be pulled whole");
+      expect(warned).toContain("beta-desktop");
+      expect(warned).toContain("alpha-laptop"); // the machine it did resolve to
+      // ...and it says WHICH condition, which is the half `unfetchableBundles`
+      // alone could never carry.
+      expect(reason).toContain("pushed before sesh-mover recorded which entry");
+      expect(p.unfetchableBundles).toEqual([
+        { machineId: MACHINE_B, machineName: "beta-desktop", bundleIds: ["b1"] },
+      ]);
+      expect(p.unplaceableBundles).toEqual([
+        { machineId: MACHINE_B, machineName: "beta-desktop", bundleId: "b1", preAssembly: true },
+      ]);
+      // No invented remedy: this branch still offers no flag.
+      expect(`${reason} ${warned}`).not.toMatch(/--[a-z]/);
+      // ...and the retired claim is gone from every string this exit produces.
+      // "sesh-mover cannot yet assemble a thread whose history is split across
+      // machines" was true when it was written and #35 is what makes it false;
+      // a message that forecloses a remedy which now exists is the same defect
+      // class as one that invents a remedy which does not.
+      expect(`${reason} ${warned}`).not.toContain("split across machines");
+      expect(`${reason} ${warned}`).not.toContain("cannot be assembled here yet");
+      expect(`${reason} ${warned}`).not.toContain("no flag or re-run fetches them");
     } finally {
       cleanupSplit(f);
     }
@@ -4154,8 +4182,20 @@ describe("hub pull: a thread split across two other machines", () => {
       const sug = "suggestion" in pull ? (pull.suggestion ?? "") : "";
       expect(err).toContain("not every thread is whole here");
       expect(err).toContain("beta-desktop");
-      expect(err).toContain("split across machines");
-      expect(sug).toContain("cannot be assembled here yet");
+      // THIS EXIT STAYS AN ERROR, and deliberately: `--latest` resolves no
+      // thread here — it looked at every one of them and found a source for
+      // none — so there is no thread id and no source machine for a `report` to
+      // be about. What it OWES the user is the same disclosure the resolved
+      // exits give, and that is what changed: the branch now runs the same
+      // assembly the fetching path runs, so it names the condition rather than
+      // only the machines.
+      expect(err).toContain("pushed before sesh-mover recorded which entry");
+      // The retired claim, in both fields a caller reads. It said no flag or
+      // re-run could fetch a thread split across machines and that sesh-mover
+      // could not assemble one; assembly is what makes both false.
+      expect(`${err} ${sug}`).not.toContain("split across machines");
+      expect(`${err} ${sug}`).not.toContain("cannot be assembled here yet");
+      expect(`${err} ${sug}`).not.toContain("no flag or re-run fetches them");
       expect(sug).not.toContain("nothing to re-run");
       expect(`${err} ${sug}`).not.toMatch(/--[a-z]/); // no invented remedy
     } finally {

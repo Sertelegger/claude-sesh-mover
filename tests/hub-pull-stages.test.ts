@@ -26,7 +26,9 @@ import { runResolveStage } from "../src/hub/pull-resolve.js";
 import {
   runSelectStage, type SelectOutcome, type SelectReport, type SourcedBundle,
 } from "../src/hub/pull-select.js";
-import { resolveThreads } from "../src/hub/threads.js";
+import {
+  findUnfetchableBundles, planThreadPull, resolveThreads, sourcedKey,
+} from "../src/hub/threads.js";
 import { createArchive } from "../src/archiver.js";
 import { computeIntegrityHashFromFile, writeManifest } from "../src/manifest.js";
 import { encodeProjectPath } from "../src/platform.js";
@@ -1971,10 +1973,13 @@ describe("select stage", () => {
       // list, so one machine — but stamped per record, not inferred from the
       // scalar above (see `SourcedBundle`).
       needed: [{ machineId: "m2", record: PEER_BUNDLE }],
-      unfetchableBundles: undefined,
+      // The shared `HubPullFindings`, empty because there is nothing to
+      // disclose — the same interface and the same spread the `report` arm
+      // carries, so a disclosure added to it reaches BOTH exits at once.
+      findings: {},
     });
     expect(Object.keys(out.value).sort()).toEqual([
-      "needed", "sourceMachineId", "threadId", "unfetchableBundles",
+      "findings", "needed", "sourceMachineId", "threadId",
     ]);
   });
 
@@ -2111,9 +2116,17 @@ describe("select stage", () => {
     expect(out.kind).toBe("proceed");
     if (out.kind !== "proceed") return;
     expect(out.value.sourceMachineId).toBe("m2");
-    expect(out.value.unfetchableBundles).toEqual([
+    expect(out.value.findings.unfetchableBundles).toEqual([
       { machineId: "m3", machineName: null, bundleIds: ["b9"] },
     ]);
+    // The PRESENCE RULE, at the one site where both halves are visible: the
+    // machine-naming field and the condition field are emitted together, and
+    // each has its sentence below. A field with no sentence leaves a caller
+    // guessing; a sentence with no field forces it to branch on wording.
+    expect(out.value.findings.unplaceableBundles).toEqual([
+      { machineId: "m3", machineName: null, bundleId: "b9", preAssembly: true },
+    ]);
+    expect(out.value.findings.chainGaps).toBeUndefined();
     expect(out.warnings).toHaveLength(2);
     expect(out.warnings[0]).toContain("Thread t-1 could not be pulled whole");
     expect(out.warnings[1]).toContain("b9");
@@ -2239,7 +2252,10 @@ describe("select stage", () => {
     // been sorted by the clock would come back reversed.
     const stamps = out.value.needed.map((n) => n.record.pushedAt);
     expect([...stamps].sort()).toEqual([...stamps].reverse());
-    expect(out.value.unfetchableBundles).toBeUndefined();
+    // Nothing was left behind, so NO disclosure key is set at all — an empty
+    // object rather than a set of `undefined`s, which is what makes the
+    // presence of any one of them meaningful to a caller.
+    expect(out.value.findings).toEqual({});
     expect(out.warnings).toEqual([]);
   });
 
@@ -2271,10 +2287,17 @@ describe("select stage", () => {
       ["mA", "b0"],
       ["mB", "b1"],
     ]);
-    // The one record no walk can place is named, once, as what it is.
-    expect(out.value.unfetchableBundles).toEqual([
+    // The one record no walk can place is named, once, as what it is — in the
+    // prose AND in the field the skill layer branches on, which is the half a
+    // caller can act on without reading English.
+    expect(out.value.findings.unfetchableBundles).toEqual([
       { machineId: "mA", machineName: null, bundleIds: ["b2"] },
     ]);
+    expect(out.value.findings.unplaceableBundles).toEqual([
+      { machineId: "mA", machineName: null, bundleId: "b2", preAssembly: true },
+    ]);
+    // ...and emphatically NOT as a gap, in the typed half either.
+    expect(out.value.findings.chainGaps).toBeUndefined();
     const note = out.warnings.find((w) => w.includes("pushed before sesh-mover recorded"));
     expect(note, "the pre-assembly bundle must be explained, not just listed").toBeDefined();
     expect(note!).toContain("b2");
@@ -2330,8 +2353,14 @@ describe("select stage", () => {
     expect(out.value.reason).toContain("Nothing to apply");
     expect(out.value.reason).toContain("advertises newer work");
     expect(out.value.reason).toContain("has not been uploaded");
-    // Nothing is unfetchable — the work is not on the hub to be fetched.
-    expect(out.value.findings).toEqual({});
+    // Nothing is unfetchable — the work is not on the hub to be fetched — and
+    // the one condition that DID fire is typed, on the exit where it is
+    // frequently the entire answer to "why did this pull do nothing".
+    expect(out.value.findings).toEqual({
+      advertisedUnshipped: [
+        { machineId: "mB", machineName: null, headEntryUuid: "head-of-work-mB-never-pushed" },
+      ],
+    });
     // ...and it is not the refusal wearing a different hat: `report` renders a
     // `success: true` result (see the report-arm block below).
     expect(out).not.toHaveProperty("result");
@@ -2396,6 +2425,218 @@ describe("select stage", () => {
     // a bundle this pull left behind, whatever assembly thinks of its links.
     expect(out.warnings).toEqual([]);
   });
+
+  /**
+   * THE DISCLOSURE FIELDS (Task 7), one condition per case.
+   *
+   * `assembleChain` has always distinguished six conditions; before this task
+   * only some of them reached a user, and none of them reached a user as
+   * anything a caller could branch on. The rule these cases pin is the presence
+   * rule from `HubPullFindings`: **a field is present exactly when the sentence
+   * describing it was emitted**, so each case asserts both halves and asserts
+   * that the OTHER conditions' fields stayed absent. A disclosure that fires on
+   * every pull trains users to ignore it, and a field that is set without a
+   * sentence leaves a caller guessing at what it means.
+   */
+  it("names a gap as a gap — in the warning and in the typed field", async () => {
+    // b1 anchors on a head no record on this hub ships, which strands b2 behind
+    // it. The chain is applied up to b0 and stops there rather than resuming
+    // past the gap: a non-contiguous transcript is what `tryAppendContinuation`
+    // would refuse anyway.
+    const indexes = chainIndexes(
+      { mA: ["b0"], mB: [{ id: "b1", anchorUuid: chainHead("gone") }, "b2<-b1"] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0"]);
+    expect(out.value.findings.chainGaps).toEqual([
+      {
+        anchorEntryUuid: chainHead("gone"),
+        machineId: "mB",
+        machineName: null,
+        bundleId: "b1",
+        strandedBundleIds: ["b1", "b2"],
+      },
+    ]);
+    expect(out.value.findings.unplaceableBundles).toBeUndefined();
+    const note = out.warnings.find((w) => w.includes("no bundle on this hub carries"));
+    expect(note, "a gap must be explained, not just listed").toBeDefined();
+    expect(note!).toContain("strands 1 later bundle");
+  });
+
+  it("names the branch of a fork it did not follow", async () => {
+    // b1 and b2 both continue b0's head. The walk follows one (bundle id
+    // ascending, with no local base to prefer) and parks the other whole —
+    // branch-vs-branch on the hub, which is NOT `hub.onDivergence`: that policy
+    // is per bundle, resolves a hub bundle against a LOCAL transcript, and is
+    // not an input to this stage at all.
+    const indexes = chainIndexes(
+      { mA: ["b0", "b1<-b0"], mB: ["b2<-b0"] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0", "b1"]);
+    expect(out.value.findings.parkedBranches).toEqual([
+      {
+        anchorEntryUuid: chainHead("b0"),
+        followedBundleId: "b1",
+        machineId: "mB",
+        machineName: null,
+        bundleId: "b2",
+        bundleIds: ["b2"],
+      },
+    ]);
+    expect(out.value.findings.chainGaps).toBeUndefined();
+    expect(out.warnings.some((w) => w.includes("forks on the hub"))).toBe(true);
+  });
+
+  /**
+   * MULTIPLE ROOTS ARE ORDINARY, and that is exactly why the silence was wrong.
+   * `computeIncrementalPlan` re-sends a session whole whenever the recorded head
+   * is empty or gone (compaction, truncation, a rollback) and `push.ts` files
+   * that `full` record under the SAME thread id — so a second starting point is
+   * a routine product of the ordinary flow, and a pull that walks one of them
+   * and says nothing about the other hands the user half a conversation with an
+   * empty `warnings` array. Two roots cannot be joined: a compaction rewrites
+   * the very entry uuids a link would need.
+   */
+  it("names a second starting point it did not walk", async () => {
+    const indexes = chainIndexes(
+      { mA: ["b0"], mB: ["b1"] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+
+    const out = await runSelectStage(input({ indexes, latest: true }));
+
+    expect(out.kind).toBe("proceed");
+    if (out.kind !== "proceed") return;
+    expect(out.value.needed.map((n) => n.record.bundleId)).toEqual(["b0"]);
+    expect(out.value.findings.unwalkedRoots).toEqual([
+      { machineId: "mB", machineName: null, bundleId: "b1", bundleIds: ["b1"] },
+    ]);
+    const note = out.warnings.find((w) => w.includes("independent starting point"));
+    expect(note, "an unwalked root must be explained, not just listed").toBeDefined();
+    expect(note!).toContain("ordinary rather than damage");
+  });
+
+  /**
+   * THE FOLD. This arrangement reaches BOTH the unfetchable stop and the report
+   * arm, and Task 7 settled which wins: a pull that can NAME the condition
+   * succeeds; a pull that can only name the machines fails.
+   *
+   * mB's bundle is a pre-assembly record, so assembly can say precisely what it
+   * is ("pushed before chain assembly existed, not a missing one") and that a
+   * fresh push from mB re-links it. That is a complete, truthful, actionable
+   * answer, and `success: false` on it is the nag loop this milestone exists to
+   * break — an error tells the caller to retry, and every retry says the same
+   * thing forever.
+   */
+  it("succeeds, rather than stopping, when it can name why the rest is out of reach", async () => {
+    const indexes = chainIndexes(
+      { mA: ["b0"], mB: [{ id: "b1", from: "b0", preAssembly: true }] },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+    writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        mA: peer({
+          received: {
+            "sess-mA": {
+              localSessionId: "local-1", type: "full", importedAt: "2026-08-01T00:00:00.000Z",
+            },
+          },
+        }),
+      },
+    });
+
+    const out = await runSelectStage(input({ indexes, threadId: "t-1" }));
+
+    expect(out.kind).toBe("report");
+    if (out.kind !== "report") return;
+    expect(out.value.reason).toContain("pushed before sesh-mover recorded which entry");
+    // Both halves ride together: the machines, and the condition.
+    expect(out.value.findings.unfetchableBundles).toEqual([
+      { machineId: "mB", machineName: null, bundleIds: ["b1"] },
+    ]);
+    expect(out.value.findings.unplaceableBundles).toEqual([
+      { machineId: "mB", machineName: null, bundleId: "b1", preAssembly: true },
+    ]);
+    // The machine-naming sentence is still emitted — on `warnings`, which the
+    // report result has a field for and the stop result does not.
+    expect(out.warnings.some((w) => w.includes("could not be pulled whole"))).toBe(true);
+    // ...and the retired foreclosure is in none of it.
+    const said = [out.value.reason, ...out.warnings].join(" ");
+    expect(said).not.toContain("split across machines");
+    expect(said).not.toContain("cannot be assembled here yet");
+  });
+
+  /**
+   * THE RESIDUAL CLASS, i.e. the half of the fold that stays an error — proof
+   * that the stop below the report arm is not dead code.
+   *
+   * b2 continues b1's head, so it is not a gap; b1 is already here, so it is not
+   * an outstanding pre-assembly bundle; there is no fork and one root. Nothing
+   * in the walk accounts for b2, and the heuristic can still see it. This pull
+   * does not know what it is missing, which is a different answer from "here is
+   * what I am missing and why" — and an error is the honest shape for it.
+   */
+  it("stays an error when another machine's bundles are out of reach for no reason it can name", async () => {
+    const indexes = chainIndexes(
+      {
+        mA: ["b0"],
+        mB: [{ id: "b1", from: "b0", preAssembly: true }],
+        mC: ["b2<-b1"],
+      },
+      { threadId: "t-1", advertise: { mA: { lastActiveAt: "2026-07-22T00:00:00Z" } } }
+    );
+    writeEveryBundleFile(indexes);
+    writeFileSync(join(targetProjectDir, "local-1.jsonl"), "{}\n", "utf-8");
+    const rec = (sessionId: string) => ({
+      [sessionId]: {
+        localSessionId: "local-1", type: "full" as const, importedAt: "2026-08-01T00:00:00.000Z",
+      },
+    });
+    writeSyncState({
+      ...emptySyncState(projectPath),
+      peers: {
+        mA: peer({ received: rec("sess-mA") }),
+        mB: peer({ received: rec("sess-mB") }),
+      },
+    });
+
+    const out = await runSelectStage(input({ indexes, threadId: "t-1" }));
+
+    expect(out.kind).toBe("stop");
+    if (out.kind !== "stop") return;
+    const result = out.result as ErrorResult;
+    expect(result.error).toContain("Already up to date with the source machine, but this thread is not whole here");
+    // It names the MACHINE holding what it cannot reach, and nothing more —
+    // which is the whole of why this exit is an error rather than a report: a
+    // `stop` result carries no `findings` field for a condition to ride on,
+    // because there is no condition to put in one.
+    expect(result.error).toContain("mC (1 bundle)");
+    expect(result.error).not.toContain("pushed before sesh-mover recorded");
+    // The rewritten suggestion, shared by all three sites that used to hold a
+    // hand-copied copy of the retired claim.
+    expect(result.suggestion).toContain("Nothing is left for this machine to fetch");
+    expect(result.suggestion).toContain("assembles a thread across every machine's bundle list");
+    expect(`${result.error} ${result.suggestion}`).not.toContain("cannot be assembled here yet");
+    expect(`${result.error} ${result.suggestion}`).not.toContain("no flag or re-run fetches them");
+    expect(`${result.error} ${result.suggestion}`).not.toMatch(/--[a-z]/);
+  });
 });
 
 /**
@@ -2455,23 +2696,35 @@ describe("select report arm (the fourth exit)", () => {
   });
 
   /**
-   * `findings` is spread, not copied field by field, and that is the property
-   * the next task depends on: the chain gaps and advertised-but-unshipped heads
-   * assembly will report are additions to `HubPullFindings`, so they must reach
-   * the result with no edit to the arm or to its renderer. The second assertion
-   * proves that mechanically, with a field the type does not declare yet.
+   * `findings` is spread, not copied field by field, and the room that left was
+   * used: `chainGaps`, `parkedBranches`, `unplaceableBundles`, `unwalkedRoots`
+   * and `advertisedUnshipped` all landed as additions to `HubPullFindings`, and
+   * neither this arm nor `reportPullResult` nor `hubPull`'s dispatch needed a
+   * line changed. The undeclared-field assertion stays, with a name the type
+   * genuinely does not declare, because the property is about the NEXT
+   * disclosure as much as the last one.
    */
   it("spreads the shared findings verbatim, including ones not declared yet", () => {
     const unfetchableBundles = [{ machineId: "m3", machineName: "laptop", bundleIds: ["b9"] }];
+    const chainGaps = [
+      {
+        anchorEntryUuid: "u-7",
+        machineId: "m3",
+        machineName: "laptop",
+        bundleId: "b9",
+        strandedBundleIds: ["b9", "b10"],
+      },
+    ];
 
-    const declared = reportPullResult(report({ findings: { unfetchableBundles } }), []);
+    const declared = reportPullResult(report({ findings: { unfetchableBundles, chainGaps } }), []);
     expect(declared.unfetchableBundles).toEqual(unfetchableBundles);
+    expect(declared.chainGaps).toEqual(chainGaps);
 
-    const future = { unfetchableBundles, chainGaps: [{ afterUuid: "u-7", stranded: 2 }] };
+    const future = { unfetchableBundles, retiredBundles: [{ bundleId: "b11" }] };
     const widened = reportPullResult(report({ findings: future as HubPullFindings }), []);
     expect(widened).toMatchObject({
       unfetchableBundles,
-      chainGaps: [{ afterUuid: "u-7", stranded: 2 }],
+      retiredBundles: [{ bundleId: "b11" }],
     });
   });
 
@@ -2510,6 +2763,33 @@ describe("select report arm (the fourth exit)", () => {
     expect(stopAt, "the stop dispatch must still be in hubPull").toBeGreaterThan(-1);
     expect(spreadAt, "the select stage's warnings must be spread after the stop dispatch").toBeGreaterThan(stopAt);
     expect(reportAt, "the report dispatch must come after that spread").toBeGreaterThan(spreadAt);
+  });
+
+  /**
+   * ...and the SAME spread on the exit that applied something, which is the
+   * other half of "one declaration" being worth anything.
+   *
+   * `SelectStageResult` used to hand back a bare `unfetchableBundles` while the
+   * report arm handed back a spread `findings`, so a disclosure added to
+   * `HubPullFindings` reached the pull that applied NOTHING and silently missed
+   * the pull that applied something — backwards, since a pull that fetched half
+   * a chain and left a parked branch behind is precisely the run whose caller
+   * has to be told. Asserted against the sequencer's own source because the
+   * behavioural half is the select-stage block above: it is the field's presence
+   * on `sel.value` that these two lines carry into the result.
+   */
+  it("spreads the same findings into the result of a pull that applied something", () => {
+    const src = readFileSync(
+      join(import.meta.dirname, "..", "src", "hub", "pull.ts"),
+      "utf-8"
+    ).replace(/\r\n/g, "\n");
+    const body = src.slice(src.indexOf("export async function hubPull("));
+
+    expect(body).toContain("needed, findings } = sel.value");
+    expect(body).toContain("...findings,");
+    // The bare field it replaced must not come back alongside it: two ways to
+    // put a disclosure on a result is how one of them stops being updated.
+    expect(body).not.toContain("unfetchableBundles,");
   });
 });
 
@@ -2754,6 +3034,50 @@ describe("cross-machine chain assembly, end to end (#35)", () => {
         const beforeThread = before.threads.find((t) => t.threadId === f.threadId);
         expect(beforeThread?.pullNeeded, "C must be told there is something to pull").toBe(true);
         expect(beforeThread?.localCopy).toBeNull();
+
+        /**
+         * SPEC §6'S CROSS-CHECK, on the real hub rather than on a builder, and
+         * measured at the one moment it is interesting: C has pulled nothing,
+         * so the whole thread is still ahead of it.
+         *
+         * `assemblySet ⊆ heuristicSet`, never equality — equality fails on
+         * exactly this case. `findUnfetchableBundles` is kept for one release to
+         * BE this check (see its doc); the pure half of it, over `chainIndexes`
+         * fixtures, is in tests/hub-threads.test.ts.
+         */
+        {
+          const { indexes: idxs } = await readAllIndexes(createFsBackend(f.hub), f.projectId);
+          const t = resolveThreads(idxs).find((x) => x.threadId === f.threadId)!;
+          const st = await f.onC(async () => readSyncState(f.projectC));
+          const p = planThreadPull({
+            thread: t, source: t.latest, state: st,
+            machineId: f.machineIdC, targetProjectDir: f.projectDirC,
+          });
+          const fetching = new Set(p.needed.map((s) => sourcedKey(s.machineId, s.record.bundleId)));
+          const heuristic = findUnfetchableBundles({
+            copies: t.copies,
+            sourceMachineId: t.latest.machineId,
+            localMachineId: f.machineIdC,
+            state: st,
+          });
+          const heuristicSet = new Set(heuristic.flatMap((u) => u.bundleIds));
+          const assemblySet = new Set(
+            heuristic.flatMap((u) =>
+              u.bundleIds.filter((id) => !fetching.has(sourcedKey(u.machineId, id)))
+            )
+          );
+          // (1) assembly invents no unfetchable bundle the heuristic did not see.
+          for (const id of assemblySet) expect([...heuristicSet]).toContain(id);
+          // (2) the difference is non-empty — otherwise assembly changed nothing
+          // and the fix did not land on the arrangement it exists for.
+          const difference = [...heuristicSet].filter((id) => !assemblySet.has(id));
+          expect(difference.length, "assembly reclassified nothing on the #35 shape").toBeGreaterThan(0);
+          // (3) every id that left the set is FETCHED, not merely reclassified —
+          // the assertion an assembly bug that quietly discards a bundle would
+          // fail while passing 1 and 2 both.
+          const plannedIds = new Set(p.needed.map((s) => s.record.bundleId));
+          for (const id of difference) expect([...plannedIds]).toContain(id);
+        }
 
         const pull = await f.pullC();
         expect(pull.success).toBe(true);

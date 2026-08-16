@@ -3,14 +3,36 @@ import type { HubBundleRecord } from "./layout.js";
 import { type ResolvedThread } from "./threads.js";
 import type { ErrorResult, HubPullFindings, NotYetSyncedResult, UnfetchableBundleGroup, WhereisThread } from "../types.js";
 /**
- * The half of a thread this pull cannot reach, in words.
+ * The half of a thread this pull could not reach, in words.
  *
- * Deliberately names NO remedy: there is no `--from-machine`, `--thread` and
- * `--target-path` resolve to the same single source, and `hub reindex` only
- * rebuilds this machine's index from its own bundles. Saying plainly that a
- * thread split across machines cannot be assembled yet is honest; inventing a
- * flag would put this in the milestone's own foreclosure class — a warning
- * whose stated remedy silently does nothing.
+ * WHAT THIS SENTENCE USED TO CLAIM, AND WHY IT NO LONGER DOES. It ended
+ * "…no flag or re-run fetches them — sesh-mover cannot yet assemble a thread
+ * whose history is split across machines", and its doc argued the foreclosure
+ * was deliberate. It was right when written and #35 is exactly what invalidates
+ * it: a pull now assembles a thread across EVERY machine's bundle list, so the
+ * split-history case this sentence was written for is the ordinary case that
+ * arrives whole. Leaving the claim in place would put it in the milestone's own
+ * defect class from the other side — a message that forecloses a remedy which
+ * exists is as wrong as one that invents a remedy which does not.
+ *
+ * IT STILL NAMES NO FLAG, for a reason that survived the change: there is no
+ * `--from-machine`, `--thread` and `--target-path` resolve to the same single
+ * source, and `hub reindex` only rebuilds this machine's index from its own
+ * bundles. What CHANGED the outcome is on the hub — a bundle pushed, a link
+ * recorded — never an argument to this command.
+ *
+ * WHAT SURVIVES THE SUBTRACTION IS NARROWER, and that is what this text now
+ * describes. Both callers subtract the assembled plan from
+ * `findUnfetchableBundles` (spec §6), so a group here holds only bundles the
+ * chain does not reach: behind a gap, on a branch this pull did not follow, or
+ * pushed before links were recorded at all. This sentence names the MACHINES and
+ * says nothing about WHICH of those it is — `describeAssembly` computes that
+ * from the walk itself and is emitted beside this sentence wherever the walk
+ * could tell. It is deliberately not a cross-reference ("see the note beside
+ * this one"): there is a residual class where the heuristic sees records the
+ * walk cannot account for, and a promise of a note that is not there is the
+ * foreclosure defect wearing its opposite face. Restating the condition rule
+ * here would be a second copy of it, which is how the two come to disagree.
  *
  * Machine names are capped at three so a hub with many machines still
  * produces one readable sentence; the full set is in the typed field.
@@ -99,8 +121,18 @@ export interface SelectStageResult {
      */
     sourceMachineId: string;
     needed: SourcedBundle[];
-    /** Read exactly once, at the caller's final `HubPullResult` assembly. */
-    unfetchableBundles: UnfetchableBundleGroup[] | undefined;
+    /**
+     * The typed disclosures, SPREAD verbatim into the result by the caller — the
+     * same field, the same interface and the same spread as `SelectReport`.
+     *
+     * It used to be a bare `unfetchableBundles` here and a spread `findings`
+     * there, which meant a disclosure added to `HubPullFindings` reached the
+     * pull that applied NOTHING and silently missed the pull that applied
+     * something. That is backwards: a pull that fetched half a chain and left a
+     * parked branch behind is precisely the run whose caller has to be told.
+     * One interface, both arms, one edit.
+     */
+    findings: HubPullFindings;
 }
 /**
  * THE FOURTH EXIT: this pull worked out a thread's history, found something it
@@ -166,8 +198,10 @@ export interface SelectReport {
      *
      * It is the shared `HubPullFindings` rather than a list of fields restated
      * here so that a disclosure added to the result type arrives on this exit with
-     * no edit at either end — the chain gaps and advertised-but-unshipped heads
-     * assembly will report are additions to that one interface, not to this arm.
+     * no edit at either end. That room was used: `chainGaps`, `parkedBranches`,
+     * `unplaceableBundles`, `unwalkedRoots` and `advertisedUnshipped` all landed
+     * as additions to that one interface, and neither this arm nor
+     * `reportPullResult` nor the dispatch in `hubPull` needed a line changed.
      */
     findings: HubPullFindings;
 }

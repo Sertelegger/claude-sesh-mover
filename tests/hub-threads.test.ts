@@ -1054,4 +1054,137 @@ describe("planThreadPull / pullSourceFor", () => {
     expect(pullSourceFor(t, syncState(), ctx())?.machineId).toBe("mB");
     expect(pullSourceFor(t, received("mB"), ctx())).toBeUndefined();
   });
+
+  /**
+   * SPEC §6'S CROSS-CHECK, and it is a SUBSET relation rather than an equality
+   * — written as an equality it fails on precisely the case #35 fixes, which is
+   * the one case worth running it for.
+   *
+   * `findUnfetchableBundles` answers "which bundles do other machines list that
+   * the RESOLVED machine's list does not offer". Before assembly that WAS the
+   * unfetchable set, because a pull read one machine's list. Assembly's whole
+   * purpose is to make most of them fetchable, so the two sets are expected to
+   * differ, in one direction only:
+   *
+   *     assemblySet ⊆ heuristicSet
+   *
+   * where `assemblySet` is what a pull now DISCLOSES (the heuristic minus the
+   * assembled plan — the subtraction both disclosure sites apply) and
+   * `heuristicSet` is the raw union-difference. Three assertions, and the third
+   * is the one that catches a silent drop:
+   *
+   *   1. assembly never invents an unfetchable bundle the heuristic did not see;
+   *   2. the difference is NON-EMPTY here — otherwise assembly changed nothing
+   *      and the fix did not land;
+   *   3. every id in the difference is FETCHED, not merely reclassified. Without
+   *      this an assembly bug that quietly discards a bundle passes 1 and 2 both.
+   *
+   * `findUnfetchableBundles` is kept for ONE RELEASE to be this cross-check, then
+   * removed (its own doc says so). This is what "kept for" means, so deleting the
+   * function means deleting this block, not silently orphaning it.
+   */
+  describe("the §6 cross-check against findUnfetchableBundles", () => {
+    /** The three sets §6 names, for one thread and one resolved source. */
+    function sets(t: ResolvedThread, st: SyncState) {
+      const p = planThreadPull({
+        thread: t, source: t.latest, state: st, machineId: ME, targetProjectDir: dir,
+      });
+      const fetching = new Set(p.needed.map((s) => `${s.machineId} ${s.record.bundleId}`));
+      const heuristic = findUnfetchableBundles({
+        copies: t.copies,
+        sourceMachineId: t.latest.machineId,
+        localMachineId: ME,
+        state: st,
+      });
+      const heuristicSet = new Set(heuristic.flatMap((u) => u.bundleIds));
+      // Exactly the subtraction pull-select.ts and whereis.ts both apply.
+      const assemblySet = new Set(
+        heuristic.flatMap((u) => u.bundleIds.filter((id) => !fetching.has(`${u.machineId} ${id}`)))
+      );
+      return { plan: p, heuristicSet, assemblySet };
+    }
+
+    function crossCheck(t: ResolvedThread, st: SyncState, expectDifference: boolean): void {
+      const { plan: p, heuristicSet, assemblySet } = sets(t, st);
+      // (1) ⊆ — a violation means assembly lost a link the union-difference
+      // could still see.
+      for (const id of assemblySet) {
+        expect([...heuristicSet], `assembly invented an unfetchable bundle: ${id}`).toContain(id);
+      }
+      const difference = [...heuristicSet].filter((id) => !assemblySet.has(id));
+      if (expectDifference) {
+        // (2) non-empty, or assembly changed nothing on a fixture built to make
+        // it change something.
+        expect(difference.length, "assembly reclassified nothing here").toBeGreaterThan(0);
+      }
+      // (3) every id in the difference is actually FETCHED.
+      const plannedIds = new Set(p.needed.map((s) => s.record.bundleId));
+      for (const id of difference) {
+        expect(
+          [...plannedIds],
+          `${id} left the unfetchable set without entering the fetch plan`
+        ).toContain(id);
+      }
+    }
+
+    it("holds on the three-machine chain a pull now assembles whole (#35)", () => {
+      // mC resolves, and the earlier half of the conversation is listed only by
+      // mA — the shape the heuristic was built to disclose and assembly now
+      // fetches. Every one of mA's records must move from "unfetchable" into
+      // the plan, not merely out of the set.
+      const t = thread(
+        { mA: ["b0"], mB: ["b1<-b0"], mC: ["b2<-b1"] },
+        { advertise: { mC: { lastActiveAt: "2026-07-23T00:00:00Z" } } }
+      );
+      expect(t.latest.machineId).toBe("mC");
+
+      crossCheck(t, syncState(), true);
+    });
+
+    it("holds when the resolved machine's own list is already fully received", () => {
+      // The #35 nag shape: mC's list is here, so the pull used to answer
+      // "already up to date" while the rest of the thread sat on mA and mB.
+      const t = thread(
+        { mA: ["b0"], mB: ["b1<-b0"], mC: ["b2<-b1"] },
+        { advertise: { mC: { lastActiveAt: "2026-07-23T00:00:00Z" } } }
+      );
+
+      crossCheck(t, received("mC"), true);
+    });
+
+    it("holds when a gap keeps the far half genuinely out of reach", () => {
+      // b1 anchors on a head no record ships, so mB's and mC's records stay
+      // unfetchable — the difference may be empty, and the ⊆ half plus "nothing
+      // silently left the set" are what the check is for here.
+      const t = thread(
+        {
+          mA: ["b0"],
+          mB: [{ id: "b1", anchorUuid: chainHead("missing") }],
+          mC: ["b2<-b1"],
+        },
+        { advertise: { mA: { lastActiveAt: "2026-07-23T00:00:00Z" } } }
+      );
+      expect(t.latest.machineId).toBe("mA");
+
+      const { plan: p } = sets(t, syncState());
+      expect(p.assembled.gaps.map((g) => g.bundleId)).toEqual(["b1"]);
+      crossCheck(t, syncState(), false);
+    });
+
+    it("holds on a wholly pre-assembly hub, where no walk links anything", () => {
+      // Every bundle already on every hub. Assembly reduces the thread to its
+      // root and the plan falls back to the resolved machine's own list, so
+      // whatever leaves the heuristic set has to be in that fallback.
+      const t = thread(
+        { mA: ["b0", "b1<-b0"], mB: ["b2<-b1"], mC: ["b3<-b2"] },
+        {
+          linkStyle: "pre-assembly",
+          advertise: { mA: { lastActiveAt: "2026-07-23T00:00:00Z" } },
+        }
+      );
+      expect(t.latest.machineId).toBe("mA");
+
+      crossCheck(t, syncState(), false);
+    });
+  });
 });

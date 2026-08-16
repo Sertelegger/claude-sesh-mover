@@ -325,7 +325,12 @@ export async function hubPull(
     // `sourceMachineId` is the machine this pull RESOLVED to and is spent only
     // on the result's source label; every ledger credit below comes from the
     // per-record `machineId` on `needed` instead (see `SourcedBundle`).
-    const { threadId, sourceMachineId, needed, unfetchableBundles } = sel.value;
+    //
+    // `findings` is the same `HubPullFindings` the `report` arm carries, and it
+    // is SPREAD into the result below for the same reason: a disclosure added to
+    // that interface reaches the pull that applied something and the pull that
+    // applied nothing at the same moment, with no edit here.
+    const { threadId, sourceMachineId, needed, findings } = sel.value;
 
     opts.onProgress?.({ phase: "hub-pull", percent: 0 });
 
@@ -520,7 +525,7 @@ export async function hubPull(
       carryApplied,
       appended: st.appended.length > 0 ? st.appended : undefined,
       divergence: st.lastDivergence,
-      unfetchableBundles,
+      ...findings,
       warnings,
     };
   } finally {
