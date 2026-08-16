@@ -9,6 +9,11 @@ export type ArchiveManifestResult = {
     detail: string;
 };
 /**
+ * The decompression budget for a `.tar.zst` of `compressedBytes`. Exported so
+ * a test can assert the exact rule rather than a hand-copied number.
+ */
+export declare function zstdDecompressionLimit(compressedBytes: number): number;
+/**
  * A `.tar.zst` was produced whose frame carries no content checksum, so the
  * container cannot tell a corrupted bundle from an intact one. Thrown by
  * `createZstdArchive` and handled in cli.ts's `finalizeExport`, which falls back

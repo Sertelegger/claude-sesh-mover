@@ -731,6 +731,78 @@ describe("importer", () => {
       expect(await landedSessions()).toHaveLength(1);
     });
 
+    it("refuses a bundle whose manifest declares an absent session, and --session-id imports the rest", async () => {
+      // The proof behind the refusal's own suggestion: it says to re-run with
+      // `--session-id` naming the sessions that ARE present, so this test runs
+      // exactly that. A `pull` surfaces the same sentence verbatim, which is
+      // why the message names `sesh-mover import` with the flag.
+      const { importSession } = await import("../src/importer.js");
+      const { readManifest, writeManifest } = await import("../src/manifest.js");
+      const { readdirSync, statSync } = await import("node:fs");
+
+      /** Every path under the target config dir, with its size — repo-relative. */
+      const configDirState = (): string[] => {
+        const walk = (rel: string): string[] =>
+          readdirSync(join(targetConfigDir, rel), { withFileTypes: true })
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .flatMap((e) =>
+              e.isDirectory()
+                ? [`${rel}/${e.name}/`, ...walk(`${rel}/${e.name}`)]
+                : [`${rel}/${e.name} ${statSync(join(targetConfigDir, rel, e.name)).size}`]
+            );
+        return walk("");
+      };
+
+      // Declare a SECOND session the bundle does not contain. Written through
+      // writeManifest, so `sessionsDigest` is restamped and the manifest stays
+      // internally consistent — the only thing wrong is the missing FILE,
+      // which is what a truncated transfer or a half-finished unpack leaves.
+      const ghostId = "11111111-2222-3333-4444-555555555555";
+      const manifest = readManifest(exportPath);
+      manifest.sessions.push({
+        ...manifest.sessions[0],
+        sessionId: ghostId,
+        slug: "ghost-session",
+      });
+      writeManifest(exportPath, manifest);
+
+      const before = configDirState();
+      const refused = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+
+      expect(refused.success).toBe(false);
+      const err = refused as ErrorResult;
+      expect(err.error).toContain("Bundle integrity check failed");
+      expect(err.error).toContain("no session file in the bundle");
+      expect(err.error).toContain(ghostId);
+      expect(err.suggestion ?? "").toContain("--session-id");
+      // "before any write" is the claim the message rests on: the target config
+      // dir has to be byte-identical, not merely free of session JSONLs.
+      expect(configDirState()).toEqual(before);
+      expect(await landedSessions()).toHaveLength(0);
+
+      // The advised re-run. The refusal is scoped to what the invocation asked
+      // for, so naming the present session skips the absent one entirely.
+      const second = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+        sessionIds: [sessionId],
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect((second as ImportResult).importedSessions).toHaveLength(1);
+      expect((second as ImportResult).importedSessions[0].originalId).toBe(sessionId);
+      expect(await landedSessions()).toHaveLength(1);
+    });
+
     it("refuses a bundle whose manifest session list no longer hashes to its own digest", async () => {
       const { importSession } = await import("../src/importer.js");
       const { readFileSync, writeFileSync } = await import("node:fs");

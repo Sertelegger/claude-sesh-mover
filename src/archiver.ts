@@ -1,5 +1,6 @@
 import {
   closeSync,
+  createWriteStream,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -9,9 +10,11 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
 import { assertSafeManifestIds } from "./manifest.js";
 import type { ExportManifest } from "./types.js";
@@ -27,6 +30,62 @@ export type ArchiveManifestResult =
     };
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
+
+/**
+ * How far a `.tar.zst` may expand before we abandon decompressing it, stated
+ * the way node-tar states its own limit: a multiple of the COMPRESSED size, so
+ * it scales with real bundles and only ever fires at a ratio no genuine
+ * session bundle reaches.
+ *
+ * ## Why this exists — measured, not reasoned
+ *
+ * The `.tar.gz` path is self-limiting for free: node-tar's Parser
+ * (`parse.js`, `MAX_DECOMPRESSION_RATIO = 1000`) aborts the stream as soon as
+ * the bytes it has inflated exceed 1000x the bytes it has consumed, and that
+ * abort surfaces here as an ordinary `unreadable`. Nothing equivalent guards
+ * the zstd CLI, which writes whatever the frame decodes to. Measured on this
+ * repo (#32): a 16 KB `.tar.zst` of zeros wrote 500 MB into the temp dir
+ * during a plain `browse` — ~32,000:1 — because `MAX_MANIFEST_BYTES` only
+ * fires once the archive is already unpacked, with the disk cost paid and up
+ * to `ARCHIVE_READ_CONCURRENCY` (8) of them in flight. `browse` is not an
+ * opt-in for this: `/sesh-mover:import` runs it automatically to build its
+ * picker, so merely opening the picker opened every archive in the directory.
+ *
+ * ## Why the bound is imposed on the bytes, not read from the frame
+ *
+ * A zstd frame *may* declare its decompressed size, and ours do (`zstd -l`
+ * reports "Decompressed Size" for a `createZstdArchive` output, which
+ * compresses a single file of known length). That field is no basis for a cap,
+ * because the attacker picks the framing: a frame produced by piping into
+ * `zstd` on stdin has an unknown input size, so the Frame_Content_Size field
+ * is simply absent — and `zstd -l` then prints an EMPTY Uncompressed column
+ * and still **exits 0** (measured, zstd 1.5.5). A pre-check reads either a
+ * blank or a number chosen by whoever wrote the file. So the only cap that
+ * holds is one we impose ourselves, on the bytes as they arrive: see
+ * `decompressZstd`, which streams `zstd -d --stdout` through a counting
+ * transform and kills the child the moment the budget is gone.
+ */
+const MAX_ZSTD_DECOMPRESSION_RATIO = 1000;
+
+/**
+ * Floor under the ratio bound. A minimal bundle is mostly tar padding (512-byte
+ * blocks plus a 1 KB zero trailer) which compresses to nearly nothing, so a
+ * few hundred compressed bytes must not translate into a few hundred KB of
+ * allowance. Cheap insurance: 1 MB x 8 concurrent reads is a rounding error
+ * next to the 500 MB a single unbounded read could cost.
+ */
+const MIN_ZSTD_DECOMPRESSION_ALLOWANCE = 1024 * 1024;
+
+/**
+ * The decompression budget for a `.tar.zst` of `compressedBytes`. Exported so
+ * a test can assert the exact rule rather than a hand-copied number.
+ */
+export function zstdDecompressionLimit(compressedBytes: number): number {
+  return Math.max(
+    MIN_ZSTD_DECOMPRESSION_ALLOWANCE,
+    compressedBytes * MAX_ZSTD_DECOMPRESSION_RATIO
+  );
+}
 
 /**
  * A `.tar.zst` was produced whose frame carries no content checksum, so the
@@ -160,31 +219,34 @@ export async function readManifestFromArchive(
       await decompressZstd(archivePath, tarFile);
     }
 
-    // Same pre-extraction validation every other extraction path runs.
-    await assertSafeEntries(tarFile);
-
-    const out = join(work, "out");
-    mkdirSync(out, { recursive: true });
-    await tar.extract({
-      file: tarFile,
-      cwd: out,
-      strip: 1,
-      // `filter` sees the path AS STORED in the archive (pre-strip), so the
-      // bundle-root manifest is exactly two segments: "<bundle>/manifest.json".
-      // Never nested manifests, never session data.
-      filter: (p) => p.split("/").filter(Boolean).length === 2 && p.endsWith("/manifest.json"),
-    });
-
-    const manifestPath = join(out, "manifest.json");
-    if (!existsSync(manifestPath)) {
+    // Same pre-extraction validation every other extraction path runs, plus
+    // the one thing only this path needs: how big the manifest says it is.
+    const { manifestSize } = await scanBundleEntries(tarFile);
+    if (manifestSize === null) {
       return {
         ok: false,
         reason: "no-manifest",
         detail: "archive contains no bundle-root manifest.json",
       };
     }
-    if (statSync(manifestPath).size > MAX_MANIFEST_BYTES) {
+    if (manifestSize > MAX_MANIFEST_BYTES) {
       return { ok: false, reason: "unreadable", detail: "manifest.json is implausibly large" };
+    }
+
+    const out = join(work, "out");
+    mkdirSync(out, { recursive: true });
+    await tar.extract({ file: tarFile, cwd: out, strip: 1, filter: isBundleRootManifest });
+
+    const manifestPath = join(out, "manifest.json");
+    // Belt-and-braces against a scan/extract disagreement: the scan saw an
+    // entry, so a missing file here means the filter and the size check are no
+    // longer looking at the same thing, which must degrade rather than throw.
+    if (!existsSync(manifestPath)) {
+      return {
+        ok: false,
+        reason: "no-manifest",
+        detail: "archive contains no bundle-root manifest.json",
+      };
     }
 
     let parsed: unknown;
@@ -257,7 +319,23 @@ function isBundleManifestShape(value: unknown): boolean {
  * Works on .tar and .tar.gz inputs (tar.list auto-detects gzip).
  */
 export async function assertSafeEntries(tarFile: string): Promise<void> {
+  await scanBundleEntries(tarFile);
+}
+
+/**
+ * The single pass `assertSafeEntries` is built on: it throws on any unsafe
+ * entry, and reports the DECLARED size of the bundle-root manifest.json (null
+ * when the archive has none).
+ *
+ * That size is not a hint — in a tar the header's size field is exactly how
+ * many bytes the parser will hand over for the entry, so it bounds the real
+ * thing rather than describing it. Reading it here lets an implausible
+ * manifest be refused before a byte of it is written to disk, where the old
+ * post-extraction `statSync` could only refuse it afterwards.
+ */
+async function scanBundleEntries(tarFile: string): Promise<{ manifestSize: number | null }> {
   const offenders: string[] = [];
+  let manifestSize: number | null = null;
   await tar.list({
     file: tarFile,
     onReadEntry: (entry) => {
@@ -268,12 +346,26 @@ export async function assertSafeEntries(tarFile: string): Promise<void> {
         offenders.push(`${p} (parent traversal)`);
       } else if (entry.type === "SymbolicLink" || entry.type === "Link") {
         offenders.push(`${p} (${entry.type})`);
+      } else if (isBundleRootManifest(p)) {
+        manifestSize = entry.size ?? 0;
       }
     },
   });
   if (offenders.length > 0) {
     throw new Error(`Unsafe archive entries detected: ${offenders.join(", ")}`);
   }
+  return { manifestSize };
+}
+
+/**
+ * Is this the ONE manifest a bundle archive is allowed to speak for? Both the
+ * entry scan and `tar.extract`'s filter see the path AS STORED (pre-strip), so
+ * the bundle-root manifest is exactly two segments: "<bundle>/manifest.json".
+ * Never a nested manifest, never session data. One copy of the rule, so the
+ * entry the size check measured is the entry the extraction writes.
+ */
+function isBundleRootManifest(p: string): boolean {
+  return p.split("/").filter(Boolean).length === 2 && p.endsWith("/manifest.json");
 }
 
 export function detectArchiveFormat(
@@ -316,13 +408,124 @@ async function createZstdArchive(sourceDir: string, archivePath: string): Promis
 }
 
 /**
- * Decompress a .tar.zst to a plain .tar at `tarPath`. Shared by the extract
- * path and by `readManifestFromArchive` so there is exactly one place that
- * knows how sesh-mover shells out to zstd. Callers must have already checked
- * `isZstdAvailable()` (or be prepared for the throw when zstd is missing).
+ * Decompress a .tar.zst to a plain .tar at `tarPath`, refusing to write more
+ * than `zstdDecompressionLimit` bytes. Shared by the extract path and by
+ * `readManifestFromArchive` so there is exactly one place that knows how
+ * sesh-mover shells out to zstd — and therefore exactly one place the bound
+ * has to hold. Callers must have already checked `isZstdAvailable()` (or be
+ * prepared for the throw when zstd is missing).
+ *
+ * Streamed rather than run file-to-file (`zstd -d in -o out`) because that
+ * form hands the size decision to zstd: the process returns only once the
+ * whole frame is on disk, so any check we make afterwards is a check made
+ * after paying the cost. Counting the bytes through a transform is the only
+ * arrangement where the cap cannot be lied to — it never consults the frame
+ * header, only what actually came out of it.
+ *
+ * The container-corruption guarantees survive the change to `--stdout`, which
+ * matters because they are the reason `.tar.zst` is an acceptable format at
+ * all (see `zstdFrameHasContentChecksum`). Measured with zstd 1.5.5: a
+ * truncated frame still exits 1 ("premature end") and a bit-flipped one still
+ * exits 1 ("Restored data doesn't match checksum"), both of which become a
+ * throw here.
  */
 async function decompressZstd(archivePath: string, tarPath: string): Promise<void> {
-  execFileSync("zstd", ["-d", archivePath, "-o", tarPath], { stdio: "ignore" });
+  const compressedBytes = statSync(archivePath).size;
+  const limit = zstdDecompressionLimit(compressedBytes);
+
+  const child = spawn("zstd", ["-d", "--stdout", archivePath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let spawnError: Error | undefined;
+  let stderr = "";
+  child.stderr?.setEncoding("utf-8");
+  child.stderr?.on("data", (chunk: string) => {
+    // Bounded on purpose: this string ends up in a user-facing `metadataError`,
+    // and a hostile archive should not get to choose how much of it there is.
+    if (stderr.length < 2048) stderr += chunk;
+  });
+
+  // Settles once the child is gone, however it went. `error` is how a missing
+  // zstd arrives now that this is not `execFileSync` (which threw ENOENT
+  // synchronously); node does not promise a `close` after a spawn `error`, so
+  // both settle it and the first one wins.
+  const ended = new Promise<number | null>((resolve) => {
+    let settled = false;
+    const finish = (code: number | null): void => {
+      if (!settled) {
+        settled = true;
+        resolve(code);
+      }
+    };
+    child.once("close", (code) => finish(code));
+    child.once("error", (e: Error) => {
+      spawnError = e;
+      finish(null);
+    });
+  });
+
+  let expanded = 0;
+  let overran = false;
+  const bounded = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      expanded += chunk.length;
+      if (expanded > limit) {
+        overran = true;
+        // Message is irrelevant — the pipeline rejection is only the signal to
+        // stop; the error a caller sees is thrown below, where the numbers are.
+        callback(new Error("zstd decompression budget exhausted"));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+
+  let pipeFailure: unknown;
+  try {
+    await pipeline(child.stdout ?? emptyStdout(), bounded, createWriteStream(tarPath));
+  } catch (e) {
+    pipeFailure = e;
+  }
+
+  if (overran) {
+    // The pipe is already torn down, but zstd may still be decoding into it and
+    // a 32,000:1 frame produces a lot of bytes per millisecond. Don't wait for
+    // it to notice EPIPE.
+    child.kill("SIGKILL");
+    await ended;
+    // Nothing here is worth keeping, and holding the partial output would
+    // concede most of what the bound was for.
+    rmSync(tarPath, { force: true });
+    throw new Error(
+      `${basename(archivePath)} expands to more than ${limit} bytes — over ${MAX_ZSTD_DECOMPRESSION_RATIO}x its ${compressedBytes} compressed bytes, which no session bundle is — so it was not decompressed`
+    );
+  }
+
+  const code = await ended;
+  if (spawnError) throw spawnError;
+  if (pipeFailure) throw pipeFailure;
+  if (code !== 0) {
+    const detail = stderr.trim();
+    throw new Error(
+      `zstd could not decompress ${basename(archivePath)} (exit ${code ?? "signal"})${detail ? `: ${detail}` : ""}`
+    );
+  }
+}
+
+/**
+ * Stand-in for a child's stdout that never existed. Only reachable if spawn
+ * failed outright, in which case `spawnError` is what the caller gets — this
+ * just keeps the pipeline from being handed a null.
+ */
+function emptyStdout(): Transform {
+  const s = new Transform({
+    transform(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+  s.end();
+  return s;
 }
 
 async function extractZstdArchive(

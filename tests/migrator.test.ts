@@ -291,6 +291,97 @@ describe("migrator", () => {
       ).toBe(true);
     });
 
+    it("blocks self-migration by default, and --force overrides the block", async () => {
+      // The proof behind the block's own suggestion. It ends "Override
+      // (unsafe): pass --force …", which is a claim that the block returns
+      // BEFORE export, import and cleanup — so the same invocation plus the
+      // flag still has a migration left to perform. Unsafe is a separate
+      // matter from reachable; this test is about reachable.
+      const { migrateSession } = await import("../src/migrator.js");
+      const sourceProjectPath = "/Users/testuser/Projects/testproject";
+      const sourceEncoded = encodeProjectPath(sourceProjectPath);
+      const sourceJsonl = join(configDir, "projects", sourceEncoded, `${sessionId}.jsonl`);
+      const opts = {
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath,
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current" as const,
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: join(sourceProjectPath, "src"),
+      };
+
+      const blocked = await migrateSession(opts);
+      expect(blocked.success).toBe(false);
+      if (blocked.success) return;
+      expect(blocked.error).toMatch(/Refusing self-migration/);
+      expect(blocked.suggestion ?? "").toContain("--force");
+      // Nothing has run: migrate is export + import + cleanup, and the source
+      // session is exactly what cleanup would have deleted.
+      expect(existsSync(sourceJsonl)).toBe(true);
+
+      const forced = await migrateSession({ ...opts, force: true });
+      expect(forced.success).toBe(true);
+      if (!forced.success) return;
+      expect(forced.importedSessions).toHaveLength(1);
+      expect(forced.cleanedUp).toBe(true);
+      expect(
+        forced.warnings.some((w) => w.includes("Self-migration detected"))
+      ).toBe(true);
+      // The migration really happened: source gone, target holds the session.
+      expect(existsSync(sourceJsonl)).toBe(false);
+      const targetEncoded = encodeProjectPath("/Users/testuser/Projects/newproject");
+      expect(
+        existsSync(
+          join(
+            configDir,
+            "projects",
+            targetEncoded,
+            `${forced.importedSessions[0].newId}.jsonl`
+          )
+        )
+      ).toBe(true);
+    });
+
+    it("requires --session-id for scope current, and migrates once it is supplied", async () => {
+      // Argument validation, raised before any read or write — so the remedy
+      // the message names ("Pass --session-id <id> …, or --scope all") runs the
+      // same invocation from the top.
+      const { migrateSession } = await import("../src/migrator.js");
+      const sourceProjectPath = "/Users/testuser/Projects/testproject";
+      const sourceEncoded = encodeProjectPath(sourceProjectPath);
+      const sourceJsonl = join(configDir, "projects", sourceEncoded, `${sessionId}.jsonl`);
+      const opts = {
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath,
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current" as const,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser", // outer dir — not a self-migration
+      };
+
+      const refused = await migrateSession(opts);
+      expect(refused.success).toBe(false);
+      if (refused.success) return;
+      expect(refused.error).toContain(
+        "Migrate with --scope current requires --session-id"
+      );
+      expect(refused.suggestion ?? "").toContain("--session-id");
+      expect(refused.suggestion ?? "").toContain("--scope all");
+      expect(existsSync(sourceJsonl)).toBe(true);
+
+      const migrated = await migrateSession({ ...opts, sessionId });
+      expect(migrated.success).toBe(true);
+      if (!migrated.success) return;
+      expect(migrated.importedSessions).toHaveLength(1);
+      expect(migrated.importedSessions[0].originalId).toBe(sessionId);
+      expect(existsSync(sourceJsonl)).toBe(false);
+    });
+
     it("merges into a target project dir that already has sessions", async () => {
       // Orphan-recovery scenario: after a botched self-migration, the source
       // project dir still has one stray session and the target already holds

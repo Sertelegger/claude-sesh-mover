@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome } from "./helpers/env.js";
@@ -83,6 +83,53 @@ describe("hub init/status", () => {
       restore.restore();
       rmSync(home, { recursive: true, force: true });
       rmSync(hub, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The executable half of init.ts's "Point --path at an empty directory or a
+   * valid sesh-mover hub." — the foreclosure question, answered by running it.
+   *
+   * The refusal a bad `--path` can actually produce is a directory that already
+   * holds a `hub.json` this build cannot read (a merely non-empty directory
+   * with no `hub.json` is ADOPTED, not refused — hub init writes the file and
+   * leaves the neighbours alone). That branch returns before `registerMachine`
+   * and before the config write, so nothing is recorded anywhere; `--path` is
+   * the invocation's own argument, and the same call at a good path runs from
+   * the top. Both halves are asserted: the refusal wrote nothing, and the
+   * re-run created a hub.
+   */
+  it("refuses a directory it cannot use as a hub, and a re-run at a good --path succeeds", async () => {
+    const home = tmp("sesh-hub-home-");
+    const badHub = tmp("sesh-hub-bad-");
+    const goodHub = tmp("sesh-hub-dir-");
+    const restore = overrideHome(home);
+    try {
+      writeFileSync(join(badHub, "hub.json"), "{ this is not json", "utf-8");
+
+      const refused = await hubInit({ hubPath: badHub, configScope: "user", cwd: home });
+      expect(refused.success).toBe(false);
+      if (refused.success) return;
+      expect(refused.error).toMatch(/hub\.json is not readable/i);
+      expect(refused.suggestion).toContain("--path");
+      // Nothing was written by the refusal: this machine was not registered on
+      // the bad hub, and hub.path was not pinned in the user config. That is
+      // what makes the re-run below a genuine retry rather than a repair.
+      expect(existsSync(join(badHub, "machines"))).toBe(false);
+      expect(existsSync(join(home, ".sesh-mover", "config.json"))).toBe(false);
+
+      // The same invocation, with the flag the suggestion named pointed
+      // somewhere usable.
+      const ok = await hubInit({ hubPath: goodHub, configScope: "user", cwd: home });
+      expect(ok.success).toBe(true);
+      if (!ok.success) return;
+      expect(ok.created).toBe(true);
+      expect(existsSync(join(goodHub, "hub.json"))).toBe(true);
+      const cfg = JSON.parse(readFileSync(join(home, ".sesh-mover", "config.json"), "utf-8"));
+      expect(cfg.hub.path).toBe(goodHub);
+    } finally {
+      restore.restore();
+      for (const d of [home, badHub, goodHub]) rmSync(d, { recursive: true, force: true });
     }
   });
 });

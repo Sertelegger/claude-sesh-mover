@@ -406,4 +406,61 @@ describe("hub unlink", () => {
       for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
     }
   });
+
+  /**
+   * The two above, fused onto ONE fixture and with the lock never released
+   * between them — which is the only way to show that the advice the refusal
+   * carries is advice a user can act on. The refusal reads nothing and removes
+   * nothing, so re-running the identical call with `--force`, against the same
+   * still-held lock, reaches the same operation and completes it. Split across
+   * two fixtures that claim is untested: each half could pass while the
+   * refusal quietly consumed something the retry needed.
+   */
+  it("refuses while the project lock is held, and --force unlinks anyway", () => {
+    const home = tmp("sesh-unlink-retry-home-");
+    const hub = tmp("sesh-unlink-retry-hub-");
+    const project = tmp("sesh-unlink-retry-proj-");
+    const restore = overrideHome(home);
+    let held: { release(): void } | null = null;
+    try {
+      // A configured hub, so the consent gate below is measuring the LINK
+      // rather than an absent `hub.path`.
+      writeSeshMoverConfig(home, { path: hub });
+      const linkPath = linkProject(project);
+      held = acquireProjectLock(project);
+
+      const refused = hubUnlink({ projectPath: project });
+      expect(refused.success).toBe(false);
+      if (refused.success) return;
+      expect(refused.command).toBe("hub-unlink");
+      expect("reason" in refused && refused.reason).toBe("lock-busy");
+      // The advice itself: the flag the retry below actually passes.
+      expect(refused.suggestion).toMatch(/--force/);
+      // A refusal means nothing happened — this is what the retry depends on.
+      expect(existsSync(linkPath)).toBe(true);
+      expect(evaluateHookGate({ cwd: project }, "autoPush").ok).toBe(true);
+
+      // Same invocation plus the advised flag, and the SAME lock still held.
+      expect(held).not.toBeNull();
+      const forced = hubUnlink({ projectPath: project, force: true });
+      expect(forced.success).toBe(true);
+      if (!forced.success) return;
+      expect(forced.wasLinked).toBe(true);
+      expect(forced.projectId).toBe(PROJECT_ID);
+      expect(forced.removedPath).toBe(linkPath);
+      expect(forced.automationDisarmed).toBe(true);
+      // The link really is gone, not merely reported gone.
+      expect(existsSync(linkPath)).toBe(false);
+      expect(evaluateHookGate({ cwd: project }, "autoPush")).toMatchObject({
+        ok: false,
+        reason: "unlinked",
+      });
+      // ...and the price of skipping the lock is still disclosed.
+      expect(forced.warnings.some((w) => /lock was skipped/i.test(w))).toBe(true);
+    } finally {
+      held?.release();
+      restore.restore();
+      for (const d of [home, hub, project]) rmSync(d, { recursive: true, force: true });
+    }
+  });
 });

@@ -709,6 +709,221 @@ describe("cli", () => {
     });
   });
 
+  // #33. v0.5.1 made ARCHIVE entries honest; directory exports kept swallowing
+  // the readManifest throw, so a store bundle with a broken manifest.json
+  // vanished from the listing entirely — the user saw nothing rather than a
+  // broken row. The fix is deliberately asymmetric, and both halves are pinned
+  // here: degrade in the store dirs (a manifest.json there is ours by
+  // construction), keep silently skipping in the cwd scan (where reading that
+  // file IS the "is this even one of ours?" test).
+  describe("browse directory metadata (#33)", () => {
+    const HEALTHY_MANIFEST = {
+      version: 1,
+      plugin: "sesh-mover",
+      exportedAt: "2026-07-25T18:30:48.718Z",
+      sourcePlatform: "wsl2",
+      sourceProjectPath: "/mnt/e/GitHub/someone/faraway",
+      sourceConfigDir: "/home/someone/.claude",
+      sourceClaudeVersion: "2.1.81",
+      sessionScope: "current",
+      includedLayers: ["jsonl"],
+      sessions: [
+        {
+          sessionId: "550e8400-e29b-41d4-a716-446655440000",
+          slug: "faraway",
+          summary: "work done elsewhere",
+          lastActiveAt: "2026-07-25T18:00:00Z",
+          messageCount: 7,
+          gitBranch: "main",
+          entrypoint: "cli",
+          integrityHash: "sha256:abc",
+        },
+      ],
+    };
+
+    /** Write `<parent>/<name>/manifest.json` with `body` verbatim. */
+    function writeBundleDir(parent: string, name: string, body: string): string {
+      const dir = join(parent, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "manifest.json"), body);
+      return dir;
+    }
+
+    it("degrades a store directory with a malformed manifest instead of dropping it", () => {
+      const homeDir = mkdtempSync(join(tmpdir(), "sesh-browse-dir-broken-"));
+      try {
+        const store = join(homeDir, ".sesh-mover");
+        mkdirSync(store, { recursive: true });
+        writeBundleDir(store, "2026-07-25-healthy", JSON.stringify(HEALTHY_MANIFEST));
+        writeBundleDir(store, "2026-07-26-truncated", '{"version":1,"plugin":"sesh-mo');
+        // No manifest.json at all: not an export CLAIM, so not an entry —
+        // not even a degraded one. That is the line between the two cases.
+        mkdirSync(join(store, "not-an-export"), { recursive: true });
+
+        const result = JSON.parse(runCli(`browse --storage user --json`, homeEnv(homeDir)));
+        expect(result.success).toBe(true);
+
+        const broken = result.exports.find(
+          (e: { name: string }) => e.name === "2026-07-26-truncated"
+        );
+        expect(broken).toBeDefined();
+        expect(broken.metadataAvailable).toBe(false);
+        expect(typeof broken.metadataError).toBe("string");
+        expect(broken.metadataError.length).toBeGreaterThan(0);
+        // Exactly the archive row shape, so the skill layer's existing
+        // `metadataAvailable: false` branch handles a directory unchanged.
+        expect(broken.exportedAt).toBeNull();
+        expect(broken.sourcePlatform).toBeNull();
+        expect(broken.sourceProjectPath).toBeNull();
+        expect(broken.sessionCount).toBeNull();
+        expect(broken.sessions).toEqual([]);
+        expect(broken.storage).toBe("user");
+        // Still selectable: commands/browse.md's import and delete steps act on
+        // `path`, and refuse a `path` that doesn't end in the entry's own name.
+        expect(broken.path).toBe(join(store, "2026-07-26-truncated"));
+
+        // One broken row degrades only itself.
+        const healthy = result.exports.find(
+          (e: { name: string }) => e.name === "2026-07-25-healthy"
+        );
+        expect(healthy.metadataAvailable).toBe(true);
+        expect(healthy.sessionCount).toBe(1);
+
+        expect(
+          result.exports.some((e: { name: string }) => e.name === "not-an-export")
+        ).toBe(false);
+      } finally {
+        rmSync(homeDir, { recursive: true, force: true });
+      }
+    });
+
+    it("degrades a structurally wrong store manifest rather than fabricating from it", () => {
+      const homeDir = mkdtempSync(join(tmpdir(), "sesh-browse-dir-shape-"));
+      try {
+        const store = join(homeDir, ".sesh-mover");
+        mkdirSync(store, { recursive: true });
+        // Parses fine, and every field a listing reports is present and
+        // plausible — but `sessions` is a string. `sessions.length` is 3.
+        writeBundleDir(
+          store,
+          "2026-07-27-sessions-string",
+          JSON.stringify({ ...HEALTHY_MANIFEST, sessions: "abc" })
+        );
+        // `sessions` a number: readManifest itself throws (not iterable), so
+        // this exercises the throwing branch on a *parseable* manifest.
+        writeBundleDir(
+          store,
+          "2026-07-28-sessions-number",
+          JSON.stringify({ ...HEALTHY_MANIFEST, sessions: 5 })
+        );
+        // No plugin marker: the store scan never checked for one before, so
+        // this row used to list as healthy. It is not a bundle manifest.
+        writeBundleDir(
+          store,
+          "2026-07-29-no-marker",
+          JSON.stringify({ ...HEALTHY_MANIFEST, plugin: undefined })
+        );
+
+        const result = JSON.parse(runCli(`browse --storage user --json`, homeEnv(homeDir)));
+        expect(result.success).toBe(true);
+        expect(result.exports).toHaveLength(3);
+
+        const byName = Object.fromEntries(
+          result.exports.map((e: { name: string }) => [e.name, e])
+        );
+
+        const stringSessions = byName["2026-07-27-sessions-string"];
+        expect(stringSessions.metadataAvailable).toBe(false);
+        // The whole point: 3 is the string's length, not a session count.
+        expect(stringSessions.sessionCount).not.toBe(3);
+        expect(stringSessions.sessionCount).toBeNull();
+        expect(stringSessions.sessions).toEqual([]);
+        expect(stringSessions.metadataError).toMatch(/bundle manifest/i);
+        // Degradation is all-or-nothing: the readable fields go too, rather
+        // than half a row sourced from a manifest we just declared untrusted.
+        expect(stringSessions.exportedAt).toBeNull();
+        expect(stringSessions.sourcePlatform).toBeNull();
+
+        for (const name of ["2026-07-28-sessions-number", "2026-07-29-no-marker"]) {
+          expect(byName[name].metadataAvailable).toBe(false);
+          expect(byName[name].metadataError.length).toBeGreaterThan(0);
+          expect(byName[name].sessionCount).toBeNull();
+          expect(byName[name].sessions).toEqual([]);
+        }
+      } finally {
+        rmSync(homeDir, { recursive: true, force: true });
+      }
+    });
+
+    // THE REGRESSION GUARD for the trap in #33: this must fail if someone
+    // later "symmetrizes" the two directory paths. In the cwd scan the
+    // readManifest failure is not a broken export — it is the answer "no, this
+    // directory is not a sesh-mover export", and degrading there would list
+    // every unrelated manifest.json-bearing directory in a user's project root
+    // as broken. Both policies run in ONE browse below, so the asymmetry is
+    // asserted as a contrast rather than as two independent facts.
+    it("skips a stranger's manifest.json in the cwd scan while degrading a store one", () => {
+      const homeDir = mkdtempSync(join(tmpdir(), "sesh-browse-cwd-home-"));
+      const projectDir = mkdtempSync(join(tmpdir(), "sesh-browse-cwd-proj-"));
+      try {
+        const store = join(homeDir, ".sesh-mover");
+        mkdirSync(store, { recursive: true });
+        writeBundleDir(store, "2026-07-26-truncated", "{ not json");
+
+        // Strangers in the project root, all with a manifest.json:
+        writeBundleDir(
+          projectDir,
+          "some-package",
+          JSON.stringify({ name: "some-package", version: "1.0.0" })
+        );
+        writeBundleDir(projectDir, "dist", "<html>definitely not json</html>");
+        // Carries our marker but a wrong-shaped session list. Skipped here —
+        // and above all never listed with a session count of 3.
+        writeBundleDir(
+          projectDir,
+          "half-ours",
+          JSON.stringify({ ...HEALTHY_MANIFEST, sessions: "abc" })
+        );
+        // Positive control: a real export dropped in the project root. Without
+        // it, "nothing was listed" could mean the cwd scan never ran.
+        writeBundleDir(projectDir, "2026-07-25-dropped", JSON.stringify(HEALTHY_MANIFEST));
+
+        const result = JSON.parse(
+          sharedRunCli(["browse", "--storage", "all", "--json"], {
+            env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(homeDir) },
+            cwd: projectDir,
+          }).stdout
+        );
+        expect(result.success).toBe(true);
+
+        const names = result.exports.map((e: { name: string }) => e.name);
+        expect(names).toContain("2026-07-25-dropped");
+        expect(names).not.toContain("some-package");
+        expect(names).not.toContain("dist");
+        expect(names).not.toContain("half-ours");
+
+        const dropped = result.exports.find(
+          (e: { name: string }) => e.name === "2026-07-25-dropped"
+        );
+        expect(dropped.metadataAvailable).toBe(true);
+        expect(dropped.sessionCount).toBe(1);
+        expect(dropped.storage).toBe("project");
+
+        // Same run, same failure mode, opposite policy — this is the contrast.
+        const broken = result.exports.find(
+          (e: { name: string }) => e.name === "2026-07-26-truncated"
+        );
+        expect(broken).toBeDefined();
+        expect(broken.metadataAvailable).toBe(false);
+        expect(broken.sessionCount).toBeNull();
+        expect(broken.storage).toBe("user");
+      } finally {
+        rmSync(homeDir, { recursive: true, force: true });
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("configure command", () => {
     it("shows current config", () => {
       // Isolated HOME on purpose: `--show` reports the EFFECTIVE config, so
