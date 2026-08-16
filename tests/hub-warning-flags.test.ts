@@ -529,6 +529,26 @@ interface MessageLine {
 }
 
 /**
+ * Escape EVERY regex metacharacter, not the one this guard's current inputs
+ * happen to contain.
+ *
+ * The three dynamic regexes below interpolate values derived from live source —
+ * flag names from `cli.ts`'s `.option(` declarations, config keys from
+ * `getDefaultConfig()`, command names from the Commander tree. Earlier versions
+ * escaped only `-` (flags) and `.` (keys), which is correct for today's inputs
+ * and silently wrong for the first one that carries a `$`, `(`, `?` or `\`: the
+ * derived pattern changes meaning or throws, and a guard that mis-derives its
+ * own pattern reports "no violations" for a reason that has nothing to do with
+ * the code it is auditing. That failure mode is not hypothetical here — a
+ * line-by-line scan in this same file already missed a prettier-wrapped
+ * `.option(` and reported five false violations.
+ *
+ * CodeQL flags the partial form as `js/incomplete-sanitization`; it is right,
+ * and the fix is completeness rather than adding whichever character it named.
+ */
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+
+/**
  * Every non-comment line under `src/` that names a declared flag or a config
  * key. The sweep used to stop at `src/hub/`, which is how `src/importer.ts` —
  * whose warnings THREE commands re-emit verbatim — stayed outside it.
@@ -547,11 +567,11 @@ interface MessageLine {
  */
 function messageLines(): MessageLine[] {
   const flagRe = new RegExp(
-    declaredFlags().map((f) => `${f.replace(/-/g, "\\-")}(?![-\\w])`).join("|"),
+    declaredFlags().map((f) => `${escapeRe(f)}(?![-\\w])`).join("|"),
     "g"
   );
   const keyRe = new RegExp(
-    `(?<![\\w.$])(?:${configKeys().map((k) => k.replace(/\./g, "\\.")).join("|")})(?![\\w.])`,
+    `(?<![\\w.$])(?:${configKeys().map(escapeRe).join("|")})(?![\\w.])`,
     "g"
   );
   const out: MessageLine[] = [];
@@ -837,7 +857,7 @@ describe("every shipped message naming a CLI flag or config key is classified", 
         // current tree that is always true anyway (workspace.ts's two budget
         // lines are the case), and the strict alternative — requiring the
         // command adjacent to the flag — rejects them wrongly.
-        if (declaring.some((c) => new RegExp(`\\b${c}\\b`).test(line.text))) continue;
+        if (declaring.some((c) => new RegExp(`\\b${escapeRe(c)}\\b`).test(line.text))) continue;
         offenders.push(
           `${line.file}:${line.line} names ${flag}, but ${missing.join("/")} do${missing.length > 1 ? "" : "es"} not declare it (only ${declaring.join("/") || "no command"} does)`
         );
