@@ -17,6 +17,7 @@ import { encodeProjectPath } from "../src/platform.js";
 import { extractArchive } from "../src/archiver.js";
 import { readSyncState } from "../src/sync-state.js";
 import { WORKSPACE_MAX_BYTES } from "../src/hub/workspace.js";
+import { projectJsonFilePath } from "../src/paths.js";
 import type { HubPushFailedResult } from "../src/types.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
@@ -253,6 +254,72 @@ describe("hub push", () => {
       expect(r.success).toBe(false);
       if (r.success) return;
       expect((r as { reason?: string }).reason).toBe("unlinked");
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The `unlinked` refusal advertises `--create-project` as the way forward, so
+   * the retry it advises has to actually reach the push. That only holds
+   * because the refusal happens BEFORE anything is written — no local link, no
+   * hub project, no bundle — which is what makes the second call a clean first
+   * push rather than a resume of a half-linked state. Asserting the advice
+   * string alone would not catch a refusal that had already minted something.
+   */
+  it("refuses an unlinked project, and --create-project then links and pushes it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-relink-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-relink-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-relink-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      // A REAL directory (git-less, so no remote candidates) — the second call
+      // links it for real, which writes `.sesh-mover-project.json` to disk.
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const args = {
+        configDir,
+        projectPath,
+        hubPath: hub,
+        claudeVersion: "2.1.81",
+      } as const;
+
+      const refused = await hubPush({ ...args });
+      expect(refused.success).toBe(false);
+      if (refused.success) return;
+      expect(refused.command).toBe("push");
+      expect((refused as { reason?: string }).reason).toBe("unlinked");
+      // The advice itself: the flag the retry below actually passes.
+      expect((refused as { suggestion?: string }).suggestion).toContain("--create-project");
+      expect((refused as { linkCandidates?: unknown[] }).linkCandidates).toEqual([]);
+
+      // The refusal wrote NOTHING — that is why the retry is a clean first push.
+      expect(existsSync(projectJsonFilePath(projectPath))).toBe(false);
+      expect(existsSync(join(hub, "projects"))).toBe(false);
+
+      // Same invocation, plus the flag the refusal named.
+      const retried = await hubPush({ ...args, createProject: true });
+      expect(retried.success).toBe(true);
+      if (!retried.success) return;
+      expect(retried.pushedSessions).toHaveLength(1);
+      expect(retried.pushedSessions[0].type).toBe("full");
+      expect(retried.upToDate).toBe(false);
+
+      // And it really linked + published, rather than merely reporting success.
+      expect(existsSync(projectJsonFilePath(projectPath))).toBe(true);
+      expect(
+        (JSON.parse(readFileSync(projectJsonFilePath(projectPath), "utf-8")) as {
+          projectId: string;
+        }).projectId
+      ).toBe(retried.projectId);
+      const { indexes } = await readAllIndexes(createFsBackend(hub), retried.projectId);
+      expect(indexes).toHaveLength(1);
+      const bundles = Object.values(indexes[0].threads)[0].bundles;
+      expect(bundles).toHaveLength(1);
+      expect(await createFsBackend(hub).exists(bundles[0].file)).toBe(true);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });

@@ -583,8 +583,14 @@ export async function importSession(
       error: `Bundle integrity check failed: ${absentFromBundle.length} session(s) declared by manifest.json have no session file in the bundle: ${named}`,
       details:
         "Nothing was written and no indexes were modified. A manifest that declares a session the bundle does not contain means the transfer was truncated or the archive was only partially unpacked.",
+      // Every flag named in this module has to name `sesh-mover import` with
+      // it. `importSession` is called by THREE commands — cli.ts's `import`,
+      // migrator.ts and hub/pull-apply-sessions.ts — and migrate and pull
+      // re-emit this ErrorResult and these warnings VERBATIM. `pull` declares
+      // no --session-id, so a bare flag here is advice its reader cannot
+      // follow. See tests/hub-warning-flags.test.ts's cross-command check.
       suggestion:
-        "Re-transfer or re-extract the bundle and import again. To import only the sessions that ARE present, pass --session-id with their ids.",
+        "Re-transfer or re-extract the bundle and import again. To import only the sessions that ARE present, pass --session-id with their ids to `sesh-mover import`.",
     };
   }
 
@@ -648,14 +654,14 @@ export async function importSession(
       }
       if (priorFileExists && prior && !prior.registered && !noRegister) {
         warnings.push(
-          `Session "${session.slug}" was previously imported with --no-register; importing a registered copy (the older unregistered copy remains on disk as ${prior.localSessionId}).`
+          `Session "${session.slug}" was previously imported with \`sesh-mover import --no-register\`; importing a registered copy (the older unregistered copy remains on disk as ${prior.localSessionId}).`
         );
       }
       return true;
     });
     if (targetSessions.length < before) {
       warnings.push(
-        `${before - targetSessions.length} session(s) already imported into this project — skipped (idempotent). Use --allow-duplicates to import anyway.`
+        `${before - targetSessions.length} session(s) already imported into this project — skipped (idempotent). Run \`sesh-mover import --allow-duplicates\` against the bundle to import them anyway.`
       );
     }
   }
@@ -927,8 +933,19 @@ export async function importSession(
             error: `Import validation failed: session "${session.slug}" contains ${streamReport.parseFailures} unparseable JSONL line(s) after rewrite`,
             details:
               "Partially written session files have been cleaned up. No indexes were modified.",
+            // This used to advise `--no-register`, and that advice was
+            // impossible: MEASURED, a second run with noRegister:true returns
+            // this identical object. The gate above reads only
+            // `streamReport.parseFailures` and `integrityFailedSessions` —
+            // `noRegister` is consulted in the dedup filters above and in the
+            // registration step BELOW this return, never here. The flag skips
+            // the session-index entry; it has nothing to say about a rewrite
+            // that produced unparseable JSONL. Naming no flag is the honest
+            // form (issue #45's tenth instance, found by the retry-works proof
+            // requirement in tests/hub-warning-flags.test.ts, not by reading
+            // the sentence).
             suggestion:
-              "Check the export bundle for corruption, or try --no-register to import as read-only.",
+              "The rewritten JSONL does not parse, so no import option changes the outcome: re-export the session from the source machine, or check the bundle for corruption in transit.",
           };
         }
       }

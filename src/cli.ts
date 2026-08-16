@@ -42,6 +42,7 @@ import { hubStatus } from "./hub/status.js";
 import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
 import type {
   ExportLayer,
+  ExportManifest,
   ExportResult,
   SessionScope,
   StorageScope,
@@ -294,6 +295,57 @@ program
 // --- Browse ---
 
 /**
+ * The one shape a READABLE bundle turns into — archive or directory, one
+ * builder, so the two paths cannot drift into reporting different field sets
+ * for the same fact.
+ */
+function readableBrowseEntry(
+  name: string,
+  path: string,
+  storage: StorageScope,
+  manifest: ExportManifest
+): BrowseResult["exports"][number] {
+  return {
+    name,
+    path,
+    exportedAt: manifest.exportedAt,
+    sourcePlatform: manifest.sourcePlatform,
+    sourceProjectPath: manifest.sourceProjectPath,
+    sessionCount: manifest.sessions.length,
+    sessions: manifest.sessions,
+    storage,
+    metadataAvailable: true,
+  };
+}
+
+/**
+ * The one shape an UNREADABLE bundle turns into: `null` everywhere a value
+ * would otherwise be invented (the browsing machine's platform, "", 0), plus
+ * the reason. Archives and directory exports both build their degraded row
+ * here, so the skill layer's single `metadataAvailable: false` branch (see
+ * `commands/browse.md`) handles either without knowing which it got.
+ */
+function degradedBrowseEntry(
+  name: string,
+  path: string,
+  storage: StorageScope,
+  detail: string
+): BrowseResult["exports"][number] {
+  return {
+    name,
+    path,
+    exportedAt: null,
+    sourcePlatform: null,
+    sourceProjectPath: null,
+    sessionCount: null,
+    sessions: [],
+    storage,
+    metadataAvailable: false,
+    metadataError: detail,
+  };
+}
+
+/**
  * One archive -> one browse entry. Reads real metadata when possible and says
  * so plainly when not; never reports the local platform for a foreign archive.
  */
@@ -303,31 +355,109 @@ async function archiveBrowseEntry(
   storage: StorageScope
 ): Promise<BrowseResult["exports"][number]> {
   const r = await readManifestFromArchive(archivePath);
-  if (!r.ok) {
+  return r.ok
+    ? readableBrowseEntry(name, archivePath, storage, r.manifest)
+    : degradedBrowseEntry(name, archivePath, storage, r.detail);
+}
+
+/**
+ * Minimal structural check that a parsed manifest.json is a sesh-mover bundle
+ * manifest: the plugin marker plus a real `sessions` array. Deliberately not a
+ * schema validator — it guards exactly the two things `browse` states as fact
+ * about a bundle it never opened further: that it is one of ours at all, and a
+ * `sessionCount` derived from a value that really is a session list. Without
+ * it, `sessions: "abc"` reports `sessionCount: 3` (string length) — an invented
+ * number in the code path whose whole point is never inventing metadata, and
+ * one `assertSafeManifestIds` does NOT catch (iterating a string yields
+ * characters whose `.sessionId` is `undefined`, which passes).
+ *
+ * `archiver.ts` applies the identical predicate to a manifest read out of an
+ * archive. The two must agree; a third caller should be the trigger to give it
+ * one home in `manifest.ts` rather than a third copy.
+ */
+function isBundleManifestShape(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const m = value as { plugin?: unknown; sessions?: unknown };
+  return m.plugin === "sesh-mover" && Array.isArray(m.sessions);
+}
+
+/** A directory bundle's manifest, or the reason it could not be read. */
+type DirectoryManifestRead =
+  | { ok: true; manifest: ExportManifest }
+  | { ok: false; detail: string };
+
+/**
+ * Read `<dir>/manifest.json` without throwing, mirroring
+ * `readManifestFromArchive`'s result contract so both halves of `browse` work
+ * from the same kind of value.
+ *
+ * It deliberately does NOT decide what a failure means: the store scan and the
+ * cwd scan disagree about that, and keeping the decision at the two call sites
+ * is what keeps the disagreement visible (see `storeDirectoryBrowseEntry` and
+ * `cwdDirectoryBrowseEntry`, whose return types differ for exactly this reason).
+ */
+function readDirectoryManifest(dir: string): DirectoryManifestRead {
+  let manifest: ExportManifest;
+  try {
+    // readManifest is the existing chokepoint: it parses AND runs the
+    // session-id safety assertion, so surfaced ids stay path-safe here too.
+    manifest = readManifest(dir);
+  } catch (e) {
+    return { ok: false, detail: (e as Error).message };
+  }
+  if (!isBundleManifestShape(manifest)) {
     return {
-      name,
-      path: archivePath,
-      exportedAt: null,
-      sourcePlatform: null,
-      sourceProjectPath: null,
-      sessionCount: null,
-      sessions: [],
-      storage,
-      metadataAvailable: false,
-      metadataError: r.detail,
+      ok: false,
+      detail:
+        'manifest.json is not a sesh-mover bundle manifest (needs plugin "sesh-mover" and a sessions array)',
     };
   }
-  return {
-    name,
-    path: archivePath,
-    exportedAt: r.manifest.exportedAt,
-    sourcePlatform: r.manifest.sourcePlatform,
-    sourceProjectPath: r.manifest.sourceProjectPath,
-    sessionCount: r.manifest.sessions.length,
-    sessions: r.manifest.sessions,
-    storage,
-    metadataAvailable: true,
-  };
+  return { ok: true, manifest };
+}
+
+/**
+ * One STORE directory (`~/.sesh-mover/<name>` or `<cwd>/.sesh-mover/<name>`)
+ * -> one browse entry, ALWAYS. The non-nullable return type is the point: a
+ * store directory that has a `manifest.json` can never be dropped from the
+ * listing.
+ *
+ * Inside a store directory a `manifest.json` is OURS BY CONSTRUCTION, so one
+ * that won't read is a broken export, not a stranger. It degrades — same row
+ * shape an unreadable archive has produced since v0.5.1 — instead of vanishing
+ * and leaving the user with nothing to look at (#33).
+ */
+function storeDirectoryBrowseEntry(
+  dirPath: string,
+  name: string,
+  storage: StorageScope
+): BrowseResult["exports"][number] {
+  const r = readDirectoryManifest(dirPath);
+  return r.ok
+    ? readableBrowseEntry(name, dirPath, storage, r.manifest)
+    : degradedBrowseEntry(name, dirPath, storage, r.detail);
+}
+
+/**
+ * One CWD directory -> a browse entry, or `null` meaning "not one of ours, say
+ * nothing". That nullable return is the entire difference from
+ * `storeDirectoryBrowseEntry`, and it is load-bearing rather than incidental.
+ *
+ * A project root is full of directories that carry a `manifest.json` and have
+ * nothing to do with sesh-mover (npm package dirs, build output, other tools'
+ * bundles). Here, reading that file IS the "is this even a sesh-mover export?"
+ * test — so a failed read is a NEGATIVE ANSWER to that question, not a broken
+ * export. Degrading here would list every stranger in the user's project root
+ * as a broken export, which is worse than the bug #33 fixes.
+ *
+ * If you have come here to make the two directory paths symmetric: this is the
+ * one that stays as it is. `tests/cli.test.ts` guards it.
+ */
+function cwdDirectoryBrowseEntry(
+  dirPath: string,
+  name: string
+): BrowseResult["exports"][number] | null {
+  const r = readDirectoryManifest(dirPath);
+  return r.ok ? readableBrowseEntry(name, dirPath, "project", r.manifest) : null;
 }
 
 /**
@@ -390,24 +520,14 @@ program
       for (const { dir, storage } of searchDirs) {
         const entries = readdirSync(dir);
         for (const entry of entries) {
+          // The presence of a manifest.json is what makes a directory an
+          // export CLAIM. No manifest.json at all (a plain subdirectory, or
+          // this dir's own config.json / locks/ / sync-state/) is not an
+          // export and is not listed; a manifest.json that won't read is a
+          // broken export and IS listed, degraded.
           const manifestPath = join(dir, entry, "manifest.json");
           if (existsSync(manifestPath)) {
-            try {
-              const manifest = readManifest(join(dir, entry));
-              exports.push({
-                name: entry,
-                path: join(dir, entry),
-                exportedAt: manifest.exportedAt,
-                sourcePlatform: manifest.sourcePlatform,
-                sourceProjectPath: manifest.sourceProjectPath,
-                sessionCount: manifest.sessions.length,
-                sessions: manifest.sessions,
-                storage,
-                metadataAvailable: true,
-              });
-            } catch {
-              // Skip malformed exports
-            }
+            exports.push(storeDirectoryBrowseEntry(join(dir, entry), entry, storage));
           }
         }
       }
@@ -437,27 +557,13 @@ program
         for (const entry of cwdEntries) {
           if (entry === PROJECT_DIR_NAME) continue; // already scanned above
           const entryPath = join(cwd, entry);
-          // Check for export directories with manifest.json
+          // Check for export directories with manifest.json. Unlike the store
+          // scan above, an unreadable or non-sesh-mover manifest here is
+          // silently skipped, never degraded — see cwdDirectoryBrowseEntry.
           const manifestPath = join(entryPath, "manifest.json");
           if (existsSync(manifestPath)) {
-            try {
-              const manifest = readManifest(entryPath);
-              if (manifest.plugin === "sesh-mover") {
-                exports.push({
-                  name: entry,
-                  path: entryPath,
-                  exportedAt: manifest.exportedAt,
-                  sourcePlatform: manifest.sourcePlatform,
-                  sourceProjectPath: manifest.sourceProjectPath,
-                  sessionCount: manifest.sessions.length,
-                  sessions: manifest.sessions,
-                  storage: "project",
-                  metadataAvailable: true,
-                });
-              }
-            } catch {
-              // Not a sesh-mover export, skip
-            }
+            const cwdEntry = cwdDirectoryBrowseEntry(entryPath, entry);
+            if (cwdEntry !== null) exports.push(cwdEntry);
           }
           // Check for archive files
           if (entry.endsWith(".tar.gz") || entry.endsWith(".tar.zst")) {

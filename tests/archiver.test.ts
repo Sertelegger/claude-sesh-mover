@@ -7,6 +7,7 @@ import {
   existsSync,
   readFileSync,
   readdirSync,
+  statSync,
   mkdirSync as mkdirSyncFs,
   chmodSync,
   symlinkSync,
@@ -18,9 +19,14 @@ import { overrideTmp, type TmpOverrideHandle } from "./helpers/env.js";
 
 /**
  * Install a fake `zstd` on PATH that implements the exact invocations the
- * archiver uses (`--version`, `-f <in> -o <out>`, `-d <in> -o <out>`) via cp.
+ * archiver uses (`--version`, `-f <in> -o <out>`, `-d --stdout <in>`).
  * Compression is faked (output = input), which is fine: the ".tar.zst" the
- * shim produces is a plain tar, and the shim's -d copies it back.
+ * shim produces is a plain tar, and the shim's -d writes it straight back out.
+ *
+ * The decompression form is pinned here deliberately. It has to be a STREAM
+ * (`--stdout`) rather than the older file-to-file `-d <in> -o <out>`, because
+ * a size bound that only gets to look at the result is a bound that has
+ * already paid for it — see the decompression-limit tests below.
  */
 function installZstdShim(tempDir: string): string {
   const binDir = join(tempDir, "shim-bin");
@@ -29,10 +35,7 @@ function installZstdShim(tempDir: string): string {
     "#!/bin/sh",
     'if [ "$1" = "--version" ]; then echo "zstd 1.5.5-fake"; exit 0; fi',
     'if [ "$1" = "-f" ]; then cp "$2" "$4"; exit 0; fi',
-    'if [ "$1" = "-d" ]; then',
-    '  if [ -e "$4" ]; then echo "exists" >&2; exit 70; fi',
-    '  cp "$2" "$4"; exit 0',
-    "fi",
+    'if [ "$1" = "-d" ] && [ "$2" = "--stdout" ]; then cat "$3"; exit 0; fi',
     "exit 64",
     "",
   ].join("\n");
@@ -355,6 +358,227 @@ describe("archiver", () => {
       mkdirSync(out2, { recursive: true });
       await extractArchive(normal, out2, quiet);
       expect(quiet).toEqual([]);
+    });
+  });
+
+  /**
+   * What a hostile archive costs to merely LOOK at. `browse` is not an opt-in
+   * for this — `/sesh-mover:import` runs it to build its picker — so the price
+   * of reading metadata is the price of opening a menu, eight archives at a
+   * time.
+   *
+   * The `.tar.gz` half is already covered for free by node-tar's own
+   * `MAX_DECOMPRESSION_RATIO`. These are the two places nothing was covering:
+   * the zstd CLI, which happily writes whatever a frame decodes to, and the
+   * manifest itself, which used to be written to disk and only then measured.
+   */
+  describe("bounded decompression when reading archive metadata", () => {
+    /**
+     * Half a gigabyte of zeros, which the real zstd turns into ~16 KB — the
+     * ratio measured on the bundle that prompted #32 (~32,000:1). Streamed
+     * through zstd's stdin rather than compressed from a file, for two
+     * reasons: nothing 512 MB wide ever touches the disk, and the resulting
+     * frame carries NO declared content size, which is exactly the shape a
+     * `zstd -l` pre-check cannot bound (see the header assertions below).
+     */
+    const BOMB_UNCOMPRESSED_BYTES = 512 * 1024 * 1024;
+
+    async function writeZstdBomb(path: string): Promise<void> {
+      const { spawn } = await import("node:child_process");
+      const child = spawn("zstd", ["-f", "-o", path], { stdio: ["pipe", "ignore", "ignore"] });
+      const done = new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code) =>
+          code === 0 ? resolve() : reject(new Error(`zstd exited ${code} building the bomb`))
+        );
+      });
+      const chunk = Buffer.alloc(8 * 1024 * 1024);
+      for (let written = 0; written < BOMB_UNCOMPRESSED_BYTES; written += chunk.length) {
+        if (!child.stdin.write(chunk)) {
+          await new Promise((r) => child.stdin.once("drain", r));
+        }
+      }
+      child.stdin.end();
+      await done;
+    }
+
+    /** Bytes of real file content under `dir`, tolerant of files vanishing mid-walk. */
+    function treeBytes(dir: string): number {
+      let total = 0;
+      let entries: ReturnType<typeof readdirSync>;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true }) as never;
+      } catch {
+        return 0; // raced with the scratch dir's own cleanup
+      }
+      for (const e of entries as unknown as { name: string; isDirectory(): boolean }[]) {
+        const p = join(dir, e.name);
+        try {
+          total += e.isDirectory() ? treeBytes(p) : statSync(p).size;
+        } catch {
+          /* same race, one file down */
+        }
+      }
+      return total;
+    }
+
+    /**
+     * Run `work` while sampling how large `dir` gets. The whole defect is a
+     * transient cost — 500 MB written and then deleted by the same call — so
+     * an assertion made after the call returns would measure an empty
+     * directory and pass against the bug.
+     */
+    async function peakWhile<T>(
+      dir: string,
+      work: () => Promise<T>
+    ): Promise<{ result: T; peak: number }> {
+      let peak = 0;
+      let running = true;
+      const sample = (): void => {
+        peak = Math.max(peak, treeBytes(dir));
+      };
+      const watcher = (async () => {
+        while (running) {
+          sample();
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        sample();
+      })();
+      let result: T;
+      try {
+        result = await work();
+      } finally {
+        running = false;
+        await watcher;
+      }
+      return { result, peak };
+    }
+
+    it("states the budget as a ratio with a floor", async () => {
+      const { zstdDecompressionLimit } = await import("../src/archiver.js");
+      // A tiny bundle is mostly tar padding and compresses to almost nothing,
+      // so the floor is what keeps the ratio from refusing a legitimate one.
+      expect(zstdDecompressionLimit(200)).toBe(1024 * 1024);
+      // Above the floor it is 1000x the compressed size — deliberately the
+      // same number node-tar's Parser enforces on the .tar.gz path, so what
+      // `browse` will and won't open does not depend on the format it meets.
+      expect(zstdDecompressionLimit(16 * 1024)).toBe(16 * 1024 * 1000);
+    });
+
+    it("refuses a zstd bomb during a metadata read instead of expanding it", async () => {
+      const { readManifestFromArchive, isZstdAvailable, zstdDecompressionLimit } = await import(
+        "../src/archiver.js"
+      );
+      if (!(await isZstdAvailable())) return; // no zstd on this runner — nothing to measure
+
+      const bomb = join(tempDir, "bomb.tar.zst");
+      await writeZstdBomb(bomb);
+      const compressed = statSync(bomb).size;
+      // It really is a bomb: 512 MB in, this many bytes out.
+      expect(compressed).toBeLessThan(64 * 1024);
+
+      // And it declares no decompressed size at all, which is why the bound
+      // cannot be read out of the frame. Frame_Header_Descriptor (RFC 8878
+      // §3.1.1.1): Frame_Content_Size_flag is bits 6-7, Single_Segment_flag is
+      // bit 5. Both zero means the field is simply absent — measured, `zstd -l`
+      // on such a frame prints an EMPTY Uncompressed column and exits 0, so a
+      // pre-check would have read a blank and let this through.
+      const head = readFileSync(bomb).subarray(0, 5);
+      expect(head.readUInt32LE(0)).toBe(0xfd2fb528);
+      expect(head[4] >> 6).toBe(0);
+      expect(head[4] & 0x20).toBe(0);
+
+      const tmpRoot = join(tempDir, "bomb-tmp");
+      mkdirSync(tmpRoot, { recursive: true });
+      let tmp: TmpOverrideHandle | undefined;
+      try {
+        tmp = overrideTmp(tmpRoot);
+        expect(tmpdir()).toBe(tmpRoot); // positive control for the peak below
+        const { result, peak } = await peakWhile(tmpRoot, () => readManifestFromArchive(bomb));
+
+        // The existing degraded shape, not a throw: browse batches these, and
+        // one rejection would take a whole listing down with it.
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.reason).toBe("unreadable");
+          expect(result.detail).toMatch(/expands to more than/i);
+        }
+        // The point of the exercise: the disk cost was never paid.
+        expect(peak).toBeLessThanOrEqual(zstdDecompressionLimit(compressed));
+        expect(peak).toBeLessThan(BOMB_UNCOMPRESSED_BYTES / 8);
+        // ...and nothing was left behind holding what little was written.
+        expect(readdirSync(tmpRoot)).toEqual([]);
+      } finally {
+        tmp?.restore();
+      }
+    });
+
+    it("bounds the same decompression when the archive is explicitly unpacked", async () => {
+      const { extractArchive, isZstdAvailable, zstdDecompressionLimit } = await import(
+        "../src/archiver.js"
+      );
+      if (!(await isZstdAvailable())) return;
+      // Import is a deliberate "unpack this", so it is lower-stakes than the
+      // browse path — but it shares one decompressZstd with it, and the bound
+      // is a ratio, so a real bundle never notices. Leaving this half unbounded
+      // would mean two zstd invocations and only one of them guarded.
+      const bomb = join(tempDir, "extract-bomb.tar.zst");
+      await writeZstdBomb(bomb);
+      const compressed = statSync(bomb).size;
+
+      const tmpRoot = join(tempDir, "extract-bomb-tmp");
+      mkdirSync(tmpRoot, { recursive: true });
+      const out = join(tempDir, "extract-bomb-out");
+      mkdirSync(out, { recursive: true });
+      let tmp: TmpOverrideHandle | undefined;
+      try {
+        tmp = overrideTmp(tmpRoot);
+        const { peak } = await peakWhile(tmpRoot, async () => {
+          await expect(extractArchive(bomb, out)).rejects.toThrow(/expands to more than/i);
+        });
+        expect(peak).toBeLessThanOrEqual(zstdDecompressionLimit(compressed));
+        expect(readdirSync(out)).toEqual([]);
+        expect(readdirSync(tmpRoot)).toEqual([]);
+      } finally {
+        tmp?.restore();
+      }
+    });
+
+    it("refuses an implausibly large manifest from its tar header, before writing it", async () => {
+      const { createArchive, readManifestFromArchive } = await import("../src/archiver.js");
+      // Format-independent, so this runs on a machine with no zstd: the
+      // .tar.gz path is bounded in the aggregate by node-tar, but a manifest
+      // inside that budget was still extracted to disk in full and only THEN
+      // measured with statSync. A tar entry's declared size is not a hint —
+      // it is exactly how many bytes the parser will hand over — so it can be
+      // refused from the listing pass instead.
+      const staging = join(tempDir, "fat-manifest");
+      mkdirSync(staging, { recursive: true });
+      const fat = {
+        version: 1,
+        plugin: "sesh-mover",
+        sessions: [],
+        padding: "x".repeat(2 * 1024 * 1024),
+      };
+      writeFileSync(join(staging, "manifest.json"), JSON.stringify(fat));
+      const archive = join(tempDir, "fat-manifest.tar.gz");
+      await createArchive(staging, archive, "gzip");
+
+      const tmpRoot = join(tempDir, "fat-tmp");
+      mkdirSync(tmpRoot, { recursive: true });
+      let tmp: TmpOverrideHandle | undefined;
+      try {
+        tmp = overrideTmp(tmpRoot);
+        const { result, peak } = await peakWhile(tmpRoot, () => readManifestFromArchive(archive));
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.reason).toBe("unreadable");
+          expect(result.detail).toMatch(/implausibly large/i);
+        }
+        expect(peak).toBeLessThan(1024 * 1024);
+      } finally {
+        tmp?.restore();
+      }
     });
   });
 

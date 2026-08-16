@@ -355,4 +355,76 @@ describe("hub reindex", () => {
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
     }
   });
+
+  /**
+   * The executable half of reindex.ts's "Run push (with --create-project or
+   * --project-id) to link and publish this project to the hub first." — the
+   * sibling test above proves the refusal happens; this one proves the advice
+   * is followable.
+   *
+   * The unlinked check is the very first thing `hubReindex` does: it returns
+   * before the project lock, before the temp dir, before `registerMachine` and
+   * before any hub read, so nothing is recorded and nothing is foreclosed. The
+   * remedy names a DIFFERENT command (push), which is what makes it reachable
+   * at all — and once that push has linked and published the project, the
+   * identical reindex invocation rebuilds the index.
+   *
+   * Unlike the sibling refusal test this needs a REAL project directory, since
+   * linking writes `.sesh-mover-project.json` under the project root.
+   */
+  it("refuses an unlinked project, and reindex works once push has linked it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      // Never linked — no push has run against this project yet.
+      const refused = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(refused.success).toBe(false);
+      if (refused.success) return;
+      expect(refused.error).toMatch(/not linked/i);
+      expect(refused.suggestion).toContain("--create-project");
+
+      // Follow the advice: the flag belongs to push, not to reindex.
+      const pushed = await hubPush({
+        configDir,
+        projectPath,
+        hubPath: hub,
+        createProject: true,
+        claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      // Drop the index the push wrote, so the re-run below has something to
+      // rebuild and "succeeded" cannot mean "found the file already there".
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      await backend.delete(indexPath(pushed.projectId, machine.id));
+      expect(await readMachineIndex(backend, pushed.projectId, machine.id)).toBeNull();
+
+      // The identical reindex invocation, now that the link exists.
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.projects).toEqual([
+        { projectId: pushed.projectId, threads: 1, bundlesScanned: 1 },
+      ]);
+      expect(result.warnings).toEqual([]);
+
+      const rebuilt = await readMachineIndex(backend, pushed.projectId, machine.id);
+      expect(rebuilt).not.toBeNull();
+      if (!rebuilt) return;
+      expect(rebuilt.projectId).toBe(pushed.projectId);
+      expect(Object.keys(rebuilt.threads)).toHaveLength(1);
+      expect(Object.values(rebuilt.threads)[0].bundles).toHaveLength(1);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
 });

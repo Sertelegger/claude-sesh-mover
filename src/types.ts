@@ -544,9 +544,15 @@ export interface BrowseResult {
   exports: Array<{
     name: string;
     path: string;
-    // Archive entries whose manifest could not be read report null for every
+    // An entry whose manifest could not be read reports null for every
     // manifest-derived field rather than a fabricated value (the browsing
     // machine's platform, "", 0). `metadataAvailable` says which case it is.
+    // True of ARCHIVES and of DIRECTORY exports found in a `.sesh-mover` store
+    // dir alike (#33) — the row shape is identical, so no consumer has to know
+    // which kind it got. The one asymmetry is upstream of this shape and stays
+    // there: a directory in the project root whose manifest won't read is not
+    // listed at all, because reading it is the only test of whether it was
+    // ever an export. See `cwdDirectoryBrowseEntry` in cli.ts.
     exportedAt: string | null;
     sourcePlatform: Platform | null;
     sourceProjectPath: string | null;

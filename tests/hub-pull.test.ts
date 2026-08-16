@@ -931,6 +931,85 @@ describe("hub pull", () => {
     }
   });
 
+  /**
+   * The two tests above, fused into ONE fixture, because the fusion is the
+   * claim: `--force-workspace` is advertised as a *re-run* remedy, and a remedy
+   * is only real if the refusal it follows left the pull re-runnable. The
+   * workspace refusal aborts before the record stage, so no bundle is marked
+   * received and the identical second invocation still finds the same payload
+   * on the hub. Two separate tests, each with its own fresh hub, cannot observe
+   * that — they would pass just as happily if the first pull had consumed the
+   * chain.
+   */
+  it("refuses a non-empty --target-path, and --force-workspace overrides it", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-pull-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-pull-fix-"));
+    let identityAnchorB: string | undefined;
+    let targetPath: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-ws");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushResult = await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushResult.success).toBe(true);
+      if (!pushResult.success) return;
+      expect(pushResult.hasWorkspace).toBe(true);
+
+      restore.restore();
+      restore = overrideHome(homeB);
+
+      const configDirB = join(homeB, ".claude");
+      identityAnchorB = mkdtempSync(join(tmpdir(), "sesh-pull-identB-"));
+      targetPath = mkdtempSync(join(tmpdir(), "sesh-pull-retry-"));
+      writeFileSync(join(targetPath, "README.md"), "stale\n"); // collides with the pushed workspace file
+      writeFileSync(join(targetPath, "keep.txt"), "untouched\n");
+
+      const opts: HubPullOptions = {
+        configDir: configDirB, projectPath: identityAnchorB, hubPath: hub,
+        targetPath, latest: true,
+        projectIdOverride: pushResult.projectId,
+        claudeVersion: "2.1.81",
+      };
+
+      // 1) The user named this destination explicitly and it is non-empty:
+      //    refuse loudly rather than silently skipping the unpack.
+      const refused = await hubPull(opts);
+      expect(refused.success).toBe(false);
+      if (refused.success) return;
+      expect((refused as { suggestion?: string }).suggestion).toContain("--force-workspace");
+      // The refusal is terminal AND clean: no session import, no project dir,
+      // and not one byte written into the destination.
+      expect(existsSync(join(configDirB, "projects", encodeProjectPath(targetPath)))).toBe(false);
+      expect(readFileSync(join(targetPath, "README.md"), "utf-8")).toBe("stale\n");
+      expect(readFileSync(join(targetPath, "keep.txt"), "utf-8")).toBe("untouched\n");
+
+      // 2) THE SAME invocation plus the flag the refusal advised. It must reach
+      //    the very same payload — if the refused run had recorded the bundle,
+      //    this would come back with nothing to apply.
+      const forced = await hubPull({ ...opts, forceWorkspace: true });
+      expect(forced.success).toBe(true);
+      if (!forced.success) return;
+      const p = forced as HubPullResult;
+      expect(p.workspaceUnpacked).not.toBeNull();
+      expect(p.workspaceUnpacked!.path).toBe(targetPath);
+      expect(p.importedSessions).toHaveLength(1);
+      // Incoming content wins the collision; unrelated local files survive.
+      expect(readFileSync(join(targetPath, "README.md"), "utf-8")).toBe("hello\n");
+      expect(readFileSync(join(targetPath, "keep.txt"), "utf-8")).toBe("untouched\n");
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (identityAnchorB) rmSync(identityAnchorB, { recursive: true, force: true });
+      if (targetPath) rmSync(targetPath, { recursive: true, force: true });
+    }
+  });
+
   it("in-place bootstrap: fresh dir + --project-id + NO target-path unpacks the workspace despite the just-planted metadata", async () => {
     const homeA = mkdtempSync(join(tmpdir(), "sesh-pull-homeA-"));
     const homeB = mkdtempSync(join(tmpdir(), "sesh-pull-homeB-"));

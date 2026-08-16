@@ -687,6 +687,47 @@ describe("resolve stage", () => {
   });
 
   /**
+   * The refusal and its advised remedy in ONE test, because the pairing is the
+   * claim: `HubUnlinkedResult`'s suggestion tells the user to re-run with
+   * `--project-id`, and that is only true if the refusal left the project
+   * re-runnable. The escape returns before `registerMachine` and links nothing,
+   * so the identical input plus the override links and proceeds. Two separate
+   * tests with two `beforeEach` fixtures cannot observe that — they would pass
+   * even if the refusal had half-linked the project on its way out.
+   */
+  it("refuses an unlinked project, and --project-id links it on the re-run", async () => {
+    writePeerIndex();
+
+    // 1) No local link, and no git remote to match a hub project by: refuse,
+    //    handing back the candidates the user is meant to choose from.
+    const refused = await runResolveStage(input());
+
+    expect(refused.kind).toBe("return");
+    if (refused.kind !== "return") return;
+    expect(refused.result).toEqual({
+      success: false,
+      command: "pull",
+      reason: "unlinked",
+      linkCandidates: [CANDIDATE],
+      suggestion: "Pass --project-id <id> to link to an existing hub project.",
+    });
+    expect(refused.result.suggestion).toContain("--project-id");
+    // Nothing was linked and no machine registered — the state the re-run needs.
+    expect(existsSync(localProjectIdPath(projectPath))).toBe(false);
+    expect(existsSync(join(hubDir, "machines"))).toBe(false);
+
+    // 2) THE SAME input plus the id the refusal advised. It links, registers,
+    //    and resolves the threads the first call never got to.
+    const linked = await runResolveStage(input({ projectIdOverride: PROJECT_ID }));
+
+    expect(linked.kind).toBe("proceed");
+    if (linked.kind !== "proceed") return;
+    expect(linked.value.local).toMatchObject({ projectId: PROJECT_ID, name: CANDIDATE.name });
+    expect(existsSync(localProjectIdPath(projectPath))).toBe(true);
+    expect(linked.value.resolved.map((t) => t.threadId)).toEqual(["t-1"]);
+  });
+
+  /**
    * `readAllIndexes`'s warnings are the stage's `reasons` — the caller spreads
    * them into `warnings` at the point the old inline `warnings.push` sat, so a
    * corrupt peer index still reaches the user.
