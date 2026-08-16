@@ -2,6 +2,13 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { SyncState } from "../types.js";
 import type { HubBundleRecord, HubIndexJson } from "./layout.js";
+// TYPE-ONLY, and it has to be: pull-select.ts imports this module for real, so
+// a value import here would close a runtime cycle. `import type` is erased by
+// tsc, so dist/hub/threads.js requires nothing from the stage. The pairing is
+// defined there because that is where it is produced and consumed; defining a
+// structurally identical second copy here is the duplication this repo keeps
+// finding at the bottom of its own defects.
+import type { SourcedBundle } from "./pull-select.js";
 
 export interface ThreadCopy {
   machineId: string;
@@ -79,6 +86,26 @@ export function resolveThreads(indexes: HubIndexJson[]): ResolvedThread[] {
     return a.threadId < b.threadId ? -1 : a.threadId > b.threadId ? 1 : 0;
   });
   return resolved;
+}
+
+/**
+ * THE LINK RULE, in one place: `""` is never a link, on either side.
+ *
+ * Both a bundle's `headEntryUuid` and the `anchorEntryUuid` that names it can
+ * legitimately be `""` — `readLastEntryUuid(...) ?? ""` is how both index
+ * writers spell a head, and it returns `null` when the bounded tail scan finds
+ * no conversation entry (a bundle boundary landing on a run of uuid-less
+ * bookkeeping lines). Two empty strings are not a match: treating them as one
+ * would silently join two unrelated bundles, and a head-keyed map that admitted
+ * `""` as a key would let two empty-headed records collide so that one vanishes
+ * from the chain entirely.
+ *
+ * Used by `findUnfetchableBundles`'s recorded-head comparison and by
+ * `assembleChain`'s walk, deliberately as ONE function rather than two inline
+ * spellings of the same sentence.
+ */
+function isLinkUuid(uuid: string | null | undefined): uuid is string {
+  return typeof uuid === "string" && uuid !== "";
 }
 
 /** One machine's bundles for a thread that a given pull cannot fetch. */
@@ -166,8 +193,11 @@ export function findUnfetchableBundles(args: {
       const rec = peer?.received?.[r.sessionIdInBundle];
       const heldHead = rec ? peer?.sent[rec.localSessionId]?.headEntryUuid : undefined;
       // Both sides can legitimately be "" (a bundle boundary landing on a
-      // uuid-less bookkeeping line), and two empty strings are not a match.
-      if (heldHead && r.headEntryUuid && heldHead === r.headEntryUuid) consumedThrough = i;
+      // uuid-less bookkeeping line), and two empty strings are not a match —
+      // `isLinkUuid` is that rule, shared with the assembly walk.
+      if (isLinkUuid(heldHead) && isLinkUuid(r.headEntryUuid) && heldHead === r.headEntryUuid) {
+        consumedThrough = i;
+      }
     }
 
     const ids = byMachine.get(c.machineId) ?? [];
@@ -284,4 +314,464 @@ export function pullSourceFor(
   ).length > 0
     ? t.latest
     : undefined;
+}
+
+// ---- Chain assembly (#35) -------------------------------------------------
+
+/** Why the walk stopped where it did. Four different facts, never merged. */
+export type ChainStop =
+  /** Nothing anchors on the last record's head: whole, as far as the hub shows. */
+  | "end"
+  /** That head is `""`, so no successor can ever be matched to it (§4.3). */
+  | "empty-head"
+  /** The next record was already in this chain — a damaged or hostile index. */
+  | "cycle"
+  /** No record could start a chain at all, so there is nothing to walk. */
+  | "no-root";
+
+/** How a branch or a root was picked when more than one was available. */
+export type ChainChoice =
+  /** Only one candidate existed. */
+  | "sole"
+  /** Exactly one candidate reaches the head this machine's own copy sits at. */
+  | "local-base"
+  /** No local base to go on, so the candidate reaching the most bundles won. */
+  | "longest"
+  /** Even that tied; broken on bundle id ascending — arbitrary, but stable. */
+  | "bundle-id"
+  /** Nothing to choose between: there were no candidates. */
+  | "none";
+
+/** A record whose anchor names a head no record in this thread ships. */
+export interface ChainGap {
+  /**
+   * The anchor that matched nothing. `""` is one of them: it can never match,
+   * by the empty-head rule, so a record carrying it is stranded exactly as if
+   * its predecessor were missing (no writer of ours emits it — see
+   * `HubBundleRecord.anchorEntryUuid`).
+   */
+  anchorEntryUuid: string;
+  /** The machine listing the stranded record, and the record itself. */
+  machineId: string;
+  bundleId: string;
+  /**
+   * That record plus everything that chains onto it — what this one gap
+   * strands. Its length is the "N later bundles unreachable" count.
+   */
+  strandedBundleIds: string[];
+}
+
+/** A branch not taken at a fork, with everything behind it. */
+export interface ChainBranch {
+  machineId: string;
+  bundleId: string;
+  /** The branch's first record and every record reachable from it. */
+  bundleIds: string[];
+}
+
+/** Two or more records claiming to continue one head. */
+export interface ChainFork {
+  /** The head they share. Never `""` — that is a gap, not a fork. */
+  anchorEntryUuid: string;
+  /** The branch this plan follows, by its first bundle id. */
+  followedBundleId: string;
+  /** Why that one. Never `"sole"`/`"none"`: a fork has at least two branches. */
+  reason: ChainChoice;
+  /** Every branch this plan parked, stated order (bundle id ascending). */
+  parked: ChainBranch[];
+}
+
+/** A record that starts a chain. Several per thread is ORDINARY — see below. */
+export interface ChainRoot {
+  machineId: string;
+  bundleId: string;
+  /**
+   * Everything reachable from this root, this record included, bundle id
+   * ascending. For a root whose chain forks this covers BOTH branches, so it is
+   * "what this starting point could reach", not "what the plan applies".
+   */
+  bundleIds: string[];
+  /** True for the one root `chain` starts at. */
+  followed: boolean;
+  /**
+   * A record carrying no `anchorEntryUuid` key at all: pushed before chain
+   * assembly existed. Still a root — `type` is what says so — but nothing can
+   * ever be proven to chain onto it, so its chain ends where its head does.
+   */
+  preAssembly: boolean;
+}
+
+/**
+ * A CONTINUATION naming no anchor at all, and so unlinkable by construction.
+ *
+ * Deliberately not a `ChainGap`. "This bundle was pushed before chain assembly
+ * existed" and "a bundle is missing" are different sentences, and only one of
+ * them describes something that could be repaired by finding it (spec §0b).
+ *
+ * Deliberately not a root either. A `continuation` is a delta; starting a chain
+ * at one hands the plan a transcript that begins mid-conversation, which
+ * `tryAppendContinuation`'s chain guard would refuse anyway.
+ */
+export interface UnanchoredBundle {
+  machineId: string;
+  bundleId: string;
+  /**
+   * `true` for the ordinary case — no `anchorEntryUuid` key, i.e. pushed before
+   * chain assembly existed. `false` means the index declares an explicit `null`
+   * anchor on a `continuation`, which is a contradiction no writer of ours can
+   * emit and which is therefore a damaged or hostile index, not old data.
+   */
+  preAssembly: boolean;
+}
+
+/** A machine whose advertised thread head matches no bundle anyone pushed. */
+export interface AdvertisedHead {
+  machineId: string;
+  headEntryUuid: string;
+}
+
+export interface AssembleChainInput {
+  /** Every machine's copy of ONE thread, exactly as `resolveThreads` built it. */
+  copies: ThreadCopy[];
+  /**
+   * The head of this machine's own copy of the thread, when it holds one — the
+   * only input that can decide a fork or pick among roots by something other
+   * than size. `""`/`null`/absent all mean "no local base to go on" (the empty
+   * head rule applies here too: an empty local head matches nothing).
+   */
+  localHeadEntryUuid?: string | null;
+}
+
+/** An ordered fetch plan for one thread, plus everything it could not reach. */
+export interface AssembledChain {
+  /**
+   * The plan: root first, each record chaining onto the one before it. Ordered
+   * by LINKS alone — never by `pushedAt`, which is the pushing machine's wall
+   * clock (§4.4.1) — and it may span machines, which is the whole point.
+   *
+   * Empty only when no record could start a chain (`stoppedBecause: "no-root"`).
+   * Everything else about this result describes what is NOT in here.
+   */
+  chain: SourcedBundle[];
+  stoppedBecause: ChainStop;
+  /** How the root `chain` starts at was picked out of `roots`. */
+  rootChoice: ChainChoice;
+  /**
+   * Every starting point this thread has, bundle id ascending. More than one is
+   * ORDINARY, not an anomaly: `computeIncrementalPlan` re-sends a session whole
+   * whenever the recorded head is empty or has gone (compaction, truncation, a
+   * rollback), and `push.ts` files that `full` record under the SAME thread id.
+   * Each root's chain is its own linked list and the two are never merged.
+   */
+  roots: ChainRoot[];
+  /** Forks met while walking the followed chain, in the order they were met. */
+  forks: ChainFork[];
+  /** Anchors naming a head nobody ships, bundle id ascending. */
+  gaps: ChainGap[];
+  /** Pre-assembly continuations, bundle id ascending. */
+  unanchored: UnanchoredBundle[];
+  /**
+   * Machines advertising a thread head no bundle record ships — "M advertises
+   * work it has not pushed", which is a machine's local state running ahead of
+   * what it uploaded, not a bundle missing from the hub. Tested against EVERY
+   * record, not just the followed chain: a head on a parked branch was pushed.
+   * A machine advertising `""` advertises nothing and is never listed.
+   */
+  advertisedUnshipped: AdvertisedHead[];
+  /**
+   * Every record NOT in `chain`, by bundle id, deduped and ascending — the
+   * union of everything the disclosures above name, in one list. Membership is
+   * by record, not by id, so a bundle id two machines both list still appears
+   * here if either machine's record was not applied.
+   */
+  unreachableBundleIds: string[];
+}
+
+/** Internal walk node: a sourced record plus its two link fields, read once. */
+interface ChainNode {
+  sourced: SourcedBundle;
+  /** Identity, because two machines may list the same bundle id. */
+  at: number;
+  /**
+   * Three-valued, read once: absent (pre-assembly, anchor unknown), `null` (no
+   * anchor exists), or a string (the predecessor's head — `""` included, which
+   * is a string that can never match).
+   */
+  anchor: string | null | undefined;
+  head: string;
+}
+
+function byBundleThenMachine(a: ChainNode, b: ChainNode): number {
+  const ai = a.sourced.record.bundleId;
+  const bi = b.sourced.record.bundleId;
+  if (ai !== bi) return ai < bi ? -1 : 1;
+  if (a.sourced.machineId !== b.sourced.machineId) {
+    return a.sourced.machineId < b.sourced.machineId ? -1 : 1;
+  }
+  return a.at - b.at;
+}
+
+function ascending(ids: string[]): string[] {
+  return [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * Read the three-valued anchor off a record.
+ *
+ * `in` rather than `?? null`, because absent and `null` are two different
+ * facts: `null` is "no anchor exists, this is a full bundle", absent is "this
+ * bundle predates chain assembly and its anchor is unrecoverable". The walk
+ * treats them alike (neither links), so what a collapse would destroy is the
+ * REPORT: every `preAssembly` flag on a root and on an unanchored record turns
+ * into a claim that the index is damaged, when in fact it is merely old — the
+ * one distinction spec §0b exists to preserve. Reading the value out (rather
+ * than stopping at the `in` test) also folds an explicit `{anchorEntryUuid:
+ * undefined}` — which a hand-built record can carry and JSON cannot — into the
+ * absent case, which is the same fact.
+ */
+function anchorOf(record: HubBundleRecord): string | null | undefined {
+  return "anchorEntryUuid" in record ? record.anchorEntryUuid : undefined;
+}
+
+/**
+ * Order every bundle every machine lists for one thread into a fetch plan, and
+ * name everything that could not be reached (#35, spec §4.3).
+ *
+ * PURE: no filesystem, no backend, no sync-state, and NO CLOCK. Ordering comes
+ * from the link structure alone. `pushedAt` is read nowhere in this function —
+ * the hub stamps nothing, so it is the pushing machine's wall clock, and
+ * ordering two machines' records by it reinstated a measured silent revert
+ * under skew (§4.4.1). The fixtures make `pushedAt` DESCEND in link order so
+ * that an implementation which sorts by it fails rather than passing by luck.
+ *
+ * IT LINKS ON `anchorEntryUuid`, NEVER ON `fromEntryUuid`. Measured: `diff.ts`
+ * writes `fromEntryUuid` as `entries[headIndex + 1].uuid`, the first entry the
+ * delta SHIPS — the anchor's child, which equals no record's head, ever. A
+ * head-keyed map walked over `fromEntryUuid` finds zero links on any real hub;
+ * that is the whole of spec §0b and the reason the anchor field exists.
+ * `fromEntryUuid` is not read here at all.
+ *
+ * THE OUTPUT IS A SEPARATE STRUCTURE and stays one (§4.4.2): nothing here
+ * writes back into any `ThreadCopy.bundles`, because a machine's stored bundle
+ * list being its OWN pushes in push order is what the `basedOn` merge-ancestor
+ * walk relies on.
+ *
+ * WHAT IT DOES NOT DO. It does not know what this machine has already received
+ * — `selectNeededBundles` is still the per-record receipt filter and runs over
+ * this plan. It does not resolve hub-vs-LOCAL divergence either: that is
+ * `hub.onDivergence`, it is per bundle, it is evaluated in the apply stage
+ * against a local transcript this function cannot see, and it is not an input
+ * here. Branch-vs-branch (below) is a different question with the same shape,
+ * which is exactly why the two must not be confused.
+ */
+export function assembleChain(input: AssembleChainInput): AssembledChain {
+  const { copies, localHeadEntryUuid } = input;
+
+  const nodes: ChainNode[] = [];
+  for (const copy of copies) {
+    for (const record of copy.bundles) {
+      nodes.push({
+        sourced: { machineId: copy.machineId, record },
+        at: nodes.length,
+        anchor: anchorOf(record),
+        head: record.headEntryUuid,
+      });
+    }
+  }
+
+  // A SET of heads, not a map: two records may legitimately ship the same head
+  // (the same session pushed twice, a damaged index), and a head->record map
+  // would silently drop one of them. Nothing here needs to go from a head back
+  // to its record — the walk goes forward, from a head to the records that
+  // anchor ON it.
+  const shippedHeads = new Set<string>();
+  for (const n of nodes) if (isLinkUuid(n.head)) shippedHeads.add(n.head);
+
+  const successors = new Map<string, ChainNode[]>();
+  for (const n of nodes) {
+    if (!isLinkUuid(n.anchor)) continue; // `""` and a missing anchor link nothing
+    successors.set(n.anchor, [...(successors.get(n.anchor) ?? []), n]);
+  }
+  // Stated order, never index-file iteration order: this decides which branch a
+  // fork tie picks, and that reaches a user.
+  for (const list of successors.values()) list.sort(byBundleThenMachine);
+
+  const reachFrom = (start: ChainNode): ChainNode[] => {
+    const seen = new Set<number>([start.at]);
+    const out = [start];
+    for (let i = 0; i < out.length; i++) {
+      const cur = out[i];
+      if (!isLinkUuid(cur.head)) continue;
+      for (const next of successors.get(cur.head) ?? []) {
+        if (seen.has(next.at)) continue;
+        seen.add(next.at);
+        out.push(next);
+      }
+    }
+    return out;
+  };
+
+  // A root is a record that names no anchor AND is a full bundle. `type` is the
+  // deciding half and the reason is spec §0b's correction: a pre-assembly FULL
+  // record has no `anchorEntryUuid` key either, so absence alone cannot tell a
+  // starting point from an orphan. Both spellings of "no anchor" are admitted
+  // (`null` = none exists, absent = unknown) because for a full bundle they say
+  // the same thing; a CONTINUATION spelling either is not promoted, since
+  // starting a chain at a delta hands the plan a transcript that begins
+  // mid-conversation.
+  const rootNodes = nodes
+    .filter((n) => n.anchor == null && n.sourced.record.type === "full")
+    .sort(byBundleThenMachine);
+
+  const localHead = isLinkUuid(localHeadEntryUuid) ? localHeadEntryUuid : null;
+  const sitsOnLocalBase = (candidate: ChainNode): boolean =>
+    localHead !== null && reachFrom(candidate).some((n) => n.head === localHead);
+
+  /**
+   * Pick one of several candidates, and say why.
+   *
+   * Preference order, and the order is the spec's: the branch this machine's
+   * own copy already sits on (so the pull continues the transcript it has),
+   * then the branch that reaches the most bundles, then bundle id ascending.
+   * "Longest", never "newest" — any notion of newest here would have to come
+   * from `pushedAt`. The candidate list arrives bundle-id ascending, so the
+   * final tiebreak is `[0]`: arbitrary as a preference and stable, which is the
+   * property being bought (the same one `newerThreadCopy`'s last key buys).
+   */
+  const choose = (candidates: ChainNode[]): { node: ChainNode; reason: ChainChoice } => {
+    if (candidates.length === 0) throw new Error("assembleChain: no candidate to choose");
+    if (candidates.length === 1) return { node: candidates[0], reason: "sole" };
+    const onBase = candidates.filter(sitsOnLocalBase);
+    // Exactly one: two branches both carrying the local head is ambiguous
+    // rather than decisive, so it falls through to size like any other unknown.
+    if (onBase.length === 1) return { node: onBase[0], reason: "local-base" };
+    const sized = candidates.map((node) => ({ node, size: reachFrom(node).length }));
+    const max = Math.max(...sized.map((s) => s.size));
+    const longest = sized.filter((s) => s.size === max);
+    return { node: longest[0].node, reason: longest.length === 1 ? "longest" : "bundle-id" };
+  };
+
+  const branchOf = (node: ChainNode): ChainBranch => ({
+    machineId: node.sourced.machineId,
+    bundleId: node.sourced.record.bundleId,
+    bundleIds: ascending(reachFrom(node).map((n) => n.sourced.record.bundleId)),
+  });
+
+  const forks: ChainFork[] = [];
+  const chain: ChainNode[] = [];
+  let stoppedBecause: ChainStop = "no-root";
+  let rootChoice: ChainChoice = "none";
+  let followedRoot: ChainNode | undefined;
+
+  if (rootNodes.length > 0) {
+    const picked = choose(rootNodes);
+    followedRoot = picked.node;
+    rootChoice = picked.reason;
+
+    const visited = new Set<number>([followedRoot.at]);
+    chain.push(followedRoot);
+    let cur = followedRoot;
+    for (;;) {
+      if (!isLinkUuid(cur.head)) {
+        // Unlinkable FORWARD by construction. Not "the chain ended": a
+        // successor may well exist and no walk can ever match it, which is the
+        // head-equality trap in another costume if it is called a clean end.
+        stoppedBecause = "empty-head";
+        break;
+      }
+      const next = successors.get(cur.head) ?? [];
+      if (next.length === 0) {
+        stoppedBecause = "end";
+        break;
+      }
+      let chosen: ChainNode;
+      if (next.length === 1) {
+        chosen = next[0];
+      } else {
+        // BRANCH-VS-BRANCH, on the hub. Not `hub.onDivergence`: that policy is
+        // per bundle, resolves a hub bundle against a LOCAL transcript, lives
+        // in the apply stage, and is not an input here. A bundle from the
+        // branch picked here that then fails to chain onto the local file still
+        // meets it there — two stages, two different questions.
+        const pick = choose(next);
+        chosen = pick.node;
+        forks.push({
+          anchorEntryUuid: cur.head,
+          followedBundleId: chosen.sourced.record.bundleId,
+          reason: pick.reason,
+          parked: next.filter((n) => n.at !== chosen.at).map(branchOf),
+        });
+      }
+      if (visited.has(chosen.at)) {
+        // Only a damaged or hostile index reaches this: transcript uuids do not
+        // form a loop. Our own writers cannot, but this walks peer-authored
+        // data, and the alternative to the guard is an unbounded loop inside a
+        // pull.
+        stoppedBecause = "cycle";
+        break;
+      }
+      visited.add(chosen.at);
+      chain.push(chosen);
+      cur = chosen;
+    }
+  }
+
+  const inChain = new Set(chain.map((n) => n.at));
+
+  const gaps: ChainGap[] = nodes
+    // A string anchor naming a head nobody ships. `""` is included by
+    // construction rather than by a special case: it is never in `shippedHeads`
+    // (isLinkUuid keeps it out), so it can only ever be a gap.
+    .filter((n) => typeof n.anchor === "string" && !shippedHeads.has(n.anchor))
+    .sort(byBundleThenMachine)
+    .map((n) => ({
+      anchorEntryUuid: n.anchor as string,
+      machineId: n.sourced.machineId,
+      bundleId: n.sourced.record.bundleId,
+      strandedBundleIds: ascending(reachFrom(n).map((x) => x.sourced.record.bundleId)),
+    }));
+
+  const unanchored: UnanchoredBundle[] = nodes
+    .filter((n) => n.anchor == null && n.sourced.record.type === "continuation")
+    .sort(byBundleThenMachine)
+    .map((n) => ({
+      machineId: n.sourced.machineId,
+      bundleId: n.sourced.record.bundleId,
+      preAssembly: n.anchor === undefined,
+    }));
+
+  const advertisedUnshipped: AdvertisedHead[] = copies
+    .filter((c) => isLinkUuid(c.headEntryUuid) && !shippedHeads.has(c.headEntryUuid))
+    .map((c) => ({ machineId: c.machineId, headEntryUuid: c.headEntryUuid }))
+    .sort((a, b) =>
+      a.machineId !== b.machineId
+        ? a.machineId < b.machineId
+          ? -1
+          : 1
+        : a.headEntryUuid < b.headEntryUuid
+          ? -1
+          : a.headEntryUuid > b.headEntryUuid
+            ? 1
+            : 0
+    );
+
+  return {
+    chain: chain.map((n) => n.sourced),
+    stoppedBecause,
+    rootChoice,
+    roots: rootNodes.map((n) => ({
+      machineId: n.sourced.machineId,
+      bundleId: n.sourced.record.bundleId,
+      bundleIds: ascending(reachFrom(n).map((x) => x.sourced.record.bundleId)),
+      followed: followedRoot !== undefined && n.at === followedRoot.at,
+      preAssembly: n.anchor === undefined,
+    })),
+    forks,
+    gaps,
+    unanchored,
+    advertisedUnshipped,
+    unreachableBundleIds: ascending(
+      nodes.filter((n) => !inChain.has(n.at)).map((n) => n.sourced.record.bundleId)
+    ),
+  };
 }

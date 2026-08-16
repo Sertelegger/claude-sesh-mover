@@ -1,5 +1,6 @@
 import type { SyncState } from "../types.js";
 import type { HubBundleRecord, HubIndexJson } from "./layout.js";
+import type { SourcedBundle } from "./pull-select.js";
 export interface ThreadCopy {
     machineId: string;
     localSessionId: string;
@@ -135,4 +136,195 @@ export declare function pullSourceFor(t: ResolvedThread, st: SyncState, ctx: {
     machineId: string;
     targetProjectDir: string;
 }): ThreadCopy | undefined;
+/** Why the walk stopped where it did. Four different facts, never merged. */
+export type ChainStop = 
+/** Nothing anchors on the last record's head: whole, as far as the hub shows. */
+"end"
+/** That head is `""`, so no successor can ever be matched to it (§4.3). */
+ | "empty-head"
+/** The next record was already in this chain — a damaged or hostile index. */
+ | "cycle"
+/** No record could start a chain at all, so there is nothing to walk. */
+ | "no-root";
+/** How a branch or a root was picked when more than one was available. */
+export type ChainChoice = 
+/** Only one candidate existed. */
+"sole"
+/** Exactly one candidate reaches the head this machine's own copy sits at. */
+ | "local-base"
+/** No local base to go on, so the candidate reaching the most bundles won. */
+ | "longest"
+/** Even that tied; broken on bundle id ascending — arbitrary, but stable. */
+ | "bundle-id"
+/** Nothing to choose between: there were no candidates. */
+ | "none";
+/** A record whose anchor names a head no record in this thread ships. */
+export interface ChainGap {
+    /**
+     * The anchor that matched nothing. `""` is one of them: it can never match,
+     * by the empty-head rule, so a record carrying it is stranded exactly as if
+     * its predecessor were missing (no writer of ours emits it — see
+     * `HubBundleRecord.anchorEntryUuid`).
+     */
+    anchorEntryUuid: string;
+    /** The machine listing the stranded record, and the record itself. */
+    machineId: string;
+    bundleId: string;
+    /**
+     * That record plus everything that chains onto it — what this one gap
+     * strands. Its length is the "N later bundles unreachable" count.
+     */
+    strandedBundleIds: string[];
+}
+/** A branch not taken at a fork, with everything behind it. */
+export interface ChainBranch {
+    machineId: string;
+    bundleId: string;
+    /** The branch's first record and every record reachable from it. */
+    bundleIds: string[];
+}
+/** Two or more records claiming to continue one head. */
+export interface ChainFork {
+    /** The head they share. Never `""` — that is a gap, not a fork. */
+    anchorEntryUuid: string;
+    /** The branch this plan follows, by its first bundle id. */
+    followedBundleId: string;
+    /** Why that one. Never `"sole"`/`"none"`: a fork has at least two branches. */
+    reason: ChainChoice;
+    /** Every branch this plan parked, stated order (bundle id ascending). */
+    parked: ChainBranch[];
+}
+/** A record that starts a chain. Several per thread is ORDINARY — see below. */
+export interface ChainRoot {
+    machineId: string;
+    bundleId: string;
+    /**
+     * Everything reachable from this root, this record included, bundle id
+     * ascending. For a root whose chain forks this covers BOTH branches, so it is
+     * "what this starting point could reach", not "what the plan applies".
+     */
+    bundleIds: string[];
+    /** True for the one root `chain` starts at. */
+    followed: boolean;
+    /**
+     * A record carrying no `anchorEntryUuid` key at all: pushed before chain
+     * assembly existed. Still a root — `type` is what says so — but nothing can
+     * ever be proven to chain onto it, so its chain ends where its head does.
+     */
+    preAssembly: boolean;
+}
+/**
+ * A CONTINUATION naming no anchor at all, and so unlinkable by construction.
+ *
+ * Deliberately not a `ChainGap`. "This bundle was pushed before chain assembly
+ * existed" and "a bundle is missing" are different sentences, and only one of
+ * them describes something that could be repaired by finding it (spec §0b).
+ *
+ * Deliberately not a root either. A `continuation` is a delta; starting a chain
+ * at one hands the plan a transcript that begins mid-conversation, which
+ * `tryAppendContinuation`'s chain guard would refuse anyway.
+ */
+export interface UnanchoredBundle {
+    machineId: string;
+    bundleId: string;
+    /**
+     * `true` for the ordinary case — no `anchorEntryUuid` key, i.e. pushed before
+     * chain assembly existed. `false` means the index declares an explicit `null`
+     * anchor on a `continuation`, which is a contradiction no writer of ours can
+     * emit and which is therefore a damaged or hostile index, not old data.
+     */
+    preAssembly: boolean;
+}
+/** A machine whose advertised thread head matches no bundle anyone pushed. */
+export interface AdvertisedHead {
+    machineId: string;
+    headEntryUuid: string;
+}
+export interface AssembleChainInput {
+    /** Every machine's copy of ONE thread, exactly as `resolveThreads` built it. */
+    copies: ThreadCopy[];
+    /**
+     * The head of this machine's own copy of the thread, when it holds one — the
+     * only input that can decide a fork or pick among roots by something other
+     * than size. `""`/`null`/absent all mean "no local base to go on" (the empty
+     * head rule applies here too: an empty local head matches nothing).
+     */
+    localHeadEntryUuid?: string | null;
+}
+/** An ordered fetch plan for one thread, plus everything it could not reach. */
+export interface AssembledChain {
+    /**
+     * The plan: root first, each record chaining onto the one before it. Ordered
+     * by LINKS alone — never by `pushedAt`, which is the pushing machine's wall
+     * clock (§4.4.1) — and it may span machines, which is the whole point.
+     *
+     * Empty only when no record could start a chain (`stoppedBecause: "no-root"`).
+     * Everything else about this result describes what is NOT in here.
+     */
+    chain: SourcedBundle[];
+    stoppedBecause: ChainStop;
+    /** How the root `chain` starts at was picked out of `roots`. */
+    rootChoice: ChainChoice;
+    /**
+     * Every starting point this thread has, bundle id ascending. More than one is
+     * ORDINARY, not an anomaly: `computeIncrementalPlan` re-sends a session whole
+     * whenever the recorded head is empty or has gone (compaction, truncation, a
+     * rollback), and `push.ts` files that `full` record under the SAME thread id.
+     * Each root's chain is its own linked list and the two are never merged.
+     */
+    roots: ChainRoot[];
+    /** Forks met while walking the followed chain, in the order they were met. */
+    forks: ChainFork[];
+    /** Anchors naming a head nobody ships, bundle id ascending. */
+    gaps: ChainGap[];
+    /** Pre-assembly continuations, bundle id ascending. */
+    unanchored: UnanchoredBundle[];
+    /**
+     * Machines advertising a thread head no bundle record ships — "M advertises
+     * work it has not pushed", which is a machine's local state running ahead of
+     * what it uploaded, not a bundle missing from the hub. Tested against EVERY
+     * record, not just the followed chain: a head on a parked branch was pushed.
+     * A machine advertising `""` advertises nothing and is never listed.
+     */
+    advertisedUnshipped: AdvertisedHead[];
+    /**
+     * Every record NOT in `chain`, by bundle id, deduped and ascending — the
+     * union of everything the disclosures above name, in one list. Membership is
+     * by record, not by id, so a bundle id two machines both list still appears
+     * here if either machine's record was not applied.
+     */
+    unreachableBundleIds: string[];
+}
+/**
+ * Order every bundle every machine lists for one thread into a fetch plan, and
+ * name everything that could not be reached (#35, spec §4.3).
+ *
+ * PURE: no filesystem, no backend, no sync-state, and NO CLOCK. Ordering comes
+ * from the link structure alone. `pushedAt` is read nowhere in this function —
+ * the hub stamps nothing, so it is the pushing machine's wall clock, and
+ * ordering two machines' records by it reinstated a measured silent revert
+ * under skew (§4.4.1). The fixtures make `pushedAt` DESCEND in link order so
+ * that an implementation which sorts by it fails rather than passing by luck.
+ *
+ * IT LINKS ON `anchorEntryUuid`, NEVER ON `fromEntryUuid`. Measured: `diff.ts`
+ * writes `fromEntryUuid` as `entries[headIndex + 1].uuid`, the first entry the
+ * delta SHIPS — the anchor's child, which equals no record's head, ever. A
+ * head-keyed map walked over `fromEntryUuid` finds zero links on any real hub;
+ * that is the whole of spec §0b and the reason the anchor field exists.
+ * `fromEntryUuid` is not read here at all.
+ *
+ * THE OUTPUT IS A SEPARATE STRUCTURE and stays one (§4.4.2): nothing here
+ * writes back into any `ThreadCopy.bundles`, because a machine's stored bundle
+ * list being its OWN pushes in push order is what the `basedOn` merge-ancestor
+ * walk relies on.
+ *
+ * WHAT IT DOES NOT DO. It does not know what this machine has already received
+ * — `selectNeededBundles` is still the per-record receipt filter and runs over
+ * this plan. It does not resolve hub-vs-LOCAL divergence either: that is
+ * `hub.onDivergence`, it is per bundle, it is evaluated in the apply stage
+ * against a local transcript this function cannot see, and it is not an input
+ * here. Branch-vs-branch (below) is a different question with the same shape,
+ * which is exactly why the two must not be confused.
+ */
+export declare function assembleChain(input: AssembleChainInput): AssembledChain;
 //# sourceMappingURL=threads.d.ts.map
