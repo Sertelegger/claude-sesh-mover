@@ -530,13 +530,22 @@ describe("importer", () => {
     // `existsSync` follows symlinks, so a DANGLING symlink at a destination
     // answers "absent" and the `copyFileSync` behind it wrote THROUGH the
     // link, landing wherever it pointed — outside the memory or plans
-    // directory entirely. `COPYFILE_EXCL` is `O_CREAT|O_EXCL`, which refuses a
-    // symlink path outright, which is why the fix is the flag and not an
-    // `lstatSync` in front of the same call.
+    // directory entirely. `O_CREAT|O_EXCL` refuses a symlink path outright,
+    // which is why the fix is the exclusive write and not an `lstatSync` in
+    // front of the same call.
     //
     // Every test here plants exactly that link and asserts the escape hatch
     // stayed empty. Each one FAILS against the pre-#64 code — a symlink test
     // that passes against the broken version asserts nothing.
+    //
+    // #64 spelled that exclusive write `copyFileSync(..., COPYFILE_EXCL)`,
+    // which is `O_CREAT|O_EXCL` on POSIX and `CopyFileW(…, bFailIfExists)` on
+    // Windows — where it resolves a reparse point and asks about the LINK'S
+    // TARGET. These tests are the ones that caught it: green on Linux and
+    // macOS, and on `windows-latest` the bundle's file was sitting in the
+    // escape directory. They stay unguarded by platform for exactly that
+    // reason (#68), and they are the ONLY place the Windows half of the guard
+    // is observable — on POSIX the exclusive create covers it either way.
     const escapeDir = () => join(tempDir, "escape-hatch");
     /** Plant a symlink at `dst` pointing at a path that does not exist. */
     const plantDanglingSymlink = (dst: string): void => {
@@ -549,6 +558,36 @@ describe("importer", () => {
       expect(readdirSync(escapeDir())).toEqual([]);
       expect(lstatSync(link).isSymbolicLink()).toBe(true);
     };
+
+    // #68: the contract the four tests below rest on, asserted directly and on
+    // EVERY platform, so a failure says which half broke — the write primitive,
+    // or the reconcile logic sitting on top of it. It is `copyToNewFile` and
+    // not `copyFileSync(..., COPYFILE_EXCL)` because those two are the same
+    // call on POSIX and are NOT the same call on Windows, where the copy
+    // resolves a reparse point at the destination and asks its "already
+    // exists?" question about the link's target. On POSIX this passes on the
+    // exclusive create alone; on Windows it is the explicit `lstat` refusal
+    // inside `copyToNewFile` that has to hold it up.
+    it("refuses a symlink destination instead of following it, live or dangling", async () => {
+      const { copyToNewFile } = await import("../src/sidecar.js");
+      const dir = join(tempDir, "exclusive-create-contract");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "src"), "SRC\n");
+      writeFileSync(join(dir, "victim"), "VICTIM\n");
+      symlinkSync(join(dir, "victim"), join(dir, "live"));
+      symlinkSync(join(dir, "nothere"), join(dir, "dangling"));
+
+      for (const link of ["live", "dangling"]) {
+        expect(() => copyToNewFile(join(dir, "src"), join(dir, link))).toThrow(
+          expect.objectContaining({ code: "EEXIST" })
+        );
+      }
+      expect(readFileSync(join(dir, "victim"), "utf-8")).toBe("VICTIM\n");
+      expect(existsSync(join(dir, "nothere"))).toBe(false);
+      // A free name still works, and the bytes are the source's.
+      copyToNewFile(join(dir, "src"), join(dir, "free"));
+      expect(readFileSync(join(dir, "free"), "utf-8")).toBe("SRC\n");
+    });
 
     it("does not write the bundle's index through a dangling symlink at MEMORY.md", async () => {
       const link = join(targetMemDir(), "MEMORY.md");
@@ -625,6 +664,31 @@ describe("importer", () => {
       expect(result.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming.md");
       expect(readMemory("test_memory.md")).toBe("mine, and staying mine\n");
       expect(readMemory("test_memory.incoming.md")).toContain("Use vitest for testing.");
+    });
+
+    // #68. The three sites above are not the only exclusive write in this step:
+    // parking goes through `sidecar.ts`'s `copyToUniqueName`, whose suffix loop
+    // uses EEXIST as its "try the next name" signal — so the SAME hazard lives
+    // there, and a link at the parked name would be written through rather than
+    // stepped over. This is also the one test that covers `copyToUniqueName` on
+    // every platform: `hub-merge.test.ts`'s sidecar symlink tests are
+    // `skipIf(isWindows)`, so the shared helper's other caller cannot see it.
+    it("does not park an incoming memory through a dangling symlink at the parked name", async () => {
+      seedMemory("test_memory.md", "mine, not theirs\n");
+      const link = join(targetMemDir(), "test_memory.incoming.md");
+      plantDanglingSymlink(link);
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryConflicts" in result)) return;
+
+      expectNothingEscaped(link);
+      // The occupied name was stepped over, not written through: the parked
+      // copy took the next name and the local file is still the local file.
+      expect(result.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming-2.md");
+      expect(readMemory("test_memory.incoming-2.md")).toContain("Use vitest for testing.");
+      expect(readMemory("test_memory.md")).toBe("mine, not theirs\n");
+      expect(readMemory("MEMORY.md")).toContain("(test_memory.incoming-2.md)");
     });
 
     it("treats EEXIST as an answer, not a failure: real files still compare, park and report", async () => {

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendFileSync, constants as fsConstants, lstatSync, rmSync, statSync, writeFileSync, } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendFileSync, lstatSync, rmSync, statSync, writeFileSync, } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, } from "./manifest.js";
@@ -10,7 +10,7 @@ import { readLastEntryUuid } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
 import { readLocalProjectId, writeLocalProjectId } from "./hub/identity.js";
 import { MEMORY_INDEX_NAME, appendIndexLines, formatMemoryPointer, memoryIndexTargets, unionMemoryIndex, } from "./memory-index.js";
-import { MAX_SIDECAR_ATTEMPTS, copyToUniqueName } from "./sidecar.js";
+import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "./sidecar.js";
 /**
  * The three auxiliary layer directories a bundle carries for one session, in
  * the layout the exporter writes them. Single source of truth shared by the
@@ -86,9 +86,9 @@ function pathIsTaken(path) {
 }
 /**
  * Copy `src` to `dst` **only if `dst` can be created**, and answer whether it
- * was. `COPYFILE_EXCL` is `O_CREAT|O_EXCL`, so the check and the write are one
- * atomic step, and `false` (EEXIST) is an ANSWER the caller falls through on —
- * never swallowed, never a failure, never an abort of the layer.
+ * was. The create is exclusive (`O_CREAT|O_EXCL`), so the check and the write
+ * are one atomic step, and `false` (EEXIST) is an ANSWER the caller falls
+ * through on — never swallowed, never a failure, never an abort of the layer.
  *
  * It replaces an `existsSync(dst)` + plain `copyFileSync` pair at all three of
  * this module's shared-layer destinations, for a reason bigger than the TOCTOU
@@ -96,9 +96,20 @@ function pathIsTaken(path) {
  * resolves to nothing, so `existsSync` answers "absent" and the copy then
  * writes THROUGH the link, landing wherever it points and outside the memory
  * or plans directory entirely. `O_EXCL` refuses a symlink path outright,
- * dangling or not — which is why the fix is the flag rather than an `lstatSync`
- * bolted in front of the same call, and why the flag has to be the thing that
- * decides, not a second opinion after a check already decided.
+ * dangling or not — which is why the fix is the exclusive create rather than an
+ * `lstatSync` bolted in front of the same call, and why that create has to be
+ * the thing that decides, not a second opinion after a check already decided.
+ *
+ * That sentence is a POSIX sentence, and #68 is where it stopped being the
+ * whole story: `COPYFILE_EXCL` is `O_CREAT|O_EXCL` on POSIX and `CopyFileW`
+ * with `bFailIfExists` on Windows, which resolves a reparse point and so asks
+ * its question about the LINK'S TARGET — measured on `windows-latest`, where
+ * the bundle's file landed in the escape directory while Linux and macOS
+ * refused it. The write here now goes through `sidecar.ts`'s `copyToNewFile`,
+ * which layers an explicit `lstat` refusal over the exclusive create precisely
+ * because the exclusive create is only known to refuse a link on POSIX. Read
+ * that function before changing any of this: the three guards, and which of
+ * them is load-bearing on which platform, are argued there.
  *
  * Same rule and same reason as `sidecar.ts`'s `copyToUniqueName`, but
  * deliberately NOT that helper: these three sites write the CANONICAL name.
@@ -113,7 +124,7 @@ function pathIsTaken(path) {
  */
 function copyIfAbsent(src, dst) {
     try {
-        copyFileSync(src, dst, fsConstants.COPYFILE_EXCL);
+        copyToNewFile(src, dst);
         return true;
     }
     catch (e) {
@@ -413,9 +424,25 @@ function reconcileSharedLayers(opts) {
                     // `w` (truncate whatever this name resolves to) is only ours to use
                     // for an index we have in hand — one we read, or one we just created
                     // exclusively. The other reachable case is "no index anywhere and a
-                    // parked copy needs a pointer", which is a CREATE: `wx` is the same
-                    // `O_CREAT|O_EXCL` the copies use, so this last write cannot land
-                    // through a link that appeared since the scan either.
+                    // parked copy needs a pointer", which is a CREATE, so it takes `wx`.
+                    //
+                    // **`wx` is not a symlink guard on Windows** (#68), and this site is
+                    // where that was nearly mis-read. Its test — "does not write the
+                    // merged index through a dangling symlink when the bundle carries
+                    // none" — passed on `windows-latest` while the three `copyIfAbsent`
+                    // sites failed, which reads like evidence that `wx` refuses a link.
+                    // It is not. MEASURED, by instrumenting this line: across the whole
+                    // importer suite it runs 13 times and takes the `w` branch every
+                    // time; in that test it never runs at all. `pathIsTaken` above is an
+                    // `lstat`, so the dangling link counts as an index — the read through
+                    // it then fails, `indexUsable` goes false, and this whole block is
+                    // skipped. Swap that `lstat` back to the pre-#64 `existsSync` and the
+                    // instrumented line prints `flag=wx` in exactly that test, i.e. the
+                    // write IS attempted and only POSIX's `O_EXCL` refuses it.
+                    //
+                    // So what protected this site on Windows was `lstatSync`, not the
+                    // flag — the same conclusion `copyToNewFile` reaches for the other
+                    // three. Do not "simplify" `pathIsTaken` to `existsSync` here.
                     writeFileSync(indexPath, indexText, {
                         encoding: "utf-8",
                         flag: indexOnDisk ? "w" : "wx",
@@ -754,8 +781,8 @@ export async function importSession(options) {
     //    one incoming `raw` line, which is newline-free by construction, so a
     //    corrupt index cannot split or forge a local line.
     //  - A prose memory is copied only when the destination can be CREATED, and a
-    //    conflicting one is parked through `copyToUniqueName`'s `COPYFILE_EXCL` —
-    //    which cannot overwrite. Same for `plans/`, minus the parking. That first
+    //    conflicting one is parked through `copyToUniqueName`'s exclusive create
+    //    — which cannot overwrite. Same for `plans/`, minus the parking. That first
     //    clause used to read "does not exist" and was tested with `existsSync`,
     //    which follows symlinks: a dangling link at the destination reported
     //    absent and the copy wrote THROUGH it, out of the directory entirely
