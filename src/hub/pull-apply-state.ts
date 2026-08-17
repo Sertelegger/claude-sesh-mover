@@ -118,6 +118,18 @@ export function sharedLayerFindings(acc: SharedLayerAccumulator): SharedLayerFin
       : undefined,
     memoryDir: acc.memoryDir,
     planConflicts: acc.planConflicts.length > 0 ? acc.planConflicts : undefined,
+    // `plansSkipped` is DELIBERATELY not projected, and this is not an
+    // oversight to tidy up: no hub bundle has ever carried `plans/`. The
+    // exporter gates that copy on `!incremental` and `hub push` passes a
+    // truthy `incremental` unconditionally, so the field could only ever be
+    // `undefined` here. A field that cannot be populated is worse than an
+    // absent one — it tells a reader the pull considered plans and found none,
+    // when the truth is that plans never reach this transport at all.
+    //
+    // Restore it in the same change that lets plans travel to the hub, and not
+    // before. That change is gated on fixing the payload's SCOPE first
+    // (`<configDir>/plans` has no project filter, so it ships every plan on the
+    // machine) — see the shared-layers section in CLAUDE.md.
   };
 }
 

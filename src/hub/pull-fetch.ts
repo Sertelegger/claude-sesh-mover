@@ -82,7 +82,15 @@ export interface FetchStageResult {
  *   `if (manifest.carry)` guard stays welded to the assignment in here so that
  *   shape is not available to write.
  *
- * Two `aborted` outcomes, and the caller's only correct handling of either is
+ * FIVE `aborted` outcomes — one per untrusted-input call, in the order they
+ * run: the download, the unpack, the manifest parse, the manifest's own digest,
+ * and the transcript that manifest declares. The count is worth stating because
+ * it only moves in one direction: every call in this stage is handed bytes off
+ * the hub, so a new one without a `try` is a new way for the stage to leave
+ * `hubPull` as a throw — which is exactly what the download and the unpack were
+ * until now.
+ *
+ * The caller's only correct handling of any of them is
  * `return fetched.terminal!` immediately. `break` falls through to the carry
  * gate, the thread mapping and the index write and then reports `success: true`
  * — a refusal turned into a successful pull. `continue` violates the chain
@@ -106,14 +114,66 @@ export async function runFetchStage(
 
   const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
   const out = createWriteStream(tarPath);
-  // record.file is hub-sourced (read out of another machine's index
-  // file) and used as a path immediately below — the backend's
-  // assertHubRelPath (hub/layout.ts, enforced inside every HubBackend
-  // method, see hub/backend.ts) is the containment that rejects
-  // traversal/absolute paths before anything touches the filesystem.
-  await pipeline(await backend.readStream(record.file), out);
+  /**
+   * The download is a GUARD, for the same reason the manifest parse below is:
+   * this is hub-fetched input and the failure is the user's to act on, not an
+   * internal fault. #78 typed the parse in the middle of this stage and left
+   * the two calls either side of it throwing — uncaught, they leave `hubPull`
+   * for the CLI's outer catch (exit 1, no `suggestion`), and since that catch
+   * builds its `ErrorResult` from the exception alone they also discard every
+   * disclosure the bundles already applied in this chain collected.
+   *
+   * The `pipeline` is inside the `try` and not merely the call that looks
+   * risky: `createFsBackend`'s `readStream` is `createReadStream`, which is
+   * lazy, so an ENOENT never comes out of `readStream` at all — it arrives as a
+   * stream error and surfaces as the `pipeline` rejection.
+   *
+   * **Deliberately not worded as `not-yet-synced`**, which models a neighbouring
+   * condition for a different code path. That result is decided by the select
+   * stage's `backend.exists` sweep BEFORE anything is applied, lists the files,
+   * and means "these have not arrived on this machine yet". This one is reached
+   * only after that sweep saw the file, so it means the opposite: it was here,
+   * and mid-chain — with earlier bundles applied and recorded — it is not
+   * readable now. The suggestion says so, and names the overlap explicitly,
+   * because a user who meets both inside a minute would otherwise read one
+   * arriving file as two faults.
+   */
+  try {
+    // record.file is hub-sourced (read out of another machine's index
+    // file) and used as a path immediately below — the backend's
+    // assertHubRelPath (hub/layout.ts, enforced inside every HubBackend
+    // method, see hub/backend.ts) is the containment that rejects
+    // traversal/absolute paths before anything touches the filesystem.
+    await pipeline(await backend.readStream(record.file), out);
+  } catch (e) {
+    return stageAbort({
+      success: false,
+      command: "pull",
+      error: `Bundle ${record.bundleId} could not be read from the hub (${record.file}): ${(e as Error).message}`,
+      suggestion:
+        "Nothing from this bundle was applied. The file was listed in the hub's index and was still there when this pull checked, so something made it unreadable in between: the share went away mid-pull, a synced folder replaced or de-hydrated it, another machine removed it, or this machine could not write the temporary copy. Retry — the bundles applied before it in this chain are recorded and will not be refetched. A retry that answers with a not-yet-synced refusal naming this same file is that file still arriving, not a second fault.",
+    });
+  }
   const extractDir = join(tempRoot, record.bundleId);
   mkdirSync(extractDir, { recursive: true });
+  /**
+   * And the same for the unpack, whose two failure modes are not the same
+   * situation and must not be answered as one.
+   *
+   * The archive is DAMAGED — gzip's CRC32 makes both a truncated and a
+   * bit-flipped `.tar.gz` throw out of node-tar, which is measured and is the
+   * whole reason this call is loud (see archiver.ts) — or it holds an entry
+   * `assertSafeEntries` REFUSES: an absolute path, a `..` segment, a symlink or
+   * a hard link. The first is fixed by a re-push (or, on a synced folder, by
+   * waiting for the rest of the file); the second is not fixed by anything,
+   * because no bundle this plugin produced contains such an entry.
+   *
+   * One abort rather than two, and not because the difference is small: telling
+   * them apart here means matching on node-tar's and the archiver's message
+   * text, which is the branching-on-prose that this codebase bans everywhere
+   * else. So the thrown message is kept whole — it is the discriminator — and
+   * the suggestion names both remedies and says which sentence answers which.
+   */
   // NO progress reporting across this call, and it is a gap rather than an
   // omission (#74): `extractArchive` (src/archiver.ts) takes no callback at
   // all, so there is no seam to report from — and on a large bundle over a
@@ -121,7 +181,17 @@ export async function runFetchStage(
   // clock. `hub push`'s `createArchive` has the identical hole. Giving the
   // archiver a progress callback is a bigger change than this one and wants
   // deciding on its own merits, so it is stated here rather than smuggled in.
-  await extractArchive(tarPath, extractDir);
+  try {
+    await extractArchive(tarPath, extractDir);
+  } catch (e) {
+    return stageAbort({
+      success: false,
+      command: "pull",
+      error: `Bundle ${record.bundleId} could not be unpacked (${record.file}): ${(e as Error).message}`,
+      suggestion:
+        "Nothing from this bundle was applied. Either the archive on the hub is damaged or was only partially written — a truncated or bit-flipped .tar.gz fails gzip's own checksum, which is what makes this loud — or it holds an entry sesh-mover refuses to extract: an absolute path, a `..` segment, a symlink or a hard link. The message above says which. For the first, if the hub is a synced folder give it a moment and retry, otherwise ask the machine that pushed it to push again; for the second no retry and no re-push helps, because no bundle sesh-mover produces contains such an entry. The bundles applied before it in this chain are recorded and will not be refetched.",
+    });
+  }
   // Archiver-rooting reality check: createArchive tars the staging dir
   // with `cwd: dirname(sourceDir)` and a single top-level entry
   // (basename(sourceDir), i.e. "bundle" for push's staging), and

@@ -53,6 +53,14 @@ export declare function applySharedLayers(opts: {
     targetProjectDir: string;
     targetConfigDir: string;
     sourceMachineName?: string;
+    /**
+     * Same default as `ImportOptions.includePlans`: OFF. Omitting it here is the
+     * correct call for the hub, and doubly so — `plans/` never travels to the hub
+     * in the first place (see CLAUDE.md), and this path runs unattended from a
+     * SessionEnd/SessionStart hook, which has no channel to disclose a
+     * machine-global write.
+     */
+    includePlans?: boolean;
 }): SharedLayerApplication;
 export interface ImportOptions {
     exportPath: string;
@@ -63,6 +71,14 @@ export interface ImportOptions {
     sessionIds?: string[];
     noRegister?: boolean;
     allowDuplicates?: boolean;
+    /**
+     * Write the bundle's `plans/` into `<targetConfigDir>/plans`. **Default off**
+     * (`--include-plans` on `sesh-mover import`): that directory is
+     * config-dir-global, so it is the one shared-layer destination an arbitrary
+     * bundle can use to write files every project on this machine sees. Absent or
+     * `false`, a bundle's plans are counted, disclosed and left in the bundle.
+     */
+    includePlans?: boolean;
     onProgress?: (ev: ProgressEvent) => void;
 }
 export declare function importSession(options: ImportOptions): Promise<ImportResult | DryRunResult | ErrorResult>;

@@ -193,6 +193,10 @@ program
   .option("--dry-run", "Show changes without applying")
   .option("--no-register", "Skip session index registration")
   .option("--allow-duplicates", "Re-import sessions even if identical content was imported before")
+  .option(
+    "--include-plans",
+    "Also write the bundle's plans/ into <config-dir>/plans, which every project on this machine shares (off by default)"
+  )
   .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
     let tempExtractDir: string | undefined;
@@ -226,6 +230,7 @@ program
         sessionIds: opts.sessionId,
         noRegister: !opts.register, // Commander.js --no-register sets opts.register to false
         allowDuplicates: !!opts.allowDuplicates,
+        includePlans: !!opts.includePlans,
         onProgress,
       });
 

@@ -52,14 +52,21 @@ You are running the sesh-mover import command. Follow these steps:
 
    Aggregate it, e.g. *"11 memory files: 10 new, 1 index — 10 entries would be added to MEMORY.md; `notes.md` differs and would be parked as `notes.incoming.md` (you can merge it afterwards)."* Do **not** describe a `park` verdict as "would be merged": the merge is step 11, it costs tokens, and it has not been offered yet.
 
-   `planConflicts` on the dry run lists plans that already exist here with different content. Those are reported and never written — say so, because the incoming plan stays in the bundle and nowhere else.
+   `plansSkipped` is the count of plan files the bundle carries that the import will **not** write, because `plans/` is opt-in (see step 8). `planConflicts` on the dry run lists plans that already exist here with different content — only ever populated when `--include-plans` was passed. Either way the incoming plan stays in the bundle and nowhere else, so say so.
 
-8. Use AskUserQuestion to confirm: "Proceed with import" (recommended) / "Cancel".
+8. **Say what will be written outside the session's own directory, then confirm.** Four of the six layers land under a session id this import mints, so they can collide with nothing. Two do not, and those are the ones to name before the user says yes:
+
+   - `memory/` → `<target-config-dir>/projects/<encoded-project-path>/memory/` — the target project's own directory. Default on. (After the run, `memoryDir` gives you this path exactly; do not derive it yourself.)
+   - `plans/` → `<target-config-dir>/plans/` — **config-dir-global, shared by every project on this machine.** Default **off**. Mention it only when `plansSkipped` is present, and give the number: *"the bundle also carries 3 plans; they'd go to `~/.claude/plans`, which every project here shares, so they're skipped unless you ask for them."*
+
+   Then use AskUserQuestion to confirm: "Proceed with import" (recommended) / "Proceed and include plans" (only offer this when `plansSkipped` is present — it appends `--include-plans` to step 9) / "Cancel".
 
 9. Execute the import:
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" import --from "<path>" [--session-id <ids>] --target-project-path "<cwd>" --target-config-dir "<config-dir>"
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" import --from "<path>" [--session-id <ids>] [--include-plans] --target-project-path "<cwd>" --target-config-dir "<config-dir>"
    ```
+
+   Pass `--include-plans` only if the user chose it at step 8.
 
 10. Report the result. Read what actually landed **before** offering anything to resume — `resumable` says the importer was allowed to register sessions, not that this run created any.
     - Import is idempotent by default, so check `skippedSessions` first. If it shows all requested sessions skipped (reason `duplicate` = identical content already imported into this project; reason `already-received` = already synced from this peer) and `importedSessions` is `[]`, tell the user **no new sessions** were imported and why, and offer **no** resume command — but do not call the run a no-op: the memory and plan layers are not session-scoped and are reconciled on a fully-duplicate import too, so read `memoryIndex` / `memoryConflicts` below before summarising — a fully-skipped import still reports `resumable: true`, and there is no new session id to resume. If the user actually intended a re-import, re-run the step 9 invocation with `--allow-duplicates` appended.
@@ -73,7 +80,9 @@ You are running the sesh-mover import command. Follow these steps:
       - `memoryIndex.droppedProse: true` — the sender's index carried headings or prose; only its entries were merged. One line, not a footnote.
       - `memoryIndex.unindexed` — memory files that arrived and that **no index lists**, so nothing will ever read them. They were usually already orphaned on the source machine; the union cannot fix that, because a file no line points at contributes no line. Name them and offer to add index entries if the user wants them (that is an ordinary edit to `MEMORY.md`, and it is the user's call, not the importer's).
       - `memoryConflicts` — memories that differ on both sides. **Yours was kept and nothing was overwritten**; `parkedAs` is the file the incoming copy was saved as, inside `memoryDir`. Both texts are on disk. Then go to step 11.
-      - `planConflicts` — plans that already exist here with different content. Yours was kept; the incoming plan was **not** written and is only in the bundle. If the user wants it, they must re-extract the bundle — say that, because unlike a memory nothing was parked for them. (Plans live in a directory every project on this machine shares, which is why nothing is written beside them.)
+      - `plansSkipped` — plan files the bundle carried that were **not written**, because `--include-plans` was not passed. Name the count and the remedy once; do not push it. Nothing was consumed by declining — the plans are still in the bundle, and a re-run with `--include-plans` lands them even when every session is now a duplicate.
+      - `planConflicts` — plans that already exist here with different content (only when `--include-plans` was passed). Yours was kept; the incoming plan was **not** written and is only in the bundle. If the user wants it, they must re-extract the bundle — say that, because unlike a memory nothing was parked for them. (Plans live in a directory every project on this machine shares, which is why nothing is written beside them.)
+      - A memory whose parked copy could **not** be listed in `MEMORY.md` says so in `warnings` — its name cannot be written as a markdown link target. The file is on disk and named in `memoryConflicts.parkedAs`; relay both, and offer to rename it if the user wants an index entry.
 
     **Incremental bundles.** The import result carries no manifest, so incremental detail has to come from the bundle itself — and only when the user picked an export **directory**: for a `.tar.gz`/`.tar.zst` the CLI extracts to a private temp dir and deletes it before returning, so nothing is left to read. When `--from` was a directory and `<path>/manifest.json` has `incremental: true`, read it and add to the report:
     - Source machine: `<sourceMachineName>` (`<sourceMachineId>`)
@@ -98,4 +107,4 @@ You are running the sesh-mover import command. Follow these steps:
        3. Remove the `MEMORY.md` pointer line whose target is `<parkedAs>` — the merged memory is reachable under its own name, and a `.pre-merge.md` backup is a backup, **not a memory**: never index it. Touch no other line of `MEMORY.md`.
     7. **On decline, change nothing.** Two files, two index entries, nothing lost.
 
-**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional/retry branches, e.g. `--no-register` for the version-mismatch fallback, `--allow-duplicates` for the duplicate-skip retry) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.
+**Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional/retry branches, e.g. `--no-register` for the version-mismatch fallback, `--allow-duplicates` for the duplicate-skip retry, `--include-plans` for the opt-in plans layer) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

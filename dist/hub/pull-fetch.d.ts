@@ -74,7 +74,15 @@ export interface FetchStageResult {
  *   `if (manifest.carry)` guard stays welded to the assignment in here so that
  *   shape is not available to write.
  *
- * Two `aborted` outcomes, and the caller's only correct handling of either is
+ * FIVE `aborted` outcomes — one per untrusted-input call, in the order they
+ * run: the download, the unpack, the manifest parse, the manifest's own digest,
+ * and the transcript that manifest declares. The count is worth stating because
+ * it only moves in one direction: every call in this stage is handed bytes off
+ * the hub, so a new one without a `try` is a new way for the stage to leave
+ * `hubPull` as a throw — which is exactly what the download and the unpack were
+ * until now.
+ *
+ * The caller's only correct handling of any of them is
  * `return fetched.terminal!` immediately. `break` falls through to the carry
  * gate, the thread mapping and the index write and then reports `success: true`
  * — a refusal turned into a successful pull. `continue` violates the chain

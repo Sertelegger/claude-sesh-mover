@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 import type {
@@ -21,6 +21,8 @@ import type {
   ErrorResult,
   ProgressEvent,
 } from "../src/types.js";
+
+const isWindows = platform() === "win32";
 
 describe("importer", () => {
   let tempDir: string;
@@ -174,7 +176,20 @@ describe("importer", () => {
       writeFileSync(join(targetMemDir(), name), content);
     };
     const readMemory = (name: string) => readFileSync(join(targetMemDir(), name), "utf-8");
-    const runImport = async (opts?: { dryRun?: boolean; from?: string }) => {
+    /**
+     * `includePlans` is passed explicitly by every test that means to exercise
+     * the plans half of the step, because the layer is OPT-IN (#74) — its
+     * destination is `<configDir>/plans`, which every project on this machine
+     * shares. Leaving it off is not a shortcut: a plans test that omits it
+     * passes trivially, since nothing is written at all. That is precisely how
+     * "does not write a bundle plan through a dangling symlink at its name"
+     * would have gone on passing while covering none of its guard.
+     */
+    const runImport = async (opts?: {
+      dryRun?: boolean;
+      from?: string;
+      includePlans?: boolean;
+    }) => {
       const { importSession } = await import("../src/importer.js");
       return importSession({
         exportPath: opts?.from ?? exportPath,
@@ -182,6 +197,7 @@ describe("importer", () => {
         targetProjectPath: TARGET_PROJECT,
         targetClaudeVersion: "2.1.81",
         dryRun: opts?.dryRun ?? false,
+        includePlans: opts?.includePlans,
       });
     };
     /**
@@ -496,7 +512,7 @@ describe("importer", () => {
       mkdirSync(plansDir, { recursive: true });
       writeFileSync(join(plansDir, "test-plan.md"), "# My own plan\n");
 
-      const result = await runImport();
+      const result = await runImport({ includePlans: true });
       expect(result.success).toBe(true);
       if (!result.success || !("planConflicts" in result)) return;
 
@@ -512,7 +528,7 @@ describe("importer", () => {
     it("still copies memory and plans that do not collide", async () => {
       seedMemory("existing.md", "---\nname: existing\n---\nExisting memory\n");
 
-      const result = await runImport();
+      const result = await runImport({ includePlans: true });
       expect(result.success).toBe(true);
       if (!result.success || !("planConflicts" in result)) return;
 
@@ -523,6 +539,145 @@ describe("importer", () => {
       expect(result.memoryConflicts).toBeUndefined();
       expect(result.planConflicts).toBeUndefined();
     });
+
+    // --- plans/ is opt-in on the receive side too (#74) ---
+    //
+    // `<configDir>/plans` is config-dir-GLOBAL: it has no project filter, so a
+    // bundle's plans layer writes files every project on this machine shares.
+    // CLAUDE.md already records the send-side half ("`plans/` deliberately does
+    // NOT travel to the hub … fix the payload's scope before widening its
+    // transport"); this is the receive side of the same argument.
+    it("does not write a bundle's plans by default, and --include-plans on the re-run lands them", async () => {
+      const plansDir = join(targetConfigDir, "plans");
+
+      const first = await runImport();
+      expect(first.success).toBe(true);
+      if (!first.success || !("plansSkipped" in first)) return;
+
+      // Not written, and not silent about it: the count is the disclosure.
+      expect(existsSync(join(plansDir, "test-plan.md"))).toBe(false);
+      expect(first.plansSkipped).toBe(1);
+      expect(first.planConflicts).toBeUndefined();
+      expect(
+        first.warnings.some((w) => w.includes("carries 1 plan file(s), and they were NOT written"))
+      ).toBe(true);
+      // The OTHER shared layer is unaffected — memory stays default-on, because
+      // it lands in this project's own directory.
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+
+      // The remedy the warning names actually reaches the payload. The re-run
+      // is a fully-duplicate import (every session already here), which is the
+      // path that returns before the session write loop — so this also pins
+      // that the flag is threaded through THAT branch, not just the main one.
+      const second = await runImport({ includePlans: true });
+      expect(second.success).toBe(true);
+      if (!second.success || !("plansSkipped" in second)) return;
+      expect(existsSync(join(plansDir, "test-plan.md"))).toBe(true);
+      expect(second.plansSkipped).toBeUndefined();
+    });
+
+    it("previews the plans skip on a dry run with the same count the real run reports", async () => {
+      const preview = await runImport({ dryRun: true });
+      expect(preview.success).toBe(true);
+      if (!preview.success || !("plansSkipped" in preview)) return;
+      expect(preview.plansSkipped).toBe(1);
+      expect(existsSync(join(targetConfigDir, "plans"))).toBe(false);
+    });
+
+    // --- MEMORY.md pointer injection ---
+    //
+    // The parked-copy pointer is the one index line this plugin CONSTRUCTS
+    // rather than copies, and every argument it interpolates is bundle-supplied
+    // and validated by nothing: a stem and a parked name derived from a filename
+    // inside the bundle, and `sourceMachineName`, which is free text on the
+    // manifest. A newline in any of them split the line and appended arbitrary
+    // entries to the user's index — the same shape as the measured
+    // `git apply --summary` defect in `hub/carry.ts`.
+    //
+    // Note what does NOT cover this: `unionMemoryIndex`'s incoming lines are
+    // newline-free *because they came out of `splitIndexLines`*, and a line
+    // built here never did.
+    /** Index lines, ignoring the file's trailing terminator. */
+    const indexLines = (text: string): string[] =>
+      text.split(/\r\n|\n|\r/).filter((l, i, a) => !(i === a.length - 1 && l === ""));
+
+    it("gains exactly one index line from a bundle whose machine name carries a newline", async () => {
+      const { readManifest, writeManifest } = await import("../src/manifest.js");
+      const { memoryIndexTargets } = await import("../src/memory-index.js");
+
+      const manifest = readManifest(exportPath);
+      manifest.sourceMachineName =
+        "laptop\n- [pwned](pwned.md) — injected by the bundle\n- [also-pwned](also-pwned.md) — and again";
+      writeManifest(exportPath, manifest);
+
+      // A conflicting prose memory is what makes the importer BUILD a pointer.
+      const local = "# Memory Index\n\n- [Test memory](test_memory.md) — mine\n";
+      seedMemory("MEMORY.md", local);
+      seedMemory("test_memory.md", "mine, not theirs\n");
+
+      const before = indexLines(readMemory("MEMORY.md")).length;
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryConflicts" in result)) return;
+
+      const after = readMemory("MEMORY.md");
+      expect(indexLines(after).length).toBe(before + 1);
+      // …and the one line that was added is the parked copy's, not theirs.
+      expect(memoryIndexTargets(after)).toEqual(["test_memory.md", "test_memory.incoming.md"]);
+      // The payload survives as inert TEXT inside the description — it is
+      // degraded, not dropped — but it is no longer a line, and so no longer an
+      // entry. That distinction is the whole fix.
+      expect(after).not.toMatch(/^[-*+]\s+\[pwned\]/m);
+      expect(after).toContain("laptop");
+      expect(result.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming.md");
+    });
+
+    it.skipIf(isWindows)(
+      "gains exactly one index line from a bundle whose memory filename carries a newline",
+      async () => {
+        const { memoryIndexTargets } = await import("../src/memory-index.js");
+        // A POSIX filename may contain anything but `/` and NUL, so the parked
+        // name derived from it may too. Windows forbids it outright, which is
+        // why this is the one half of the pair that is platform-guarded.
+        const hostile = "notes\n- [pwned](pwned.md) — injected.md";
+
+        const from = await exportWithMemory(
+          { [hostile]: "theirs\n" },
+          "hostile-memory-filename-export"
+        );
+        // The local index already lists the bundle's own memory, so the union
+        // adds nothing: every line this test counts comes from a parked-copy
+        // pointer, which is the code path under test.
+        seedMemory("MEMORY.md", "# Memory Index\n\n- [Test memory](test_memory.md) — mine\n");
+        seedMemory("test_memory.md", "mine, not theirs\n");
+        seedMemory(hostile, "mine, not theirs\n");
+
+        const before = indexLines(readMemory("MEMORY.md")).length;
+        const result = await runImport({ from });
+        expect(result.success).toBe(true);
+        if (!result.success || !("memoryConflicts" in result)) return;
+
+        const after = readMemory("MEMORY.md");
+        // Exactly one: the pointer for `test_memory.md`'s parked copy. The
+        // hostile name gets NO line — it cannot be written as a link target, so
+        // it is refused rather than escaped into something that points nowhere.
+        expect(indexLines(after).length).toBe(before + 1);
+        expect(memoryIndexTargets(after)).toEqual(["test_memory.md", "test_memory.incoming.md"]);
+        expect(after).not.toMatch(/^[-*+]\s+\[pwned\]/m);
+        // Refused, and SAID: the parked copy is on disk and named in the typed
+        // field, so nothing is lost silently.
+        const hostileParked = `${hostile.slice(0, -".md".length)}.incoming.md`;
+        expect(result.memoryConflicts?.some((c) => c.parkedAs === hostileParked)).toBe(true);
+        const refusal = result.warnings.find((w) =>
+          w.includes("cannot be written as a markdown link")
+        );
+        expect(refusal).toBeDefined();
+        // The refusal names the hostile filename, so it is the one message
+        // certain to interpolate one — it quotes rather than pastes.
+        expect(refusal!.includes("\n")).toBe(false);
+        expect(refusal).toContain(JSON.stringify(hostile));
+      }
+    );
 
     // --- #64: a destination is claimed by an EXCLUSIVE write, never by a
     // check standing in front of one ---
@@ -632,7 +787,7 @@ describe("importer", () => {
       const link = join(plansDir, "test-plan.md");
       plantDanglingSymlink(link);
 
-      const result = await runImport();
+      const result = await runImport({ includePlans: true });
       expect(result.success).toBe(true);
       if (!result.success) return;
 
@@ -703,7 +858,7 @@ describe("importer", () => {
       mkdirSync(plansDir, { recursive: true });
       writeFileSync(join(plansDir, "test-plan.md"), "# My own plan\n");
 
-      const result = await runImport();
+      const result = await runImport({ includePlans: true });
       expect(result.success).toBe(true);
       if (!result.success || !("memoryConflicts" in result)) return;
 
@@ -829,7 +984,7 @@ describe("importer", () => {
       const plansDir = join(targetConfigDir, "plans");
       mkdirSync(join(plansDir, "test-plan.md"), { recursive: true });
 
-      const result = await runImport();
+      const result = await runImport({ includePlans: true });
       expect(result.success).toBe(true);
       if (!result.success || !("memoryIndex" in result)) return;
 
@@ -1190,6 +1345,10 @@ describe("importer", () => {
         targetProjectPath,
         targetClaudeVersion: "2.1.81",
         dryRun: false,
+        // The claim is "no digest, no complaint" — so the plans layer has to be
+        // applied here rather than skipped, or the empty-warnings assertion
+        // would be satisfied by the opt-in notice being the only thing missing.
+        includePlans: true,
       });
       expect(result.success).toBe(true);
       if (!result.success) return;
@@ -1871,5 +2030,114 @@ describe("importer", () => {
       // prototype write lost it: JSON.stringify reads own enumerable keys only.
       expect(JSON.stringify(peer.received)).toContain("__proto__");
     });
+  });
+});
+
+/**
+ * `formatMemoryPointer` is the chokepoint that stops a bundle writing lines of
+ * its choosing into the user's `MEMORY.md`. These are unit tests over the rule
+ * itself; the two importer tests above are the same rule seen end to end.
+ *
+ * The module under test has no other test file, so the ordinary-case round trip
+ * is asserted here too — a guard that only ever sees hostile input is one
+ * refactor away from refusing everything and still passing.
+ */
+describe("memory index pointer construction", () => {
+  /** ESC, spelled by code point so no literal control byte sits in this file. */
+  const ESC = String.fromCharCode(0x1b);
+  /** Everything a pointer line may not carry: C0, DEL, C1, and U+2028/9. */
+  const CONTROLISH = new RegExp("[\\u0000-\\u001f\\u007f\\u0080-\\u009f\\u2028\\u2029]");
+
+  it("round-trips an ordinary pointer through this module's own parser", async () => {
+    const { formatMemoryPointer, pointerTarget, splitIndexLines } = await import(
+      "../src/memory-index.js"
+    );
+    const line = formatMemoryPointer(
+      "notes (incoming copy)",
+      "notes.incoming.md",
+      "incoming version of notes.md from laptop — differs from your copy, not merged"
+    );
+    expect(line).toBe(
+      "- [notes (incoming copy)](notes.incoming.md) — incoming version of notes.md from laptop — differs from your copy, not merged"
+    );
+    expect(splitIndexLines(line!)).toHaveLength(1);
+    expect(pointerTarget(line!)).toBe("notes.incoming.md");
+  });
+
+  it("cannot emit a second line, whatever a bundle puts in the title or description", async () => {
+    const { formatMemoryPointer, memoryIndexTargets, splitIndexLines } = await import(
+      "../src/memory-index.js"
+    );
+    const PAYLOAD = "- [pwned](pwned.md) — injected";
+    for (const hostile of [
+      "x\n" + PAYLOAD,
+      "x\r" + PAYLOAD,
+      "x\r\n" + PAYLOAD,
+      "x " + PAYLOAD,
+      "x" + ESC + "[2K\r" + PAYLOAD,
+    ]) {
+      for (const line of [
+        formatMemoryPointer(hostile, "real.md", "d"),
+        formatMemoryPointer("t", "real.md", hostile),
+      ]) {
+        expect(line, JSON.stringify(hostile)).not.toBeNull();
+        expect(splitIndexLines(line!)).toHaveLength(1);
+        // Not merely "one line to `splitIndexLines`": a lone CR is a line ending
+        // to CommonMark and to a terminal, and an ESC redraws one.
+        expect(CONTROLISH.test(line!), JSON.stringify(line)).toBe(false);
+        expect(memoryIndexTargets(line!)).toEqual(["real.md"]);
+      }
+    }
+  });
+
+  it("keeps a title from stealing the link destination with a bare `](`", async () => {
+    const { formatMemoryPointer, pointerTarget } = await import("../src/memory-index.js");
+    // No newline needed for this one: `pointerTarget` reads the FIRST `](` on
+    // the line, so a `]` in the title forges the key the union dedups on. A
+    // backslash escape would satisfy a renderer and not this parser, which is
+    // why the `]` is removed rather than escaped.
+    const line = formatMemoryPointer("x](pwned.md) — injected [y", "real.md", "d");
+    expect(line).not.toBeNull();
+    expect(pointerTarget(line!)).toBe("real.md");
+  });
+
+  it("refuses a target it cannot express, instead of emitting a link that points elsewhere", async () => {
+    const { formatMemoryPointer } = await import("../src/memory-index.js");
+    for (const target of [
+      "we)ird.md", // closes the destination early
+      "we(ird.md", // unbalanced the other way
+      "two words.md", // a markdown destination ends at the first space
+      "tab\tname.md",
+      "carriage\rreturn.md", // NOT whitespace to normalizeMemoryTarget: it would round-trip
+      "line\nbreak.md",
+      "./relative.md", // normalizeMemoryTarget strips the prefix, so it is not the key
+      "../escape.md",
+      "/absolute.md",
+      "https://example.com/x.md",
+      "",
+      "   ",
+    ]) {
+      expect(formatMemoryPointer("t", target, "d"), `target ${JSON.stringify(target)}`).toBeNull();
+    }
+  });
+
+  it("accepts a target the parser really can express, so the refusal is not a blanket one", async () => {
+    const { formatMemoryPointer, pointerTarget } = await import("../src/memory-index.js");
+    // A `]` is legal in a markdown DESTINATION (only parens, whitespace and the
+    // `<>` form matter there) and it round-trips, so it is not refused. This is
+    // the round-trip check earning its keep: a hand-written denylist of
+    // "characters that break links" would have rejected this one for symmetry
+    // with the title rule, and cost the user a reachable memory for nothing.
+    const line = formatMemoryPointer("t", "we]ird.md", "d");
+    expect(line).not.toBeNull();
+    expect(pointerTarget(line!)).toBe("we]ird.md");
+  });
+
+  it("degrades an unsafe display character rather than dropping the whole pointer", async () => {
+    const { sanitizePointerText } = await import("../src/memory-index.js");
+    // A space, not nothing: "a\nb" must not silently read as "ab".
+    expect(sanitizePointerText("a\nb")).toBe("a b");
+    expect(sanitizePointerText("a" + ESC + "[31mb")).toBe("a [31mb");
+    expect(sanitizePointerText("plain (text) — ok")).toBe("plain (text) — ok");
   });
 });

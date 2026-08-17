@@ -486,8 +486,35 @@ export interface SharedLayerFindings {
    * no index and no union, and `plans/` is config-dir-global, so nothing is
    * written beside it. The local plan is kept and the incoming one stays in the
    * bundle.
+   *
+   * Only ever populated when the plans layer was applied at all — see
+   * `plansSkipped`.
    */
   planConflicts?: AuxiliaryConflict[];
+  /**
+   * How many plan files the bundle carried that were **not written**, because
+   * `--include-plans` was not passed. Present only when the bundle had some.
+   *
+   * The plans layer is opt-in on the receive side for the reason CLAUDE.md
+   * already gives for keeping it off the hub: `<configDir>/plans` is
+   * config-dir-global with no project filter, so applying it writes files every
+   * project on this machine shares, on the say-so of a bundle. `memory/` lands
+   * in the target project's own directory and stays default-on.
+   *
+   * A count and not a boolean, because the number is the disclosure: "this
+   * bundle wanted to write 14 files into a shared directory" is a different
+   * sentence from "it wanted to write 1".
+   *
+   * REACH, and it is narrower than the "one declaration" note above promises:
+   * declaring a field here gives all three shapes the TYPE, not the value. The
+   * two projections that build a `MigrateResult` (`migrator.ts`) and a
+   * `HubPullResult` (`hub/pull-apply-state.ts`'s `sharedLayerFindings`) are
+   * hand-written field lists, so this one is populated on `import` only. That
+   * is currently harmless — a pull never writes plans and `plans/` never
+   * reaches the hub — and the accompanying warning does cross both, but the
+   * field does not follow the type until those two lists name it.
+   */
+  plansSkipped?: number;
 }
 
 export interface ImportResult extends SharedLayerFindings {
@@ -523,6 +550,8 @@ export interface DryRunResult {
   memoryPlan?: MemoryPlanEntry[];
   memoryDir?: string;
   planConflicts?: AuxiliaryConflict[];
+  /** Plans the bundle carries that the real run would not write. Same rule. */
+  plansSkipped?: number;
 }
 
 export interface MigrateResult extends SharedLayerFindings {

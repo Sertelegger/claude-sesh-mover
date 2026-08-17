@@ -228,6 +228,16 @@ export async function migrateSession(options) {
             memoryIndex: imported.memoryIndex,
             memoryDir: imported.memoryDir,
             planConflicts: imported.planConflicts,
+            // `plansSkipped` matters MORE here than on import, not less. `migrate`
+            // declares no `--include-plans`, so it always takes the skip — and unlike
+            // an import, the user is moving a session and may reasonably read that as
+            // "everything came with it". The warning already crosses; without this
+            // the count is the one part the skill layer cannot branch on. (It is not
+            // data loss either way: cleanup deletes only the source project's
+            // sessions and file-history, never `<sourceConfigDir>/plans`, so the
+            // source plans stay where they are. The visible gap is a cross-config-dir
+            // migrate.)
+            plansSkipped: imported.plansSkipped,
             // The EXPORT's warnings ride along too, and they are not decoration on a
             // migrate: `--exclude` drops a layer from the bundle, but cleanup then
             // deletes the whole source session directory and its file-history

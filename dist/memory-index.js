@@ -244,9 +244,116 @@ export function unionMemoryIndex(local, incoming) {
         droppedProse,
     };
 }
-/** Build one pointer line in the shape every index already uses. */
+/**
+ * Characters that must never reach a pointer line, in any of its three fields.
+ *
+ * `\n` is the obvious one — it ends the line, so everything after it is a NEW
+ * line of the index. `\r` is the same defect wearing a different byte: CommonMark
+ * counts a lone carriage return as a line ending, so a renderer (and a human
+ * reading the file) sees two entries where `splitIndexLines` sees one. The rest
+ * of C0 is here for ``, which starts an ANSI sequence and can redraw or
+ * hide whatever a terminal has already printed; C1 and DEL for the same reason
+ * on a terminal in 8-bit mode; and U+2028/U+2029 because they are line
+ * terminators to a JS reader and to some renderers even though `indexOf("\n")`
+ * never sees them.
+ *
+ * This is a class, not a list of the characters one attacker used.
+ */
+function isUnsafeInlineCodePoint(cp) {
+    return (cp < 0x20 || // C0: \n, \r, \t, ESC …
+        cp === 0x7f || // DEL
+        (cp >= 0x80 && cp <= 0x9f) || // C1
+        cp === 0x2028 || // LINE SEPARATOR
+        cp === 0x2029 // PARAGRAPH SEPARATOR
+    );
+}
+/**
+ * Make an arbitrary string safe to interpolate into a pointer line's **display**
+ * fields (its title and its description).
+ *
+ * Display text is SANITISED rather than rejected, because refusing a pointer
+ * over an odd machine name would cost the user the index entry that makes a
+ * memory reachable — which is #49's defect, arriving by a new route. Every
+ * unsafe code point becomes a single space (not nothing: `a\nb` must not silently
+ * read as `ab`), and `]` is dropped from a title by `formatMemoryPointer`
+ * because a title carrying `](` steals the link's destination from this module's
+ * own matcher.
+ *
+ * Note what this is NOT: a markdown escaper. `\]` would satisfy a renderer and
+ * NOT `pointerTarget`, which is escape-blind by construction — it looks for the
+ * first literal `](`. A guard the parser cannot see is not a guard.
+ */
+export function sanitizePointerText(text) {
+    let out = "";
+    for (const ch of text) {
+        out += isUnsafeInlineCodePoint(ch.codePointAt(0)) ? " " : ch;
+    }
+    return out;
+}
+/** Does any code point of `s` fall in the class above? */
+function hasUnsafeInline(s) {
+    for (const ch of s) {
+        if (isUnsafeInlineCodePoint(ch.codePointAt(0)))
+            return true;
+    }
+    return false;
+}
+/**
+ * Build one pointer line in the shape every index already uses, or `null` when
+ * the target cannot be expressed as one.
+ *
+ * ## Why the three fields are treated differently
+ *
+ * A pointer line is built here from strings this module did not author: a title
+ * and a target derived from a **bundle filename**, and a description carrying a
+ * bundle's self-declared machine name, which nothing validates. Raw
+ * interpolation let any of them carry a newline and append arbitrary entries to
+ * the user's `MEMORY.md` — the same shape as the measured `git apply --summary`
+ * defect in `hub/carry.ts`, where an attacker-controlled destination split a
+ * line and a floor-protected file was deleted as a result. `unionMemoryIndex`
+ * does not cover this: its incoming lines are newline-free *because they came
+ * out of `splitIndexLines`*, and a line constructed here never did.
+ *
+ * - **Title and description are SANITISED** (see `sanitizePointerText`). They are
+ *   prose with no identity role, so degrading a character is cheaper than
+ *   withholding the line.
+ * - **The target is REJECTED, never rewritten.** It is the key the union dedups
+ *   on and the name of a real file on disk; escaping or stripping a character
+ *   would produce a line that points at nothing *and* whose key no longer equals
+ *   the caller's `parkedAs`, so the caller's "one pointer per parked file, ever"
+ *   check would miss it and append a fresh duplicate on every single import. A
+ *   target this module cannot express is a `null`, and the caller says so.
+ *
+ * ## The check is a round-trip, not a denylist
+ *
+ * The final guard is the module's OWN parser: the assembled line must split into
+ * exactly one line and must read back through `pointerTarget` as the target that
+ * was asked for. That cannot drift from `pointerTarget`/`normalizeMemoryTarget`
+ * the way a hand-maintained character list would, and it covers, without naming
+ * them, every way a target breaks the link: an unescaped `)` (closes the
+ * destination early), a `(`, whitespace (a markdown destination ends at the
+ * first space), a `./` prefix, a `..` segment, an absolute path, a `://` scheme.
+ */
 export function formatMemoryPointer(title, target, description) {
-    return `- [${title}](${target}) — ${description}`;
+    // A `]` anywhere in the title lets it carry `](`, which `pointerTarget` reads
+    // as THIS line's destination — a forged key, no newline required. Dropped
+    // rather than escaped, for the reason given in `sanitizePointerText`.
+    const safeTitle = sanitizePointerText(title).replace(/]/g, "");
+    const line = `- [${safeTitle}](${target}) — ${sanitizePointerText(description)}`;
+    // The control-character check runs over the WHOLE assembled line, and it has
+    // to: the round-trip below does not catch a control character in the TARGET.
+    // `normalizeMemoryTarget` truncates a destination at a space or a tab and at
+    // nothing else, so `carriage\rreturn.md` reads back as itself, the round-trip
+    // agrees, and the line ships a raw CR — which CommonMark counts as a line
+    // ending. Measured, by the test that names that exact target. Only the target
+    // can reach here unsanitised, so a hit is a rejection, not a rewrite.
+    if (hasUnsafeInline(line))
+        return null;
+    if (splitIndexLines(line).length !== 1)
+        return null;
+    if (pointerTarget(line) !== target)
+        return null;
+    return line;
 }
 /** Every memory file an index points at, deduped, in first-seen order. */
 export function memoryIndexTargets(text) {
