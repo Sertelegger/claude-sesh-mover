@@ -362,23 +362,27 @@ export interface MemoryPlanEntry {
     parkedAs?: string;
     note?: string;
 }
-export interface ImportResult {
-    success: true;
-    command: "import";
-    dryRun?: false;
-    importedSessions: Array<{
-        originalId: string;
-        newId: string;
-        slug: string;
-        messageCount: number;
-    }>;
-    skippedSessions: Array<{
-        originalId: string;
-        reason: "duplicate" | "already-received";
-    }>;
-    warnings: string[];
-    resumable: boolean;
-    versionAdaptations?: string[];
+/**
+ * What a run did to the two **shared-namespace** auxiliary layers — `memory/`
+ * (into the target project dir) and `plans/` (into the target config dir).
+ * Produced by `reconcileSharedLayers` in `src/importer.ts`, which is the single
+ * implementation every path shares.
+ *
+ * ONE DECLARATION, mixed into `ImportResult`, `MigrateResult` and
+ * `HubPullResult`, for the same reason `HubPullFindings` is one declaration: an
+ * import is reachable through three commands, and a hand-written second copy of
+ * these fields on one of them is exactly how a field ends up readable on `import`
+ * and absent on `pull` — which is what it did (#59 item 3), and what #49 was
+ * before it. A field added here reaches all three shapes with no edit.
+ *
+ * **Warnings are not a substitute for these fields.** `pull` and `migrate` both
+ * folded the importer's `warnings` into their own and stopped there, so the
+ * skill layer got the sentence "…saved theirs as notes.incoming.md…" and no
+ * machine-readable path to act on. `commands/import.md` branches on the typed
+ * fields and uses the warning only for wording; `commands/pull.md` and
+ * `commands/migrate.md` now do the same.
+ */
+export interface SharedLayerFindings {
     /**
      * Prose memory files that differ on both sides. Never `MEMORY.md` — the index
      * is unioned, so it is reported in `memoryIndex` instead.
@@ -401,6 +405,24 @@ export interface ImportResult {
      */
     planConflicts?: AuxiliaryConflict[];
 }
+export interface ImportResult extends SharedLayerFindings {
+    success: true;
+    command: "import";
+    dryRun?: false;
+    importedSessions: Array<{
+        originalId: string;
+        newId: string;
+        slug: string;
+        messageCount: number;
+    }>;
+    skippedSessions: Array<{
+        originalId: string;
+        reason: "duplicate" | "already-received";
+    }>;
+    warnings: string[];
+    resumable: boolean;
+    versionAdaptations?: string[];
+}
 export interface DryRunResult {
     success: true;
     command: "import";
@@ -416,7 +438,7 @@ export interface DryRunResult {
     memoryDir?: string;
     planConflicts?: AuxiliaryConflict[];
 }
-export interface MigrateResult {
+export interface MigrateResult extends SharedLayerFindings {
     success: true;
     command: "migrate";
     /**
@@ -449,6 +471,13 @@ export interface MigrateResult {
     directoryRenamed: boolean;
     sourcePath: string;
     targetPath: string;
+    /**
+     * Dry run only: what the memory step WOULD do, computed by the same function
+     * that does it. The mixed-in `memoryConflicts`/`memoryIndex` describe writes
+     * that happened, so they are absent on a preview and this is what stands in
+     * for them — the same split `DryRunResult` makes for a plain import.
+     */
+    memoryPlan?: MemoryPlanEntry[];
     warnings: string[];
 }
 export interface BrowseResult {
@@ -867,7 +896,19 @@ export interface HubPullNothingToApply {
      */
     reason: string;
 }
-export interface HubPullResult extends HubPullFindings {
+/**
+ * `HubPullResult` mixes in `SharedLayerFindings` as well as `HubPullFindings`.
+ *
+ * A pull applies a CHAIN of bundles, each through its own `importSession` call,
+ * all of them into the SAME memory directory — so the shared-layer fields are
+ * **aggregated across the chain, not reported per session**. That is not a
+ * convenience: `memory/` and `plans/` are not session-scoped at all (they are
+ * project- and config-dir-scoped), so "per session" is a category error, and a
+ * pull of five bundles that each park a memory file must report five parked
+ * paths rather than the last one. The aggregation and its dedup rules live in
+ * `hub/pull-apply-state.ts` (`recordSharedLayers` / `sharedLayerFindings`).
+ */
+export interface HubPullResult extends HubPullFindings, SharedLayerFindings {
     success: true;
     command: "pull";
     threadId: string;

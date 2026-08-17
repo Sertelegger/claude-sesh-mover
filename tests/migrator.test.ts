@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   writeFileSync,
+  readFileSync,
   readdirSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -788,6 +789,111 @@ describe("migrator", () => {
       expect(result.warnings.join(" ")).toContain("file-history excluded by user request");
       // Still a preview: the source layer is untouched.
       expect(existsSync(join(configDir, "file-history", sessionId))).toBe(true);
+    });
+  });
+
+  /**
+   * #59 item 3 — the shared-layer reconciliation reaches the MIGRATE result as
+   * typed fields, not only as warning prose.
+   *
+   * A migrate IS an import (export + import + cleanup), so it touches the same
+   * two directories the target already owns. Until this, only the importer's
+   * `warnings` were forwarded, so `commands/migrate.md` could relay a sentence
+   * about a parked memory and had no `parkedAs` to act on — and the intermediate
+   * bundle is a temp dir the migrate deletes, which makes the parked file the
+   * only copy of the incoming text on the machine.
+   */
+  describe("migrateSession — the shared layers as typed result fields", () => {
+    const TARGET = "/Users/testuser/Projects/newproject";
+    const targetMemDir = () =>
+      join(configDir, "projects", encodeProjectPath(TARGET), "memory");
+
+    function seedTargetMemory(): void {
+      mkdirSync(targetMemDir(), { recursive: true });
+      writeFileSync(
+        join(targetMemDir(), "MEMORY.md"),
+        "- [Test memory](test_memory.md) — my version\n"
+      );
+      writeFileSync(
+        join(targetMemDir(), "test_memory.md"),
+        "---\nname: Test memory\n---\n\nMine, not theirs.\n"
+      );
+    }
+
+    function opts(over: Record<string, unknown> = {}) {
+      return {
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: TARGET,
+        scope: "current" as const,
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        currentCwd: "/Users/testuser",
+        ...over,
+      };
+    }
+
+    it("a migrate that parks a memory file exposes parkedAs and memoryDir", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      seedTargetMemory();
+
+      const result = await migrateSession(opts());
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      expect(result.memoryDir).toBe(targetMemDir());
+      expect(result.memoryConflicts).toHaveLength(1);
+      const conflict = result.memoryConflicts![0];
+      expect(conflict.filename).toBe("test_memory.md");
+      expect(conflict.parkedAs).toBe("test_memory.incoming.md");
+      expect(conflict.existingHash).not.toBe(conflict.incomingHash);
+      expect(result.memoryIndex).toBeDefined();
+
+      // The fields describe files that are really there, and the target's own
+      // memory was not overwritten.
+      const read = (n: string) => readFileSync(join(targetMemDir(), n), "utf-8");
+      expect(read("test_memory.md")).toContain("Mine, not theirs.");
+      expect(read("test_memory.incoming.md")).toContain("Use vitest for testing.");
+      expect(read("MEMORY.md")).toContain("(test_memory.incoming.md)");
+    });
+
+    it("nothing to reconcile is reported by omission, not with an empty array", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      // No seeded target memory: the layer arrives clean, so there is no
+      // conflict — but it DID arrive, which `memoryDir` is what says.
+      const result = await migrateSession(opts());
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.memoryConflicts).toBeUndefined();
+      expect(result.planConflicts).toBeUndefined();
+      expect(result.memoryDir).toBe(targetMemDir());
+      expect(
+        readFileSync(join(targetMemDir(), "test_memory.md"), "utf-8")
+      ).toContain("Use vitest for testing.");
+    });
+
+    it("the dry run previews the memory plan the real run executes, and writes nothing", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      seedTargetMemory();
+
+      const preview = await migrateSession(opts({ dryRun: true }));
+      expect(preview.success).toBe(true);
+      if (!preview.success) return;
+      expect(preview.dryRun).toBe(true);
+      expect(preview.memoryDir).toBe(targetMemDir());
+      const parked = preview.memoryPlan?.find((e) => e.filename === "test_memory.md");
+      expect(parked).toBeDefined();
+      expect(parked!.verdict).toBe("park");
+      expect(parked!.parkedAs).toBe("test_memory.incoming.md");
+      // A preview writes nothing, and reports no conflict either: nothing was
+      // parked, so there is no `parkedAs` on disk to act on yet.
+      expect(preview.memoryConflicts).toBeUndefined();
+      expect(existsSync(join(targetMemDir(), "test_memory.incoming.md"))).toBe(false);
+      expect(
+        readFileSync(join(targetMemDir(), "MEMORY.md"), "utf-8")
+      ).not.toContain("incoming");
     });
   });
 });

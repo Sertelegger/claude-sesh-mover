@@ -9,7 +9,12 @@ import { stageOk, stageSkip, stageRefuse, stageAbort } from "../src/hub/pull-sta
 import type {
   ErrorResult, ExportManifest, HubPullFindings, HubPullResult,
 } from "../src/types.js";
-import { initApplyState, type PulledCarry } from "../src/hub/pull-apply-state.js";
+import {
+  initApplyState,
+  recordSharedLayers,
+  sharedLayerFindings,
+  type PulledCarry,
+} from "../src/hub/pull-apply-state.js";
 import { runApplyCarryStage } from "../src/hub/pull-apply-carry.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import type { HubBackend } from "../src/hub/backend.js";
@@ -3183,4 +3188,127 @@ describe("cross-machine chain assembly, end to end (#35)", () => {
       }
     });
   }
+});
+
+/**
+ * The shared-layer accumulator (#59 item 3). A pull walks a CHAIN of bundles,
+ * each reconciled by its own `importSession` call into the SAME memory and
+ * plans directories — so the result's shared-layer fields are pull-wide, and
+ * the rules for folding them together are the thing that can silently drop a
+ * finding. These are pure: no filesystem, no hub.
+ */
+describe("shared-layer accumulation across a bundle chain", () => {
+  const acc = () => initApplyState({ needed: [] }).sharedLayers;
+
+  it("keeps every parked memory in the chain, not just the last one", () => {
+    const a = acc();
+    // Five bundles, each parking a DIFFERENT incoming version of the same file
+    // — the case the issue names. Reporting only the last is the defect.
+    for (let n = 1; n <= 5; n++) {
+      recordSharedLayers(a, {
+        memoryDir: "/target/memory",
+        memoryConflicts: [
+          {
+            filename: "notes.md",
+            existingHash: "sha256:local",
+            incomingHash: `sha256:incoming-${n}`,
+            parkedAs: n === 1 ? "notes.incoming.md" : `notes.incoming-${n}.md`,
+          },
+        ],
+        memoryIndex: { added: [], alreadyPresent: 0, droppedProse: false, unindexed: [] },
+      });
+    }
+
+    const found = sharedLayerFindings(a);
+    expect(found.memoryConflicts).toHaveLength(5);
+    expect(found.memoryConflicts!.map((c) => c.parkedAs)).toEqual([
+      "notes.incoming.md",
+      "notes.incoming-2.md",
+      "notes.incoming-3.md",
+      "notes.incoming-4.md",
+      "notes.incoming-5.md",
+    ]);
+    expect(found.memoryDir).toBe("/target/memory");
+  });
+
+  it("collapses the identical conflict five bundles report for one file on disk", () => {
+    const a = acc();
+    // The importer REUSES a byte-identical parked copy rather than planting
+    // `.incoming-2.md`, so an unchanged memory travelling on five bundles is
+    // one file and must be one offer to merge — not five.
+    const same = {
+      filename: "notes.md",
+      existingHash: "sha256:local",
+      incomingHash: "sha256:incoming",
+      parkedAs: "notes.incoming.md",
+    };
+    for (let n = 0; n < 5; n++) {
+      recordSharedLayers(a, { memoryConflicts: [{ ...same }], planConflicts: [
+        { filename: "plan.md", existingHash: "sha256:l", incomingHash: "sha256:i" },
+      ] });
+    }
+    const found = sharedLayerFindings(a);
+    expect(found.memoryConflicts).toHaveLength(1);
+    expect(found.planConflicts).toHaveLength(1);
+  });
+
+  it("a file a later bundle's index union adopted is no longer reported unindexed", () => {
+    const a = acc();
+    recordSharedLayers(a, {
+      memoryDir: "/target/memory",
+      memoryIndex: {
+        added: [],
+        alreadyPresent: 1,
+        droppedProse: false,
+        unindexed: ["orphan.md", "still-orphan.md"],
+      },
+    });
+    recordSharedLayers(a, {
+      memoryDir: "/target/memory",
+      memoryIndex: {
+        // The second bundle's index names orphan.md, so the union appended a
+        // pointer at it: it is reachable now and naming it would be a false
+        // alarm. Reported per bundle, this is exactly what over-reports.
+        added: ["orphan.md"],
+        alreadyPresent: 2,
+        droppedProse: true,
+        unindexed: [],
+      },
+    });
+
+    const found = sharedLayerFindings(a);
+    expect(found.memoryIndex!.unindexed).toEqual(["still-orphan.md"]);
+    expect(found.memoryIndex!.added).toEqual(["orphan.md"]);
+    expect(found.memoryIndex!.droppedProse).toBe(true);
+    expect(found.memoryIndex!.alreadyPresent).toBe(3);
+  });
+
+  it("says nothing at all when no bundle carried a shared layer", () => {
+    // Absence is the empty object, never `[]` or a zeroed report — the same
+    // presence rule HubPullFindings keeps.
+    const found = sharedLayerFindings(acc());
+    expect(found.memoryConflicts).toBeUndefined();
+    expect(found.memoryIndex).toBeUndefined();
+    expect(found.memoryDir).toBeUndefined();
+    expect(found.planConflicts).toBeUndefined();
+  });
+
+  it("reports an empty memory report when a bundle carried the layer with nothing to say", () => {
+    // Distinct from the case above: the layer WAS carried and reconciled, it
+    // simply had no conflicts. A caller must be able to tell "no memory in this
+    // pull" from "memory arrived and matched".
+    const a = acc();
+    recordSharedLayers(a, {
+      memoryDir: "/target/memory",
+      memoryIndex: { added: [], alreadyPresent: 0, droppedProse: false, unindexed: [] },
+    });
+    const found = sharedLayerFindings(a);
+    expect(found.memoryIndex).toEqual({
+      added: [],
+      alreadyPresent: 0,
+      droppedProse: false,
+      unindexed: [],
+    });
+    expect(found.memoryConflicts).toBeUndefined();
+  });
 });

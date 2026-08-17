@@ -1,3 +1,63 @@
+function keyOf(c) {
+    return `${c.filename}\0${c.existingHash}\0${c.incomingHash}\0${c.parkedAs ?? ""}`;
+}
+/** Fold one bundle's import result into the pull-wide accumulator. */
+export function recordSharedLayers(acc, found) {
+    if (found.memoryDir !== undefined)
+        acc.memoryDir = found.memoryDir;
+    for (const c of found.memoryConflicts ?? []) {
+        if (!acc.memoryConflicts.some((seen) => keyOf(seen) === keyOf(c))) {
+            acc.memoryConflicts.push(c);
+        }
+    }
+    for (const c of found.planConflicts ?? []) {
+        if (!acc.planConflicts.some((seen) => keyOf(seen) === keyOf(c))) {
+            acc.planConflicts.push(c);
+        }
+    }
+    const idx = found.memoryIndex;
+    if (!idx)
+        return;
+    acc.sawMemoryLayer = true;
+    for (const target of idx.added) {
+        if (!acc.addedIndexEntries.includes(target))
+            acc.addedIndexEntries.push(target);
+    }
+    for (const f of idx.unindexed) {
+        if (!acc.unindexed.includes(f))
+            acc.unindexed.push(f);
+    }
+    acc.alreadyPresent += idx.alreadyPresent;
+    acc.droppedProse ||= idx.droppedProse;
+}
+/**
+ * Project the accumulator onto the shape the result carries. SPREAD into
+ * `HubPullResult` at the one assembly site, never copied field by field, for the
+ * same reason `HubPullFindings` is: a field added to `SharedLayerFindings`
+ * reaches the pull with no edit here, which is the defect class (#59 item 3, and
+ * #49 before it) this whole path exists to close.
+ */
+export function sharedLayerFindings(acc) {
+    // A file left unindexed by an EARLIER bundle can be indexed by a LATER one's
+    // union, in which case it is no longer unindexed and reporting it would be a
+    // false alarm. `addedIndexEntries` is exactly the set of targets the chain
+    // appended, and a single bundle already computes `unindexed` after its own
+    // union — so subtracting it here applies the same rule across the chain.
+    const unindexed = acc.unindexed.filter((f) => !acc.addedIndexEntries.includes(f));
+    return {
+        memoryConflicts: acc.memoryConflicts.length > 0 ? acc.memoryConflicts : undefined,
+        memoryIndex: acc.sawMemoryLayer
+            ? {
+                added: acc.addedIndexEntries,
+                alreadyPresent: acc.alreadyPresent,
+                droppedProse: acc.droppedProse,
+                unindexed,
+            }
+            : undefined,
+        memoryDir: acc.memoryDir,
+        planConflicts: acc.planConflicts.length > 0 ? acc.planConflicts : undefined,
+    };
+}
 /**
  * An undecided divergence stopped the chain, so a payload out of a bundle
  * the user is about to pull AGAIN stops with it: applying or saving it now
@@ -175,6 +235,16 @@ export function initApplyState(input) {
          */
         abortIndex: -1,
         ourWritesFrom,
+        sharedLayers: {
+            memoryConflicts: [],
+            planConflicts: [],
+            addedIndexEntries: [],
+            unindexed: [],
+            alreadyPresent: 0,
+            droppedProse: false,
+            sawMemoryLayer: false,
+            memoryDir: undefined,
+        },
         // The newest carry payload in this chain, if any — see the loop.
         lastCarry: null,
         /**

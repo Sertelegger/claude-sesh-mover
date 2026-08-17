@@ -24,6 +24,21 @@ function layerDirsFor(exportPath, bundleSessionId) {
         ["file-history", join(exportPath, "file-history", bundleSessionId)],
     ];
 }
+/**
+ * The public `SharedLayerFindings` projection of a report. ONE place, so the
+ * three result shapes that carry these fields (`ImportResult` here,
+ * `MigrateResult` via migrator.ts, `HubPullResult` via the pull's accumulator)
+ * cannot disagree about when a field is present — an empty array is reported as
+ * absent, never as `[]`, and that rule is written once.
+ */
+function sharedFindings(shared) {
+    return {
+        memoryConflicts: shared.memoryConflicts.length > 0 ? shared.memoryConflicts : undefined,
+        memoryIndex: shared.memoryIndex,
+        memoryDir: shared.memoryDir,
+        planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
+    };
+}
 function readTextFile(path) {
     try {
         return readFileSync(path, "utf-8");
@@ -543,10 +558,7 @@ export async function importSession(options) {
             skippedSessions,
             warnings,
             resumable: true,
-            memoryConflicts: shared.memoryConflicts.length > 0 ? shared.memoryConflicts : undefined,
-            memoryIndex: shared.memoryIndex,
-            memoryDir: shared.memoryDir,
-            planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
+            ...sharedFindings(shared),
         };
     }
     // Step 1.5: Version reconciliation
@@ -602,6 +614,50 @@ export async function importSession(options) {
             }
         }
     }
+    // Step 3b, and it is a DECISION not to act: `manifest.memoryDigest` is NOT
+    // verified here, and that is deliberate rather than an omission (#59 item 2).
+    // Written down so the next reader does not re-litigate it.
+    //
+    // The gate above exists because of what those three layers DO after they land:
+    // a file-history backup is later restored over the user's own file by Claude
+    // Code, so a backup that cannot be shown to be the backup that was taken has no
+    // business being written where something may restore it. `memory/` has no such
+    // actuator — nothing consumes it but a human or a model reading markdown — and
+    // the reconciliation it feeds is non-destructive BY CONSTRUCTION, verified
+    // rather than assumed:
+    //
+    //  - `unionMemoryIndex` emits the local index verbatim. Every return path of
+    //    `appendIndexLines` is either `text` unchanged or `text` with an insertion
+    //    spliced in; no local byte is removed or rewritten, and an appended line is
+    //    one incoming `raw` line, which is newline-free by construction, so a
+    //    corrupt index cannot split or forge a local line.
+    //  - A prose memory is copied only when the destination does not exist, and a
+    //    conflicting one is parked through `copyToUniqueName`'s `COPYFILE_EXCL` —
+    //    which cannot overwrite. Same for `plans/`, minus the parking.
+    //  - So the worst a damaged payload achieves is a bad NEW file, a bad parked
+    //    copy, and a bad index line pointing at one — all of them named in the
+    //    result's typed fields (`memoryIndex.added`/`unindexed`, `memoryConflicts`),
+    //    on `pull` and `migrate` as well as `import` since #59 item 3. Visible and
+    //    reversible, where a bad file-history entry is neither.
+    //
+    // The exposure is also narrower than it looks. An archive bundle's damage is
+    // already caught upstream — gzip's CRC32 and zstd's XXH64 frame checksum both
+    // make a truncated or bit-flipped archive throw out of extraction (archiver.ts)
+    // — and every hub bundle is a `bundle.tar.gz` (hub/push.ts), so no hub pull
+    // reaches this code with silently damaged bytes. What remains is a DIRECTORY
+    // export damaged in place, and a hand-made `--no-check` `.tar.zst` this plugin
+    // refuses to produce: both chosen by hand, on this machine.
+    //
+    // The cost of acting is real, and it is #49's defect coming back: a whole-layer
+    // gate means one flipped byte in one memory file withholds the entire memory
+    // layer INCLUDING the index union, which is the one edit that makes the other
+    // machine's memories reachable at all.
+    //
+    // REVISIT THIS if either premise moves: if any path here starts overwriting a
+    // file the target already had, or if a memory payload gains a consumer that
+    // acts on it without a human reading it. Then the check belongs right here,
+    // beside the loop above, and `manifest.memoryDigest` is what it compares
+    // against `computeLayerDigest(join(exportPath, "memory"))`.
     // Generate new session IDs
     const sessionIdMap = new Map();
     for (const session of targetSessions) {
@@ -887,10 +943,7 @@ export async function importSession(options) {
         warnings,
         resumable: !noRegister,
         versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
-        memoryConflicts: shared.memoryConflicts.length > 0 ? shared.memoryConflicts : undefined,
-        memoryIndex: shared.memoryIndex,
-        memoryDir: shared.memoryDir,
-        planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
+        ...sharedFindings(shared),
     };
 }
 //# sourceMappingURL=importer.js.map

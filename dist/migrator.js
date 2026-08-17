@@ -142,6 +142,14 @@ export async function migrateSession(options) {
                 directoryRenamed: renamePlan.rename,
                 sourcePath: sourceProjectPath,
                 targetPath: targetProjectPath,
+                // The shared-layer preview, forwarded rather than re-derived. A migrate
+                // is an import, so its dry run has the same memory plan an `import
+                // --dry-run` has, and dropping it here was why `commands/migrate.md`
+                // could preview sessions but not the one part of the move that touches
+                // a directory the target already owns.
+                memoryPlan: dryResult.memoryPlan,
+                memoryDir: dryResult.memoryDir,
+                planConflicts: dryResult.planConflicts,
                 warnings: [
                     ...selfMigrationWarnings,
                     // The export runs for real even on a dry run (into a temp staging
@@ -208,6 +216,18 @@ export async function migrateSession(options) {
             directoryRenamed,
             sourcePath: sourceProjectPath,
             targetPath: targetProjectPath,
+            // The typed shared-layer fields, forwarded ALONGSIDE the import's warnings
+            // rather than instead of them (#59 item 3). A migrate reconciles `memory/`
+            // and `plans/` into the target exactly as an import does — it IS an import
+            // — so a migrate that parks a memory file must hand the skill layer the
+            // same `parkedAs`/`memoryDir` pair `commands/import.md` acts on. Only the
+            // warnings crossed this line before, which made the parked copy visible
+            // and unactionable. One migrate is one import call, so there is nothing to
+            // aggregate here (unlike a pull, which walks a chain).
+            memoryConflicts: imported.memoryConflicts,
+            memoryIndex: imported.memoryIndex,
+            memoryDir: imported.memoryDir,
+            planConflicts: imported.planConflicts,
             // The EXPORT's warnings ride along too, and they are not decoration on a
             // migrate: `--exclude` drops a layer from the bundle, but cleanup then
             // deletes the whole source session directory and its file-history

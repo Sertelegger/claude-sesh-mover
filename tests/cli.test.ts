@@ -1322,6 +1322,145 @@ describe("cli", () => {
       );
       expect(manifest.sessions.length).toBe(0);
     });
+
+    /**
+     * #59 item 1 — `export --incremental --to <peer>` reads the peer's memory
+     * ledger. Only `hub push` passed `peerMemoryDigest` before, so a plain
+     * incremental export re-shipped the whole `memory/` directory on every run:
+     * safe (absent means ship), just never minimal.
+     *
+     * It has to go through the CLI: `resolveIncrementalOptions` is
+     * module-private to src/cli.ts and the ledger read is the thing under test,
+     * so calling the exporter directly would test the exporter's half again.
+     */
+    describe("--to reads the peer's memory ledger", () => {
+      const projectPath = "/Users/testuser/Projects/testproject";
+
+      /** A HOME with a fixed machine id and one peer that is caught up on sessions. */
+      function seedPeerHome(tempHome: string, memoryDigest?: string): string {
+        const seshDir = join(tempHome, ".sesh-mover");
+        mkdirSync(join(seshDir, "sync-state"), { recursive: true });
+        writeFileSync(
+          join(seshDir, "machine-id.json"),
+          JSON.stringify({
+            id: "machine-local",
+            name: "local-machine",
+            createdAt: new Date().toISOString(),
+          }) + "\n"
+        );
+        const statePath = join(
+          seshDir,
+          "sync-state",
+          `${encodeProjectPath(projectPath)}.json`
+        );
+        writeFileSync(
+          statePath,
+          JSON.stringify({
+            projectPath,
+            schemaVersion: 1,
+            peers: {
+              "peer-1": {
+                name: "peer-machine",
+                lastSentAt: null,
+                lastReceivedAt: null,
+                // Caught up on session content, so `memory/` is the only
+                // variable the bundle's contents can turn on.
+                sent: {
+                  [sessionId]: {
+                    headEntryUuid: "entry-3",
+                    messageCount: 3,
+                    sentAsType: "full",
+                    sentAsSessionId: sessionId,
+                  },
+                },
+                received: {},
+                ...(memoryDigest ? { memoryDigest } : {}),
+              },
+            },
+            lineage: {},
+            imported: {},
+          }) + "\n"
+        );
+        return statePath;
+      }
+
+      function runIncrementalTo(tempHome: string, name: string): Record<string, unknown> {
+        const outputDir = join(tempDir, name);
+        mkdirSync(outputDir, { recursive: true });
+        runCli(
+          `export --scope all --source-config-dir "${configDir}" --project-path ${projectPath} --storage user --format dir --name ${name} --output "${outputDir}" --incremental --to peer-1`,
+          homeEnv(tempHome)
+        );
+        return JSON.parse(
+          readFileSync(join(outputDir, name, "manifest.json"), "utf-8")
+        ) as Record<string, unknown>;
+      }
+
+      it("nothing known about the peer: memory ships (the safe default is unchanged)", () => {
+        const tempHome = mkdtempSync(join(tmpdir(), "sesh-cli-mem-ship-"));
+        try {
+          seedPeerHome(tempHome);
+          const manifest = runIncrementalTo(tempHome, "inc-to-mem-first");
+          expect(existsSync(join(tempDir, "inc-to-mem-first", "inc-to-mem-first", "memory"))).toBe(
+            true
+          );
+          expect(manifest.includedLayers as string[]).toContain("memory");
+          expect(manifest.memoryDigest as string).toMatch(/^sha256:[0-9a-f]{64}$/);
+        } finally {
+          rmSync(tempHome, { recursive: true, force: true });
+        }
+      });
+
+      it("peer already holds this exact memory: it is not re-shipped", () => {
+        const tempHome = mkdtempSync(join(tmpdir(), "sesh-cli-mem-skip-"));
+        try {
+          seedPeerHome(tempHome);
+          const first = runIncrementalTo(tempHome, "inc-to-mem-a");
+          const digest = first.memoryDigest as string;
+          expect(digest).toMatch(/^sha256:/);
+
+          // Credit the peer exactly as a delivery would (`setPeerMemoryDigest`
+          // takes the BUNDLE's digest), then export again. The export above
+          // rewrote this file via recordSentFromBundle, so re-seed rather than
+          // patching a copy read before it.
+          seedPeerHome(tempHome, digest);
+          const second = runIncrementalTo(tempHome, "inc-to-mem-b");
+          expect(existsSync(join(tempDir, "inc-to-mem-b", "inc-to-mem-b", "memory"))).toBe(false);
+          expect(second.includedLayers as string[]).not.toContain("memory");
+          // Nothing shipped, so nothing may be credited on the receiving end.
+          expect(second.memoryDigest).toBeUndefined();
+        } finally {
+          rmSync(tempHome, { recursive: true, force: true });
+        }
+      });
+
+      it("a stale digest is not a skip: changed memory ships again", () => {
+        const tempHome = mkdtempSync(join(tmpdir(), "sesh-cli-mem-changed-"));
+        try {
+          seedPeerHome(tempHome);
+          const first = runIncrementalTo(tempHome, "inc-to-mem-c");
+          const digest = first.memoryDigest as string;
+
+          writeFileSync(
+            join(configDir, "projects", encodeProjectPath(projectPath), "memory", "test_memory.md"),
+            "---\nname: Test memory\n---\n\nSomething new was learned.\n"
+          );
+          seedPeerHome(tempHome, digest);
+          const second = runIncrementalTo(tempHome, "inc-to-mem-d");
+          expect(second.includedLayers as string[]).toContain("memory");
+          expect(second.memoryDigest).not.toBe(digest);
+          expect(
+            readFileSync(
+              join(tempDir, "inc-to-mem-d", "inc-to-mem-d", "memory", "test_memory.md"),
+              "utf-8"
+            )
+          ).toContain("Something new was learned.");
+        } finally {
+          rmSync(tempHome, { recursive: true, force: true });
+        }
+      });
+    });
+
   });
 
   describe("hub init/status CLI", () => {

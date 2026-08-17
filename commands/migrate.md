@@ -41,6 +41,13 @@ You are running the sesh-mover migrate command. This is a same-machine operation
    - **Source files that will be deleted** — the result carries no file list. Cleanup deletes, for every id in `importedSessions[].originalId` **and** `skippedSessions[].originalId`: `<sourceConfigDir>/projects/<encoded-source-path>/<id>.jsonl`, that session's subdirectory beside it (subagents, tool-results), and `<sourceConfigDir>/file-history/<id>/`. Name the session ids; don't invent paths beyond that. `cleanedUp` is the boolean summary (on a dry-run, "cleanup would run").
    - **Whether the project directory will be renamed** — `directoryRenamed`, plus the explaining warning when it is `false` (see step 5).
    - **`sourcePath` → `targetPath`** — the one path rewrite migrate reports. There is no per-path translation report in a migrate result; do not claim to list individual rewritten paths.
+   - **What will happen to the memory layer** — `memoryPlan` is one entry per file in the move's `memory/`, produced by the same function the real run executes. A migrate is an import, so the target's memory directory is one of the two places it touches files the user already owns; give the user one sentence *before* it happens rather than a warning after it:
+     - `copy` — absent at the target, will be written · `identical` — same bytes, no write
+     - `index-union` — this is `MEMORY.md` and it differs; `added` lists the entries that will be appended to the target's index and `alreadyPresent` those already in it
+     - `park` — a memory that differs on both sides; the target's is kept and the source's is saved as `parkedAs` beside it
+     - `keep-local` / `skip` — nothing will be written; `note` says why
+
+     Aggregate it, e.g. *"11 memory files: 10 new, 1 index — 10 entries would be added to MEMORY.md; `notes.md` differs and would be parked as `notes.incoming.md`."* Do **not** describe a `park` verdict as "would be merged": the merge is step 12, it costs tokens, and it has not been offered yet. `planConflicts` lists plans that already exist at the target with different content — reported and never written, so say so.
    - **Any `warnings`.**
 
    On a dry-run the result carries `dryRun: true`, and *every* field above is a prediction — `cleanedUp` and `directoryRenamed` mean "would happen", not "happened". A real run has no `dryRun` field and those same booleans are facts. Say which one you are reporting.
@@ -56,6 +63,21 @@ You are running the sesh-mover migrate command. This is a same-machine operation
     If the CLI returns `success: false` with an error mentioning "self-migration", do NOT retry with `--force` automatically. Present the `suggestion` field to the user and stop. Only pass `--force` if the user explicitly confirms they understand the risk AND asserts that the active Claude Code session is not in the source path.
 
 11. Report: sessions moved (`importedSessions`, with `newId` — this is the id to resume by), sessions skipped as duplicates, whether cleanup ran (`cleanedUp`), whether the directory was renamed (`directoryRenamed`, with the reason from `warnings` when it was not), and any remaining warnings.
+
+    **Report the memory layer from the typed fields, not from the warnings.** A migrate moves `memory/` into a directory the *target* project owns, and a session's memories are only reachable through `memory/MEMORY.md` — so a move that lands them and leaves the index alone lands nothing usable (that is #49, measured: ten memory files on disk, referenced by nothing, reported as `success: true`). All four fields are absent when the move carried no memory or plans layer:
+    - `memoryIndex.added` — link targets appended to the target's `MEMORY.md`. Name the count. `alreadyPresent` is how many the index already had.
+    - `memoryIndex.droppedProse: true` — the source's index carried headings or prose; only its entries were merged. One line, not a footnote.
+    - `memoryIndex.unindexed` — memory files that moved and that **no index lists**, so nothing will ever read them. They were usually already orphaned at the source; the union cannot fix that, because a file no line points at contributes no line. Name them and offer to add index entries if the user wants them (that is an ordinary edit to `MEMORY.md`, and it is the user's call, not the migrate's).
+    - `memoryConflicts` — memories that differ on both sides. **The target's was kept and nothing was overwritten**; `parkedAs` is the file the incoming copy was saved as, inside `memoryDir`. Both texts are on disk. Then go to step 12.
+    - `planConflicts` — plans that already exist here with different content. The local plan was kept and the incoming one was **not** written. **Say this plainly on a migrate, because it is worse here than on an import:** cleanup has already deleted the source session files, and the intermediate bundle lived in a temp directory that is gone by the time you read the result — so unlike an import, there is nothing left to extract the incoming plan from. It exists only at the source `plans/` directory, which a migrate does not delete (`plans/` is config-dir-global and cleanup only touches the moved sessions' own files), so point the user there.
+
+12. **Offer to merge the conflicting memories** — only if `memoryConflicts` is non-empty and every entry you act on has a `parkedAs`. This step is yours, not the CLI's: `dist/cli.js` does pure filesystem work and never calls a model, so the semantic merge happens here, in the session the user is already paying for, where its cost is visible and it can be confirmed before it happens.
+
+    **When there is nobody to confirm — do nothing.** A scripted `migrate` reaches this state with no user attached. What the CLI already did (the target's kept, the source's parked, both indexed) is a **complete and correct outcome**, not a fallback that failed. Never merge without asking.
+
+    The procedure is the one `/sesh-mover:import` step 11 documents and it is authoritative there — follow it rather than a paraphrase. In outline: size the conflicts in bytes and say the number before offering; offer per file (plus "All of them" / "None, leave them parked"); read both texts and classify every contradiction as `superseded` / `both-true-scoped` / `unresolved`; **any `unresolved` blocks the write** and is shown to the user instead of being decided; show the full proposed text and get an explicit yes; and on acceptance write the merged text to `<memoryDir>/<filename>`, save the **pre-merge local** text as `<memoryDir>/<stem>.pre-merge.md`, delete `<memoryDir>/<parkedAs>`, and remove only the `MEMORY.md` pointer line whose target was `<parkedAs>`.
+
+    **One difference from import, and it raises the stakes:** a migrate's bundle was a temp directory that is already deleted, so the parked file is the *only* copy of the incoming text on this machine — there is no bundle to go back to and no hub holding one. Both halves of every conflict exist in exactly one place each, which is why the "keep the pre-merge local text" step is not optional here.
 
 ## Other flags
 
