@@ -2,7 +2,7 @@ import type { HubBackend } from "./backend.js";
 import type { HubBundleRecord } from "./layout.js";
 import type { ApplyState } from "./pull-apply-state.js";
 import { type StageOutcome } from "./pull-stages.js";
-import type { ExportManifest } from "../types.js";
+import type { ExportManifest, ProgressEvent } from "../types.js";
 export interface FetchStageInput {
     backend: HubBackend;
     record: HubBundleRecord;
@@ -20,6 +20,11 @@ export interface FetchStageInput {
      * bundle a divergence abort deferred.
      */
     bundleIndex: number;
+    /**
+     * How many bundles this pull's chain has — the denominator of the `hub-pull`
+     * percent below, and the only thing this stage uses it for.
+     */
+    chainLength: number;
     /** Private temp dir for this pull; the archive and its extraction land here. */
     tempRoot: string;
     /**
@@ -27,6 +32,11 @@ export interface FetchStageInput {
      * rather than returning them. See the doc on `runFetchStage`.
      */
     state: ApplyState;
+    /**
+     * `hubPull`'s own callback, forwarded (#74). Optional and usually absent —
+     * only `--progress` supplies one — so everything below is a no-op by default.
+     */
+    onProgress?: (ev: ProgressEvent) => void;
 }
 /**
  * What a fetched bundle hands to the rest of the loop.

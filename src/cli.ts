@@ -55,7 +55,6 @@ import type {
   CliResult,
   ErrorResult,
   ConfigureResult,
-  HubNoSuchProjectResult,
   OnDivergenceMode,
 } from "./types.js";
 import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "./paths.js";
@@ -982,19 +981,11 @@ program
         outputError("push", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
         return;
       }
-      // Before hubPush, deliberately: this push would otherwise register this
-      // machine on the hub, mint a thread and run a full export before it ever
-      // read the id. See refuseUnknownProjectId.
-      const badId = await refuseUnknownProjectId("push", hubPath, opts.projectId);
-      if (badId) {
-        outputRefusal(badId);
-        return;
-      }
       const { hubPush } = await import("./hub/push.js");
       const onProgress = opts.progress
         ? (ev: import("./types.js").ProgressEvent) => process.stderr.write(JSON.stringify(ev) + "\n")
         : undefined;
-      output(await hubPush({
+      outputHubResult(await hubPush({
         configDir, projectPath, hubPath,
         sessionIds: opts.sessionId,
         noWorkspace: opts.workspace === false || config.hub.noWorkspace,
@@ -1052,16 +1043,11 @@ program
         outputError("pull", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
         return;
       }
-      const badId = await refuseUnknownProjectId("pull", hubPath, opts.projectId);
-      if (badId) {
-        outputRefusal(badId);
-        return;
-      }
       const { hubPull } = await import("./hub/pull.js");
       const onProgress = opts.progress
         ? (ev: import("./types.js").ProgressEvent) => process.stderr.write(JSON.stringify(ev) + "\n")
         : undefined;
-      output(await hubPull({
+      outputHubResult(await hubPull({
         configDir, projectPath, hubPath,
         threadId: opts.thread,
         latest: !!opts.latest,
@@ -1360,79 +1346,6 @@ function parseScope(value: string, command: string): SessionScope {
   );
 }
 
-/**
- * Validate `--project-id` against the hub BEFORE the verb runs (#29).
- *
- * Returns `null` when the flag was not passed or names a hub project that
- * exists; otherwise the typed refusal to emit instead of running the verb.
- *
- * Why here and not inside push/pull. Both funnel the flag into
- * `readHubProjectAsLocal`, which throws two different ways — `assertSafeHubId`
- * for a path-unsafe id, a raw `ENOENT` for a well-formed one the hub doesn't
- * have — and both escaped to the generic catch as an untyped `error` string
- * (the ENOENT one carrying the hub's absolute path). Worse on push: it decides
- * identity early but *resolves* it only after `registerMachine` (a hub write),
- * after minting a thread into local sync-state, and after a full incremental
- * export — so a typo'd id failed with residue on the hub and no typed result to
- * say so. A validation failure must not happen after side effects, and the CLI
- * boundary is the one point that is before all of them.
- *
- * This is a READ of `projects/<id>/project.json` and nothing else: it writes
- * nothing, links nothing, and does not weaken push's deferred-link consent gate
- * (that rationale is about the link WRITE, not about reading the project).
- */
-async function refuseUnknownProjectId(
-  command: "push" | "pull",
-  hubPath: string,
-  projectId: string | undefined
-): Promise<HubNoSuchProjectResult | null> {
-  if (!projectId) return null;
-  const { createFsBackend } = await import("./hub/backend.js");
-  const { HUB_JSON } = await import("./hub/layout.js");
-  const { readHubProjectAsLocal, listHubProjects } = await import("./hub/identity.js");
-  const backend = createFsBackend(hubPath);
-  // An unreachable hub (unmounted share, a sync client mid-copy) makes EVERY
-  // read fail, including this one — and answering "no such project" there would
-  // be a confident wrong diagnosis, sending the user to fix an id that is
-  // fine. Say nothing and let the verb report the hub problem in its own words.
-  if (!(await backend.exists(HUB_JSON))) return null;
-  try {
-    await readHubProjectAsLocal(backend, projectId);
-    return null;
-  } catch {
-    // Deliberately one arm for both throw flavours: from the caller's side
-    // "that id is not a project on this hub" is the same fact and the same
-    // remedy, and reflecting WHICH failure it was would mean reflecting the
-    // hub's absolute path (the ENOENT message) back out.
-    let linkCandidates: HubNoSuchProjectResult["linkCandidates"] = [];
-    try {
-      linkCandidates = (await listHubProjects(backend)).map((p) => ({
-        projectId: p.projectId,
-        name: p.name,
-        gitRemotes: p.matchers.gitRemotes,
-      }));
-    } catch {
-      // An unreadable/absent hub yields no pick list. The refusal still
-      // stands — an empty array, never a missing field.
-    }
-    return {
-      success: false,
-      command,
-      reason: "no-such-project",
-      requestedProjectId: projectId,
-      linkCandidates,
-      suggestion:
-        linkCandidates.length > 0
-          ? `No hub project with that id. Pick one of the ${linkCandidates.length} project(s) in linkCandidates and pass its projectId to --project-id` +
-            (command === "push" ? ", or pass --create-project to mint a new one." : ".")
-          : `No hub project with that id, and this hub lists no projects to pick from` +
-            (command === "push"
-              ? " — pass --create-project to mint one."
-              : " — push from the machine that has this project first."),
-    };
-  }
-}
-
 // Validates BOTH the flag and hub.onDivergence from config — a typo'd config
 // value must fail loudly here rather than silently resolving to a mode the
 // user didn't pick.
@@ -1722,6 +1635,31 @@ function output(result: unknown): void {
 function outputRefusal(result: CliResult & { success: false }): void {
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   process.exit(1);
+}
+
+/**
+ * Emit a push/pull result under the two exit conventions above.
+ *
+ * The gate that produces `no-such-project` moved from this file into
+ * `src/hub/preflight.ts` (#75) so that a library caller of `hubPush`/`hubPull`
+ * gets the same refusal. Only the SHAPE moved: it is still a bad invocation —
+ * the same class as `--on-divergence bogus` — so it still exits 1, and that is
+ * what this function is for. Routing everything through `output()` instead
+ * would have silently changed the exit code as a side effect of a refactor.
+ *
+ * `hub-unreachable` deliberately goes the OTHER way, and it is the one exit
+ * code this change moves (it was 1, as an untyped `ErrorResult` out of a raw
+ * ENOENT). The command was fine; the environment is not ready — an unmounted
+ * share, a synced folder mid-copy — which is the `unlinked` / `lock-busy` /
+ * `not-yet-synced` class: read the shape, remedy it, retry the same
+ * invocation. Exiting 1 for it would say the user typed something wrong.
+ */
+function outputHubResult(result: CliResult): void {
+  if (result.success === false && "reason" in result && result.reason === "no-such-project") {
+    outputRefusal(result);
+    return;
+  }
+  output(result);
 }
 
 function outputError(command: string, error: Error): void {

@@ -1632,4 +1632,244 @@ describe("importer", () => {
       { originalId: sessionId, reason: "duplicate" },
     ]);
   });
+
+  /**
+   * The importer is one of the five `readManifest` callers #72 audits. Its
+   * failure contract is the loudest of them — `readManifest` already sits
+   * inside a try/catch that returns a typed `ErrorResult` — which is most of
+   * the argument for folding the shape guard into `readManifest` rather than
+   * repeating it at five call sites: this site absorbs it verbatim.
+   */
+  describe("manifest shape refusal (#72)", () => {
+    const targetProjectPath = "/Users/newuser/Projects/newproject";
+
+    /** Rewrite the export's manifest.json with `sessions` set to `value`. */
+    async function setSessions(value: unknown): Promise<void> {
+      const raw = JSON.parse(readFileSync(join(exportPath, "manifest.json"), "utf-8"));
+      raw.sessions = value;
+      writeFileSync(join(exportPath, "manifest.json"), JSON.stringify(raw, null, 2));
+    }
+
+    /** Every .jsonl now in the target project dir. */
+    async function landedSessions(): Promise<string[]> {
+      const { encodeProjectPath } = await import("../src/platform.js");
+      const dir = join(targetConfigDir, "projects", encodeProjectPath(targetProjectPath));
+      return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".jsonl")) : [];
+    }
+
+    it('refuses `sessions: "abc"` as a typed error, without fabricating a count', async () => {
+      const { importSession } = await import("../src/importer.js");
+      await setSessions("abc");
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+
+      expect(result.success).toBe(false);
+      const err = result as ErrorResult;
+      expect(err.command).toBe("import");
+      expect(err.error).toMatch(/not a sesh-mover bundle manifest/i);
+      // Before the guard this reached step 1b instead, which iterated the
+      // string's characters and reported `3 session(s) declared by
+      // manifest.json` — a session count invented from a string's length, by
+      // the very check whose job is refusing invented inventories.
+      expect(err.error).not.toMatch(/3 session\(s\)/);
+      expect(await landedSessions()).toHaveLength(0);
+      expect(existsSync(join(targetConfigDir, "history.jsonl"))).toBe(false);
+    });
+
+    it('refuses `sessions: "abc"` with --session-id too, where it used to TypeError', async () => {
+      // The sharper half. `targetSessions = manifest.sessions.filter(...)` sits
+      // OUTSIDE the try/catch around `readManifest`, so with a string list and
+      // a --session-id this used to throw `manifest.sessions.filter is not a
+      // function` straight out of `importSession` — an unhandled rejection on a
+      // path that has three callers (import, migrate, hub pull).
+      const { importSession } = await import("../src/importer.js");
+      await setSessions("abc");
+
+      const result = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+        sessionIds: [sessionId],
+      });
+
+      expect(result.success).toBe(false);
+      expect((result as ErrorResult).error).toMatch(/not a sesh-mover bundle manifest/i);
+      expect(await landedSessions()).toHaveLength(0);
+    });
+  });
+
+  /**
+   * The durable-bookkeeping tail (#28). Three steps run after the write loop's
+   * rollback is out of reach, and each one used to throw the whole in-memory
+   * `SyncState` away with the rejected promise — leaving the sessions on disk
+   * and `state.imported` unwritten, so the next attempt imported them all over
+   * again. Each test drives the real failure with an EISDIR (a directory where
+   * a file has to be written), which reproduces on any uid.
+   */
+  describe("durable bookkeeping survives a failing tail (#28)", () => {
+    const targetProjectPath = "/Users/newuser/Projects/newproject";
+
+    async function importOnce(): Promise<ImportResult | ErrorResult> {
+      const { importSession } = await import("../src/importer.js");
+      return (await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      })) as ImportResult | ErrorResult;
+    }
+
+    it("a project dir that cannot take the identity file does not cost the import registry", async () => {
+      // `writeLocalProjectId` writes into the user's PROJECT directory, the one
+      // place in this tail that is outside the config dir. A project dir the
+      // importing user cannot write made it throw deterministically — every
+      // retry, forever — and the retry is what created the duplicates.
+      const { readSyncState } = await import("../src/sync-state.js");
+      const { PROJECT_JSON_FILE_NAME } = await import("../src/paths.js");
+
+      const projectDir = join(tempDir, "proj");
+      mkdirSync(projectDir, { recursive: true });
+      // A DIRECTORY where the identity file goes: writeFileSync -> EISDIR.
+      mkdirSync(join(projectDir, PROJECT_JSON_FILE_NAME), { recursive: true });
+
+      // The bundle has to carry a projectId for that write to be attempted.
+      const raw = JSON.parse(readFileSync(join(exportPath, "manifest.json"), "utf-8"));
+      raw.projectId = "11111111-1111-1111-1111-111111111111";
+      writeFileSync(join(exportPath, "manifest.json"), JSON.stringify(raw, null, 2));
+
+      const { importSession } = await import("../src/importer.js");
+      const first = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath: projectDir,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      expect(
+        (first as ImportResult).warnings.some((w) =>
+          w.includes("Could not write the project identity file")
+        )
+      ).toBe(true);
+
+      // The registry reached disk, which is the whole point.
+      const state = readSyncState(projectDir);
+      expect(Object.keys(state.imported)).toHaveLength(1);
+
+      // And the consequence that used to follow is gone: a re-run is a
+      // duplicate, not a second copy.
+      const second = await importSession({
+        exportPath,
+        targetConfigDir,
+        targetProjectPath: projectDir,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect((second as ImportResult).importedSessions).toHaveLength(0);
+      expect((second as ImportResult).skippedSessions).toEqual([
+        { originalId: sessionId, reason: "duplicate" },
+      ]);
+    });
+
+    it("a history.jsonl that cannot be appended records registered:false rather than throwing", async () => {
+      const { readSyncState } = await import("../src/sync-state.js");
+      // A DIRECTORY named history.jsonl: appendFileSync -> EISDIR.
+      mkdirSync(join(targetConfigDir, "history.jsonl"), { recursive: true });
+
+      const result = await importOnce();
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const ok = result as ImportResult;
+
+      expect(ok.warnings.some((w) => w.includes("resume list"))).toBe(true);
+      // `resumable` has to tell the truth: the session imported, but Claude
+      // Code will not offer it.
+      expect(ok.resumable).toBe(false);
+      expect(ok.importedSessions).toHaveLength(1);
+
+      const state = readSyncState(targetProjectPath);
+      const entries = Object.values(state.imported);
+      expect(entries).toHaveLength(1);
+      // The flag that the dedup filter reads. Recorded as it HAPPENED, so the
+      // next import re-imports (correct: the session is not resumable yet)
+      // rather than skipping it forever as a registered duplicate.
+      expect(entries[0].registered).toBe(false);
+    });
+
+    it("a sync-state that cannot be written is a warning, not a discarded import", async () => {
+      // The last step of the tail, and the only one whose failure the import
+      // genuinely survives: files written, sessions registered. Throwing there
+      // discarded a COMPLETED import — and on `migrate` it left the source
+      // sessions undeleted beside the copies that had already landed.
+      const { syncStatePath } = await import("../src/sync-state.js");
+      // A DIRECTORY where the state file goes: writeSyncState's rename -> EISDIR.
+      mkdirSync(syncStatePath(targetProjectPath), { recursive: true });
+
+      const result = await importOnce();
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const ok = result as ImportResult;
+      expect(ok.importedSessions).toHaveLength(1);
+      // The consequence has to be stated, because it is the one thing the user
+      // can act on: the next import of this bundle will not be deduped.
+      expect(
+        ok.warnings.some((w) => w.includes("sync-state could not be saved"))
+      ).toBe(true);
+      expect(ok.warnings.some((w) => w.includes("second copy"))).toBe(true);
+    });
+
+    it("a __proto__ session id from a new peer keeps its receipt as an own key", async () => {
+      // sync-state.ts's rule is "anything that BUILDS one of these records must
+      // use foreignKeyedRecord". The importer BUILDS one, for a peer it has
+      // never seen — so it does not inherit the container-level guarantee. On a
+      // plain object `received["__proto__"] = receipt` invokes the inherited
+      // setter, creates no own key, and serializes as `{}`.
+      const { readSyncState } = await import("../src/sync-state.js");
+      const { writeManifest, readManifest, computeIntegrityHashFromFile } = await import(
+        "../src/manifest.js"
+      );
+      const { renameSync } = await import("node:fs");
+
+      const manifest = readManifest(exportPath);
+      renameSync(
+        join(exportPath, "sessions", `${sessionId}.jsonl`),
+        join(exportPath, "sessions", "__proto__.jsonl")
+      );
+      manifest.sessions[0].sessionId = "__proto__";
+      manifest.sessions[0].integrityHash = await computeIntegrityHashFromFile(
+        join(exportPath, "sessions", "__proto__.jsonl")
+      );
+      manifest.sourceMachineId = "peer-never-seen-before";
+      manifest.sourceMachineName = "laptop";
+      writeManifest(exportPath, manifest);
+
+      const result = await importOnce();
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const state = readSyncState(targetProjectPath);
+      const peer = state.peers["peer-never-seen-before"];
+      expect(peer).toBeDefined();
+      expect(Object.hasOwn(peer.received, "__proto__")).toBe(true);
+      expect(peer.received["__proto__"].localSessionId).toBe(
+        (result as ImportResult).importedSessions[0].newId
+      );
+      // The receipt has to survive the round trip to disk, which is where the
+      // prototype write lost it: JSON.stringify reads own enumerable keys only.
+      expect(JSON.stringify(peer.received)).toContain("__proto__");
+    });
+  });
 });

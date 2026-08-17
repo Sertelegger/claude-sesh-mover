@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
-import { HUB_JSON, bundleDir, bundleFileName, type HubBundleRecord, type HubJson } from "./layout.js";
+import { bundleDir, bundleFileName, type HubBundleRecord, type HubJson } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import {
   resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId,
@@ -15,6 +15,7 @@ import {
   type GitRemoteScan, type LocalProjectId,
 } from "./identity.js";
 import { registerMachine } from "./init.js";
+import { preflightHub } from "./preflight.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
 import { snapshotWorkspace, isNeverIncludable } from "./workspace.js";
 import { captureCarry, gitChildEnv, type CarryMeta } from "./carry.js";
@@ -29,7 +30,8 @@ import {
   setPeerMemoryDigest,
 } from "../sync-state.js";
 import type {
-  ErrorResult, HubLockBusyResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, ProgressEvent,
+  ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPushFailedResult, HubPushResult,
+  HubUnlinkedResult, HubUnreachableResult, ProgressEvent,
 } from "../types.js";
 import { includeFilePath } from "../paths.js";
 
@@ -311,11 +313,24 @@ function failedAfterLink(
   };
 }
 
-export async function hubPush(
-  opts: HubPushOptions
-): Promise<
-  HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | ErrorResult
-> {
+/**
+ * Everything `hubPush` can answer with, named rather than spelled out inline.
+ *
+ * A named union is what a library consumer needs in order to write one handler
+ * for the verb (`src/index.ts` re-exports this module), and it is the sibling of
+ * `HubPullOutcome`. The two refusals at the end arrive from the shared
+ * preflight (#75) and are the two that used to be a raw throw.
+ */
+export type HubPushOutcome =
+  | HubPushResult
+  | HubUnlinkedResult
+  | HubLockBusyResult
+  | HubPushFailedResult
+  | HubUnreachableResult
+  | HubNoSuchProjectResult
+  | ErrorResult;
+
+export async function hubPush(opts: HubPushOptions): Promise<HubPushOutcome> {
   // An empty array is programmatically distinct from "omitted" but must mean
   // the same thing here — otherwise it mints zero threads (the filter below
   // matches nothing) while still exporting every session (exportAllSessions
@@ -348,6 +363,14 @@ export async function hubPush(
   try {
     staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
     const backend = createFsBackend(opts.hubPath);
+    // BEFORE the identity decision, the export and every hub write: is there a
+    // hub here at all, and does `--project-id` name a project on it? Both
+    // refusals are worth having only because nothing has happened yet (#75).
+    const pre = await preflightHub({
+      command: "push", hubPath: opts.hubPath, backend,
+      projectIdOverride: opts.projectIdOverride,
+    });
+    if (pre.kind === "refuse") return pre.result;
     const warnings: string[] = [];
     // A budget that could not be read as written. Said once, up front, rather
     // than folded into the decline it causes — the two are different facts, and
@@ -465,8 +488,23 @@ export async function hubPush(
     };
 
     await registerMachine(opts.hubPath);
-    const hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
+    // Read once, by the preflight above — a second read here would put back the
+    // very `ENOENT` the `hub-unreachable` refusal replaces (#75).
+    const hub: HubJson = pre.hub;
     const hubPeerId = `hub:${hub.hubId}`;
+    // NOT moved into a `try`/`finally` pair the way `hubPull`'s was (#74),
+    // although push has the same hole: three of its exits emit this `0` and
+    // never the matching `100` (the export's own failure return, the
+    // `failedAfterLink` disclosure, and the rethrow above it). The obvious fix
+    // is `hubPull`'s — open here, close in the `finally`, swallowing a throwing
+    // callback so it cannot replace the failure being reported — and it would
+    // silently delete a DOCUMENTED behaviour of this module: a caller callback
+    // that throws right after the link is committed is the deterministic seam
+    // `tests/hub-push.test.ts`'s "refuses to remove a link that now names a
+    // different project" uses to reproduce the concurrent-link-modification
+    // race, and that test states the coverage is deliberate. Push's terminal
+    // event therefore wants its own decision, like `createArchive`'s missing
+    // progress callback — see `runFetchStage`.
     opts.onProgress?.({ phase: "hub-push", percent: 0 });
 
     // Thread minting for every session in scope

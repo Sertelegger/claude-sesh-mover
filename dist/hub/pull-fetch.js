@@ -30,7 +30,16 @@ import { readManifest, verifySessionsDigest } from "../manifest.js";
  * records* the next bundle, foreclosing the remedy.
  */
 export async function runFetchStage(input) {
-    const { backend, record, machineId, bundleIndex: i, tempRoot, state: st } = input;
+    const { backend, record, machineId, bundleIndex: i, chainLength, tempRoot, state: st } = input;
+    // Bundles COMPLETED over bundles total, emitted as this one starts: bundle 0
+    // reports 0%, and the chain's last bundle reports (n-1)/n rather than 100 —
+    // the terminal 100 is `hubPull`'s `finally` and belongs to nobody else. It is
+    // the only monotonic denominator available here; a byte-level number would
+    // need a size the index does not record.
+    input.onProgress?.({
+        phase: "hub-pull",
+        percent: chainLength > 0 ? Math.round((i / chainLength) * 100) : 0,
+    });
     const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
     const out = createWriteStream(tarPath);
     // record.file is hub-sourced (read out of another machine's index
@@ -41,6 +50,13 @@ export async function runFetchStage(input) {
     await pipeline(await backend.readStream(record.file), out);
     const extractDir = join(tempRoot, record.bundleId);
     mkdirSync(extractDir, { recursive: true });
+    // NO progress reporting across this call, and it is a gap rather than an
+    // omission (#74): `extractArchive` (src/archiver.ts) takes no callback at
+    // all, so there is no seam to report from — and on a large bundle over a
+    // network share the download above and this extraction are most of the wall
+    // clock. `hub push`'s `createArchive` has the identical hole. Giving the
+    // archiver a progress callback is a bigger change than this one and wants
+    // deciding on its own merits, so it is stated here rather than smuggled in.
     await extractArchive(tarPath, extractDir);
     // Archiver-rooting reality check: createArchive tars the staging dir
     // with `cwd: dirname(sourceDir)` and a single top-level entry

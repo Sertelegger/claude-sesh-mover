@@ -1874,3 +1874,160 @@ describe("hub push — an index poisoned by an older version", () => {
     }
   });
 });
+
+/**
+ * #75 — the two things a push must settle about the HUB before it does
+ * anything, now decided in `src/hub/preflight.ts` where a library caller of
+ * `hubPush` meets them too (they were CLI-only, or an uncaught throw).
+ *
+ * Every assertion here is about ORDER as much as shape. `hubPush` registers
+ * this machine on the hub, mints thread ids into local sync-state and runs a
+ * full incremental export before it ever resolved the identity, so a refusal
+ * that arrives late is barely a refusal at all.
+ */
+describe("hub push — the hub preflight", () => {
+  const MISSING_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+  const syncStatePath = (home: string, projectPath: string): string =>
+    join(home, ".sesh-mover", "sync-state", `${encodeProjectPath(projectPath)}.json`);
+
+  it("refuses an unknown --project-id before any write, and --create-project then pushes", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-pre-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-pre-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-pre-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const refused = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        projectIdOverride: MISSING_ID, claudeVersion: "2.1.81",
+      });
+
+      expect(refused.success).toBe(false);
+      expect("reason" in refused && refused.reason).toBe("no-such-project");
+      expect("requestedProjectId" in refused && refused.requestedProjectId).toBe(MISSING_ID);
+      // An empty hub has nothing to offer, and the suggestion says so by
+      // naming the flag that mints one instead.
+      expect("linkCandidates" in refused && refused.linkCandidates).toEqual([]);
+      expect("suggestion" in refused && refused.suggestion).toContain("--create-project");
+      // The refusal reflects the id the user typed and nothing about where the
+      // hub is: the ENOENT it replaces carried the hub's absolute path.
+      expect(JSON.stringify(refused)).not.toContain(hub);
+      // NOTHING happened. The sync-state file is the sharpest of these — push
+      // mints a thread id into it before it resolves the identity — and the
+      // machine record is the one that used to be written by `registerMachine`
+      // regardless.
+      expect(existsSync(syncStatePath(home, projectPath))).toBe(false);
+      expect(existsSync(projectJsonFilePath(projectPath))).toBe(false);
+      expect(existsSync(join(hub, "projects"))).toBe(false);
+
+      // ...so the advised re-run reaches the work, which is what makes the
+      // suggestion true rather than merely plausible.
+      const retry = await hubPush({
+        configDir, projectPath, hubPath: hub,
+        createProject: true, claudeVersion: "2.1.81",
+      });
+
+      expect(retry.success).toBe(true);
+      if (!retry.success) return;
+      expect(retry.pushedSessions.length).toBeGreaterThan(0);
+      expect(existsSync(projectJsonFilePath(projectPath))).toBe(true);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an unreachable hub without creating anything at that path", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-gone-home-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-gone-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      // Never created: an unmounted share or a synced folder that has not
+      // appeared on this machine looks exactly like this.
+      const gone = join(base, "not-mounted");
+
+      const r = await hubPush({
+        configDir, projectPath, hubPath: gone, claudeVersion: "2.1.81",
+      });
+
+      expect(r.success).toBe(false);
+      expect("reason" in r && r.reason).toBe("hub-unreachable");
+      expect("hubState" in r && r.hubState).toBe("no-directory");
+      expect(JSON.stringify(r)).not.toContain(gone);
+      // THE sharp one: `registerMachine` writes `machines/<id>.json` through
+      // `writeAtomic`, which mkdir -p's its way there — so a push at a mistyped
+      // path used to materialise a half-built "hub" at it, which every later
+      // command would then treat as real.
+      expect(existsSync(gone)).toBe(false);
+      expect(existsSync(syncStatePath(home, projectPath))).toBe(false);
+      expect(existsSync(projectJsonFilePath(projectPath))).toBe(false);
+    } finally {
+      restore.restore();
+      for (const d of [home, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a directory that is not a hub, distinctly from one that is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-nothub-home-"));
+    const notAHub = mkdtempSync(join(tmpdir(), "sesh-push-nothub-dir-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-nothub-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      // A real directory with real contents and no hub.json — someone's
+      // Documents folder, or a synced hub whose first sync is still in flight.
+      writeFileSync(join(notAHub, "notes.txt"), "not a hub\n");
+
+      const r = await hubPush({
+        configDir, projectPath, hubPath: notAHub, claudeVersion: "2.1.81",
+      });
+
+      expect(r.success).toBe(false);
+      expect("reason" in r && r.reason).toBe("hub-unreachable");
+      expect("hubState" in r && r.hubState).toBe("not-a-hub");
+      // Read-only: the directory the user pointed at is untouched.
+      expect(readdirSync(notAHub)).toEqual(["notes.txt"]);
+      expect(existsSync(projectJsonFilePath(projectPath))).toBe(false);
+    } finally {
+      restore.restore();
+      for (const d of [home, notAHub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A hub.json that is present but unusable is the SAME refusal as an absent
+   * one, deliberately: from the caller's side "this machine cannot tell which
+   * hub that is" is one fact with one remedy, and a truncated file is what a
+   * sync client mid-copy actually produces.
+   */
+  it("treats an unusable hub.json as not-a-hub rather than throwing", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-badjson-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-badjson-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-badjson-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      writeFileSync(join(hub, "hub.json"), '{"schemaVersion": 1, "hubId"');
+
+      const r = await hubPush({
+        configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81",
+      });
+
+      expect(r.success).toBe(false);
+      expect("reason" in r && r.reason).toBe("hub-unreachable");
+      expect("hubState" in r && r.hubState).toBe("not-a-hub");
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+});

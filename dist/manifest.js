@@ -22,6 +22,43 @@ export function writeManifest(exportDir, manifest) {
     };
     writeFileSync(manifestPath, JSON.stringify(stamped, null, 2) + "\n", "utf-8");
 }
+/**
+ * Parse `<exportDir>/manifest.json` and run the trust boundary's first two
+ * steps in order: *is this a manifest at all* (`isBundleManifestShape`), then
+ * *are its ids path-safe* (`assertSafeManifestIds`). Throws on either. Step
+ * three (`verifySessionsDigest`) is the caller's, because only the caller knows
+ * whether a digest mismatch is a refusal or a warning.
+ *
+ * ## Why the shape check is here and not at each of the five call sites (#72)
+ *
+ * It is not a new fourth step — it is step one, applied where the parse
+ * happens. `assertSafeManifestIds` ALREADY throws for almost every wrong
+ * `sessions` value, because `for...of` over a non-iterable throws: measured
+ * against a `JSON.parse` result, `null`, a number, a boolean, a plain object
+ * and a missing key all raise `manifest.sessions is not iterable` inside it,
+ * and `[null]` raises on `.sessionId`. So every caller here already has to
+ * survive a `readManifest` throw for a wrong-shaped list; this only widens
+ * WHICH wrong shapes reach that throw instead of passing silently.
+ *
+ * Exactly one silent survivor motivated the change, and it is the one #72
+ * names: a **string**. Strings are the only iterable JSON can produce that is
+ * not an array, so `sessions: "abc"` iterates three characters whose
+ * `.sessionId` is `undefined`, every id check is skipped, and
+ * `manifest.sessions.length` then reports a session count of 3 that no session
+ * list ever supplied.
+ *
+ * ## The honest limit — do not read this as "the list is now validated"
+ *
+ * `Array.isArray` is true for `[1,2,3]` and `["a"]`, so an array of
+ * NON-OBJECTS still passes both steps here. That is deliberate rather than
+ * overlooked: at every call site those degrade into an existing typed refusal
+ * (the importer's step-1b "declared session has no file in the bundle", the
+ * reindex per-session "no local thread mapping" drop) because each element's
+ * `.sessionId` is `undefined`, whereas a string additionally fabricates a
+ * *count* out of a value that is not a list at all. A per-element schema check
+ * is a different, larger decision — it would belong beside `assertSafeManifestIds`,
+ * not inside this predicate, whose whole contract is "is this one of ours".
+ */
 export function readManifest(exportDir) {
     const manifestPath = join(exportDir, "manifest.json");
     if (!existsSync(manifestPath)) {
@@ -29,6 +66,9 @@ export function readManifest(exportDir) {
     }
     const raw = readFileSync(manifestPath, "utf-8");
     const manifest = JSON.parse(raw);
+    if (!isBundleManifestShape(manifest)) {
+        throw new Error(`manifest.json in ${exportDir} is not a sesh-mover bundle manifest (needs plugin "sesh-mover" and a sessions array)`);
+    }
     assertSafeManifestIds(manifest);
     return manifest;
 }
@@ -71,11 +111,15 @@ export function readManifest(exportDir) {
  * the comparison reappears under `src/` (see the guard's own doc comment for
  * what that check can and cannot see).
  *
- * `readManifest` deliberately does not call this: its contract is to throw,
- * and the two readers that must DEGRADE rather than throw — `browse`'s
- * directory scan and `readManifestFromArchive` — call it themselves against
- * their own parse. Folding it into `readManifest` would change what the import
- * and hub-pull paths throw, which is a larger decision than this predicate.
+ * `readManifest` DOES call this, since #72 — see the reasoning on
+ * `readManifest` itself. The two readers that must DEGRADE rather than throw —
+ * `browse`'s directory scan and `readManifestFromArchive` — still call it
+ * themselves, because neither goes through `readManifest`: the archive path
+ * parses the manifest out of a tar stream, and `browse`'s store scan needs the
+ * refusal as a value rather than an exception. `cli.ts`'s call is now reached
+ * only when `readManifest` did not throw first; it stays because the
+ * consolidation guard below reads the call as the evidence that the directory
+ * path has not quietly re-derived its own copy.
  *
  * Returns `boolean`, not a type predicate: narrowing to `ExportManifest` would
  * claim a validation of the other fields that this does not perform.

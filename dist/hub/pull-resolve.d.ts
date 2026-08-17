@@ -2,7 +2,7 @@ import type { HubBackend } from "./backend.js";
 import { type HubJson } from "./layout.js";
 import { type LocalProjectId } from "./identity.js";
 import { type ResolvedThread } from "./threads.js";
-import type { HubUnlinkedResult } from "../types.js";
+import type { HubNoSuchProjectResult, HubUnlinkedResult, HubUnreachableResult } from "../types.js";
 export interface ResolveStageInput {
     backend: HubBackend;
     /**
@@ -39,6 +39,12 @@ export interface ResolveStageValue {
  * A second reason to keep `refused` out of this stage: once it meant
  * "unlinked", any later `try`/`catch` wrapped around the body would silently
  * relabel every throw below as one.
+ *
+ * The `return` arm carries the preflight's two refusals as well (#75), for the
+ * same reason: `hub-unreachable` and `no-such-project` are finished results
+ * with fields of their own, and each is emitted before this stage reads or
+ * writes anything, so `hubPull` returns them verbatim exactly as it does the
+ * unlinked escape.
  */
 export type ResolveStageOutcome = {
     kind: "proceed";
@@ -46,19 +52,25 @@ export type ResolveStageOutcome = {
     reasons: string[];
 } | {
     kind: "return";
-    result: HubUnlinkedResult;
+    result: HubUnlinkedResult | HubUnreachableResult | HubNoSuchProjectResult;
 };
 /**
  * The pull's first stage: settle which hub project this directory IS, announce
  * this machine to the hub, and read what every machine's index says about the
  * project's threads.
  *
- * **Nothing here is caught.** `linkToHubProject` (an unsafe `--project-id`, a
- * missing or corrupt project.json), `resolveProjectIdentity`, `registerMachine`,
- * the `HUB_JSON` read + parse (the realistic one: the configured hub path is not
- * a hub) and `readAllIndexes` all escape to `cli.ts`, which turns them into an
- * `ErrorResult`. A `try`/`catch` in this module would convert a mistyped hub
- * path into a confident, wrong answer.
+ * **Almost nothing here is caught.** `resolveProjectIdentity`, `registerMachine`
+ * and `readAllIndexes` all escape to `cli.ts`, which turns them into an
+ * `ErrorResult`; a `try`/`catch` around them in this module would convert a
+ * mistyped hub path into a confident, wrong answer.
+ *
+ * The two exceptions are the preflight's, and they are caught THERE rather than
+ * here (#75): an unreachable hub and a `--project-id` naming no hub project
+ * were the two realistic throws in this stage — the first out of the `hub.json`
+ * read, the second out of `linkToHubProject` — and both are now typed refusals
+ * decided before this stage touches anything. That is also why the `hub.json`
+ * read no longer happens in this file: the preflight hands the parsed record
+ * over, and a second read here would leave the `ENOENT` exactly where it was.
  *
  * The project lock is the caller's: `hubPull` acquires it before calling this
  * and releases it in its own `finally`. This stage neither acquires, releases

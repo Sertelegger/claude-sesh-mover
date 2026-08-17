@@ -1,4 +1,4 @@
-import type { ErrorResult, HubLockBusyResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult, ProgressEvent } from "../types.js";
 export interface HubPushOptions {
     configDir: string;
     projectPath: string;
@@ -66,5 +66,14 @@ export interface HubPushOptions {
     quiet?: boolean;
     onProgress?: (ev: ProgressEvent) => void;
 }
-export declare function hubPush(opts: HubPushOptions): Promise<HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | ErrorResult>;
+/**
+ * Everything `hubPush` can answer with, named rather than spelled out inline.
+ *
+ * A named union is what a library consumer needs in order to write one handler
+ * for the verb (`src/index.ts` re-exports this module), and it is the sibling of
+ * `HubPullOutcome`. The two refusals at the end arrive from the shared
+ * preflight (#75) and are the two that used to be a raw throw.
+ */
+export type HubPushOutcome = HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | HubUnreachableResult | HubNoSuchProjectResult | ErrorResult;
+export declare function hubPush(opts: HubPushOptions): Promise<HubPushOutcome>;
 //# sourceMappingURL=push.d.ts.map

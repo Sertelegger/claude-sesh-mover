@@ -140,7 +140,35 @@ export async function hubReindex(opts) {
             // tar-entry validation (assertSafeEntries) as pull's cross-machine
             // download, no special-casing "trusted" archives.
             await extractArchive(tarPath, extractDir);
-            const manifest = readManifest(extractDir);
+            // DEGRADE, do not throw (#72). `readManifest` throws for a missing or
+            // unparseable manifest.json, an unsafe session id, and — since #72 — a
+            // manifest that is not one of ours at all. Every one of those is a
+            // property of THIS FILE, and reindex is the repair tool for a lost index:
+            // letting one file abort the rebuild leaves the index lost, which is the
+            // condition the command exists to end. Same rule `readMachineIndex`
+            // already states for a poisoned index record — the blast radius of a bad
+            // record must be that record.
+            //
+            // Narrow on purpose: only the manifest read is caught. The download and
+            // the extract above still throw, because those fail for ENVIRONMENT
+            // reasons (an unreachable share, a full temp dir) that would otherwise
+            // silently drop every bundle and then publish an index referencing none
+            // of them — this machine's work would go invisible to every other
+            // machine, which is exactly what `droppedBundles` is typed to disclose.
+            //
+            // Without this, `sessions: "abc"` (the one wrong shape that used to pass
+            // both manifest checks silently) iterated three characters, and each one
+            // reported `sessionId: undefined` into `droppedBundles` — three fabricated
+            // entries in a TYPED data-loss field, for a bundle declaring no sessions.
+            let manifest;
+            try {
+                manifest = readManifest(extractDir);
+            }
+            catch (e) {
+                warnings.push(`bundle file ${file} has no readable sesh-mover manifest (${e.message}) — skipped.`);
+                unrecognizedBundleFiles.push(file);
+                continue;
+            }
             const hasWorkspace = !!manifest.workspace;
             for (const s of manifest.sessions) {
                 // Same mapping as push's index-projection step: a continuation

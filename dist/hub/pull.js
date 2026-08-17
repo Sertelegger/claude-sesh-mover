@@ -166,6 +166,39 @@ export function reportPullResult(report, warnings) {
         warnings,
     };
 }
+/**
+ * Sequencing over the eight pull stages. What is worth knowing before reading
+ * the body is in `tests/hub-pull-invariants.test.ts`'s "hubPull is sequencing"
+ * block; this note is only about `onProgress`, whose contract is invisible from
+ * any single call site (#74).
+ *
+ * **`{percent: 0}` is emitted as the first statement inside the `try`, and
+ * `{percent: 100}` from the `finally`.** That pairing is the whole point:
+ * before it, three exits emitted `0` and never `100` — a fetch abort, a
+ * workspace abort and an import failure — so a consumer waiting for the
+ * terminal event waited forever. The close therefore also fires on a typed
+ * refusal, on a mid-chain abort and on a thrown exception, and `percent: 100`
+ * accordingly means *"the operation is over"*, never *"it succeeded"*; the
+ * returned result says which. It is wrapped in a `try`/`catch` because a
+ * `finally` is exactly where a caller's throwing callback would replace the
+ * real failure.
+ *
+ * **The exits BEFORE the lock emit nothing at all, and that is the contract
+ * rather than an oversight** (stated on `ProgressEvent` too, where a consumer
+ * will look): `lock-busy` — and a non-busy throw out of `acquireProjectLock` —
+ * return above the `try`, so there is no `finally` to close a pair they never
+ * opened. A consumer gets either no events or a matched pair. The opening event
+ * moved here from just after thread selection for the same reason: it used to
+ * mean every early exit (already up to date, nothing to pull, pick-required —
+ * the *common* outcomes) emitted zero events while the uncommon ones emitted an
+ * unclosed `0`, which is precisely backwards.
+ *
+ * Between the two, granularity comes from the stages: `runFetchStage` emits one
+ * `hub-pull` percent per bundle, and `runApplySessionsStage` forwards this
+ * callback into `importSession`, whose `import-verify` and byte-level
+ * `import-rewrite` events are the per-session detail. The tar step is the one
+ * hole — see `runFetchStage`.
+ */
 export async function hubPull(opts) {
     // Captured ONCE for the whole operation, never per bundle: append.ts treats
     // a base whose mtime is >= this as "written by us, not by a live Claude
@@ -191,6 +224,7 @@ export async function hubPull(opts) {
     }
     let tempRoot = null;
     try {
+        opts.onProgress?.({ phase: "hub-pull", percent: 0 }); // see the doc above
         tempRoot = mkdtempSync(join(tmpdir(), "sesh-hub-pull-"));
         const backend = createFsBackend(opts.hubPath);
         const warnings = [];
@@ -275,7 +309,6 @@ export async function hubPull(opts) {
         // that interface reaches the pull that applied something and the pull that
         // applied nothing at the same moment, with no edit here.
         const { threadId, sourceMachineId, needed, findings } = sel.value;
-        opts.onProgress?.({ phase: "hub-pull", percent: 0 });
         // Every accumulator this pull's per-bundle loop writes, in one MUTABLE
         // object passed by reference. Nothing here may be snapshotted or copied —
         // see pull-apply-state.ts. It is handed the RECORDS alone: all it asks of
@@ -292,6 +325,7 @@ export async function hubPull(opts) {
             // whenever a later bundle has none.
             const fetched = await runFetchStage({
                 backend, record, machineId: bundleMachineId, bundleIndex: i, tempRoot, state: st,
+                chainLength: needed.length, onProgress: opts.onProgress,
             });
             // The only correct handling of a fetch abort. `break` would fall through
             // to the carry gate, the thread mapping, `writeSyncState` and
@@ -379,6 +413,7 @@ export async function hubPull(opts) {
                 state: st,
                 recordSplice,
                 countEntriesAfterOffset,
+                onProgress: opts.onProgress,
             });
             // Spread HERE, at the position the moved code occupied and after the
             // workspace stage's reasons: the three in-loop stages are phases of one
@@ -452,7 +487,6 @@ export async function hubPull(opts) {
         });
         warnings.push(...recorded.reasons);
         const localSessionId = recorded.value?.localSessionId ?? null;
-        opts.onProgress?.({ phase: "hub-pull", percent: 100 });
         return {
             success: true,
             command: "pull",
@@ -482,6 +516,12 @@ export async function hubPull(opts) {
         if (tempRoot)
             rmSync(tempRoot, { recursive: true, force: true });
         lock.release();
+        try {
+            opts.onProgress?.({ phase: "hub-pull", percent: 100 }); // see the doc above
+        }
+        catch {
+            /* a progress consumer's fault is never this operation's outcome */
+        }
     }
 }
 //# sourceMappingURL=pull.js.map

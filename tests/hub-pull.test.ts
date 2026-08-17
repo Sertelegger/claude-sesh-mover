@@ -20,6 +20,7 @@ import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes, writeMachineIndex } from "../src/hub/index-file.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
 import { machinePath } from "../src/hub/layout.js";
+import { acquireProjectLock } from "../src/hub/lock.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { idx, entry, bundle } from "./helpers/hub-fixtures.js";
 import { createArchive, extractArchive } from "../src/archiver.js";
@@ -28,7 +29,9 @@ import { computeIntegrityHashFromFile, computeSessionsDigest } from "../src/mani
 import { readSyncState, writeSyncState, getThreadId, syncStatePath } from "../src/sync-state.js";
 import { readLastEntryUuid } from "../src/jsonl.js";
 import { encodeProjectPath } from "../src/platform.js";
-import type { ErrorResult, ExportManifest, HubPullListResult, HubPullResult, NotYetSyncedResult } from "../src/types.js";
+import type {
+  ErrorResult, ExportManifest, HubPullListResult, HubPullResult, NotYetSyncedResult, ProgressEvent,
+} from "../src/types.js";
 import { isPluginStateName } from "../src/paths.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
@@ -4902,6 +4905,160 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
     } finally {
       f.cleanup();
     }
+  });
+
+  /**
+   * #74 — what `--progress` actually emits, and the contract a consumer can
+   * hold `hubPull` to.
+   *
+   * Nested HERE, inside the integrity fixtures, for one reason: the bug worth
+   * fixing was a FETCH ABORT emitting `{percent: 0}` and never `{percent: 100}`,
+   * so the arrangement it needs is a corrupt bundle — which is exactly what
+   * `twoMachines` + `mutateFullBundle` above build. Duplicating them below would
+   * be a second copy of a fixture, not a second test.
+   */
+  describe("--progress events", () => {
+    /** Every event a pull emits, in order. */
+    function recorder(): { events: ProgressEvent[]; onProgress: (ev: ProgressEvent) => void } {
+      const events: ProgressEvent[] = [];
+      return { events, onProgress: (ev) => events.push(ev) };
+    }
+
+    const hubPhase = (events: ProgressEvent[]): Array<number | undefined> =>
+      events.filter((e) => e.phase === "hub-pull").map((e) => e.percent);
+
+    /**
+     * THE bug. A consumer that renders on the first event and closes on the
+     * terminal one waited forever, because the abort returns from the middle of
+     * the per-bundle loop — as do the workspace abort and the import failure
+     * beside it. The fix is structural (the close is in `hubPull`'s `finally`),
+     * so this one case standing in for the three is honest.
+     */
+    it("still emits the terminal event when a fetch aborts mid-pull", async () => {
+      const f = await twoMachines("sesh-pull-prog-abort");
+      const { events, onProgress } = recorder();
+      try {
+        await mutateFullBundle(f.hub, f.projectId, (dir) => {
+          const p = join(dir, "manifest.json");
+          const m = JSON.parse(readFileSync(p, "utf-8"));
+          m.sessions[0].integrityHash = "sha256:0000";
+          writeFileSync(p, JSON.stringify(m, null, 2) + "\n");
+        });
+
+        const result = await f.pull({ onProgress });
+
+        // Precondition: this really is the abort path, not some other refusal.
+        expect(result.success).toBe(false);
+        expect((result as ErrorResult).error).toMatch(/failed its integrity check/);
+        expect(hubPhase(events)[0]).toBe(0);
+        expect(hubPhase(events).at(-1)).toBe(100);
+        expect(events.at(-1)).toEqual({ phase: "hub-pull", percent: 100 });
+      } finally {
+        f.cleanup();
+      }
+    });
+
+    /**
+     * The early exits — "already up to date", "nothing to pull", pick-required —
+     * are the COMMON outcomes, and every one of them used to emit nothing at
+     * all, because the opening event sat after thread selection. A consumer that
+     * renders a bar on the first event showed nothing for the ordinary case and
+     * an unclosed bar for the unusual one, which is precisely backwards.
+     */
+    it("emits a matched pair on an early exit that applies nothing", async () => {
+      const f = await twoMachines("sesh-pull-prog-early");
+      const { events, onProgress } = recorder();
+      try {
+        expect((await f.pull()).success).toBe(true);
+
+        const second = await f.pull({ onProgress });
+
+        expect(second.success).toBe(false);
+        expect((second as ErrorResult).error).toMatch(/Nothing to pull/);
+        // Exactly two, and no per-bundle events in between: nothing was fetched.
+        expect(events).toEqual([
+          { phase: "hub-pull", percent: 0 },
+          { phase: "hub-pull", percent: 100 },
+        ]);
+      } finally {
+        f.cleanup();
+      }
+    });
+
+    /**
+     * The other half of the contract, stated as a test because it is a decision
+     * and not an oversight: the ONE exit above the lock emits nothing, so a
+     * consumer gets either no events or a matched pair — never an opening event
+     * with no close.
+     */
+    it("emits nothing at all when the project lock is already held", async () => {
+      const f = await twoMachines("sesh-pull-prog-lock");
+      const { events, onProgress } = recorder();
+      const held = acquireProjectLock(f.projectB);
+      try {
+        const result = await f.pull({ onProgress });
+
+        expect(result.success).toBe(false);
+        expect("reason" in result && result.reason).toBe("lock-busy");
+        expect(events).toEqual([]);
+      } finally {
+        held.release();
+        f.cleanup();
+      }
+    });
+
+    /**
+     * Between the two hub-pull events, the detail comes from the stages: one
+     * `hub-pull` percent per bundle from the fetch stage, and the importer's own
+     * per-session phases, which `runApplySessionsStage` simply omitted at its
+     * `importSession` call — so `--progress` on a pull reported nothing about
+     * the work itself.
+     */
+    it("forwards the importer's per-session phases and one hub-pull percent per bundle", async () => {
+      const f = await twoMachines("sesh-pull-prog-detail");
+      const { events, onProgress } = recorder();
+      try {
+        const result = await f.pull({ onProgress });
+
+        expect(result.success).toBe(true);
+        // A one-bundle chain: bundle 0 of 1 reports 0%, and 100 is the
+        // terminal event rather than the bundle's.
+        expect(hubPhase(events)).toEqual([0, 0, 100]);
+        const verify = events.filter((e) => e.phase === "import-verify");
+        expect(verify).toHaveLength(1);
+        expect(verify[0].sessionId).toBeTruthy();
+        expect(events.some((e) => e.phase === "import-rewrite" && e.bytesTotal! > 0)).toBe(true);
+      } finally {
+        f.cleanup();
+      }
+    });
+
+    /**
+     * The terminal event fires from a `finally`, which is exactly where a
+     * caller's throwing callback would REPLACE whatever the pull was reporting —
+     * including `append.ts`'s refuse-and-throw, the loudest safety property in
+     * the codebase. So it is wrapped, and a progress consumer's own fault is
+     * never this operation's outcome.
+     */
+    it("does not let a throwing progress callback change the pull's outcome", async () => {
+      const f = await twoMachines("sesh-pull-prog-throw");
+      let calls = 0;
+      try {
+        const result = await f.pull({
+          onProgress: (ev: ProgressEvent) => {
+            calls++;
+            if (ev.phase === "hub-pull" && ev.percent === 100) throw new Error("consumer blew up");
+          },
+        });
+
+        expect(calls).toBeGreaterThan(0);
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect((result as HubPullResult).importedSessions.length).toBeGreaterThan(0);
+      } finally {
+        f.cleanup();
+      }
+    });
   });
 });
 

@@ -231,6 +231,125 @@ describe("manifest", () => {
     });
   });
 
+  /**
+   * `readManifest` applies the shape guard (#72). Five callers use it with no
+   * guard of their own — `hub/pull-fetch.ts`, `hub/push.ts`, `hub/reindex.ts`,
+   * `importer.ts`, `sync-state.ts` — and `assertSafeManifestIds` is blind to a
+   * wrong-shaped session list.
+   *
+   * The measured premise these tests rest on: `for...of` already throws for
+   * almost every wrong value, so the only shape that used to pass SILENTLY out
+   * of a `JSON.parse` is a **string** (the one iterable JSON produces that is
+   * not an array). Everything else here is characterization of the boundary —
+   * including the shapes the guard deliberately does not catch.
+   */
+  describe("readManifest applies the shape guard (#72)", () => {
+    /** `<tempDir>/<name>/manifest.json`, written verbatim. */
+    function bundleWithSessions(name: string, sessions: unknown): string {
+      const dir = join(tempDir, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "manifest.json"),
+        JSON.stringify({ ...makeTestManifest(), sessions })
+      );
+      return dir;
+    }
+
+    it('throws on `sessions: "abc"` instead of fabricating a count of 3', async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const dir = bundleWithSessions("sessions-string", "abc");
+
+      let message = "";
+      expect(() => {
+        try {
+          readManifest(dir);
+        } catch (e) {
+          message = (e as Error).message;
+          throw e;
+        }
+      }).toThrow(/not a sesh-mover bundle manifest/i);
+
+      // The fabrication, stated as an assertion so a future "friendlier"
+      // message cannot reintroduce it: the refusal must not report a count,
+      // because 3 here is a string's length and no session list supplied it.
+      expect(message).not.toMatch(/\b3\b/);
+      expect(message).toContain("sessions array");
+    });
+
+    it("throws on a manifest with no sesh-mover plugin marker", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      const dir = join(tempDir, "stranger");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "manifest.json"),
+        JSON.stringify({ some: "other tool", sessions: [] })
+      );
+      expect(() => readManifest(dir)).toThrow(/not a sesh-mover bundle manifest/i);
+    });
+
+    it("runs the shape check BEFORE the id check, so step one reports first", async () => {
+      // The trust boundary's documented order is: is this a manifest at all ->
+      // are its ids path-safe -> is the list the one the exporter wrote. A
+      // manifest failing both of the first two must name the first, or the
+      // ordering has silently inverted.
+      const { readManifest } = await import("../src/manifest.js");
+      const dir = join(tempDir, "both-wrong");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "manifest.json"),
+        JSON.stringify({
+          ...makeTestManifest(),
+          plugin: "other-tool",
+          sessions: [{ sessionId: "../../etc/shadow" }],
+        })
+      );
+      expect(() => readManifest(dir)).toThrow(/not a sesh-mover bundle manifest/i);
+      expect(() => readManifest(dir)).not.toThrow(/unsafe session id/i);
+    });
+
+    it("still reads a healthy manifest unchanged", async () => {
+      const { readManifest, writeManifest } = await import("../src/manifest.js");
+      const dir = join(tempDir, "healthy");
+      mkdirSync(dir, { recursive: true });
+      writeManifest(dir, makeTestManifest());
+      expect(readManifest(dir).sessions).toHaveLength(1);
+    });
+
+    /**
+     * The honest limit, pinned so nobody reads the guard as "the session list
+     * is validated". `Array.isArray` is the whole test, so an array of
+     * NON-objects passes both steps — at every call site those degrade into an
+     * existing typed refusal (each element's `.sessionId` is `undefined`),
+     * whereas a string additionally invents a count out of a value that is not
+     * a list. If this ever starts throwing, the guard grew a per-element check
+     * and `readManifest`'s doc comment has to grow with it.
+     */
+    it("does NOT catch an array of non-objects — that is a different check", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      for (const [name, sessions] of [
+        ["array-of-numbers", [1, 2, 3]],
+        ["array-of-strings", ["a"]],
+      ] as const) {
+        const m = readManifest(bundleWithSessions(name, sessions));
+        expect(m.sessions).toEqual(sessions);
+      }
+    });
+
+    it("keeps throwing for the shapes assertSafeManifestIds already caught", async () => {
+      const { readManifest } = await import("../src/manifest.js");
+      // Not iterable -> the for...of inside assertSafeManifestIds threw before
+      // #72 too. These stay refusals; only the message changes.
+      for (const [name, sessions] of [
+        ["sessions-null", null],
+        ["sessions-number", 5],
+        ["sessions-object", { length: 3 }],
+        ["sessions-missing", undefined],
+      ] as const) {
+        expect(() => readManifest(bundleWithSessions(name, sessions))).toThrow();
+      }
+    });
+  });
+
   describe("computeIntegrityHashFromFile", () => {
     it("matches the string-based hash for the same content (old bundles keep verifying)", async () => {
       const { computeIntegrityHash, computeIntegrityHashFromFile } = await import("../src/manifest.js");

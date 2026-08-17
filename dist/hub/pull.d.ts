@@ -1,5 +1,5 @@
 import { type SelectReport } from "./pull-select.js";
-import type { ErrorResult, HubLockBusyResult, HubPullListResult, HubPullResult, HubUnlinkedResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPullListResult, HubPullResult, HubUnlinkedResult, HubUnreachableResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
 export interface HubPullOptions {
     configDir: string;
     projectPath: string;
@@ -69,5 +69,54 @@ export { selectNeededBundles } from "./threads.js";
  * explicitly below, which is why the spread sits between the two groups.
  */
 export declare function reportPullResult(report: SelectReport, warnings: string[]): HubPullResult;
-export declare function hubPull(opts: HubPullOptions): Promise<HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubLockBusyResult | ErrorResult>;
+/**
+ * Everything `hubPull` can answer with, named rather than spelled out inline on
+ * the signature.
+ *
+ * A library consumer needs a name to write one handler for the verb —
+ * `src/index.ts` re-exports this module, and `HubPushOutcome` is its sibling —
+ * and #75 added two more arms (`hub-unreachable`, `no-such-project`), which is
+ * exactly the kind of growth an inline union spreads across a signature.
+ *
+ * Stated plainly because the ratchet below measures from `hubPull`'s
+ * declaration: moving eight lines of union out of the signature takes eight
+ * lines off that measurement without moving any logic. The change is worth
+ * making on its own, but it is not a shrinking of the body, and the margin it
+ * reports is eight lines more generous than the body's own history.
+ */
+export type HubPullOutcome = HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnreachableResult | HubLockBusyResult | ErrorResult;
+/**
+ * Sequencing over the eight pull stages. What is worth knowing before reading
+ * the body is in `tests/hub-pull-invariants.test.ts`'s "hubPull is sequencing"
+ * block; this note is only about `onProgress`, whose contract is invisible from
+ * any single call site (#74).
+ *
+ * **`{percent: 0}` is emitted as the first statement inside the `try`, and
+ * `{percent: 100}` from the `finally`.** That pairing is the whole point:
+ * before it, three exits emitted `0` and never `100` — a fetch abort, a
+ * workspace abort and an import failure — so a consumer waiting for the
+ * terminal event waited forever. The close therefore also fires on a typed
+ * refusal, on a mid-chain abort and on a thrown exception, and `percent: 100`
+ * accordingly means *"the operation is over"*, never *"it succeeded"*; the
+ * returned result says which. It is wrapped in a `try`/`catch` because a
+ * `finally` is exactly where a caller's throwing callback would replace the
+ * real failure.
+ *
+ * **The exits BEFORE the lock emit nothing at all, and that is the contract
+ * rather than an oversight** (stated on `ProgressEvent` too, where a consumer
+ * will look): `lock-busy` — and a non-busy throw out of `acquireProjectLock` —
+ * return above the `try`, so there is no `finally` to close a pair they never
+ * opened. A consumer gets either no events or a matched pair. The opening event
+ * moved here from just after thread selection for the same reason: it used to
+ * mean every early exit (already up to date, nothing to pull, pick-required —
+ * the *common* outcomes) emitted zero events while the uncommon ones emitted an
+ * unclosed `0`, which is precisely backwards.
+ *
+ * Between the two, granularity comes from the stages: `runFetchStage` emits one
+ * `hub-pull` percent per bundle, and `runApplySessionsStage` forwards this
+ * callback into `importSession`, whose `import-verify` and byte-level
+ * `import-rewrite` events are the per-session detail. The tar step is the one
+ * hole — see `runFetchStage`.
+ */
+export declare function hubPull(opts: HubPullOptions): Promise<HubPullOutcome>;
 //# sourceMappingURL=pull.d.ts.map
