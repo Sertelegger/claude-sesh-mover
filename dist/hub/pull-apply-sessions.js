@@ -555,6 +555,7 @@ export async function runApplySessionsStage(input) {
         targetClaudeVersion: claudeVersion,
         dryRun: false,
         sessionIds: [record.sessionIdInBundle],
+        onProgress: input.onProgress,
     });
     // importer already rolled back partial writes. Returned VERBATIM by the
     // caller, `command: "import"` and all — and note this happens BEFORE the

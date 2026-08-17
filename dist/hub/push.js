@@ -5,10 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
-import { HUB_JSON, bundleDir, bundleFileName } from "./layout.js";
+import { bundleDir, bundleFileName } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, scanGitRemotes, readLocalProjectId, localProjectIdPath, } from "./identity.js";
 import { registerMachine } from "./init.js";
+import { preflightHub } from "./preflight.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
 import { snapshotWorkspace, isNeverIncludable } from "./workspace.js";
 import { captureCarry, gitChildEnv } from "./carry.js";
@@ -223,6 +224,15 @@ export async function hubPush(opts) {
     try {
         staging = mkdtempSync(join(tmpdir(), "sesh-hub-push-"));
         const backend = createFsBackend(opts.hubPath);
+        // BEFORE the identity decision, the export and every hub write: is there a
+        // hub here at all, and does `--project-id` name a project on it? Both
+        // refusals are worth having only because nothing has happened yet (#75).
+        const pre = await preflightHub({
+            command: "push", hubPath: opts.hubPath, backend,
+            projectIdOverride: opts.projectIdOverride,
+        });
+        if (pre.kind === "refuse")
+            return pre.result;
         const warnings = [];
         // A budget that could not be read as written. Said once, up front, rather
         // than folded into the decline it causes — the two are different facts, and
@@ -315,8 +325,23 @@ export async function hubPush(opts) {
             commits.linkWritten = true;
         };
         await registerMachine(opts.hubPath);
-        const hub = JSON.parse((await backend.read(HUB_JSON)).toString());
+        // Read once, by the preflight above — a second read here would put back the
+        // very `ENOENT` the `hub-unreachable` refusal replaces (#75).
+        const hub = pre.hub;
         const hubPeerId = `hub:${hub.hubId}`;
+        // NOT moved into a `try`/`finally` pair the way `hubPull`'s was (#74),
+        // although push has the same hole: three of its exits emit this `0` and
+        // never the matching `100` (the export's own failure return, the
+        // `failedAfterLink` disclosure, and the rethrow above it). The obvious fix
+        // is `hubPull`'s — open here, close in the `finally`, swallowing a throwing
+        // callback so it cannot replace the failure being reported — and it would
+        // silently delete a DOCUMENTED behaviour of this module: a caller callback
+        // that throws right after the link is committed is the deterministic seam
+        // `tests/hub-push.test.ts`'s "refuses to remove a link that now names a
+        // different project" uses to reproduce the concurrent-link-modification
+        // race, and that test states the coverage is deliberate. Push's terminal
+        // event therefore wants its own decision, like `createArchive`'s missing
+        // progress callback — see `runFetchStage`.
         opts.onProgress?.({ phase: "hub-push", percent: 0 });
         // Thread minting for every session in scope
         let sessions = discoverSessions(opts.configDir, opts.projectPath);

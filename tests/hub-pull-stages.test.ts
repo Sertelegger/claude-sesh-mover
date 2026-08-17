@@ -757,18 +757,111 @@ describe("resolve stage", () => {
   });
 
   /**
-   * No `try`/`catch` anywhere in the stage: "the hub path is not a hub" must
-   * keep escaping to cli.ts, which is what turns it into an ErrorResult. A
-   * stage that swallowed it would report `unlinked` for a mistyped hub path.
+   * "The hub path is not a hub" is a TYPED refusal now, not a throw (#75).
+   *
+   * This test asserted the opposite until that issue — `rejects.toThrow()`,
+   * because the stage caught nothing and the `hub.json` read escaped to cli.ts
+   * as an untyped `ErrorResult` carrying the hub's absolute path. The half of
+   * its premise that survives verbatim is the one that mattered: a mistyped or
+   * unmounted hub must never be reported as `unlinked`, which is the confident
+   * wrong answer (`resolveProjectIdentity` sees an empty `projects/` listing and
+   * says "no match"). What changed is that the right answer now has a name.
+   *
+   * The directory is still there and only `hub.json` is gone, so this is the
+   * `not-a-hub` arm; `no-directory` is exercised end-to-end in tests/cli.test.ts.
    */
-  it("lets a non-hub path throw instead of reporting it as unlinked", async () => {
+  it("refuses a non-hub path as hub-unreachable rather than unlinked or a throw", async () => {
     writeLocalProjectId(projectPath, {
       projectId: PROJECT_ID, name: CANDIDATE.name,
       createdAt: "2026-08-01T00:00:00.000Z", createdByMachine: "m2",
     });
     rmSync(join(hubDir, HUB_JSON));
 
-    await expect(runResolveStage(input())).rejects.toThrow();
+    const out = await runResolveStage(input());
+
+    expect(out.kind).toBe("return");
+    if (out.kind !== "return") return;
+    expect(out.result).toEqual({
+      success: false,
+      command: "pull",
+      reason: "hub-unreachable",
+      hubState: "not-a-hub",
+      suggestion: expect.stringContaining("no usable hub.json"),
+    });
+    // Nothing about the hub's location is echoed back — the ENOENT this
+    // replaces carried the absolute path.
+    expect(JSON.stringify(out.result)).not.toContain(hubDir);
+  });
+
+  /**
+   * The refusal is a REFUSAL: `registerMachine` writes this machine's record
+   * into the hub directory on every pull, and `writeAtomic` mkdir -p's its way
+   * there — so a pull at a mistyped path used to leave a `machines/` directory
+   * behind at that path before failing. The gate is before it.
+   */
+  it("writes nothing into a directory that is not a hub", async () => {
+    writeLocalProjectId(projectPath, {
+      projectId: PROJECT_ID, name: CANDIDATE.name,
+      createdAt: "2026-08-01T00:00:00.000Z", createdByMachine: "m2",
+    });
+    rmSync(join(hubDir, HUB_JSON));
+    const before = readdirSync(hubDir).sort();
+
+    const out = await runResolveStage(input());
+
+    expect(out.kind).toBe("return");
+    expect(readdirSync(hubDir).sort()).toEqual(before);
+    expect(existsSync(join(hubDir, "machines"))).toBe(false);
+  });
+
+  /**
+   * The reachability check runs BEFORE the `--project-id` one, and the order is
+   * load-bearing: on an unreachable hub every read fails, the project read
+   * included, so answering `no-such-project` would send the user to fix an id
+   * that is fine.
+   */
+  it("blames the hub, not --project-id, when both would fail", async () => {
+    rmSync(join(hubDir, HUB_JSON));
+
+    const out = await runResolveStage(input({ projectIdOverride: "no-such-id" }));
+
+    expect(out.kind).toBe("return");
+    if (out.kind !== "return") return;
+    expect(out.result.reason).toBe("hub-unreachable");
+  });
+
+  /**
+   * ...and with the hub readable, a `--project-id` naming no project on it is
+   * the typed `no-such-project` refusal — decided HERE now, not at the CLI
+   * boundary (#75), so a library caller of `hubPull` gets it too. It must land
+   * before `linkToHubProject`, which would otherwise write the link file for an
+   * id it then failed to read.
+   */
+  it("refuses an unknown --project-id, then links and resolves with the right one", async () => {
+    const out = await runResolveStage(input({ projectIdOverride: "not-on-this-hub" }));
+
+    expect(out.kind).toBe("return");
+    if (out.kind !== "return") return;
+    expect(out.result).toEqual({
+      success: false,
+      command: "pull",
+      reason: "no-such-project",
+      requestedProjectId: "not-on-this-hub",
+      linkCandidates: [CANDIDATE],
+      suggestion: expect.stringContaining("--project-id"),
+    });
+    // The half that makes the suggestion true rather than plausible: the
+    // refusal wrote nothing, so the re-run the message advises really does
+    // reach the link. `linkToHubProject` is what would have written this file
+    // for an id it then failed to read.
+    expect(existsSync(localProjectIdPath(projectPath))).toBe(false);
+
+    const retry = await runResolveStage(input({ projectIdOverride: PROJECT_ID }));
+
+    expect(retry.kind).toBe("proceed");
+    if (retry.kind !== "proceed") return;
+    expect(retry.value.local.projectId).toBe(PROJECT_ID);
+    expect(existsSync(localProjectIdPath(projectPath))).toBe(true);
   });
 });
 
@@ -930,7 +1023,7 @@ describe("fetch stage", () => {
     const st = initApplyState({ needed: [record] });
 
     const out = await runFetchStage({
-      backend, record, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st,
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
     });
 
     expect(out.status).toBe("aborted");
@@ -965,7 +1058,7 @@ describe("fetch stage", () => {
     const st = initApplyState({ needed: [record] });
 
     const out = await runFetchStage({
-      backend, record, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st,
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
     });
 
     expect(out.status).toBe("aborted");
@@ -992,7 +1085,7 @@ describe("fetch stage", () => {
     const st = initApplyState({ needed: [record] });
 
     const out = await runFetchStage({
-      backend, record, machineId: MACHINE_ID, bundleIndex: 3, tempRoot, state: st,
+      backend, record, machineId: MACHINE_ID, bundleIndex: 3, chainLength: 4, tempRoot, state: st,
     });
 
     expect(out.status).toBe("applied");
@@ -1019,7 +1112,9 @@ describe("fetch stage", () => {
     const record = await writeHealthyBundle({ basedOn: null });
     const st = initApplyState({ needed: [record] });
 
-    await runFetchStage({ backend, record, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st });
+    await runFetchStage({
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
+    });
 
     expect(st.chainWorkspaceBases).toEqual([{ machineId: MACHINE_ID, bundleId: null }]);
   });
@@ -1037,10 +1132,16 @@ describe("fetch stage", () => {
     });
     const st = initApplyState({ needed: [withCarry, without] });
 
-    await runFetchStage({ backend, record: withCarry, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st });
+    await runFetchStage({
+      backend, record: withCarry, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 2,
+      tempRoot, state: st,
+    });
     expect(st.lastCarry?.bundleFile).toBe(withCarry.file);
 
-    await runFetchStage({ backend, record: without, machineId: MACHINE_ID, bundleIndex: 1, tempRoot, state: st });
+    await runFetchStage({
+      backend, record: without, machineId: MACHINE_ID, bundleIndex: 1, chainLength: 2,
+      tempRoot, state: st,
+    });
     expect(st.lastCarry?.bundleFile).toBe(withCarry.file);
     expect(st.lastCarry?.bundleIndex).toBe(0);
   });
@@ -1053,8 +1154,14 @@ describe("fetch stage", () => {
     });
     const st = initApplyState({ needed: [older, newer] });
 
-    await runFetchStage({ backend, record: older, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st });
-    await runFetchStage({ backend, record: newer, machineId: MACHINE_ID, bundleIndex: 1, tempRoot, state: st });
+    await runFetchStage({
+      backend, record: older, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 2,
+      tempRoot, state: st,
+    });
+    await runFetchStage({
+      backend, record: newer, machineId: MACHINE_ID, bundleIndex: 1, chainLength: 2,
+      tempRoot, state: st,
+    });
 
     expect(st.lastCarry?.bundleFile).toBe(newer.file);
     expect(st.lastCarry?.bundleIndex).toBe(1);

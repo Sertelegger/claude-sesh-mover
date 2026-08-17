@@ -568,6 +568,59 @@ describe("cli", () => {
         for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
       }
     });
+
+    /**
+     * #75 — what that hub problem now reads as, through the real CLI.
+     *
+     * Until this, an unreachable `hub.path` threw a raw `ENOENT` out of push and
+     * pull alike, which the generic outer catch turned into an untyped
+     * `{error: "ENOENT: no such file or directory, open '<hub>/hub.json'"}`. Two
+     * things were wrong with that and both are asserted here: the skill layer
+     * had no `reason` to branch on while every other hub failure has one, and
+     * the message volunteered the hub's absolute path.
+     *
+     * Through the BUILT CLI rather than by calling `hubPull`, because half the
+     * claim is about the process boundary: exactly one JSON object on stdout and
+     * no exception text anywhere in it.
+     */
+    it("reports an unreachable hub as one typed JSON object naming no path", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-gonehub-home-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cli-gonehub-proj-"));
+      try {
+        const gone = join(home, "not-mounted");
+        runCli(["configure", "--scope", "user", "--set", `hub.path=${gone}`], homeEnv(home));
+
+        for (const argv of [
+          ["pull", "--latest", "--project-path", project, "--source-config-dir", configDir],
+          ["push", "--project-path", project, "--source-config-dir", configDir],
+        ]) {
+          const { stdout, status } = runCli(argv, homeEnv(home));
+          // Throws if stdout is not exactly one JSON document.
+          const result = JSON.parse(stdout);
+          expect(result.success).toBe(false);
+          // Exit 0, deliberately, and this is the one exit code #75 moves (it
+          // was 1, as an untyped ErrorResult). The invocation was fine; the
+          // environment is not ready — the `unlinked` / `lock-busy` /
+          // `not-yet-synced` class, all of which exit 0 so the caller reads the
+          // shape and retries. See outputRefusal's doc in src/cli.ts.
+          expect(status).toBe(0);
+          expect(result.command).toBe(argv[0]);
+          expect(result.reason).toBe("hub-unreachable");
+          expect(result.hubState).toBe("no-directory");
+          expect(result.suggestion).toBeTruthy();
+          // No raw exception text, and no path.
+          expect(result.error).toBeUndefined();
+          expect(stdout).not.toContain("ENOENT");
+          expect(stdout).not.toContain(gone);
+        }
+        // ...and neither verb built a hub at the mistyped path on its way to
+        // failing: `registerMachine` writes through `writeAtomic`, which
+        // mkdir -p's, so this used to leave a `machines/` directory behind.
+        expect(existsSync(gone)).toBe(false);
+      } finally {
+        for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("hub unlink command", () => {

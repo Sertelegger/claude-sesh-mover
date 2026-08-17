@@ -78,7 +78,7 @@ Move a session from machine A to machine B:
 
 **Migrate** is for same-machine moves (repo relocated, home dir renamed, config dir switched). Don't run it from inside the session being migrated — the CLI blocks this; exit, start a fresh session from an outer directory (e.g. `~/`), and run it there. `--scope current` requires `--session-id`.
 
-`export`, `import`, and `migrate` all accept `--progress`, which emits NDJSON progress events on stderr (one JSON object per line) while leaving stdout's JSON result contract unchanged — useful when driving the CLI directly rather than through the slash commands.
+`export`, `import`, `migrate`, `push`, and `pull` all accept `--progress`, which emits NDJSON progress events on stderr (one JSON object per line) while leaving stdout's JSON result contract unchanged — useful when driving the CLI directly rather than through the slash commands. On `push` and `pull` the `hub-push`/`hub-pull` events carry a coarse `percent` and the per-session detail comes from the export/import phases underneath them. A `pull` emits either no events at all (it was refused before it took the project lock) or an opening `percent: 0` and a closing `percent: 100` — the closing one always arrives, including when the pull is refused or fails, so `100` means "finished", not "succeeded".
 
 ### Incremental sync between two machines
 

@@ -26,7 +26,7 @@ import {
   getApplicableAdapters,
   classifyVersionDifference,
 } from "./version-adapters.js";
-import { readSyncState, writeSyncState } from "./sync-state.js";
+import { foreignKeyedRecord, readSyncState, writeSyncState } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
 import { readLocalProjectId, writeLocalProjectId } from "./hub/identity.js";
@@ -922,8 +922,14 @@ export async function importSession(
         return true;
       });
       if (targetSessions.length < before) {
+        // JSON.stringify, not bare interpolation (#28). Both halves of this are
+        // bundle-supplied strings that nothing validates — see the reach note
+        // at the peer-ledger write below — and index-file.ts already states the
+        // rule for every hub-supplied string echoed into a message: quoting is
+        // what escapes the control characters that let a name redraw the line
+        // it is printed on.
         warnings.push(
-          `${before - targetSessions.length} session(s) already received from ${manifest.sourceMachineName ?? manifest.sourceMachineId} — skipped (idempotent).`
+          `${before - targetSessions.length} session(s) already received from ${JSON.stringify(manifest.sourceMachineName ?? manifest.sourceMachineId)} — skipped (idempotent).`
         );
       }
     }
@@ -1363,6 +1369,32 @@ export async function importSession(
     };
   }
 
+  // ---------------------------------------------------------------------
+  // DURABLE-BOOKKEEPING TAIL (#28). Everything from here to `writeSyncState`
+  // runs AFTER the write loop's try/catch, so `rollbackImportedFiles` is out of
+  // reach: the session JSONL is on disk and staying there. The invariant this
+  // stretch has to keep is therefore not "roll back on failure" — it is
+  // **`writeSyncState` must be reached**, because `state.imported` is the only
+  // record that a later import of the same bundle is a duplicate.
+  //
+  // It was not reached. Three steps here threw, and each one left the sessions
+  // written (and possibly registered) while the whole in-memory state — the
+  // imported-hash registry, the peer receipts, the lineage — was discarded with
+  // the rejected promise. The observable result is a DUPLICATE FACTORY, not a
+  // crash window: the user retries, no dedup filter has anything to match, and
+  // every session imports again under a fresh uuid, one full extra copy per
+  // attempt. The trigger did not need a crash — `writeLocalProjectId` below
+  // writes into the user's PROJECT directory, so a project dir that is
+  // read-only to the importing user made it throw EACCES deterministically,
+  // every time.
+  //
+  // So each of the three is guarded where it stands, and reports what was lost:
+  // planting the project identity (a convenience whose two sibling arms already
+  // only warn), registering in `history.jsonl` (guarded per session, so the
+  // `registered` flag records what actually happened rather than what was
+  // intended), and the state write itself.
+  // ---------------------------------------------------------------------
+
   // Plant the project identity carried by the bundle so hub adoption is
   // seamless later. Never overwrite an existing (different) identity.
   // manifest.projectId isn't covered by assertSafeManifestIds (that only
@@ -1374,14 +1406,30 @@ export async function importSession(
     } else {
       const existing = readLocalProjectId(targetProjectPath);
       if (!existing) {
-        writeLocalProjectId(targetProjectPath, {
-          projectId: manifest.projectId,
-          name:
-            manifest.sourceProjectPath.split(/[\\/]/).filter(Boolean).pop() ??
-            "project",
-          createdAt: new Date().toISOString(),
-          createdByMachine: manifest.sourceMachineId ?? "unknown",
-        });
+        try {
+          writeLocalProjectId(targetProjectPath, {
+            projectId: manifest.projectId,
+            name:
+              manifest.sourceProjectPath.split(/[\\/]/).filter(Boolean).pop() ??
+              "project",
+            createdAt: new Date().toISOString(),
+            createdByMachine: manifest.sourceMachineId ?? "unknown",
+          });
+        } catch (e) {
+          // Warn, never throw. This is the one step in the tail that writes
+          // OUTSIDE the config dir — into the user's project directory, which
+          // an importing user may not own — and nothing about the import
+          // depends on it: the file only lets a later push already know this
+          // project's hub id, which a push asks for itself when it does not.
+          //
+          // The message names no flag deliberately. The remedy is the OS error
+          // plus the path; a flag named here would be a second thing that can
+          // be wrong, and it would need its own entry and re-run proof in
+          // tests/hub-warning-flags.test.ts.
+          warnings.push(
+            `Could not write the project identity file into ${targetProjectPath} (${(e as Error).message}) — the sessions imported normally. Only this project's hub link is affected; nothing else in the import depends on that file.`
+          );
+        }
       } else if (existing.projectId !== manifest.projectId) {
         warnings.push(
           `Bundle carries project id ${manifest.projectId} but this project is already ${existing.projectId} — kept existing.`
@@ -1403,6 +1451,8 @@ export async function importSession(
   warnings.push(...shared.warnings);
 
   // Step 7: Register in indexes (only after successful validation)
+  /** Sessions whose `history.jsonl` append failed, so they are NOT resumable. */
+  const registrationFailed = new Set<string>();
   if (!noRegister) {
     const historyPath = join(targetConfigDir, "history.jsonl");
     for (const session of targetSessions) {
@@ -1414,7 +1464,20 @@ export async function importSession(
         project: targetProjectPath,
         sessionId: newSessionId,
       };
-      appendFileSync(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
+      try {
+        appendFileSync(historyPath, JSON.stringify(historyEntry) + "\n", "utf-8");
+      } catch (e) {
+        // Per session, not per import, so `registered` below records what
+        // actually happened. An unguarded throw here cost the whole registry
+        // (see the tail note above); an import-wide flag would instead record
+        // "unregistered" for sessions that ARE registered, and the dedup filter
+        // treats an unregistered prior as re-importable — which would duplicate
+        // them on the next run. Both directions have to be right.
+        registrationFailed.add(session.sessionId);
+        warnings.push(
+          `Session "${session.slug}" imported but could not be added to ${historyPath} (${(e as Error).message}), so it will not appear in Claude Code's resume list. Its files are in place; nothing was lost.`
+        );
+      }
     }
   }
 
@@ -1425,10 +1488,36 @@ export async function importSession(
     state.imported[session.integrityHash] = {
       localSessionId: newId,
       importedAt: new Date().toISOString(),
-      registered: !noRegister,
+      registered: !noRegister && !registrationFailed.has(session.sessionId),
     };
   }
 
+  // WHAT `manifest.sourceMachineId` CAN REACH (#28). It is the one id on a
+  // bundle manifest that goes through no validation at all — not
+  // `assertSafeManifestIds` (session ids and the two continuation ids only),
+  // not `assertSafeHubId`. That is deliberate, and this is the record of why,
+  // so the next reader does not have to re-derive it:
+  //
+  //   - It is a KEY into `state.peers` (here and at the dedup filter above) and
+  //     a VALUE in `state.lineage[…].sourceMachineId`. Those records are
+  //     null-prototype by construction, so a hostile key is an ordinary key.
+  //   - It is a VALUE in `.sesh-mover-project.json`'s `createdByMachine`, which
+  //     round-trips to `HubProjectJson.createdByMachine` and back as a value
+  //     and is never a path segment.
+  //   - It is echoed into two warnings (quoted — see the dedup filter above).
+  //
+  // It reaches NO path. `machinePath()` is called only from `init.ts`,
+  // `status.ts` and `whereis.ts`'s `createMachineNameLookup`, and every caller
+  // passes either this machine's own identity or a machineId taken from a hub
+  // INDEX — never a peers key, and never a manifest field. `bundleDir()` and
+  // `indexPath()` likewise take local identity or an index-derived id. So there
+  // is no chokepoint for it to pass through, and adding a gate here would only
+  // choose between refusing an otherwise-good bundle and dropping the receipt
+  // that stops the next import duplicating it.
+  //
+  // RE-DERIVE THIS before letting the field reach anything new. The moment a
+  // peers key, a lineage source, or `createdByMachine` is used to build a hub
+  // or filesystem path, `assertSafeHubId` belongs right here, at the read.
   if (manifest.sourceMachineId) {
     const peerId = manifest.sourceMachineId;
     const peerName = manifest.sourceMachineName ?? "unknown";
@@ -1437,8 +1526,19 @@ export async function importSession(
         name: peerName,
         lastSentAt: null,
         lastReceivedAt: null,
-        sent: {},
-        received: {},
+        // `foreignKeyedRecord`, not `{}` (#28). sync-state.ts's own rule is
+        // "anything that BUILDS one of these records must use this", and this
+        // is the site that BUILDS one — it does not inherit the guarantee from
+        // the state object it was handed, which is why the container-level fix
+        // did not reach it. Measured: `received["__proto__"] = receipt` on a
+        // plain object invokes Object.prototype's setter, creates NO own key,
+        // and serializes as `{}` — so the receipt for a session the manifest
+        // named `__proto__` (which `isSafeSessionId` allows) is silently lost
+        // and every later import of it duplicates. It bites only on FIRST
+        // contact with a peer, because `parseSyncState` re-wraps the record
+        // null-prototype on the next read — which is exactly why it survived.
+        sent: foreignKeyedRecord(),
+        received: foreignKeyedRecord(),
       };
     }
     const peer: SyncStatePeer = state.peers[peerId];
@@ -1479,7 +1579,20 @@ export async function importSession(
     }
   }
 
-  writeSyncState(state);
+  try {
+    writeSyncState(state);
+  } catch (e) {
+    // The last step of the tail, and the only one whose failure the import
+    // itself survives intact: the sessions are written and registered, so this
+    // import SUCCEEDED. What is lost is the bookkeeping that makes the NEXT one
+    // idempotent, so the honest report is success plus the consequence, spelled
+    // out — not an exception that discards a completed import (and, on
+    // `migrate`, left the source sessions undeleted beside the copies that
+    // already landed).
+    warnings.push(
+      `The sessions imported, but this project's sync-state could not be saved (${(e as Error).message}). Importing this same bundle again will NOT be recognized as a duplicate — it would add a second copy of each session. Free space or fix permissions before re-running an import here.`
+    );
+  }
 
   return {
     success: true,
@@ -1487,7 +1600,7 @@ export async function importSession(
     importedSessions,
     skippedSessions,
     warnings,
-    resumable: !noRegister,
+    resumable: !noRegister && registrationFailed.size === 0,
     versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
     ...sharedFindings(shared),
   } satisfies ImportResult;

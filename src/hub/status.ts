@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { createFsBackend } from "./backend.js";
+import { createFsBackend, type HubBackend } from "./backend.js";
 import { HUB_JSON, machinePath, type HubJson } from "./layout.js";
 import { resolveHubPath } from "./init.js";
 import { readMachineId } from "../machine.js";
@@ -8,6 +8,46 @@ import { readLocalProjectId } from "./identity.js";
 import { peekSyncState } from "../sync-state.js";
 import { projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 import type { HubStatusResult } from "../types.js";
+
+/**
+ * How many machines this hub knows about (#28) — `machines/<id>.json`, counted
+ * the way `readAllIndexes` counts `index/<id>.json`, and for the identical
+ * reason.
+ *
+ * `backend.list` walks RECURSIVELY and filters only `.tmp-` in a basename, so
+ * `(await backend.list("machines")).length` was every file underneath
+ * `machines/`. The hub is documented as a shared or synced directory, which
+ * makes foreign entries the EXPECTED case rather than a hostile one: a
+ * Syncthing `.stversions/` directory added one per RETAINED VERSION of a single
+ * machine's record; a `.DS_Store`, a `Thumbs.db`, an editor swap file or a
+ * `~syncthing~…tmp` each added one. The displayed count then said
+ * more machines had joined the hub than ever had — silently, with no way for a
+ * reader to tell.
+ *
+ * Immediate `.json` children only, deduped by the id the filename carries. The
+ * dedupe is what a plain `.endsWith(".json")` filter would still get wrong on a
+ * Dropbox conflict copy (`machines/<name>'s conflicted copy 2026-08-03/<id>.json`)
+ * — that is nested, so the immediate-children rule already excludes it, and the
+ * `seen` set is the belt for a future backend whose `list` is a flat prefix
+ * listing over an object store with no real directories.
+ *
+ * Deliberately does NOT read or validate the files: this is a count for a
+ * status line, and a machine record that is present but corrupt is still a
+ * machine that joined. `isSafeSessionId` is not applied either — nothing here
+ * turns the name into a path (contrast `readAllIndexes`, which does).
+ */
+async function countKnownMachines(backend: HubBackend): Promise<number> {
+  const prefix = "machines/";
+  const seen = new Set<string>();
+  for (const file of await backend.list("machines")) {
+    if (!file.startsWith(prefix)) continue;
+    const name = file.slice(prefix.length);
+    if (name.includes("/")) continue;
+    if (!name.endsWith(".json")) continue;
+    seen.add(name.slice(0, -".json".length));
+  }
+  return seen.size;
+}
 
 export async function hubStatus(opts: { cwd: string }): Promise<HubStatusResult> {
   const warnings: string[] = [];
@@ -48,7 +88,7 @@ export async function hubStatus(opts: { cwd: string }): Promise<HubStatusResult>
   const identity = readMachineId();
   const machineRegistered =
     reachable && identity !== null && (await backend.exists(machinePath(identity.id)));
-  const machinesKnown = reachable ? (await backend.list("machines")).length : 0;
+  const machinesKnown = reachable ? await countKnownMachines(backend) : 0;
 
   const local = readLocalProjectId(opts.cwd);
 

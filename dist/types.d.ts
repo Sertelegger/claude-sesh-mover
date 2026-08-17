@@ -749,21 +749,23 @@ export interface HubUnlinkedResult {
  * "unlinked" would misdescribe it and its remedy ("pick a project to link to")
  * is only half of this one's.
  *
- * Produced at the CLI boundary, BEFORE the verb runs (`src/cli.ts`), which is
- * the point of it: `hub push` used to discover a bad `--project-id` deep in its
- * own identity resolution — after it had registered this machine on the hub,
- * minted a thread into local sync-state and run a full export — and then throw
- * an `ENOENT` carrying the hub's absolute path out through the generic catch. A
- * validation failure must not happen after side effects.
+ * Produced BEFORE the verb does any work, by the shared gate in
+ * `src/hub/preflight.ts`, which is the point of it: `hub push` used to discover
+ * a bad `--project-id` deep in its own identity resolution — after it had
+ * registered this machine on the hub, minted a thread into local sync-state and
+ * run a full export — and then throw an `ENOENT` carrying the hub's absolute
+ * path out through the generic catch. A validation failure must not happen
+ * after side effects.
  *
  * `linkCandidates` is the same pick list `HubUnlinkedResult` carries, so a
  * caller can offer one branch for both; it is empty (never absent) when the hub
  * itself could not be listed.
  *
- * Scope, stated rather than implied: the guarantee is CLI-level. A library
- * consumer calling `hubPush`/`hubPull` directly still gets the throw from
- * `readHubProjectAsLocal`, because the gate lives in `src/cli.ts` and not in
- * either orchestrator. Moving it inward would be the stronger fix.
+ * Scope: the guarantee is the LIBRARY's, not just the CLI's. The gate was
+ * CLI-level when it was introduced (#29), which left a consumer calling
+ * `hubPush`/`hubPull` through `src/index.ts` still getting the throw from
+ * `readHubProjectAsLocal`; #75 moved it inward so the two agree. The CLI keeps
+ * its own exit-code convention for it — see `outputRefusal` in `src/cli.ts`.
  */
 export interface HubNoSuchProjectResult {
     success: false;
@@ -776,6 +778,47 @@ export interface HubNoSuchProjectResult {
         name: string;
         gitRemotes: string[];
     }>;
+    suggestion: string;
+}
+/**
+ * The configured hub could not be used AT ALL: nothing about it was read, so
+ * push and pull refuse before touching the project, the hub or their own
+ * bookkeeping (#75).
+ *
+ * Replaces a raw `ENOENT` that escaped both verbs through the CLI's generic
+ * catch — untyped, so the skill layer had nothing to branch on while every
+ * other hub failure (`unlinked`, `lock-busy`, `not-yet-synced`,
+ * `no-such-project`) carried a `reason`, and carrying the hub's absolute path
+ * in its message for no benefit. **Nothing here names the path**, deliberately:
+ * `hub status` is where a user asks which path is configured.
+ *
+ * **Not `NotYetSyncedResult`, and the difference is not a shade of meaning.**
+ * That one presupposes a fully readable hub — its `hub.json`, its machine
+ * indexes, the thread it resolved — and reports that specific *bundle files*
+ * those indexes reference have not landed on this machine's copy of a synced
+ * folder yet; it can therefore list them (`missing`), and the remedy is to wait
+ * for the same sync client to finish. This one is emitted when the hub itself
+ * could not be read, so nothing is known about it and there is no file list to
+ * give. The two can never both be true: `not-yet-synced` is only reachable
+ * after this gate has passed.
+ */
+export interface HubUnreachableResult {
+    success: false;
+    command: "push" | "pull";
+    reason: "hub-unreachable";
+    /**
+     * Which of the two shapes it is — an enum rather than prose, because the
+     * remedies differ and `skills/session-porter/SKILL.md` forbids branching on
+     * message text.
+     *
+     * - `no-directory` — the configured path is not a directory this machine can
+     *   stat: an unmounted share, a synced folder that has not appeared here, a
+     *   path that was never right, or one it may not read.
+     * - `not-a-hub` — the directory is there but carries no usable `hub.json`. A
+     *   synced folder whose first sync is still in flight looks exactly like a
+     *   directory that is simply not a hub, so this arm covers both.
+     */
+    hubState: "no-directory" | "not-a-hub";
     suggestion: string;
 }
 export interface HubLockBusyResult {
@@ -1097,6 +1140,16 @@ export interface HubPullListResult {
     threads: WhereisThread[];
     warnings: string[];
 }
+/**
+ * The hub is readable and its indexes resolved a thread, but specific BUNDLE
+ * FILES those indexes reference have not landed on this machine's copy of the
+ * hub directory yet (a synced folder mid-copy, on-demand hydration).
+ *
+ * The narrow one of the pair: see `HubUnreachableResult` for why "the hub
+ * itself could not be read" is a different result and not a second spelling of
+ * this. Reaching this exit means the reachability gate already passed, which is
+ * what makes `missing` a real, enumerable list.
+ */
 export interface NotYetSyncedResult {
     success: false;
     command: "pull";
@@ -1190,7 +1243,7 @@ export interface HubUnlinkResult {
     automationDisarmed: boolean;
     warnings: string[];
 }
-export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | HubPushFailedResult | WhereisResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnlinkResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | HubReindexResult | HubReindexFailedResult | ErrorResult;
+export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | HubPushFailedResult | WhereisResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnreachableResult | HubUnlinkResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | HubReindexResult | HubReindexFailedResult | ErrorResult;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;
@@ -1228,6 +1281,18 @@ export interface ProgressEvent {
      * Absent entirely on the two hub phases: `hub-push`/`hub-pull` events carry
      * `percent` only, and the per-session detail under them comes from the
      * exporter/importer events the hub verb forwards.
+     *
+     * THE TERMINAL-EVENT CONTRACT for those two phases (#74), because a consumer
+     * that waits for one has to know when it is entitled to it. Once `hubPush`/
+     * `hubPull` has acquired the project lock, it emits exactly one
+     * `{percent: 0}` and, from its `finally`, exactly one `{percent: 100}` —
+     * **on every outcome**, including a typed refusal, a mid-chain abort and a
+     * thrown exception. `percent: 100` therefore means "the operation is over",
+     * not "everything succeeded"; the returned result says which, and a throw
+     * still throws. The one exit BEFORE the lock (`lock-busy`, plus a non-busy
+     * throw out of the lock itself) emits nothing at all, which is the contract
+     * rather than an oversight: a consumer gets either no events or a matched
+     * pair, never an opening event with no close.
      */
     sessionIndex?: number;
     /** See `sessionIndex`: the current sub-batch's size, not the whole phase's. */

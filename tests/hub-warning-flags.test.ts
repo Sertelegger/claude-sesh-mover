@@ -280,6 +280,57 @@ const REGISTRY: FlagUse[] = [
     klass: "descriptive",
     why: "Names the flag as the cause of an outcome the caller already chose. Nothing is being asked of the user beyond checking afterwards.",
   },
+  // ---- src/hub/preflight.ts (#75) ------------------------------------------
+  //
+  // These four lines were in `src/cli.ts` until #75 and so were outside this
+  // sweep (see SWEEP_EXCLUDES). Moving the gate into a hub module — which is
+  // what makes a library caller of hubPush/hubPull get the same refusal —
+  // brought them in, unchanged in wording.
+  {
+    file: "src/hub/preflight.ts",
+    match: "Pick one of the ",
+    klass: "retry-works",
+    why: "The whole point of the gate is that it decides before anything happens: no lock write, no link, no machine registration, no thread minted, no export. The same invocation with a corrected --project-id runs from the top.",
+    provenBy: {
+      test: "hub-pull-stages.test.ts",
+      name: "refuses an unknown --project-id, then links and resolves with the right one",
+      reruns: "runResolveStage",
+    },
+  },
+  {
+    file: "src/hub/preflight.ts",
+    match: ", or pass --create-project to mint a new one.",
+    klass: "retry-works",
+    why: "Push's half of the same refusal, and reachable for the same reason — the refusal is before the export and before every hub write. --create-project is the answer when the pick list holds nothing the user wants.",
+    provenBy: {
+      test: "hub-push.test.ts",
+      name: "refuses an unknown --project-id before any write, and --create-project then pushes",
+      reruns: "hubPush",
+    },
+  },
+  {
+    file: "src/hub/preflight.ts",
+    match: " — pass --create-project to mint one.",
+    klass: "retry-works",
+    why: "The same push remedy worded for an EMPTY hub, where there is no pick list to choose from and minting is the only move. Same branch, same 'nothing has happened yet' guarantee, so the same proof covers it.",
+    provenBy: {
+      test: "hub-push.test.ts",
+      name: "refuses an unknown --project-id before any write, and --create-project then pushes",
+      reruns: "hubPush",
+    },
+  },
+  {
+    file: "src/hub/preflight.ts",
+    match: "hub.path names a directory this machine cannot see",
+    klass: "descriptive",
+    why: "A config-key line of exactly status.ts's shape, and for the same reason: hub.path is the SUBJECT — it names what is inconsistent, not something to change. Nothing is asked of the user beyond checking the mount, and the refusal happens before any read or write, so there is nothing for the foreclosure question to bite on.",
+  },
+  {
+    file: "src/hub/preflight.ts",
+    match: "otherwise hub.path is set to a directory that is not a sesh-mover hub",
+    klass: "descriptive",
+    why: "The other arm of the same refusal, and the same judgement: the key is named as the state that explains the outcome. Deliberately not phrased as 'point hub.path at ...' — that would make it advice and put it back in front of the foreclosure question.",
+  },
   // ---- everything else in src/hub/ -----------------------------------------
   {
     file: "src/hub/init.ts",
@@ -624,6 +675,11 @@ const SURFACES: Record<string, string[]> = {
   "src/hub/pull-apply-sessions.ts": ["pull"],
   "src/hub/pull-apply-workspace.ts": ["pull"],
   "src/hub/pull-resolve.ts": ["pull"],
+  // The one file BOTH verbs surface verbatim: `preflightHub` is called by
+  // `hub/push.ts` and `hub/pull-resolve.ts` alike, so a flag named here is read
+  // by a user running either. `--create-project` is push's, which is why both
+  // lines that name it also say "push".
+  "src/hub/preflight.ts": ["push", "pull"],
   "src/hub/push.ts": ["push"],
   "src/hub/reindex.ts": ["reindex"],
   "src/hub/status.ts": ["status"],

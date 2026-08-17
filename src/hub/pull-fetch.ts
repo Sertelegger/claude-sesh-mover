@@ -7,7 +7,7 @@ import type { ApplyState } from "./pull-apply-state.js";
 import { stageAbort, stageOk, type StageOutcome } from "./pull-stages.js";
 import { extractArchive } from "../archiver.js";
 import { readManifest, verifySessionsDigest } from "../manifest.js";
-import type { ExportManifest } from "../types.js";
+import type { ExportManifest, ProgressEvent } from "../types.js";
 
 export interface FetchStageInput {
   backend: HubBackend;
@@ -26,6 +26,11 @@ export interface FetchStageInput {
    * bundle a divergence abort deferred.
    */
   bundleIndex: number;
+  /**
+   * How many bundles this pull's chain has — the denominator of the `hub-pull`
+   * percent below, and the only thing this stage uses it for.
+   */
+  chainLength: number;
   /** Private temp dir for this pull; the archive and its extraction land here. */
   tempRoot: string;
   /**
@@ -33,6 +38,11 @@ export interface FetchStageInput {
    * rather than returning them. See the doc on `runFetchStage`.
    */
   state: ApplyState;
+  /**
+   * `hubPull`'s own callback, forwarded (#74). Optional and usually absent —
+   * only `--progress` supplies one — so everything below is a no-op by default.
+   */
+  onProgress?: (ev: ProgressEvent) => void;
 }
 
 /**
@@ -82,7 +92,17 @@ export interface FetchStageResult {
 export async function runFetchStage(
   input: FetchStageInput
 ): Promise<StageOutcome<FetchStageResult>> {
-  const { backend, record, machineId, bundleIndex: i, tempRoot, state: st } = input;
+  const { backend, record, machineId, bundleIndex: i, chainLength, tempRoot, state: st } = input;
+
+  // Bundles COMPLETED over bundles total, emitted as this one starts: bundle 0
+  // reports 0%, and the chain's last bundle reports (n-1)/n rather than 100 —
+  // the terminal 100 is `hubPull`'s `finally` and belongs to nobody else. It is
+  // the only monotonic denominator available here; a byte-level number would
+  // need a size the index does not record.
+  input.onProgress?.({
+    phase: "hub-pull",
+    percent: chainLength > 0 ? Math.round((i / chainLength) * 100) : 0,
+  });
 
   const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
   const out = createWriteStream(tarPath);
@@ -94,6 +114,13 @@ export async function runFetchStage(
   await pipeline(await backend.readStream(record.file), out);
   const extractDir = join(tempRoot, record.bundleId);
   mkdirSync(extractDir, { recursive: true });
+  // NO progress reporting across this call, and it is a gap rather than an
+  // omission (#74): `extractArchive` (src/archiver.ts) takes no callback at
+  // all, so there is no seam to report from — and on a large bundle over a
+  // network share the download above and this extraction are most of the wall
+  // clock. `hub push`'s `createArchive` has the identical hole. Giving the
+  // archiver a progress callback is a bigger change than this one and wants
+  // deciding on its own merits, so it is stated here rather than smuggled in.
   await extractArchive(tarPath, extractDir);
   // Archiver-rooting reality check: createArchive tars the staging dir
   // with `cwd: dirname(sourceDir)` and a single top-level entry

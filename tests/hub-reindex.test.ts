@@ -481,6 +481,82 @@ describe("hub reindex", () => {
     }
   });
 
+  /**
+   * The third condition, and #72's reindex half: a bundle whose NAME parses but
+   * whose manifest is not a sesh-mover manifest.
+   *
+   * Two things are asserted, because the fix has two halves that fail in
+   * opposite directions. Without the manifest shape guard, `sessions: "abc"`
+   * iterated three characters and reported three `droppedBundles` entries whose
+   * `sessionId` is `undefined` — fabricated records in the field typed
+   * specifically to disclose data loss. Without reindex's own try/catch, the
+   * guard's throw would abort the whole rebuild, leaving the index lost, which
+   * is the condition this command exists to end.
+   */
+  it("skips a bundle whose manifest is not ours instead of aborting the rebuild (#72)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const work = mkdtempSync(join(tmpdir(), "sesh-reindex-work-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      const jsonlPath = join(
+        configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+      );
+      continueSession(jsonlPath, sessionId, projectPath);
+      const second = await hubPush({ configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81" });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const original = await readMachineIndex(backend, first.projectId, machine.id);
+      if (!original) throw new Error("no index after push");
+      const bundlesBefore = Object.values(original.threads)[0].bundles;
+      expect(bundlesBefore).toHaveLength(2);
+      const contFile = bundlesBefore[1].file;
+
+      // Restamped by the real writer, so the digest is valid over the wrong
+      // value — the manifest is internally consistent and simply not ours.
+      await rewriteBundleManifest(hub, contFile, work, (m) => {
+        (m as unknown as { sessions: unknown }).sessions = "abc";
+      });
+
+      await backend.delete(indexPath(first.projectId, machine.id));
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.unrecognizedBundleFiles).toEqual([contFile]);
+      // The fabrication: three `sessionId: undefined` records for a bundle that
+      // declares no sessions at all.
+      expect(result.droppedBundles).toBeUndefined();
+      expect(result.warnings.some((w) => w.includes("no readable sesh-mover manifest"))).toBe(
+        true
+      );
+      // The healthy bundle beside it still rebuilt, which is the half a plain
+      // throw would have cost.
+      expect(result.projects[0].bundlesScanned).toBe(2);
+      const rebuilt = await readMachineIndex(backend, first.projectId, machine.id);
+      if (!rebuilt) throw new Error("no index after reindex");
+      expect(Object.values(rebuilt.threads)[0].bundles.map((b) => b.file)).toEqual([
+        bundlesBefore[0].file,
+      ]);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base, work]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
   it("carries forward a thread whose local session was deleted after being pushed", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));

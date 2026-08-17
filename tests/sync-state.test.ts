@@ -208,6 +208,52 @@ describe("sync-state", () => {
     expect(state.peers["peer-1"].lastSentAt).not.toBeNull();
   });
 
+  /**
+   * `recordSentFromBundle` is one of the five unguarded `readManifest` callers
+   * #72 audits, and the only one that WRITES durable state directly off the
+   * iteration. Its comment says "readManifest is the validation chokepoint …
+   * ids here are already guaranteed safe" — which was true of the ids and
+   * false of the LIST, the distinction the guard now closes.
+   */
+  it('refuses a bundle whose `sessions` is a string, rather than writing an "undefined" ledger entry (#72)', async () => {
+    const { recordSentFromBundle, readSyncState, syncStatePath } = await import(
+      "../src/sync-state.js"
+    );
+    const { mkdirSync } = await import("node:fs");
+
+    const bundleDir = join(tempHome, "bundle-shapeless");
+    mkdirSync(join(bundleDir, "sessions"), { recursive: true });
+    // Hand-written, not via writeManifest: the point is a manifest that parses
+    // and passes the id chokepoint while not being a session list at all.
+    writeFileSync(
+      join(bundleDir, "manifest.json"),
+      JSON.stringify({
+        version: 1,
+        plugin: "sesh-mover",
+        exportedAt: "2026-08-16T00:00:00Z",
+        sourcePlatform: "linux",
+        sourceProjectPath: "/p",
+        sourceConfigDir: "/c",
+        sourceClaudeVersion: "2.1.114",
+        sessionScope: "all",
+        includedLayers: ["jsonl"],
+        sessions: "abc",
+      })
+    );
+
+    expect(() =>
+      recordSentFromBundle("/shapeless", { id: "peer-1", name: "peer-one" }, bundleDir)
+    ).toThrow(/not a sesh-mover bundle manifest/i);
+
+    // The damage the guard prevents, asserted directly. Iterating "abc" yielded
+    // three characters whose `.sessionId` is undefined, so the loop wrote
+    // `sent["undefined"]` three times and then persisted it — a permanent junk
+    // key in the peer's sent ledger, keyed by a session that does not exist.
+    expect(existsSync(syncStatePath("/shapeless"))).toBe(false);
+    const state = readSyncState("/shapeless");
+    expect(state.peers["peer-1"]).toBeUndefined();
+  });
+
   it("recordSentFromBundle maps continuation entries back to the local session id", async () => {
     const { recordSentFromBundle, readSyncState } = await import("../src/sync-state.js");
     const { writeManifest } = await import("../src/manifest.js");

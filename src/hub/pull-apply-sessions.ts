@@ -21,6 +21,7 @@ import type {
   ExportManifest,
   HubPullDivergence,
   OnDivergenceMode,
+  ProgressEvent,
   SessionManifest,
   SyncState,
 } from "../types.js";
@@ -349,6 +350,21 @@ export interface ApplySessionsStageInput {
   recordSplice: (b: RecordSpliceInput) => void;
   /** `pull.ts`'s bounded entry count from a byte offset; called twice. */
   countEntriesAfterOffset: (path: string, offset: number) => Promise<number>;
+  /**
+   * `hubPull`'s own callback, forwarded straight into `importSession` (#74).
+   *
+   * This is where the pull's only per-SESSION detail comes from — the importer's
+   * `import-verify` event and its byte-level, percent-throttled
+   * `import-rewrite` — and the call below simply omitted it, so `--progress` on
+   * a pull reported nothing between the two hub-pull percents. Nothing here
+   * interprets it: the events keep the importer's own phases, which is what
+   * `ProgressEvent` already documents the hub phases as being coarse over.
+   *
+   * The two splice paths (append, adopt-hub) return BEFORE that call and so
+   * report nothing — they write bytes directly rather than going through the
+   * importer, and there is no seam in `append.ts` either.
+   */
+  onProgress?: (ev: ProgressEvent) => void;
 }
 
 /**
@@ -825,6 +841,7 @@ export async function runApplySessionsStage(
     targetClaudeVersion: claudeVersion,
     dryRun: false,
     sessionIds: [record.sessionIdInBundle],
+    onProgress: input.onProgress,
   });
   // importer already rolled back partial writes. Returned VERBATIM by the
   // caller, `command: "import"` and all — and note this happens BEFORE the
