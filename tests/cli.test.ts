@@ -228,6 +228,65 @@ describe("cli", () => {
       expect(third.success).toBe(true);
       expect(third.archivePath).toMatch(/arch-col-2\.tar\.gz$/);
     });
+
+    /**
+     * The command-level half of the config-merge fix (57cd7b7, #29).
+     *
+     * `readConfig` backfills defaults even for a file that does not exist, so
+     * merging two independently backfilled layers reset every user-scope-only
+     * setting to its default whenever the project scope simply had no config
+     * file — the ordinary case. `computeEffectiveConfig` layers raw file
+     * contents instead, and `tests/config.test.ts` pins that at unit level.
+     *
+     * What nothing pinned is the WIRING: `cli.ts`'s `loadEffectiveConfig` is
+     * what `export` and `migrate` call, and no export test could catch a
+     * regression there because every one of them passes `--format`/`--storage`
+     * explicitly, so config is bypassed. This one deliberately passes neither.
+     *
+     * Through `sharedRunCli` with an explicit `cwd`, because the project layer
+     * is read from `process.cwd()` — the local wrapper cannot express that, and
+     * an unset cwd would read the developer's own repo as the project scope.
+     */
+    it("honours a user-scope-only export setting when the project has no config file", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cfg-export-home-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cfg-export-proj-"));
+      const outputDir = mkdtempSync(join(tmpdir(), "sesh-cfg-export-out-"));
+      try {
+        const env = { env: { CLAUDE_CONFIG_DIR: configDir, ...homeEnv(home) }, cwd: project };
+        const set = JSON.parse(
+          sharedRunCli(["configure", "--scope", "user", "--set", "export.format=archive"], env).stdout
+        );
+        expect(set.success).toBe(true);
+        expect(set.config.export.format).toBe("archive");
+        // The condition the defect needed, asserted rather than assumed: the
+        // project scope has no file at all. A `.sesh-mover/` here would make
+        // this test pass for the wrong reason.
+        expect(existsSync(join(project, ".sesh-mover"))).toBe(false);
+
+        const result = JSON.parse(
+          sharedRunCli(
+            [
+              "export", "--scope", "current", "--session-id", sessionId,
+              "--source-config-dir", configDir,
+              "--project-path", "/Users/testuser/Projects/testproject",
+              "--name", "cfgmerge", "--output", outputDir,
+              // No --format and no --storage: the whole point is that the
+              // effective config decides, which is the code path a regression
+              // in loadEffectiveConfig would break.
+            ],
+            env
+          ).stdout
+        );
+        expect(result.success).toBe(true);
+        // "archive" survived the absent project layer. Under the old merge this
+        // read back as the default "dir" and produced a plain directory.
+        expect(result.archivePath).toMatch(/cfgmerge\.tar\.gz$/);
+        expect(result.exportPath).toBe(result.archivePath);
+        expect(existsSync(result.archivePath)).toBe(true);
+      } finally {
+        for (const d of [home, project, outputDir]) rmSync(d, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("pull command", () => {
@@ -315,6 +374,198 @@ describe("cli", () => {
         for (const d of [homeA, homeB, hubDir, cloneRoot]) {
           rmSync(d, { recursive: true, force: true });
         }
+      }
+    });
+
+    /**
+     * "Already up to date" AT CLI LEVEL (#29).
+     *
+     * Module-level coverage of this refusal is good, but no in-process
+     * `hubPull` test can observe what `commands/pull.md` actually tells the
+     * skill layer to read: exactly one JSON object on stdout, and an exit code.
+     * Both are `src/cli.ts` wiring.
+     *
+     * Two things worth knowing before changing this test. First, the refusal is
+     * `success: false`, NOT a `success: true` no-op — so a caller that branches
+     * on `success` alone reports a routine second pull as a failure unless it
+     * reads `error`. Second, it exits **0**: `output()` writes the body and
+     * returns, and only `outputError()` exits 1. That split is real and this
+     * test pins it — every typed hub refusal (`unlinked`, `lock-busy`,
+     * `not-yet-synced`, this one) exits 0 while a bad invocation exits 1 — but
+     * it means an exit code cannot be used to detect a failed pull.
+     */
+    it("a second identical pull is a success:false 'already up to date' refusal on a zero exit", async () => {
+      const homeA = mkdtempSync(join(tmpdir(), "sesh-cli-up-homeA-"));
+      const homeB = mkdtempSync(join(tmpdir(), "sesh-cli-up-homeB-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-up-hub-"));
+      const targetRoot = mkdtempSync(join(tmpdir(), "sesh-cli-up-target-"));
+      const configDirB = join(homeB, ".claude");
+      // Its own directory, not tempDir: the fixture config dir lives under
+      // tempDir and a push of tempDir would snapshot it.
+      const projectPath = join(tempDir, "upproj");
+      mkdirSync(projectPath, { recursive: true });
+      writeFileSync(join(projectPath, "README.md"), "hello\n");
+      const { writeLocalProjectId } = await import("../src/hub/identity.js");
+      try {
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", encodeProjectPath(projectPath)),
+          { recursive: true }
+        );
+
+        runCli(["hub", "init", "--path", hubDir], homeEnv(homeA));
+        const push = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir],
+            homeEnv(homeA)
+          ).stdout
+        );
+        expect(push.success).toBe(true);
+
+        runCli(["hub", "init", "--path", hubDir], homeEnv(homeB));
+        const target = join(targetRoot, "uptarget");
+        mkdirSync(target, { recursive: true });
+        writeLocalProjectId(target, {
+          projectId: push.projectId, name: "upproj",
+          createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+        });
+
+        const envB = { ...homeEnv(homeB), CLAUDE_CONFIG_DIR: configDirB };
+        const args = ["pull", "--latest", "--project-path", target, "--source-config-dir", configDirB];
+        const first = runCli(args, envB);
+        expect(first.status).toBe(0);
+        const firstResult = JSON.parse(first.stdout);
+        expect(firstResult.success).toBe(true);
+        expect(firstResult.importedSessions).toHaveLength(1);
+
+        // The identical invocation again — the ordinary "did anything change?"
+        // re-run, not an error case.
+        const second = runCli(args, envB);
+        const secondResult = JSON.parse(second.stdout); // throws unless stdout is exactly one JSON doc
+        expect(secondResult.success).toBe(false);
+        expect(secondResult.command).toBe("pull");
+        expect(secondResult.suggestion).toBeTruthy();
+        expect(second.status).toBe(0);
+        // `--latest` selects across threads, so it stops at the PLURAL exit —
+        // receipt-shaped, deliberately not a claim about heads.
+        //
+        // Deliberately NOT also asserting the singular exit's wording ("Already
+        // up to date with the source machine.") by re-running with `--thread
+        // <id>`: after this pull both machines hold the same head with the same
+        // lastActiveAt, so which one `resolveThreads` calls `latest` comes down
+        // to a tiebreak over two randomly generated machine ids, and the
+        // singular refusal is worded from that choice — "Already up to date
+        // with the source machine." when A wins, "The latest copy of this
+        // thread is already local." when B does. Measured: it alternates
+        // between runs. Both are correct; neither is pinnable here.
+        expect(secondResult.error).toBe(
+          "Nothing to pull: every bundle the machine each thread resolves to lists has already been received here."
+        );
+        // A refusal applies nothing: no second copy of the session landed.
+        const sessions = readdirSync(
+          join(configDirB, "projects", encodeProjectPath(target))
+        ).filter((f) => f.endsWith(".jsonl"));
+        expect(sessions).toHaveLength(1);
+      } finally {
+        for (const d of [homeA, homeB, hubDir, targetRoot]) {
+          rmSync(d, { recursive: true, force: true });
+        }
+      }
+    });
+
+    /**
+     * A `--project-id` naming no hub project: a typed refusal, before anything
+     * happens (#29).
+     *
+     * It used to escape as whatever `readHubProjectAsLocal` threw — an
+     * `assertSafeHubId` message for a path-unsafe id, a raw `ENOENT` carrying
+     * the hub's absolute path for a well-formed one — through the generic outer
+     * catch, with no `reason` and no candidates. The irony was exact: the typed
+     * `unlinked` refusal's own suggestion is "Pass --project-id <id>", and
+     * following it with a wrong id dropped the caller off the typed path.
+     */
+    it("refuses an unknown --project-id with a typed result and a pick list, leaking no hub path", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-badid-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-badid-hub-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cli-badid-proj-"));
+      const { createFsBackend } = await import("../src/hub/backend.js");
+      const { projectJsonPath } = await import("../src/hub/layout.js");
+      try {
+        runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+        const realId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        await createFsBackend(hubDir).writeAtomic(
+          projectJsonPath(realId),
+          JSON.stringify({
+            schemaVersion: 1, projectId: realId, name: "a-real-project",
+            matchers: { gitRemotes: ["github.com/user/repo"] },
+            createdAt: "2026-08-01T00:00:00Z", createdByMachine: "m1",
+          }) + "\n"
+        );
+
+        const missingId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const missing = runCli(
+          ["pull", "--latest", "--project-path", project, "--project-id", missingId,
+            "--source-config-dir", configDir],
+          homeEnv(home)
+        );
+        const result = JSON.parse(missing.stdout);
+        expect(result.success).toBe(false);
+        expect(result.command).toBe("pull");
+        expect(result.reason).toBe("no-such-project");
+        expect(result.requestedProjectId).toBe(missingId);
+        // The pick list the raw throw could never carry.
+        expect(result.linkCandidates).toHaveLength(1);
+        expect(result.linkCandidates[0].projectId).toBe(realId);
+        expect(result.linkCandidates[0].name).toBe("a-real-project");
+        // A bad invocation, so it still exits non-zero — but the BODY is now a
+        // shape rather than an error string, and nothing echoes the hub's
+        // absolute path back out (the old ENOENT message did).
+        expect(missing.status).not.toBe(0);
+        expect(missing.stdout).not.toContain(hubDir);
+        expect(result.error).toBeUndefined();
+
+        // Second flavour, same answer: an id that is not path-safe at all. This
+        // one threw out of assertSafeHubId rather than out of the read.
+        const unsafe = runCli(
+          ["pull", "--latest", "--project-path", project, "--project-id", "../../etc",
+            "--source-config-dir", configDir],
+          homeEnv(home)
+        );
+        const unsafeResult = JSON.parse(unsafe.stdout);
+        expect(unsafeResult.reason).toBe("no-such-project");
+        expect(unsafeResult.requestedProjectId).toBe("../../etc");
+        expect(unsafe.status).not.toBe(0);
+
+        // ...and nothing was linked by either attempt.
+        expect(existsSync(join(project, ".sesh-mover-project.json"))).toBe(false);
+      } finally {
+        for (const d of [home, hubDir, project]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * The other half of that gate: an id is only "unknown" if the HUB could be
+     * asked. On an unmounted share or a sync client mid-copy every read fails,
+     * including the validating one — answering `no-such-project` there would be
+     * a confident wrong diagnosis with a wrong remedy (fix an id that is fine).
+     * The pre-flight stands down and the verb reports the hub problem instead.
+     */
+    it("does not blame the --project-id when the hub itself is unreachable", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-nohub-id-home-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-cli-nohub-id-proj-"));
+      try {
+        const gone = join(home, "not-mounted");
+        runCli(["configure", "--scope", "user", "--set", `hub.path=${gone}`], homeEnv(home));
+        const { stdout } = runCli(
+          ["pull", "--latest", "--project-path", project, "--project-id",
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "--source-config-dir", configDir],
+          homeEnv(home)
+        );
+        const result = JSON.parse(stdout);
+        expect(result.success).toBe(false);
+        expect(result.reason).not.toBe("no-such-project");
+      } finally {
+        for (const d of [home, project]) rmSync(d, { recursive: true, force: true });
       }
     });
   });
@@ -1685,6 +1936,65 @@ describe("cli", () => {
       }
     });
 
+    /**
+     * The ordering half of the `--project-id` fix (#29), and the reason it is
+     * worth more than the error shape.
+     *
+     * `hub push` decides identity early but only RESOLVES it after
+     * `registerMachine` (a hub write), after minting a thread into local
+     * sync-state, and after a full incremental export — so a typo'd
+     * `--project-id` failed with residue already written, and the outer catch
+     * rethrew rather than producing the typed `failed-after-link` shape,
+     * because `commits` was still null. A validation failure must not happen
+     * after side effects.
+     *
+     * The project needs real sessions or the export short-circuits on "No
+     * sessions found" and the bad id is never reached at all.
+     */
+    it("refuses an unknown --project-id before the export and leaves no local or hub state", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-pushbadid-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-pushbadid-hub-"));
+      try {
+        await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
+
+        const projectPath = join(tempDir, "badidpushproj");
+        mkdirSync(projectPath, { recursive: true });
+        writeFileSync(join(projectPath, "README.md"), "hello\n");
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", encodeProjectPath(projectPath)),
+          { recursive: true }
+        );
+
+        const missingId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        const { stdout, status } = await runCli(
+          ["push", "--project-path", projectPath, "--project-id", missingId,
+            "--source-config-dir", configDir],
+          homeEnv(home)
+        );
+        const result = JSON.parse(stdout);
+        expect(result.success).toBe(false);
+        expect(result.command).toBe("push");
+        expect(result.reason).toBe("no-such-project");
+        expect(result.requestedProjectId).toBe(missingId);
+        expect(result.suggestion).toContain("--create-project");
+        expect(status).not.toBe(0);
+
+        // NOTHING happened. The sync-state file is the sharpest of these: push
+        // mints a thread id into it before it resolves the identity, so its
+        // absence is what says the refusal really did land ahead of the work.
+        expect(
+          existsSync(join(home, ".sesh-mover", "sync-state", `${encodeProjectPath(projectPath)}.json`))
+        ).toBe(false);
+        expect(existsSync(join(projectPath, ".sesh-mover-project.json"))).toBe(false);
+        expect(existsSync(join(hubDir, "projects"))).toBe(false);
+        expect(existsSync(join(hubDir, "bundles"))).toBe(false);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+
     it("push without a configured hub returns an error", async () => {
       const home = mkdtempSync(join(tmpdir(), "sesh-cli-push-nohub-home-"));
       try {
@@ -1709,17 +2019,28 @@ describe("cli", () => {
       try {
         await runCli(["hub", "init", "--path", hubDir], homeEnv(home));
 
-        // Same real-directory arrangement as the plain push CLI test above —
-        // hub identity writes .sesh-mover-project.json under the real
-        // project directory.
+        // Same real-directory arrangement as the plain push CLI test above,
+        // INCLUDING its isolation: hub identity writes
+        // .sesh-mover-project.json under the real project directory, and the
+        // fixture config dir lives under tempDir — so pushing tempDir itself
+        // snapshotted `<tempDir>/.claude`, i.e. this test's own bundle carried
+        // the fixture's transcripts inside the WORKSPACE payload. That is
+        // currently harmless only because `.claude` sits on
+        // DEFAULT_WORKSPACE_EXCLUDES, which `src/hub/workspace.ts` documents as
+        // a re-includable convenience default rather than the NEVER_INCLUDABLE
+        // floor — so a user-overridable policy, not directory isolation, was
+        // holding this test's hygiene up. Own directory instead.
+        const projectPath = join(tempDir, "progressproj");
+        mkdirSync(projectPath, { recursive: true });
+        writeFileSync(join(projectPath, "README.md"), "hello\n");
         const fixtureEncoded = "-Users-testuser-Projects-testproject";
-        const realEncoded = encodeProjectPath(tempDir);
+        const realEncoded = encodeProjectPath(projectPath);
         cpSync(join(configDir, "projects", fixtureEncoded), join(configDir, "projects", realEncoded), {
           recursive: true,
         });
 
         const { stdout, stderr } = await runCli(
-          ["push", "--project-path", tempDir, "--create-project", "--source-config-dir", configDir, "--progress"],
+          ["push", "--project-path", projectPath, "--create-project", "--source-config-dir", configDir, "--progress"],
           homeEnv(home)
         );
         const result = JSON.parse(stdout); // throws if stdout isn't exactly one JSON doc
@@ -1737,6 +2058,11 @@ describe("cli", () => {
         const hubPushEvents = events.filter((e) => e.phase === "hub-push");
         expect(hubPushEvents.some((e) => e.percent === 0)).toBe(true);
         expect(hubPushEvents.some((e) => e.percent === 100)).toBe(true);
+        // The isolation above, made checkable: the push linked its own
+        // directory and nothing else, so tempDir (which holds the fixture
+        // config dir) was never the project being pushed.
+        expect(existsSync(join(projectPath, ".sesh-mover-project.json"))).toBe(true);
+        expect(existsSync(join(tempDir, ".sesh-mover-project.json"))).toBe(false);
       } finally {
         rmSync(home, { recursive: true, force: true });
         rmSync(hubDir, { recursive: true, force: true });

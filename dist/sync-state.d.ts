@@ -1,5 +1,39 @@
 import type { SyncState, SyncStateSessionSent, WorkspaceGenerationRef } from "./types.js";
 export declare function syncStatePath(projectPath: string): string;
+/**
+ * A record whose KEYS come from outside this machine, built with NO PROTOTYPE.
+ *
+ * `peers`, `lineage`, `imported` and each peer's `sent`/`received` are all keyed
+ * by strings a peer supplies — a `machineId` read off a hub index file, a
+ * `sourceMachineId` off a bundle manifest, a `sessionIdInBundle` off an index
+ * record, an `integrityHash` off the same manifest. The only filter any of them
+ * passes is `isSafeSessionId`, which answers a DIFFERENT question (path shapes):
+ * `__proto__`, `constructor`, `toString`, `valueOf` and `hasOwnProperty` all
+ * pass it.
+ *
+ * On a plain `{}` those keys are already "present". `state.peers["__proto__"]`
+ * yields `Object.prototype`, so the `state.peers[id] ??= {…}` / `if
+ * (!state.peers[id])` guards every writer here uses do NOT create the entry, and
+ * the writes that follow land on `Object.prototype` ITSELF before dying on the
+ * first nested one. Measured against shipped `dist/`: `name` and
+ * `lastReceivedAt` were added to `Object.prototype` and the operation then threw
+ * `Cannot set properties of undefined` — in `hub/pull.ts`'s `recordSplice`,
+ * which runs AFTER the user's transcript has already been extended, so the throw
+ * leaves the splice unrecorded and the next pull re-needs the same bundle.
+ *
+ * A null prototype answers the whole family at the container: every lookup is an
+ * own lookup, so a hostile key is an ordinary key and the guards mean what they
+ * say. ONE copy of the rule on purpose — `importer.ts` and `cli.ts` also index
+ * these records with peer-supplied strings, and they get the guarantee from the
+ * state object they were handed rather than from a guard each of them has to
+ * remember to write. Anything that BUILDS one of these records must use this
+ * (`hub/pull.ts` does), which is why it is exported.
+ *
+ * JSON round-trips unchanged: `JSON.stringify` reads own enumerable keys, and
+ * `JSON.parse` defines a `__proto__` key as an OWN property, which `Object.assign`
+ * then copies onto a null-prototype target as an own property too.
+ */
+export declare function foreignKeyedRecord<T>(from?: Record<string, T> | null): Record<string, T>;
 export declare function readSyncState(projectPath: string): SyncState;
 /**
  * Read-only twin of `readSyncState`: same file, same parse, but it NEVER

@@ -803,25 +803,70 @@ export interface WhereisResult {
  * result of the `hub unlink` verb — the deliberate act of removing a link.
  * This one is a refusal: nothing happened, and `linkCandidates` is the pick
  * list for linking.
+ *
+ * **`whereis` is deliberately NOT a member** (#29). It is a read, so an
+ * unresolved identity is not a refusal for it: it reports the same pick list
+ * through `WhereisResult.linked: false` + `linkCandidates` on a `success: true`
+ * result, and `hubWhereis` is declared to return `WhereisResult` alone — it
+ * *cannot* produce this shape. The member sat here unconstructed from the day
+ * it was written, which is worse than absent: `commands/whereis.md` and the
+ * skill doc both tell the caller there is no error case to catch, so a third
+ * member here invited someone to write a branch that can never run. If a
+ * `whereis` refusal is ever wanted, changing `WhereisResult` is the change —
+ * re-adding the member alone would not produce one.
  */
 export interface HubUnlinkedResult {
   success: false;
-  command: "push" | "pull" | "whereis";
+  command: "push" | "pull";
   reason: "unlinked";
+  linkCandidates: Array<{ projectId: string; name: string; gitRemotes: string[] }>;
+  suggestion: string;
+}
+
+/**
+ * `--project-id` named a hub project the hub does not have (or whose id is not
+ * path-safe). A refusal, and deliberately NOT `HubUnlinkedResult`: this
+ * directory may well be linked already — only the *flag* is wrong — so
+ * "unlinked" would misdescribe it and its remedy ("pick a project to link to")
+ * is only half of this one's.
+ *
+ * Produced at the CLI boundary, BEFORE the verb runs (`src/cli.ts`), which is
+ * the point of it: `hub push` used to discover a bad `--project-id` deep in its
+ * own identity resolution — after it had registered this machine on the hub,
+ * minted a thread into local sync-state and run a full export — and then throw
+ * an `ENOENT` carrying the hub's absolute path out through the generic catch. A
+ * validation failure must not happen after side effects.
+ *
+ * `linkCandidates` is the same pick list `HubUnlinkedResult` carries, so a
+ * caller can offer one branch for both; it is empty (never absent) when the hub
+ * itself could not be listed.
+ *
+ * Scope, stated rather than implied: the guarantee is CLI-level. A library
+ * consumer calling `hubPush`/`hubPull` directly still gets the throw from
+ * `readHubProjectAsLocal`, because the gate lives in `src/cli.ts` and not in
+ * either orchestrator. Moving it inward would be the stronger fix.
+ */
+export interface HubNoSuchProjectResult {
+  success: false;
+  command: "push" | "pull";
+  reason: "no-such-project";
+  /** Echoed back verbatim — this is the value the user typed, not a hub value. */
+  requestedProjectId: string;
   linkCandidates: Array<{ projectId: string; name: string; gitRemotes: string[] }>;
   suggestion: string;
 }
 
 export interface HubLockBusyResult {
   success: false;
-  command: "push" | "pull" | "hub-unlink";
+  command: "push" | "pull" | "hub-unlink" | "hub-reindex";
   reason: "lock-busy";
   holderPid: number | null;
   ageSeconds: number | null;
   /**
    * The lock error's own message (which pid, how old). Set by `hub unlink`,
    * whose refusal a HUMAN reads while deciding whether to wait or to `--force`
-   * past it; push and pull leave it absent, because for them a busy lock means
+   * past it, and by `hub reindex`, which is a manual repair verb read the same
+   * way; push and pull leave it absent, because for them a busy lock means
    * another operation is already doing the work and the caller is told to
    * retry, not to adjudicate.
    */
@@ -1156,7 +1201,49 @@ export interface HubReindexResult {
   success: true;
   command: "hub-reindex";
   projects: Array<{ projectId: string; threads: number; bundlesScanned: number }>;
+  /**
+   * Bundle files in this machine's own bundle directory whose names the rebuild
+   * could not parse, so nothing they contain reached the index. Absent on an
+   * ordinary rebuild. Foreign files in that directory are the ordinary cause;
+   * a sync client's conflict copy (`… (conflicted copy).tar.gz`) is the one to
+   * expect.
+   */
+  unrecognizedBundleFiles?: string[];
+  /**
+   * Bundle records the rebuild DROPPED because this machine's sync-state has no
+   * thread mapping for the session they carry — the rebuilt index is missing
+   * them, and a bundle no index references is invisible to every other machine.
+   *
+   * Typed rather than left to `warnings` because it is data loss, not advice:
+   * `skills/session-porter/SKILL.md` forbids branching on warning text, so
+   * without a field the only way to notice was to regex the prose. Absent when
+   * nothing was dropped.
+   */
+  droppedBundles?: Array<{ sessionId: string; file: string }>;
   warnings: string[];
+}
+
+/**
+ * `hub reindex` refused before it rebuilt anything. Additive (#29): every
+ * reindex failure used to be an untyped `ErrorResult`, so a caller could only
+ * tell the cases apart by regexing `error`.
+ *
+ * The busy-lock refusal is NOT here — it is `HubLockBusyResult`, the same shape
+ * push, pull and `hub unlink` return, so "wait and retry" stays one branch
+ * across every verb that takes the project lock.
+ */
+export interface HubReindexFailedResult {
+  success: false;
+  command: "hub-reindex";
+  /**
+   * `unlinked` — this directory is linked to no hub project, so there is
+   * nothing to rebuild from. Deliberately not `HubUnlinkedResult`: reindex
+   * returns before a backend exists, so it has no candidate list to offer, and
+   * its remedy is "push first", not "pick a project".
+   */
+  reason: "unlinked";
+  error: string;
+  suggestion: string;
 }
 
 /**
@@ -1205,12 +1292,14 @@ export type CliResult =
   | HubPushFailedResult
   | WhereisResult
   | HubUnlinkedResult
+  | HubNoSuchProjectResult
   | HubUnlinkResult
   | HubLockBusyResult
   | HubPullResult
   | HubPullListResult
   | NotYetSyncedResult
   | HubReindexResult
+  | HubReindexFailedResult
   | ErrorResult;
 
 // --- Version Adapters ---
@@ -1250,7 +1339,25 @@ export interface ProgressEvent {
     | "hub-push"
     | "hub-pull";
   sessionId?: string;
+  /**
+   * 0-BASED, AND NOT MONOTONIC WITHIN A PHASE (#16/#29). Every emitter derives
+   * it from `Array.prototype.entries()`, so a "session i of N" renderer must add
+   * one — but it must NOT assume the sequence only ever climbs.
+   *
+   * `export-copy` is emitted from two consecutive loops over two different
+   * arrays — the sessions copied whole and the sessions shipped as
+   * continuations (`src/exporter.ts`) — and each numbers from 0 against its
+   * OWN length. One export carrying two of each therefore emits `0/2, 1/2,
+   * 0/2, 1/2`, which a naive renderer shows as the progress bar restarting
+   * mid-phase. `sessionCount` is the size of the current sub-batch, never of
+   * the export.
+   *
+   * Absent entirely on the two hub phases: `hub-push`/`hub-pull` events carry
+   * `percent` only, and the per-session detail under them comes from the
+   * exporter/importer events the hub verb forwards.
+   */
   sessionIndex?: number;
+  /** See `sessionIndex`: the current sub-batch's size, not the whole phase's. */
   sessionCount?: number;
   bytesProcessed?: number;
   bytesTotal?: number;

@@ -16,7 +16,9 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { readSyncState, getThreadId } from "../sync-state.js";
-import type { ErrorResult, HubReindexResult } from "../types.js";
+import type {
+  HubLockBusyResult, HubReindexFailedResult, HubReindexResult,
+} from "../types.js";
 
 export interface HubReindexOptions {
   configDir: string;
@@ -54,12 +56,21 @@ function parseBundleFileName(fileName: string): { pushedAt: string; bundleId: st
 // bundle history) is reconstructible from the bundles themselves plus this
 // machine's local sync-state (which thread each local session belongs to).
 // A repair tool for a lost/corrupt index.json, not a sync primitive.
-export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexResult | ErrorResult> {
+//
+// Both refusals below carry a machine-readable `reason` (#29). They were plain
+// `ErrorResult`s, so the only way to tell "wait for the other operation" from
+// "this project was never pushed" — two failures whose remedies share nothing —
+// was to regex the prose, which `skills/session-porter/SKILL.md` forbids for
+// exactly this reason.
+export async function hubReindex(
+  opts: HubReindexOptions
+): Promise<HubReindexResult | HubReindexFailedResult | HubLockBusyResult> {
   const local = readLocalProjectId(opts.projectPath);
   if (!local) {
     return {
       success: false,
       command: "hub-reindex",
+      reason: "unlinked",
       error: "This project is not linked to a hub project — there is nothing to reindex from.",
       suggestion: "Run push (with --create-project or --project-id) to link and publish this project to the hub first.",
     };
@@ -74,9 +85,16 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
     lock = acquireProjectLock(opts.projectPath);
   } catch (e) {
     if (e instanceof LockBusyError) {
+      // The same structured refusal push, pull and `hub unlink` give — and the
+      // same FIELDS: `holderPid`/`ageSeconds` are what let a caller decide
+      // whether to wait, and this arm used to discard both while its three
+      // siblings surfaced them.
       return {
         success: false,
         command: "hub-reindex",
+        reason: "lock-busy",
+        holderPid: e.holderPid,
+        ageSeconds: e.ageMs === null ? null : Math.round(e.ageMs / 1000),
         error: e.message,
         suggestion: "Another sesh-mover hub operation is running for this project — wait for it or retry.",
       };
@@ -89,6 +107,13 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
     tempRoot = mkdtempSync(join(tmpdir(), "sesh-hub-reindex-"));
     const backend = createFsBackend(opts.hubPath);
     const warnings: string[] = [];
+    // The two non-fatal conditions below, typed alongside their warning rather
+    // than only inside it. `droppedBundles` in particular is data loss — the
+    // rebuilt index does not reference those bundles, so no other machine can
+    // see them — and a caller must be able to notice that without matching
+    // prose.
+    const unrecognizedBundleFiles: string[] = [];
+    const droppedBundles: Array<{ sessionId: string; file: string }> = [];
     const machine = loadOrCreateMachineId();
     await registerMachine(opts.hubPath);
 
@@ -123,6 +148,7 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
       const parsed = parseBundleFileName(fileName);
       if (!parsed) {
         warnings.push(`bundle file ${file} has an unrecognized name — skipped.`);
+        unrecognizedBundleFiles.push(file);
         continue;
       }
 
@@ -147,6 +173,7 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
         const threadId = getThreadId(state, localSessionId);
         if (!threadId) {
           warnings.push(`no local thread mapping for bundled session ${s.sessionId} (bundle ${file}) — dropped.`);
+          droppedBundles.push({ sessionId: s.sessionId, file });
           continue;
         }
         const headEntryUuid = readLastEntryUuid(join(extractDir, "sessions", `${s.sessionId}.jsonl`)) ?? "";
@@ -236,6 +263,12 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
       projects: [
         { projectId: local.projectId, threads: Object.keys(built.threads).length, bundlesScanned: files.length },
       ],
+      // Absent on an ordinary rebuild rather than present-and-empty, matching
+      // `unfetchableBundles`: a field that only appears when there is something
+      // to say cannot be read as "checked, nothing found" by a caller of an
+      // older build that never set it.
+      ...(unrecognizedBundleFiles.length > 0 ? { unrecognizedBundleFiles } : {}),
+      ...(droppedBundles.length > 0 ? { droppedBundles } : {}),
       warnings,
     };
   } finally {

@@ -94,6 +94,57 @@ describe("index file", () => {
     expect(forward.threads.t1.localSessionId).toBe("s-aaa");
   });
 
+  // Regression: a thread id is ADOPTED from a foreign index (pull-select
+  // records whatever the hub published into sync-state), and the only filter it
+  // passed is isSafeSessionId, which answers a different question — every
+  // Object.prototype name gets through. Measured against the committed dist/:
+  // all three ids below threw a raw `TypeError: Cannot read properties of
+  // undefined (reading 'slice')` straight out of `hub push`, because
+  // `priorIndex?.threads[threadId]?.bundles` found Object.prototype rather than
+  // nothing. `__proto__` also re-parented the accumulator, so a build that got
+  // past that would have published an index with the thread simply missing.
+  it.each(["__proto__", "constructor", "toString"])(
+    "builds and publishes a thread whose id is the Object.prototype name %s",
+    (threadId) => {
+      // The prior index is this machine's OWN previous push and does not carry
+      // the new thread — which is what makes the lookup hazardous: on a plain
+      // record `threads["constructor"]` is not "absent", it is the `Object`
+      // constructor, whose `.bundles` is undefined.
+      const unrelated = buildIndexFile({
+        projectId: "p", machineId: "m", projectPath: "/x",
+        sessions: [{ ...SESSION, sessionId: "s0" }], state: stateWithThreads({ s0: "t-other" }),
+        priorIndex: null, newBundles: [{ threadId: "t-other", record: RECORD }], now: "t-1",
+      });
+      const first = buildIndexFile({
+        projectId: "p", machineId: "m", projectPath: "/x",
+        sessions: [SESSION], state: stateWithThreads({ s1: threadId }),
+        priorIndex: JSON.parse(JSON.stringify(unrelated)) as HubIndexJson,
+        newBundles: [{ threadId, record: RECORD }], now: "t0",
+      });
+      expect(Object.hasOwn(first.threads, threadId)).toBe(true);
+      expect(first.threads[threadId].bundles.map((b) => b.bundleId)).toEqual(["b1"]);
+
+      // The prior index arrives as JSON parsed off the hub, so the second push
+      // has to read that same history back through the same lookup.
+      const prior = JSON.parse(JSON.stringify(first)) as HubIndexJson;
+      expect(Object.hasOwn(prior.threads, threadId)).toBe(true);
+      const next = buildIndexFile({
+        projectId: "p", machineId: "m", projectPath: "/x",
+        sessions: [{ ...SESSION, messageCount: 5, headEntryUuid: "u2" }],
+        state: stateWithThreads({ s1: threadId }),
+        priorIndex: prior,
+        newBundles: [{ threadId, record: { ...RECORD, bundleId: "b2" } }],
+        now: "t1",
+      });
+      expect(next.threads[threadId].bundles.map((b) => b.bundleId)).toEqual(["b1", "b2"]);
+      // What reaches the hub is the serialized form — that is where a
+      // re-parented map loses the entry without any error.
+      const onDisk = JSON.parse(JSON.stringify(next)) as HubIndexJson;
+      expect(Object.hasOwn(onDisk.threads, threadId)).toBe(true);
+      expect(onDisk.threads[threadId].messageCount).toBe(5);
+    }
+  );
+
   it("sessions without a thread mapping are omitted (never pushed)", () => {
     const built = buildIndexFile({
       projectId: "p", machineId: "m", projectPath: "/x",

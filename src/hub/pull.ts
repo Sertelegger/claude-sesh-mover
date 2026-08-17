@@ -17,7 +17,7 @@ import { loadOrCreateMachineId } from "../machine.js";
 import { countJsonlLines } from "../jsonl.js";
 import { encodeProjectPath } from "../platform.js";
 import {
-  readSyncState, writeSyncState, recordSentToPeer,
+  foreignKeyedRecord, readSyncState, writeSyncState, recordSentToPeer,
 } from "../sync-state.js";
 import type {
   ErrorResult,
@@ -136,9 +136,16 @@ function recordSplice(b: {
   const now = new Date().toISOString();
   const messageCount = countJsonlLines(b.basePath);
   const st = readSyncState(b.projectPath);
+  // `b.peerId` is a machineId read straight off a hub index file, and
+  // `b.record.sessionIdInBundle` is an id off one of its records: both are
+  // peer-authored and neither is filtered against `Object.prototype`'s names.
+  // The `??=` below and the nested writes are only safe because `readSyncState`
+  // hands back prototype-less records — see `foreignKeyedRecord`, which is also
+  // why the two maps created here are built with it rather than as `{}`.
   st.peers[b.peerId] ??= {
     name: b.manifest.sourceMachineName ?? b.peerId,
-    lastSentAt: null, lastReceivedAt: null, sent: {}, received: {},
+    lastSentAt: null, lastReceivedAt: null,
+    sent: foreignKeyedRecord(), received: foreignKeyedRecord(),
   };
   const peer = st.peers[b.peerId];
   if (b.manifest.sourceMachineName) peer.name = b.manifest.sourceMachineName;

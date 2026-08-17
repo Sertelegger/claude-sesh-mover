@@ -485,4 +485,86 @@ describe("sync-state v2 (hub)", () => {
     expect(() => getThreadId(half, "sess")).not.toThrow();
     expect(getThreadId(half, "sess")).toBeNull();
   });
+
+  it("setThreadId survives a v2 hub block with no threadByLocalSession", async () => {
+    const { setThreadId, getThreadId } = await import("../src/sync-state.js");
+    // The WRITE half of the guard above, and the half that fails harder: the
+    // file parses (parseSyncState never inspects `hub`), so the corrupt-file
+    // rename-aside never fires, and `state.hub.threadByLocalSession[id] = …`
+    // threw `Cannot set properties of undefined` on every push, pull and
+    // reindex of that project — silently forever on the SessionEnd auto-push,
+    // whose errors go to a hook diagnostic and exit 0.
+    const half = { schemaVersion: 2, projectPath: "/p", peers: {}, lineage: {}, imported: {},
+      hub: { hubId: "h" } } as unknown as Parameters<typeof setThreadId>[0];
+    expect(() => setThreadId(half, "h", "sess", "thread-1")).not.toThrow();
+    expect(getThreadId(half, "sess")).toBe("thread-1");
+  });
+
+  it("knownWorkspaceGenerations reads a non-array workspaceGenerations as none", async () => {
+    const { knownWorkspaceGenerations } = await import("../src/sync-state.js");
+    // Same blind spot, third field: `hub` is not shape-checked, so this can be
+    // any JSON value. `?? []` let a string straight through — `list[0]?.bundleId`
+    // reads a character's absent property and `.slice()` returns the string —
+    // and chooseMergeAncestor then called `.some()` on it. Reading it as "no
+    // generations" degrades toward no ancestor, i.e. no merge.
+    const bent = { schemaVersion: 2, projectPath: "/p", peers: {}, lineage: {}, imported: {},
+      hub: { hubId: "h", threadByLocalSession: {}, workspaceGenerations: "nope" },
+    } as unknown as Parameters<typeof knownWorkspaceGenerations>[0];
+    expect(knownWorkspaceGenerations(bent)).toEqual([]);
+  });
+
+  it("records a peer whose id is an Object.prototype name, without polluting it", async () => {
+    const { readSyncState, recordSentToPeer } = await import("../src/sync-state.js");
+    // A peer id is a machineId read off a hub index file or a manifest's
+    // `sourceMachineId`; the only filter either passes is isSafeSessionId,
+    // which accepts every Object.prototype name. On a plain `{}` the
+    // `if (!state.peers[id])` guard saw Object.prototype as an existing entry,
+    // so `name`/`lastReceivedAt` landed ON Object.prototype and the operation
+    // then threw — measured against the committed dist/ for both ids below.
+    const proto = Object.prototype as unknown as Record<string, unknown>;
+    try {
+      for (const badId of ["__proto__", "constructor"]) {
+        const projectPath = `/tmp/proj-proto-${badId.replace(/\W/g, "")}`;
+        expect(() =>
+          recordSentToPeer(projectPath, { id: badId, name: "hostile" }, "local-1", {
+            headEntryUuid: "u1", messageCount: 3,
+            sentAsType: "continuation", sentAsSessionId: "sib",
+          })
+        ).not.toThrow();
+        const back = readSyncState(projectPath);
+        expect(Object.hasOwn(back.peers, badId)).toBe(true);
+        expect(back.peers[badId].sent["local-1"].headEntryUuid).toBe("u1");
+        expect(Object.hasOwn(proto, "name")).toBe(false);
+        expect(Object.hasOwn(proto, "lastReceivedAt")).toBe(false);
+      }
+    } finally {
+      // Belt and braces: if this ever regresses, the pollution must not leak
+      // into the rest of the worker's tests.
+      delete proto.name;
+      delete proto.lastReceivedAt;
+    }
+  });
+
+  it("keeps a receipt whose bundle session id is an Object.prototype name", async () => {
+    const { readSyncState, writeSyncState } = await import("../src/sync-state.js");
+    // One level in from the test above: `sessionIdInBundle` is index-supplied
+    // too, and on a plain `received` map `received["__proto__"] = …` re-parents
+    // the map instead of adding to it, so JSON.stringify publishes nothing and
+    // the receipt vanishes. A lost receipt makes the next pull re-need the
+    // bundle it just applied.
+    const projectPath = "/tmp/proj-proto-receipt";
+    const st = readSyncState(projectPath);
+    st.peers["m1"] = {
+      name: "m1", lastSentAt: null, lastReceivedAt: null, sent: {}, received: {},
+    };
+    writeSyncState(st);
+    const reread = readSyncState(projectPath);
+    reread.peers["m1"].received["__proto__"] = {
+      localSessionId: "s9", type: "full", importedAt: "2026-08-16T00:00:00.000Z",
+    };
+    writeSyncState(reread);
+    const after = readSyncState(projectPath);
+    expect(Object.hasOwn(after.peers["m1"].received, "__proto__")).toBe(true);
+    expect(after.peers["m1"].received["__proto__"].localSessionId).toBe("s9");
+  });
 });

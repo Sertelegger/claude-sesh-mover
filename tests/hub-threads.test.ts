@@ -68,6 +68,27 @@ describe("resolveThreads", () => {
     expect(resolveThreads([...copies].reverse())[0].latest.machineId).toBe("mA");
   });
 
+  it("breaks the tie BELOW machineId too, when two index files declare the same one", () => {
+    // machineId was the LAST key, and it is not an identity: resolveThreads
+    // stamps a copy with the id an index file's CONTENT declares, while
+    // readAllIndexes dedupes on the id derived from the file's NAME. Two
+    // differently-named files that both declare "X" therefore arrive as two
+    // copies with every key equal, and `copies.reduce(newer)` fell back to the
+    // accumulator — readdirSync order — deciding which bundle list
+    // `pullSourceFor` hands to a pull. Measured against the shipped dist/: the
+    // forward listing resolved to one file's bundles and the reverse to the
+    // other's.
+    const shared = { localSessionId: "sX", headEntryUuid: "u", messageCount: 1,
+      lastActiveAt: "2026-07-21T00:00:00Z" };
+    const fileA = idx("X", { t1: entry({ ...shared, bundles: [bundle({ bundleId: "FROM-FILE-A" })] }) });
+    const fileB = idx("X", { t1: entry({ ...shared, bundles: [bundle({ bundleId: "FROM-FILE-B" })] }) });
+    const pick = (indexes: ReturnType<typeof idx>[]): string[] =>
+      resolveThreads(indexes)[0].latest.bundles.map((b) => b.bundleId);
+    expect(pick([fileA, fileB])).toEqual(pick([fileB, fileA]));
+    // Arbitrary as a preference and stable, which is the property being bought.
+    expect(pick([fileA, fileB])).toEqual(["FROM-FILE-A"]);
+  });
+
   it("sorts threads by latest activity desc and takes slug/summary from latest", () => {
     const r = resolveThreads([
       idx("mA", {
