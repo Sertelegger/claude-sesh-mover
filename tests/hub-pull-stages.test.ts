@@ -930,7 +930,7 @@ describe("fetch stage", () => {
     const st = initApplyState({ needed: [record] });
 
     const out = await runFetchStage({
-      backend, record, bundleIndex: 0, tempRoot, state: st,
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st,
     });
 
     expect(out.status).toBe("aborted");
@@ -965,7 +965,7 @@ describe("fetch stage", () => {
     const st = initApplyState({ needed: [record] });
 
     const out = await runFetchStage({
-      backend, record, bundleIndex: 0, tempRoot, state: st,
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st,
     });
 
     expect(out.status).toBe("aborted");
@@ -992,7 +992,7 @@ describe("fetch stage", () => {
     const st = initApplyState({ needed: [record] });
 
     const out = await runFetchStage({
-      backend, record, bundleIndex: 3, tempRoot, state: st,
+      backend, record, machineId: MACHINE_ID, bundleIndex: 3, tempRoot, state: st,
     });
 
     expect(out.status).toBe("applied");
@@ -1000,7 +1000,10 @@ describe("fetch stage", () => {
     expect(out.value?.extractDir).toBe(join(tempRoot, record.bundleId));
     expect(out.value?.manifest.sessions[0].sessionId).toBe(record.sessionIdInBundle);
 
-    expect(st.chainWorkspaceBases).toEqual(["gen-1"]);
+    // ATTRIBUTED to the machine that listed the record, not a bare id: the
+    // merge-ancestor rule may only consider bases declared by the machine whose
+    // payload it is about to merge, and a chain can span machines (#35).
+    expect(st.chainWorkspaceBases).toEqual([{ machineId: MACHINE_ID, bundleId: "gen-1" }]);
     expect(st.lastCarry).toEqual({
       dir: join(tempRoot, record.bundleId, "carry"),
       meta: CARRY,
@@ -1016,9 +1019,9 @@ describe("fetch stage", () => {
     const record = await writeHealthyBundle({ basedOn: null });
     const st = initApplyState({ needed: [record] });
 
-    await runFetchStage({ backend, record, bundleIndex: 0, tempRoot, state: st });
+    await runFetchStage({ backend, record, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st });
 
-    expect(st.chainWorkspaceBases).toEqual([null]);
+    expect(st.chainWorkspaceBases).toEqual([{ machineId: MACHINE_ID, bundleId: null }]);
   });
 
   /**
@@ -1034,10 +1037,10 @@ describe("fetch stage", () => {
     });
     const st = initApplyState({ needed: [withCarry, without] });
 
-    await runFetchStage({ backend, record: withCarry, bundleIndex: 0, tempRoot, state: st });
+    await runFetchStage({ backend, record: withCarry, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st });
     expect(st.lastCarry?.bundleFile).toBe(withCarry.file);
 
-    await runFetchStage({ backend, record: without, bundleIndex: 1, tempRoot, state: st });
+    await runFetchStage({ backend, record: without, machineId: MACHINE_ID, bundleIndex: 1, tempRoot, state: st });
     expect(st.lastCarry?.bundleFile).toBe(withCarry.file);
     expect(st.lastCarry?.bundleIndex).toBe(0);
   });
@@ -1050,8 +1053,8 @@ describe("fetch stage", () => {
     });
     const st = initApplyState({ needed: [older, newer] });
 
-    await runFetchStage({ backend, record: older, bundleIndex: 0, tempRoot, state: st });
-    await runFetchStage({ backend, record: newer, bundleIndex: 1, tempRoot, state: st });
+    await runFetchStage({ backend, record: older, machineId: MACHINE_ID, bundleIndex: 0, tempRoot, state: st });
+    await runFetchStage({ backend, record: newer, machineId: MACHINE_ID, bundleIndex: 1, tempRoot, state: st });
 
     expect(st.lastCarry?.bundleFile).toBe(newer.file);
     expect(st.lastCarry?.bundleIndex).toBe(1);
@@ -1333,7 +1336,10 @@ describe("apply.workspace stage", () => {
       targetPathGiven: false,
       forceWorkspace: false,
       bundleDeclaresWorkspace: true,
-      chainWorkspaceBases: ["gen-shared"],
+      // Declared by the SAME machine whose payload is being applied — which is
+      // what makes it a candidate at all. See the sibling test below.
+      chainWorkspaceBases: [{ machineId: "m-other", bundleId: "gen-shared" }],
+      machineId: "m-other",
       hubId: "hub-1",
       record: {
         bundleId: "b1",
@@ -1356,6 +1362,81 @@ describe("apply.workspace stage", () => {
     // ...and above all not a generation. Recording one for a payload this tree
     // never received is exactly how the next merge reads the whole payload as
     // "deleted here".
+    expect(knownWorkspaceGenerations(readSyncState(project)).map((g) => g.bundleId)).toEqual([
+      "gen-shared",
+    ]);
+  });
+
+  /**
+   * The false-positive control for the test above, and the stage-level pin on
+   * the machine filter: the SAME arrangement, with the base declared by a
+   * DIFFERENT machine from the one whose payload is being applied.
+   *
+   * `basedOn` is a self-report about one machine's own generation history. A
+   * generation another machine descended from proves nothing about THIS
+   * payload's tree, so it is not a legal base — and since #35 assembled a
+   * chain across machines, one can sit in `chainWorkspaceBases` beside the
+   * payload's own. Consuming it merges a tree against a generation it never
+   * held, which `mergeWorkspaceTrees` scores as `taken`: an atomic overwrite
+   * with no sidecar and no backup, reported as a clean merge.
+   *
+   * The tell is the FIRST reason. Above, the intersection is non-empty and the
+   * ancestor hunt gets as far as fetching, so the degradation sentence names
+   * `gen-shared`. Here the id must never be looked up at all, so that sentence
+   * cannot appear and the no-common-point skip is the only thing said.
+   */
+  it("ignores a base declared by a machine other than the payload's own", async () => {
+    const hubDir = join(root, "hub");
+    const tempRoot = join(root, "temp");
+    const project = join(root, "project");
+    const extractDir = join(root, "extract");
+    mkdirSync(hubDir, { recursive: true });
+    mkdirSync(tempRoot, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    mkdirSync(join(extractDir, "workspace"), { recursive: true });
+    writeFileSync(join(extractDir, "workspace", "incoming.txt"), "theirs\n", "utf-8");
+    writeFileSync(join(project, "local.txt"), "mine\n", "utf-8");
+
+    const backend = createFsBackend(hubDir);
+
+    const before = readSyncState(project);
+    setLastWorkspace(before, "hub-1", {
+      bundleId: "gen-shared",
+      file: `${bundleDir("p1", "m-other")}/2026-08-01T00-00-00-000Z_gen-shared.tar.gz`,
+      pushedAt: "2026-08-01T00:00:00.000Z",
+    });
+    writeSyncState(before);
+
+    const out = await runApplyWorkspaceStage({
+      backend,
+      extractDir,
+      effectiveProjectPath: project,
+      targetPathGiven: false,
+      forceWorkspace: false,
+      bundleDeclaresWorkspace: true,
+      // `m-third` declared it; `m-other` is applying. Same id, same local
+      // generation history — only the attribution differs.
+      chainWorkspaceBases: [{ machineId: "m-third", bundleId: "gen-shared" }],
+      machineId: "m-other",
+      hubId: "hub-1",
+      record: {
+        bundleId: "b1",
+        file: `${bundleDir("p1", "m-other")}/2026-08-02T00-00-00-000Z_b1.tar.gz`,
+        pushedAt: "2026-08-02T00:00:00.000Z",
+      },
+      tempRoot,
+    });
+
+    expect(out.status).toBe("skipped");
+    expect(out.value).toBeNull();
+    // ONE reason, and it is the skip. No degradation sentence, because no
+    // candidate was ever named to fetch.
+    expect(out.reasons).toHaveLength(1);
+    expect(out.reasons[0]).toContain("no common point to merge from and NOTHING was written");
+    expect(out.reasons.join(" ")).not.toContain("gen-shared");
+
+    expect(existsSync(join(project, "incoming.txt"))).toBe(false);
+    expect(readFileSync(join(project, "local.txt"), "utf-8")).toBe("mine\n");
     expect(knownWorkspaceGenerations(readSyncState(project)).map((g) => g.bundleId)).toEqual([
       "gen-shared",
     ]);

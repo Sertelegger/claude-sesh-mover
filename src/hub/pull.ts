@@ -350,7 +350,7 @@ export async function hubPull(
       // `?? null` at this call site, which would clear an earlier bundle's carry
       // whenever a later bundle has none.
       const fetched = await runFetchStage({
-        backend, record, bundleIndex: i, tempRoot, state: st,
+        backend, record, machineId: bundleMachineId, bundleIndex: i, tempRoot, state: st,
       });
       // The only correct handling of a fetch abort. `break` would fall through
       // to the carry gate, the thread mapping, `writeSyncState` and
@@ -378,6 +378,10 @@ export async function hubPull(
         forceWorkspace: !!opts.forceWorkspace,
         bundleDeclaresWorkspace: i === st.workspaceBundleIndex && !!bundleManifest.workspace,
         chainWorkspaceBases: st.chainWorkspaceBases,
+        // This bundle's own machine, like the sessions stage's ledger below:
+        // when this stage acts, this IS the machine whose workspace payload is
+        // applied, and only its declared bases are legal ancestors.
+        machineId: bundleMachineId,
         hubId: hub.hubId,
         record,
         tempRoot,

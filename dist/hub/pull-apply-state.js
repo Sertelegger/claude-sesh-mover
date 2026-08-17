@@ -116,8 +116,10 @@ export function initApplyState(input) {
         }
     }
     // Every generation the bundles in this chain declare they descend from,
-    // oldest first — the peer's half of the "common to both trees" test that
-    // `chooseMergeAncestor` intersects with our own generation history.
+    // oldest first, EACH STAMPED WITH THE MACHINE THAT DECLARED IT — the peer's
+    // half of the "common to both trees" test that `chooseMergeAncestor`
+    // intersects with our own generation history. See `ChainWorkspaceBase` for
+    // why the stamp is load-bearing once a chain can span machines.
     const chainWorkspaceBases = [];
     const importedSessions = [];
     const skippedSessions = [];

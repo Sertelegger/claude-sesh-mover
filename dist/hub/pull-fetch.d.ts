@@ -7,6 +7,13 @@ export interface FetchStageInput {
     backend: HubBackend;
     record: HubBundleRecord;
     /**
+     * The machine whose index listed THIS record (`SourcedBundle.machineId`), not
+     * the machine the pull resolved to. It is stamped onto the workspace
+     * generation this stage records, and the merge-ancestor rule is only sound
+     * because of it — see `ChainWorkspaceBase`.
+     */
+    machineId: string;
+    /**
      * This bundle's position in the chain. Load-bearing rather than bookkeeping:
      * it is stamped onto `state.lastCarry` so the carry gate after the loop can
      * tell a payload out of a bundle this pull already recorded from one out of a

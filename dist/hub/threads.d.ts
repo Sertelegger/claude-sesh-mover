@@ -391,6 +391,16 @@ export interface AssembledChain {
  * list being its OWN pushes in push order is what the `basedOn` merge-ancestor
  * walk relies on.
  *
+ * THAT BAN IS NECESSARY AND WAS NOT SUFFICIENT. The `chain` this returns is
+ * itself a cross-machine, link-ordered list, and `hub/pull.ts` walks it — so the
+ * ancestor walk sees several machines' `basedOn` claims interleaved whether or
+ * not any stored list was mutated. It reads them per machine
+ * (`ChainWorkspaceBase`); before it did, an earlier bundle's base from one
+ * machine was used as the merge ancestor for a later bundle's payload from
+ * another, and the local tree was silently overwritten. Anything else that
+ * consumes this chain and assumes one machine's monotonic history needs the
+ * same treatment.
+ *
  * WHAT IT DOES NOT DO. It does not know what this machine has already received
  * — `selectNeededBundles` is still the per-record receipt filter and runs over
  * this plan. It does not resolve hub-vs-LOCAL divergence either: that is

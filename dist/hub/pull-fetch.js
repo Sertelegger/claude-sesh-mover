@@ -30,7 +30,7 @@ import { readManifest, verifySessionsDigest } from "../manifest.js";
  * records* the next bundle, foreclosing the remedy.
  */
 export async function runFetchStage(input) {
-    const { backend, record, bundleIndex: i, tempRoot, state: st } = input;
+    const { backend, record, machineId, bundleIndex: i, tempRoot, state: st } = input;
     const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
     const out = createWriteStream(tarPath);
     // record.file is hub-sourced (read out of another machine's index
@@ -92,8 +92,16 @@ export async function runFetchStage(input) {
             suggestion: "Nothing from this bundle was applied. The archive on the hub is truncated or was only partially written — if the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again.",
         });
     }
+    // Attributed, never bare. `basedOn` is a claim about ONE machine's own
+    // generation history, and since #35 the chain around it may be assembled from
+    // several — so a base recorded without its machine is indistinguishable from
+    // a base of the machine whose payload will actually be merged. See
+    // `ChainWorkspaceBase` and `chooseMergeAncestor`.
     if (bundleManifest.workspace) {
-        st.chainWorkspaceBases.push(bundleManifest.workspace.basedOn?.bundleId ?? null);
+        st.chainWorkspaceBases.push({
+            machineId,
+            bundleId: bundleManifest.workspace.basedOn?.bundleId ?? null,
+        });
     }
     // The carry is applied AFTER the whole chain, and the newest one wins:
     // each payload is a full `git diff HEAD` of the sender's tree at that
