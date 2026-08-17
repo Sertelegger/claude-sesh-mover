@@ -1099,6 +1099,17 @@ function resolveIncrementalOptions(opts) {
             targetMachineId: match.id,
             targetMachineName: state.peers[match.id].name,
             peerSent: state.peers[match.id].sent,
+            // The memory layer's "already has it" ledger — the whole-file counterpart
+            // of `peerSent`, read from the same peer entry and written by the same
+            // rule (only once a bundle actually reached the peer; see
+            // `setPeerMemoryDigest`). Without it every `--incremental --to` bundle
+            // re-shipped the whole `memory/` directory, which is safe but not minimal.
+            //
+            // `?? null` rather than omitted, because absent and null mean the same
+            // thing to the exporter — nothing known, therefore ship — and spelling it
+            // makes that the visible default for a peer this machine has never
+            // delivered memory to.
+            peerMemoryDigest: state.peers[match.id].memoryDigest ?? null,
             lastSyncAt: state.peers[match.id].lastSentAt ?? undefined,
         };
     }
@@ -1115,6 +1126,22 @@ function resolveIncrementalOptions(opts) {
             sentAsSessionId: s.sessionId,
         };
     }
+    // NO `peerMemoryDigest` on the `--since` path, deliberately, and it is not the
+    // one-liner it looks like (#59 item 1).
+    //
+    // `refManifest.memoryDigest` describes the memory directory THAT BUNDLE
+    // carried. It says nothing about what the peer holds: a `--since` reference is
+    // an artifact sitting on this machine, and nothing records that it was ever
+    // delivered anywhere. That is precisely the rule `setPeerMemoryDigest` is
+    // written to keep — credit the ledger only once the bundle has reached the peer
+    // — and deriving a digest from a bundle whose delivery is unknown breaks it
+    // from the reading side instead of the writing side.
+    //
+    // The `peerSent` map above IS derived from the same unverified reference, and
+    // the asymmetry is on purpose: a session skipped in error still arrives, as a
+    // continuation the receiver's append guard refuses and imports as its own
+    // session, so the content lands either way. A memory skipped in error is
+    // simply never sent and nobody is told. Ship the redundant copy.
     return {
         sourceMachineId: machine.id,
         sourceMachineName: machine.name,

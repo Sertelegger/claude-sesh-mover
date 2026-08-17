@@ -4677,3 +4677,199 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
     }
   });
 });
+
+/**
+ * #59 item 3 — the shared-layer reconciliation reaches the PULL result as typed
+ * fields, not only as warning prose.
+ *
+ * `commands/pull.md` branches on the fields and uses the warning for wording, so
+ * a pull that parks a memory file and reports only a sentence cannot offer the
+ * merge `/sesh-mover:import` offers: there is no `parkedAs` to act on. Warning
+ * text is not an interface anywhere else in this result; it was not one here
+ * either, and only the warnings crossed.
+ */
+describe("hub pull — the shared layers as typed result fields", () => {
+  /** A's fixture memory, byte for byte, as `createFixtureTree` writes it. */
+  const A_MEMORY_V1 = "Use vitest for testing.";
+  const A_MEMORY_V2 = "---\nname: Test memory\n---\n\nSomething new was learned.\n";
+
+  /** Machine A pushed the fixture thread; machine B is linked and has memory. */
+  async function arrangeMemoryPull(label: string) {
+    const homeA = mkdtempSync(join(tmpdir(), `${label}-homeA-`));
+    const homeB = mkdtempSync(join(tmpdir(), `${label}-homeB-`));
+    const hub = mkdtempSync(join(tmpdir(), `${label}-hub-`));
+    const base = mkdtempSync(join(tmpdir(), `${label}-fix-`));
+    let restore = overrideHome(homeA);
+    const { configDir: configDirA } = createFixtureTree(base);
+    const projectA = createRealProject(base, configDirA, "projA");
+    const projectDirA = join(configDirA, "projects", encodeProjectPath(projectA));
+    await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+    const first = await hubPush({
+      configDir: configDirA, projectPath: projectA, hubPath: hub,
+      createProject: true, noWorkspace: true, claudeVersion: "2.1.81",
+    });
+    if (!first.success) throw new Error("setup push failed");
+
+    /**
+     * A second push carrying a CHANGED memory. Both halves are required: the
+     * exporter only ships `memory/` when its digest differs from the one the hub
+     * peer is credited with, and `hub push` returns early with no bundle at all
+     * when there is no new session content.
+     */
+    async function pushChangedMemory() {
+      const back = overrideHome(homeA);
+      try {
+        writeFileSync(join(projectDirA, "memory", "test_memory.md"), A_MEMORY_V2);
+        appendEntries(
+          join(projectDirA, `${FIXTURE_SESSION_ID}.jsonl`),
+          moreEntries(FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID, projectA)
+        );
+        const second = await hubPush({
+          configDir: configDirA, projectPath: projectA, hubPath: hub,
+          noWorkspace: true, claudeVersion: "2.1.81",
+        });
+        if (!second.success) throw new Error("second push failed");
+      } finally {
+        back.restore();
+      }
+    }
+
+    const toB = () => {
+      restore.restore();
+      restore = overrideHome(homeB);
+    };
+
+    const configDirB = join(homeB, ".claude");
+    const projectB = mkdtempSync(join(tmpdir(), `${label}-projB-`));
+    const memDirB = join(configDirB, "projects", encodeProjectPath(projectB), "memory");
+
+    return {
+      hub, projectId: first.projectId, configDirB, projectB, memDirB, toB,
+      pushChangedMemory,
+      /** Give B a memory of the same name with different text — a tier-2 conflict. */
+      seedConflictingMemory() {
+        mkdirSync(memDirB, { recursive: true });
+        writeFileSync(join(memDirB, "MEMORY.md"), "- [Test memory](test_memory.md) — my version\n");
+        writeFileSync(join(memDirB, "test_memory.md"), "---\nname: Test memory\n---\n\nMine, not theirs.\n");
+      },
+      link() {
+        writeLocalProjectId(projectB, {
+          projectId: first.projectId, name: "projA",
+          createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+        });
+      },
+      pull: (over: Record<string, unknown> = {}) =>
+        hubPull({
+          configDir: configDirB, projectPath: projectB, hubPath: hub,
+          latest: true, claudeVersion: "2.1.81", ...over,
+        } as HubPullOptions),
+      cleanup: () => {
+        restore.restore();
+        for (const d of [homeA, homeB, hub, base, projectB]) {
+          rmSync(d, { recursive: true, force: true });
+        }
+      },
+    };
+  }
+
+  it("a pull that parks a memory file exposes the parked path as a TYPED field", async () => {
+    const f = await arrangeMemoryPull("sesh-pull-mem1");
+    try {
+      f.toB();
+      f.link();
+      f.seedConflictingMemory();
+
+      const pull = await f.pull();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.importedSessions).toHaveLength(1);
+
+      // The point of the whole issue: `parkedAs` and `memoryDir` are fields, so
+      // the skill layer can find both texts on disk without parsing a sentence.
+      expect(p.memoryDir).toBe(f.memDirB);
+      expect(p.memoryConflicts).toHaveLength(1);
+      const conflict = p.memoryConflicts![0];
+      expect(conflict.filename).toBe("test_memory.md");
+      expect(conflict.parkedAs).toBe("test_memory.incoming.md");
+      expect(conflict.existingHash).not.toBe(conflict.incomingHash);
+
+      // And the union ran — the #49 half of the same reconciliation. Both sides
+      // point at `test_memory.md`, so it deduped rather than appending.
+      // `added`/`alreadyPresent` describe the UNION only; the pointer at the
+      // parked copy is written by the parking step and reported through
+      // `memoryConflicts[].parkedAs`, not counted here.
+      expect(p.memoryIndex).toBeDefined();
+      expect(p.memoryIndex!.added).toEqual([]);
+      expect(p.memoryIndex!.alreadyPresent).toBe(1);
+      expect(p.memoryIndex!.unindexed).toEqual([]);
+
+      // The fields describe files that really are there, and the local one was
+      // not touched.
+      expect(readTextLf(join(f.memDirB, conflict.filename))).toContain("Mine, not theirs.");
+      expect(readTextLf(join(f.memDirB, conflict.parkedAs!))).toContain(A_MEMORY_V1);
+      expect(readTextLf(join(f.memDirB, "MEMORY.md"))).toContain("(test_memory.incoming.md)");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("a chain of bundles reports EVERY parked memory, not just the last bundle's", async () => {
+    const f = await arrangeMemoryPull("sesh-pull-mem2");
+    try {
+      await f.pushChangedMemory();
+      f.toB();
+      f.link();
+      f.seedConflictingMemory();
+
+      // --no-append so both bundles go through an import rather than the second
+      // being spliced onto the first; the aggregation is what is under test.
+      const pull = await f.pull({ noAppend: true });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.importedSessions.length).toBeGreaterThan(1);
+
+      // Two bundles, two different incoming versions, two parked copies — and
+      // the result names both. Reporting only the last bundle's is the failure
+      // this asserts against.
+      expect(p.memoryConflicts).toHaveLength(2);
+      const parked = p.memoryConflicts!.map((c) => c.parkedAs);
+      expect(parked).toEqual(["test_memory.incoming.md", "test_memory.incoming-2.md"]);
+      expect(readTextLf(join(f.memDirB, "test_memory.incoming.md"))).toContain(A_MEMORY_V1);
+      expect(readTextLf(join(f.memDirB, "test_memory.incoming-2.md"))).toContain(
+        "Something new was learned."
+      );
+      // Still exactly one local file, untouched.
+      expect(readTextLf(join(f.memDirB, "test_memory.md"))).toContain("Mine, not theirs.");
+      for (const name of parked) {
+        expect(readTextLf(join(f.memDirB, "MEMORY.md"))).toContain(`(${name})`);
+      }
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("a pull with no memory conflict says so by omission, not with an empty array", async () => {
+    const f = await arrangeMemoryPull("sesh-pull-mem3");
+    try {
+      f.toB();
+      f.link();
+
+      const pull = await f.pull();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.memoryConflicts).toBeUndefined();
+      expect(p.planConflicts).toBeUndefined();
+      // The layer still arrived and was reconciled — `memoryDir` and the index
+      // report say so, which is what tells a caller "memory landed clean" apart
+      // from "this bundle carried none".
+      expect(p.memoryDir).toBe(f.memDirB);
+      expect(p.memoryIndex).toBeDefined();
+      expect(readTextLf(join(f.memDirB, "test_memory.md"))).toContain(A_MEMORY_V1);
+    } finally {
+      f.cleanup();
+    }
+  });
+});

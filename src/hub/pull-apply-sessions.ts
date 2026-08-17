@@ -7,7 +7,7 @@ import { type HubBundleRecord } from "./layout.js";
 import {
   adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS,
 } from "./append.js";
-import { type ApplyState } from "./pull-apply-state.js";
+import { recordSharedLayers, type ApplyState } from "./pull-apply-state.js";
 import { importSession } from "../importer.js";
 import { computeIntegrityHashFromFile } from "../manifest.js";
 import {
@@ -779,6 +779,14 @@ export async function runApplySessionsStage(
   st.lastBundleManifest = bundleManifest;
   st.importedSessions.push(...importResult.importedSessions);
   st.skippedSessions.push(...importResult.skippedSessions);
+  // The typed shared-layer fields, folded in ALONGSIDE the warnings below rather
+  // than instead of them. Until #59 only the warnings crossed this line, so a
+  // pull that parked a memory file handed the skill layer a sentence and no
+  // machine-readable path — `commands/pull.md` could describe the parked copy but
+  // not offer the merge `commands/import.md` offers, because there was no
+  // `parkedAs` to act on. Aggregated across the chain: see
+  // `SharedLayerAccumulator`.
+  recordSharedLayers(st.sharedLayers, importResult);
   reasons.push(...importResult.warnings);
   if (importResult.importedSessions.length > 0) {
     st.lastImportedNewId = importResult.importedSessions[importResult.importedSessions.length - 1].newId;

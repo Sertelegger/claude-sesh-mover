@@ -8,7 +8,7 @@ import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { runApplyCarryStage } from "./pull-apply-carry.js";
 import { runApplySessionsStage } from "./pull-apply-sessions.js";
 import { runApplyWorkspaceStage } from "./pull-apply-workspace.js";
-import { initApplyState, isCarrySuppressed } from "./pull-apply-state.js";
+import { initApplyState, isCarrySuppressed, sharedLayerFindings } from "./pull-apply-state.js";
 import { runFetchStage } from "./pull-fetch.js";
 import { runRecordStage } from "./pull-record.js";
 import { runResolveStage } from "./pull-resolve.js";
@@ -526,6 +526,11 @@ export async function hubPull(
       appended: st.appended.length > 0 ? st.appended : undefined,
       divergence: st.lastDivergence,
       ...findings,
+      // What the chain's imports did to `memory/` and `plans/`, aggregated over
+      // every bundle rather than reported per session — those two layers are not
+      // session-scoped. SPREAD, like `findings` above, so a field added to
+      // `SharedLayerFindings` arrives here with no edit.
+      ...sharedLayerFindings(st.sharedLayers),
       warnings,
     };
   } finally {
