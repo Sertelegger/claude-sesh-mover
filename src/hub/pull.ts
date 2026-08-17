@@ -221,6 +221,29 @@ export function reportPullResult(report: SelectReport, warnings: string[]): HubP
 }
 
 /**
+ * Attach the disclosures collected before an abort, without touching anything
+ * the aborting stage said.
+ *
+ * A mid-chain abort is not a pull that did nothing. Bundles before the aborting
+ * one are applied, recorded as received, and — because they are recorded — will
+ * never be offered again; a workspace may have been merged, a memory parked, a
+ * carry saved. Returning only the abort's own sentence made every one of those
+ * disclosures vanish, which the failure contract forbids: truthfulness is the
+ * invariant and completeness is best-effort, and this was the invariant losing.
+ *
+ * Deliberately NOT applied to `select`'s `stop` arm. Those results are a
+ * different thing — nothing was applied on any of them, and the stage's
+ * collected text is dispatched before the spread on purpose (see the ORDER IS
+ * THE CONTRACT comment). This helper is for terminals that follow real work.
+ *
+ * Empty stays absent rather than becoming `[]`, so "disclosed nothing" and "had
+ * nothing to disclose" stay distinguishable.
+ */
+function withPriorWarnings(terminal: ErrorResult, warnings: string[]): ErrorResult {
+  return warnings.length > 0 ? { ...terminal, warnings: [...warnings] } : terminal;
+}
+
+/**
  * Everything `hubPull` can answer with, named rather than spelled out inline on
  * the signature.
  *
@@ -416,7 +439,7 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
       // into a successful pull. `continue` would violate the chain invariant
       // (bundle N+1 is anchored on N's head) and fragment-import AND record the
       // next bundle, foreclosing the remedy the message names.
-      if (fetched.status === "aborted") return fetched.terminal!;
+      if (fetched.status === "aborted") return withPriorWarnings(fetched.terminal!, warnings);
       const { extractDir, manifest: bundleManifest } = fetched.value!;
 
       // Merge, unpack, or decline the chain's workspace payload. Self-gating:
@@ -447,7 +470,7 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
       // Terminal, never apply-safe. Carrying on past it would import this
       // bundle's sessions and record it, foreclosing the --force-workspace
       // re-run the abort's own message promises.
-      if (ws.status === "aborted") return ws.terminal!;
+      if (ws.status === "aborted") return withPriorWarnings(ws.terminal!, warnings);
       if (ws.value) {
         st.workspaceUnpacked = ws.value.unpacked;
         st.workspaceMerge = ws.value.merge;
@@ -507,9 +530,11 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
       // record stage entirely. See flushThreadMapping for what that costs.
       flushThreadMapping({ effectiveProjectPath, hubId: hub.hubId, threadId, needed, apply: st });
       // Forwarded VERBATIM, `command: "import"` and all — it is the importer's
-      // own diagnosis carrying the importer's own suggestion, and the
-      // importer's warnings are dropped with it exactly as before.
-      if (ss.control.kind === "fail") return ss.control.result;
+      // own diagnosis carrying the importer's own suggestion. Only `warnings`
+      // is added, and it is the PULL's accumulator, not the importer's: the
+      // importer's own list is folded into `ss.reasons` by the stage and
+      // spread above, so it is already in here.
+      if (ss.control.kind === "fail") return withPriorWarnings(ss.control.result, warnings);
       // A REAL break, never a continue. A divergence stops the whole thread,
       // and since the workspace gate is evaluated at the TOP of each iteration
       // this is also what stops a payload on a LATER bundle being applied by a

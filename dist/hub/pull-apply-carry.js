@@ -1,4 +1,4 @@
-import { applyCarry } from "./carry.js";
+import { applyCarry, normalizeCarryMeta, orNotRecorded, } from "./carry.js";
 import { isCarrySuppressed } from "./pull-apply-state.js";
 import { isReadableDir } from "./fs-probe.js";
 import { stageOk, stageSkip } from "./pull-stages.js";
@@ -14,7 +14,12 @@ import { stageOk, stageSkip } from "./pull-stages.js";
  */
 function describeCarryApply(result, meta, bundleFile) {
     const out = [];
-    const origin = `branch ${meta.branch} at commit ${meta.baseCommit.slice(0, 8)}`;
+    // Both halves through `orNotRecorded`: `meta` has been normalized, so an
+    // unreadable field arrives here as `""` and would otherwise render as
+    // "branch  at commit " — a sentence that reads like a bug rather than like a
+    // damaged bundle. `.slice` is safe for the same reason: `normalizeCarryMeta`
+    // guarantees a string, which is exactly what a raw `carry: {}` did not.
+    const origin = `branch ${orNotRecorded(meta.branch)} at commit ${orNotRecorded(meta.baseCommit.slice(0, 8))}`;
     if (!result.applied) {
         const lost = `The uncommitted changes this pull carried (${origin}) were not applied: ${result.detail}. ` +
             (result.savedTo === null
@@ -60,6 +65,33 @@ function describeCarryApply(result, meta, bundleFile) {
     return out;
 }
 /**
+ * The disclosure for a `carry` block this version could not read in full.
+ *
+ * It is a statement about the BUNDLE, in the same register as the sibling
+ * "declares a carry it does not contain" skip below — not an accusation. The
+ * three causes are named in the order they are likely, older-version first,
+ * exactly as `describeCarryApply`'s own `refused` sentence names them: a field
+ * added after the bundle was written is indistinguishable from damage here, and
+ * being wrong about that in the other direction would tell a user their peer
+ * attacked them.
+ *
+ * It never says the payload was skipped, because it was not: the stage runs to
+ * completion and the payload is applied or saved on its own merits. What it does
+ * say — when `baseCommit` is one of the unreadable fields AND there is a payload
+ * to say it about — is that this one can only ever be saved, which is a
+ * consequence of `applyCarry`'s wrong-base guard rather than of a decision taken
+ * here. `payloadPresent` is what keeps that clause off the branch where the
+ * bundle declared a carry it does not contain: there, promising a saved copy
+ * would name a remedy that does not exist.
+ */
+function describeUnreadableCarryMeta(unreadable, payloadPresent) {
+    const many = unreadable.length > 1;
+    return (`This bundle's manifest describes the uncommitted changes it carries in a way this version could not read (${unreadable.join(", ")}), so ${many ? "those fields are" : "that field is"} reported as "(not recorded)". A current sesh-mover always records ${many ? "them" : "it"}, so this bundle came from an older version, was damaged in transit, or was not produced by sesh-mover at all.` +
+        (payloadPresent && unreadable.includes("baseCommit")
+            ? " The commit those changes were captured against is one of them, and that is the whole of what makes applying them reversible here — so this payload can only be saved beside the project, never applied to your working tree."
+            : ""));
+}
+/**
  * Deliver the newest carried payload in the chain — by applying it, or by
  * SAVING it.
  *
@@ -91,6 +123,18 @@ function describeCarryApply(result, meta, bundleFile) {
  * bundle is inspected, and it reaches `HubPullResult` even when nothing could
  * be done with it.
  *
+ * A `carry` block this version could not read adds ONE reason to whichever of
+ * those rows applies and changes none of them — it is not a fifth row, and
+ * deliberately not an abort. The argument is the one the third row already
+ * makes: "the manifest says something about this bundle that does not hold" is
+ * a statement about the bundle, apply-safe by construction, and the sessions
+ * and workspace this pull already applied are not made wrong by it. Aborting
+ * would also be the one outcome that guarantees data loss — a fetch abort stops
+ * the pull *before* this stage runs at all, so the payload would go with the
+ * extraction directory. See `normalizeCarryMeta` for how fail-closed is
+ * expressed instead: as a `baseCommit` no HEAD can match, which declines the
+ * apply and keeps the save.
+ *
  * **No `try`/`catch` here, on purpose.** `applyCarry` can reject
  * (`listPayloadFiles` sits outside its own try). Today that propagates past
  * `hubPull`'s `finally`, which still releases the lock and clears the temp
@@ -105,19 +149,36 @@ export async function runApplyCarryStage(input) {
     // The one predicate, shared with the sessions disclosure that reports it.
     if (isCarrySuppressed(st))
         return stageSkip([]);
-    const carryAvailable = carry.meta;
+    // The one place the manifest's `carry` block is turned from a parsed JSON
+    // value into a `CarryMeta`. It is read HERE and not in `pull-fetch.ts`, where
+    // the manifest is parsed, for a reason that is about disclosure rather than
+    // tidiness: this stage is the only consumer of `PulledCarry.meta`, and it is
+    // the only one of the two whose reasons `pull.ts` spreads into the pull's
+    // warnings — a normalization done in the fetch stage would be silent.
+    //
+    // Deliberately NOT a refusal. Every exit below still reaches `applyCarry`,
+    // because a malformed block says nothing about the bytes beside it and
+    // skipping the call destroys the payload permanently (see the module doc).
+    const { meta: carryAvailable, unreadable } = normalizeCarryMeta(carry.meta);
+    // First, always: it is what makes the "(not recorded)" in every sentence after
+    // it mean "the bundle did not say" rather than "sesh-mover lost it".
+    const describeMeta = (payloadPresent) => unreadable.length > 0 ? [describeUnreadableCarryMeta(unreadable, payloadPresent)] : [];
     // isDirectory, not exists — see the workspace guard in `pull.ts`.
     if (!isReadableDir(carry.dir)) {
         return stageSkip([
+            ...describeMeta(false),
             "The bundle's manifest declares carried uncommitted changes but the bundle does not contain them, so there was nothing to apply. The bundle is damaged or was not produced by sesh-mover.",
         ], { carryAvailable, carryApplied: undefined });
     }
     const carryApplied = await applyCarry({
         carryDir: carry.dir,
         targetPath,
-        meta: carry.meta,
+        // The normalized meta, never the raw block: `applyCarry` compares
+        // `meta.baseCommit` to this machine's HEAD and interpolates three of these
+        // fields into the README it saves beside the payload.
+        meta: carryAvailable,
         saveOnly: !applyRequested,
     });
-    return stageOk({ carryAvailable, carryApplied }, describeCarryApply(carryApplied, carry.meta, carry.bundleFile));
+    return stageOk({ carryAvailable, carryApplied }, [...describeMeta(true), ...describeCarryApply(carryApplied, carryAvailable, carry.bundleFile)]);
 }
 //# sourceMappingURL=pull-apply-carry.js.map

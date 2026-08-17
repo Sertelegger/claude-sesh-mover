@@ -608,6 +608,22 @@ export interface ErrorResult {
   error: string;
   details?: string;
   suggestion?: string;
+  /**
+   * Disclosures collected BEFORE the failure, present only when there are any.
+   *
+   * A failure is not a reason to withhold what already happened. `hub pull`
+   * applies bundles one at a time and accumulates a disclosure per bundle; when
+   * bundle 3 aborts, bundles 0-2 are on disk, recorded as received, and will
+   * never be offered again — so a result that reports only the abort is not
+   * merely terse, it is **untruthful about what this command did**. That is the
+   * invariant the failure contract puts first: truthfulness, with completeness
+   * best-effort.
+   *
+   * Absent, never `[]`, when nothing was collected — so a reader can tell "this
+   * command disclosed nothing" from "this command had nothing to disclose"
+   * without either being a lie.
+   */
+  warnings?: string[];
 }
 
 // --- Hub ---
@@ -622,11 +638,48 @@ export interface HubInitResult {
   configScope: StorageScope;
 }
 
+/**
+ * What this machine can see at the configured `hub.path`, as one answer shared
+ * by every verb that asks (`src/hub/preflight.ts`'s `probeHubReachable`).
+ *
+ * The two failing members are the ones `HubUnreachableResult` is built from —
+ * they are declared here rather than there so that the diagnostic verbs, which
+ * report the state instead of refusing on it, cannot drift into a second,
+ * differently-spelled opinion about what "reachable" means. `hub status` saying
+ * `reachable: true` for a directory `push` refuses as `not-a-hub` is exactly the
+ * disagreement this type exists to make impossible.
+ */
+export type HubReachabilityState = "ok" | "no-directory" | "not-a-hub";
+
 export interface HubStatusResult {
   success: true;
   command: "hub-status";
   hubPath: string | null;
+  /**
+   * `hubState === "ok"`, restated as the boolean this result has always carried.
+   *
+   * It is derived rather than computed separately on purpose: it used to mean
+   * "hub.json exists and parsed", which said `true` for a `hub.json` carrying no
+   * `hubId` — a file push and pull refuse outright. The two now answer from one
+   * probe.
+   */
   reachable: boolean;
+  /**
+   * WHICH of the states above, so a caller can tell an unmounted share from a
+   * directory that is not a hub without reading `warnings` — the same enum, and
+   * the same distinction of remedy, that `HubUnreachableResult.hubState` carries
+   * for the verbs that refuse.
+   *
+   * `null` — and ONLY then — when `hubPath` is null: no hub is configured, so
+   * the question was never asked. That is a different fact from "asked and could
+   * not see it", and collapsing it into `no-directory` would send a user who has
+   * simply never run `hub init` to check whether a share is mounted.
+   *
+   * `hub status` is also the one place the configured path IS reported
+   * (`hubPath`): the refusals withhold it deliberately, and this is the command
+   * they point at instead.
+   */
+  hubState: HubReachabilityState | null;
   hubId: string | null;
   machineRegistered: boolean;
   machinesKnown: number;
@@ -793,6 +846,31 @@ export interface WhereisResult {
   projectId: string | null;
   linkCandidates?: Array<{ projectId: string; name: string; gitRemotes: string[] }>;
   threads: WhereisThread[];
+  /**
+   * Could this machine read the hub at all?
+   *
+   * **A field on a `success: true` result rather than a refusal, deliberately**
+   * — the precedent is this command's own `linked: false`, which reports an
+   * unresolved identity in the normal shape because `whereis` is a read (see
+   * `HubUnlinkedResult`). An unreachable hub is the same kind of fact and gets
+   * the same treatment; `push` and `pull` refuse on it because they were about
+   * to write.
+   *
+   * **Read it before anything else, because it re-reads two other fields.** When
+   * it is false: `threads` is `[]` meaning UNKNOWN, never "this project has no
+   * threads on the hub"; `linked` is a purely local fact (the presence of
+   * `.sesh-mover-project.json`) that says nothing about whether the hub still
+   * has that project; and `linkCandidates` is ABSENT rather than empty, because
+   * an empty pick list is documented to mean "the hub lists no projects" and the
+   * projects listing is exactly what could not be read.
+   *
+   * Until this field existed all three of those read as confident answers: an
+   * unmounted share produced `linked: true, threads: []` — identical to a linked
+   * project nobody has ever pushed — with nothing to tell the two apart.
+   */
+  reachable: boolean;
+  /** Which state `reachable` is short for; `"ok"` exactly when it is true. */
+  hubState: HubReachabilityState;
   warnings: string[];
 }
 
@@ -879,10 +957,18 @@ export interface HubNoSuchProjectResult {
  * could not be read, so nothing is known about it and there is no file list to
  * give. The two can never both be true: `not-yet-synced` is only reachable
  * after this gate has passed.
+ *
+ * **Which verbs return it is a judgement per verb, not a rollout.** The three
+ * here WRITE (push, pull) or repair by writing (`hub reindex`), so refusing is
+ * what keeps the write from happening. The two diagnostic verbs deliberately do
+ * NOT: `hub status` exists to answer "what state is this in", so it reports the
+ * same `hubState` inside its `success: true` result, and `whereis` follows its
+ * own `linked: false` precedent and does the same. `hub unlink` never asks the
+ * question at all — it is the disarm path and constructs no backend.
  */
 export interface HubUnreachableResult {
   success: false;
-  command: "push" | "pull";
+  command: "push" | "pull" | "hub-reindex";
   reason: "hub-unreachable";
   /**
    * Which of the two shapes it is — an enum rather than prose, because the
@@ -895,8 +981,13 @@ export interface HubUnreachableResult {
    * - `not-a-hub` — the directory is there but carries no usable `hub.json`. A
    *   synced folder whose first sync is still in flight looks exactly like a
    *   directory that is simply not a hub, so this arm covers both.
+   *
+   * Spelled as the non-`ok` half of `HubReachabilityState` rather than as its
+   * own pair of literals: the diagnostic verbs report the SAME probe's answer,
+   * and one declaration is what stops a renamed (or third) state reaching `hub
+   * status` and never reaching here.
    */
-  hubState: "no-directory" | "not-a-hub";
+  hubState: Exclude<HubReachabilityState, "ok">;
   suggestion: string;
 }
 

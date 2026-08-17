@@ -372,12 +372,18 @@ const REGISTRY: FlagUse[] = [
     klass: "descriptive",
     why: "A config-key remedy, not a flag one — this is the reason the sweep reads src/config.ts's defaults too. It names the key as the CAUSE of the decline; push.ts is where it becomes advice, and workspace.ts's sibling line carries that wording.",
   },
-  {
-    file: "src/hub/status.ts",
-    match: "hub.path is set (${hubPath}) but hub.json is missing",
-    klass: "descriptive",
-    why: "A config-key line, and the key is the SUBJECT of the sentence — it names hub.path as the state that is inconsistent, not as something to change. The remedy it does name (`hub init`) is a command, not a flag or a key, so there is nothing here for the foreclosure question to bite on: `hub status` reads and writes nothing at all.",
-  },
+  // `src/hub/status.ts` used to carry an entry here for
+  //   "hub.path is set (${hubPath}) but hub.json is missing — run hub init."
+  // It is gone because the line is: `hub status` now pushes
+  // `describeHubUnreachable(probe.state)` — the SAME sentence the push/pull
+  // refusal carries, classified above under `src/hub/preflight.ts` — instead of
+  // wording its own. Two things went with it, and both were defects rather than
+  // prose: status and the gate no longer disagree about what "reachable" means,
+  // and the `run hub init` remedy no longer fires for a hub directory that is
+  // merely NOT MOUNTED, where following it mints a competing hub at the mount
+  // point. status.ts names no flag or key of its own any more, so it has no
+  // entry; its SURFACES row below stays, because the map is about which
+  // commands COULD surface that file's messages.
   {
     file: "src/hub/workspace.ts",
     match: "or pass --no-workspace on future pushes",

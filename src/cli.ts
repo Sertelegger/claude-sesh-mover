@@ -232,11 +232,18 @@ program
       // Container-level observations belong in the same warnings array as the
       // bundle-level ones: the user asked one question ("import this") and
       // should get one answer. Prepended because they describe something that
-      // happened before the import did. An ErrorResult carries no `warnings`,
-      // and its `error` is the more important message — the extraction note
-      // would only bury it.
-      if (extractWarnings.length > 0 && "warnings" in result) {
-        result.warnings = [...extractWarnings, ...result.warnings];
+      // happened before the import did.
+      //
+      // These now reach a FAILED import too. The older rule was "an ErrorResult
+      // carries no `warnings`, and its `error` is the more important message —
+      // the extraction note would only bury it", which conflated prominence
+      // with disclosure: `error` is still the headline, and a note in its own
+      // field buries nothing. Dropping it was the worse outcome, because an
+      // extraction observation (a zstd frame with no checksum, say) describes
+      // something that really happened to the user's bytes and is *more*
+      // relevant when the import then fails, not less.
+      if (extractWarnings.length > 0) {
+        result.warnings = [...extractWarnings, ...(result.warnings ?? [])];
       }
       output(result);
     } catch (e) {
@@ -383,15 +390,29 @@ type DirectoryManifestRead =
 function readDirectoryManifest(dir: string): DirectoryManifestRead {
   let manifest: ExportManifest;
   try {
-    // readManifest is the existing chokepoint: it parses AND runs the
-    // session-id safety assertion, so surfaced ids stay path-safe here too.
+    // readManifest is the existing chokepoint: it parses, runs the shape check
+    // AND runs the session-id safety assertion, so surfaced ids stay path-safe
+    // here too — and a manifest that is not one of ours never gets this far.
     manifest = readManifest(dir);
   } catch (e) {
     return { ok: false, detail: (e as Error).message };
   }
-  // Shape before content, using the SAME predicate the archive path applies
-  // (manifest.ts) — a `sessions` that is not an array is what turns a listing
-  // into a fabricated `sessionCount`, and readManifest above does not see it.
+  // UNREACHABLE, AND IT STAYS. #77 folded `isBundleManifestShape` into
+  // `readManifest` itself (manifest.ts step one of three), so a shapeless
+  // manifest — the `sessions: "abc"` that used to survive every check and turn
+  // into a fabricated `sessionCount: 3` — now throws above and leaves through
+  // the `catch`. This branch can no longer be entered from here.
+  //
+  // Deleting it would be the wrong repair for two reasons. The predicate's
+  // anti-duplication guard (#60, tests/manifest.test.ts "one home") asserts that
+  // every file naming this shape IMPORTS it from manifest.ts rather than
+  // carrying a private copy, and `cli.ts` is one of the files it checks — the
+  // import is the thing being pinned, and dropping the only call site drops the
+  // import with it. And the reachability is a property of `readManifest`'s
+  // current internals, not of this contract: this function's job is to answer
+  // "shape before content" for the directory half of `browse`, and the day that
+  // chokepoint is narrowed again, the belt is already fastened. It costs one
+  // predicate call per directory bundle.
   if (!isBundleManifestShape(manifest)) {
     return {
       ok: false,
@@ -1512,7 +1533,30 @@ function recordAutoPushOutcome(projectPath: string, result: { success: boolean }
       const warnings = Array.isArray(r.warnings) ? (r.warnings as unknown[]) : [];
       notes.push(...warnings.filter((w): w is string => typeof w === "string"));
     } else {
-      const error = typeof r.error === "string" ? r.error : JSON.stringify(result);
+      // `error` FIRST, then the `reason` discriminator, and only then the whole
+      // object.
+      //
+      // The middle arm is not defensive padding: `HubUnreachableResult` (#75)
+      // has no `error` field at all — `reason` + `hubState` + `suggestion` and
+      // nothing else — and an unreachable hub is the single likeliest way for an
+      // unattended session-end push to fail. Before that shape existed every
+      // failure reaching here carried `error`, so the `JSON.stringify` fallback
+      // was unreachable in practice; now it was the ordinary path, and it wrote
+      // a wall of escaped JSON into a note a human reads out of `hub status`'s
+      // `lastAutoPush`. The `suggestion` appended below already carries the
+      // diagnosis, so the prefix only has to name WHICH refusal it was.
+      //
+      // `lock-busy` is the other `error`-optional shape but never arrives here:
+      // the SessionEnd endpoint filters it out before calling this, because that
+      // push did nothing. The `JSON.stringify` fallback stays as the last resort
+      // for a future `success: false` with neither field.
+      const reason = typeof r.reason === "string" ? r.reason : null;
+      const error =
+        typeof r.error === "string"
+          ? r.error
+          : reason !== null
+            ? `The push was refused (${reason}${typeof r.hubState === "string" ? `: ${r.hubState}` : ""}).`
+            : JSON.stringify(result);
       const suggestion = typeof r.suggestion === "string" ? ` ${r.suggestion}` : "";
       notes.push(`${error}${suggestion}`);
       // The link disclosure, carried across as its own note.

@@ -905,6 +905,13 @@ describe("fetch stage", () => {
       basedOn?: string | null;
       carry?: boolean;
       omitSessionFile?: boolean;
+      /**
+       * Replace `manifest.json` with these exact bytes after the real writer
+       * stamped it, or REMOVE it when `null`. The three damage shapes
+       * `readManifest` throws on — unparseable, parseable but not one of ours,
+       * absent — have no other way in: `writeManifest` cannot produce them.
+       */
+      manifestBytes?: string | null;
     } = {}
   ): Promise<HubBundleRecord> {
     const bundleId = over.bundleId ?? "b0";
@@ -975,6 +982,11 @@ describe("fetch stage", () => {
     // its hashes, never the files beside it, so removing the transcript leaves a
     // manifest that is internally self-consistent and lying.
     if (over.omitSessionFile) rmSync(jsonlPath);
+    if (over.manifestBytes !== undefined) {
+      const manifestPath = join(bundleStaging, "manifest.json");
+      if (over.manifestBytes === null) rmSync(manifestPath);
+      else writeFileSync(manifestPath, over.manifestBytes, "utf-8");
+    }
 
     const archivePath = join(staging, "bundle.tar.gz");
     await createArchive(bundleStaging, archivePath, "gzip");
@@ -1046,6 +1058,69 @@ describe("fetch stage", () => {
     // A refused bundle contributes no merge ancestor and no carry.
     expect(st.chainWorkspaceBases).toEqual([]);
     expect(st.lastCarry).toBeNull();
+  });
+
+  /**
+   * The parse itself, which used to be the one untrusted-input call in this
+   * stage with no `try`.
+   *
+   * `readManifest` throws on all three of these, and the throw left `hubPull`
+   * for the CLI's outer catch — exit 1, `suggestion` gone, and a damaged bundle
+   * reported in a shape indistinguishable from an internal fault. It is the
+   * bundles the pull cannot even name that need the typed refusal most.
+   */
+  it.each([
+    ["a manifest.json that is not JSON", "{ not json at all"],
+    ["a manifest.json that is JSON but not ours", JSON.stringify({ hello: "world" })],
+    ["a sessions value that is a string rather than a list", JSON.stringify({
+      plugin: "sesh-mover", version: 1, sessions: "abc",
+    })],
+    ["a session id that is not path-safe", JSON.stringify({
+      plugin: "sesh-mover", version: 1, sessions: [{ sessionId: "../../escape" }],
+    })],
+    ["no manifest.json at all", null],
+  ])("aborts, rather than throwing, on a bundle with %s", async (_label, bytes) => {
+    const record = await writeHealthyBundle({ manifestBytes: bytes, basedOn: "gen-1", carry: true });
+    const st = initApplyState({ needed: [record] });
+
+    const out = await runFetchStage({
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
+    });
+
+    expect(out.status).toBe("aborted");
+    expect(out.value).toBeNull();
+    expect(out.terminal).toMatchObject({ success: false, command: "pull" });
+    expect(out.terminal?.error).toContain(
+      `Bundle ${record.bundleId} does not carry a readable sesh-mover manifest`
+    );
+    // The hub path, because that is the file the user can go and look at.
+    expect(out.terminal?.error).toContain(record.file);
+    // Both user-facing fields travel — the whole point of a typed refusal over
+    // a throw, which keeps neither.
+    expect(out.terminal?.suggestion).toContain("Nothing from this bundle was applied.");
+    expect(out.terminal?.suggestion).toContain("will not be refetched");
+    // It really did get through download and extraction: this is the manifest
+    // guard firing, not a fetch that never happened.
+    expect(existsSync(join(tempRoot, `${record.bundleId}.tar.gz`))).toBe(true);
+    expect(
+      existsSync(join(tempRoot, record.bundleId, "sessions", `${record.sessionIdInBundle}.jsonl`))
+    ).toBe(true);
+    // A manifest that could not be read contributes no ancestor and no carry,
+    // even though this bundle's real manifest declared both.
+    expect(st.chainWorkspaceBases).toEqual([]);
+    expect(st.lastCarry).toBeNull();
+  });
+
+  /** The thrown message is kept whole: it is what says WHICH damage this is. */
+  it("keeps the parse failure's own words inside the refusal", async () => {
+    const record = await writeHealthyBundle({ manifestBytes: JSON.stringify({ hello: "world" }) });
+    const st = initApplyState({ needed: [record] });
+
+    const out = await runFetchStage({
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
+    });
+
+    expect(out.terminal?.error).toContain("is not a sesh-mover bundle manifest");
   });
 
   /**
@@ -1353,6 +1428,111 @@ describe("apply.carry stage", () => {
     expect(out.value?.carryAvailable).toBe(carry.meta);
     expect(out.value?.carryApplied).toBeUndefined();
     expect(existsSync(projectSeshMoverDir(proj))).toBe(false);
+  });
+
+  /**
+   * The second uncaught throw on this surface: `carry: {}` in a hub-fetched
+   * manifest reached `meta.baseCommit.slice(0, 8)` in `describeCarryApply`.
+   *
+   * The decision this pins is where it belongs — NOT an abort, and not a skip
+   * either. A malformed block is a statement about the bundle, apply-safe like
+   * the "declares a carry it does not contain" skip beside it; and refusing to
+   * reach `applyCarry` would destroy the payload, because the pull has already
+   * recorded its bundles and `hubPull`'s `finally` removes the extraction
+   * directory. So the stage runs to completion and discloses what it repaired.
+   */
+  it("saves a payload whose manifest carry block is empty, instead of throwing on it", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry = carried({ meta: {} as CarryMeta });
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: false,
+      apply: { lastCarry: carry, divergenceAborted: false, abortIndex: -1 },
+    });
+
+    expect(out.status).toBe("applied");
+    const { reason, savedTo } = declined(out.value?.carryApplied);
+    expect(reason).toBe("not-requested");
+    expect(existsSync(join(savedTo as string, "untracked", "note.txt"))).toBe(true);
+
+    // The disclosure comes FIRST, so the "(not recorded)" in the sentence after
+    // it reads as "the bundle did not say" rather than as a rendering fault.
+    expect(out.reasons.length).toBeGreaterThan(1);
+    expect(out.reasons[0]).toContain("could not read");
+    expect(out.reasons[0]).toContain("baseCommit");
+    expect(out.reasons[0]).toContain("can only be saved beside the project, never applied");
+    expect(out.reasons[1]).toContain("branch (not recorded) at commit (not recorded)");
+
+    // `carryAvailable` reaches HubPullResult, so it has to be a real CarryMeta
+    // rather than the `{}` the manifest declared.
+    expect(out.value?.carryAvailable.baseCommit).toBe("");
+    expect(out.value?.carryAvailable.reIncluded).toEqual([]);
+  });
+
+  /**
+   * A block that IS readable is passed through untouched — the identity the
+   * result's own doc promises, and the silence that makes the disclosure above
+   * mean something.
+   */
+  it("says nothing, and copies nothing, about a carry block it could read", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry = carried();
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: false,
+      apply: { lastCarry: carry, divergenceAborted: false, abortIndex: -1 },
+    });
+
+    expect(out.value?.carryAvailable).toBe(carry.meta);
+    expect(out.reasons.some((r) => r.includes("could not read"))).toBe(false);
+    expect(out.reasons.some((r) => r.includes("(not recorded)"))).toBe(false);
+  });
+
+  /** One field wrong is one field disclosed — and the base commit still gates. */
+  it("names only the field it had to repair, and says nothing about applying when it is not the base", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry = carried({ meta: { ...meta(), inProgress: "bisect" as never } });
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: false,
+      apply: { lastCarry: carry, divergenceAborted: false, abortIndex: -1 },
+    });
+
+    expect(out.reasons[0]).toContain("(inProgress)");
+    expect(out.reasons[0]).not.toContain("can only be saved");
+    // The readable half is intact: the origin phrase is the real one.
+    expect(out.reasons[1]).toContain("branch feature/carry at commit 01234567");
+  });
+
+  /** A bundle can be damaged in both ways at once, and says so in both. */
+  it("discloses an unreadable block on the skip for a payload the bundle lacks", async () => {
+    const proj = tmp("sm-carry-proj-");
+    const carry: PulledCarry = {
+      dir: join(tmp("sm-carry-gone-"), "carry"),
+      meta: {} as CarryMeta,
+      bundleFile: "projects/p1/bundles/b9.tar.gz",
+      bundleIndex: 0,
+    };
+
+    const out = await runApplyCarryStage({
+      targetPath: proj,
+      applyRequested: true,
+      apply: { lastCarry: carry, divergenceAborted: false, abortIndex: -1 },
+    });
+
+    expect(out.status).toBe("skipped");
+    expect(out.reasons).toHaveLength(2);
+    expect(out.reasons[0]).toContain("could not read");
+    expect(out.reasons[0]).toContain("baseCommit");
+    // ...but NOT the "it can only be saved beside the project" clause, which
+    // would name a saved copy that does not exist: there was no payload.
+    expect(out.reasons[0]).not.toContain("can only be saved");
+    expect(out.reasons[1]).toContain("the bundle does not contain them");
+    expect(out.value?.carryApplied).toBeUndefined();
+    expect(out.value?.carryAvailable.branch).toBe("");
   });
 
   /** A plain file where the carry directory belongs reads the same way (ENOTDIR). */
