@@ -615,19 +615,30 @@ describe("hub hook-session-end (CLI)", () => {
     // that gets a breadcrumb at all: `setLastAutoPush` is a documented no-op
     // without this block, and the reachability refusal returns before the
     // thread-minting that would create one. See the note below the assertions.
+    // Keyed by the REAL path, and written for both spellings when they differ —
+    // the same rule as the two tests above, for the same measured reason: a
+    // child process's cwd is always resolved, and on macOS /var is a symlink to
+    // /private/var. Keying only the unresolved path made this pass on Linux and
+    // Windows and fail on macOS, because the CLI then looked for a differently
+    // named file and found none, which is indistinguishable from the no-hub-
+    // block gap this test exists to pin the far side of.
+    const { realpathSync } = await import("node:fs");
+    const projectReal = realpathSync(project);
     const syncDir = join(home, ".sesh-mover", "sync-state");
     mkdirSync(syncDir, { recursive: true });
-    writeFileSync(
-      join(syncDir, `${encodeProjectPath(project)}.json`),
+    const stateFor = (p: string) =>
       JSON.stringify({
         schemaVersion: 2,
-        projectPath: project,
+        projectPath: p,
         lineage: {},
         imported: {},
         peers: {},
         hub: { hubId: "hub-fixture-1", threadByLocalSession: {} },
-      }) + "\n"
-    );
+      }) + "\n";
+    writeFileSync(join(syncDir, `${encodeProjectPath(project)}.json`), stateFor(project));
+    if (projectReal !== project) {
+      writeFileSync(join(syncDir, `${encodeProjectPath(projectReal)}.json`), stateFor(projectReal));
+    }
 
     const r = runHook(JSON.stringify({ cwd: project, session_id: sessionId }));
     expect(r.status).toBe(0);
