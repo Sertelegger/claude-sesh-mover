@@ -8,6 +8,26 @@ export interface LocalProjectId {
 }
 export declare function localProjectIdPath(projectPath: string): string;
 export declare function readLocalProjectId(projectPath: string): LocalProjectId | null;
+/**
+ * Remove this directory's hub link, but ONLY while it still names `projectId`.
+ *
+ * The re-read is the whole point: a link the user (or a concurrent operation)
+ * changed underneath us is not ours to remove, so the check and the unlink are
+ * as close together as they can be made. Two callers, one rule — `hub/push.ts`
+ * rolling back a link its own failed push wrote, and `hub/delete`'s cleanup
+ * after the hub project it pointed at has been destroyed. A second hand-written
+ * copy of this is how one of them ends up unlinking a directory it did not link.
+ *
+ * It removes the FILE and nothing else — never an `rmdir` of the parent, which
+ * since 0.8.0 is the user's project root (see `rollbackLocalLink`).
+ *
+ * `removed: true` with an empty `detail` also covers "there was no link", which
+ * is the requested state either way.
+ */
+export declare function removeLocalProjectIdIfMatches(projectPath: string, projectId: string): {
+    removed: boolean;
+    detail: string;
+};
 export declare function writeLocalProjectId(projectPath: string, id: LocalProjectId): void;
 export declare function normalizeGitRemote(url: string): string | null;
 /**

@@ -280,6 +280,52 @@ const REGISTRY: FlagUse[] = [
     klass: "descriptive",
     why: "Names the flag as the cause of an outcome the caller already chose. Nothing is being asked of the user beyond checking afterwards.",
   },
+  // ---- src/hub/retire.ts + src/hub/tombstone.ts (#43) ----------------------
+  {
+    file: "src/hub/retire.ts",
+    match: "or name the hub project with --project-id <id>",
+    klass: "retry-works",
+    why: "The unlinked refusal is the first thing either verb decides — before the hub is probed, before the project lock, before any read of the hub. The same invocation plus --project-id runs from the top, which is the whole reason the flag exists (an orphaned hub project has no local link to be run from).",
+    provenBy: {
+      test: "hub-retire.test.ts",
+      name: "refuses an unlinked directory, and --project-id names the project on the re-run",
+      reruns: "hubRetire",
+    },
+  },
+  {
+    file: "src/hub/retire.ts",
+    match: "It can be withdrawn later, from this machine only",
+    klass: "future-only",
+    why: "The retire succeeded; there is nothing about THIS operation to re-run. --undo is a later, separate operation, and it is scoped that way in the sentence. Naming it here is the point of phase 1 being reversible at all — a user who has just retired a project needs to know the way back before the grace window makes the next step irreversible.",
+  },
+  {
+    file: "src/hub/retire.ts",
+    match: "Write a fresh assertion with `sesh-mover hub retire --undo`",
+    klass: "future-only",
+    why: "The unreadable-timestamp arm of the grace refusal. The delete refused and changed nothing, but the named remedy is not a re-run of the delete: it is two retire operations, and the delete only becomes possible a grace window LATER. Saying 'run this again' here would be the foreclosure defect in reverse — advice that appears to work now and cannot.",
+  },
+  {
+    file: "src/hub/tombstone.ts",
+    match: "to pull this once without retracting it",
+    klass: "retry-works",
+    why: "The retirement gate refuses in the pull's resolve stage, before registerMachine and before any link write, so nothing is applied or recorded for any bundle — the same pull with --ignore-retirement reaches all of it. Both remedies on the line are true for the same reason; --undo is the one available to the machine that made the assertion, which is the branch this sentence belongs to.",
+    provenBy: {
+      test: "hub-retire.test.ts",
+      name: "refuses a pull of a retired project, and --ignore-retirement pulls it anyway",
+      reruns: "hubPull",
+    },
+  },
+  {
+    file: "src/hub/tombstone.ts",
+    match: "fetches it anyway — do that before",
+    klass: "retry-works",
+    why: "The same refusal, worded for a machine that did NOT assert the retirement and therefore cannot withdraw it. Retry-works for the same reason (the pull refused before doing anything), and this is the arm where it matters most: it is the only route this user has to work that is on the hub before the owner machine deletes it.",
+    provenBy: {
+      test: "hub-retire.test.ts",
+      name: "refuses a pull of a retired project, and --ignore-retirement pulls it anyway",
+      reruns: "hubPull",
+    },
+  },
   // ---- src/hub/preflight.ts (#75) ------------------------------------------
   //
   // These four lines were in `src/cli.ts` until #75 and so were outside this
@@ -732,6 +778,15 @@ const SURFACES: Record<string, string[]> = {
   "src/hub/preflight.ts": ["push", "pull"],
   "src/hub/push.ts": ["push"],
   "src/hub/reindex.ts": ["reindex"],
+  // Retirement's two verbs share one module, so a flag named there is read by a
+  // user running either — which is why the `--project-id` line has to work for
+  // both (it does; both declare it) and the `--undo` lines name `retire`
+  // explicitly, since `delete` has no such flag.
+  "src/hub/retire.ts": ["retire", "delete"],
+  // `retiredPullRefusal` is built in tombstone.ts and returned by the pull's
+  // resolve stage. Only `pull` ever surfaces it — `hub retire`'s own results are
+  // composed in retire.ts.
+  "src/hub/tombstone.ts": ["pull"],
   "src/hub/status.ts": ["status"],
   "src/hub/unlink.ts": ["unlink"],
   "src/hub/workspace.ts": ["push"],

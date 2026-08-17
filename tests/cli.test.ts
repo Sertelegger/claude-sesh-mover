@@ -2267,6 +2267,14 @@ describe("cli", () => {
         ],
         ["unlinked", { success: false, command: "push", reason: "unlinked" }, 2],
         ["no-such-project", { success: false, command: "pull", reason: "no-such-project" }, 2],
+        ["project-retired", { success: false, command: "pull", reason: "project-retired" }, 2],
+        ["not-owner", { success: false, command: "hub-retire", reason: "not-owner" }, 2],
+        ["not-retired", { success: false, command: "hub-delete", reason: "not-retired" }, 2],
+        ["project-gone", { success: false, command: "hub-delete", reason: "project-gone" }, 2],
+        // NOT class 3, and the one worth stating: "wait and try again" sounds
+        // retryable, but class 3 means retryable UNCHANGED IN A MOMENT and this
+        // is a deliberate multi-day hold. Class 3 would invite a caller to loop.
+        ["grace-period", { success: false, command: "hub-delete", reason: "grace-period" }, 2],
         ["hub-unreachable", { success: false, command: "pull", reason: "hub-unreachable" }, 3],
         ["lock-busy", { success: false, command: "push", reason: "lock-busy" }, 3],
         ["not-yet-synced", { success: false, command: "pull", reason: "not-yet-synced" }, 3],

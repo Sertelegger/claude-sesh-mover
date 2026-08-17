@@ -26,6 +26,7 @@ import type {
   HubNoSuchProjectResult,
   HubPullListResult,
   HubPullResult,
+  HubProjectRetiredResult,
   HubUnlinkedResult,
   HubUnreachableResult,
   NotYetSyncedResult,
@@ -56,6 +57,13 @@ export interface HubPullOptions {
   noAppend?: boolean;
   /** How to resolve a two-sided fork. Defaults to "fragment". */
   onDivergence?: OnDivergenceMode;
+  /**
+   * Pull a RETIRED project anyway (#43). See `ResolveStageInput` for why the
+   * gate has an escape hatch at all; the short version is that only the machine
+   * that retired a project can un-retire it, and everyone else may still have
+   * work on the hub they need before its bytes are deleted.
+   */
+  ignoreRetirement?: boolean;
   onProgress?: (ev: ProgressEvent) => void;
 }
 
@@ -265,6 +273,7 @@ export type HubPullOutcome =
   | HubUnlinkedResult
   | HubNoSuchProjectResult
   | HubUnreachableResult
+  | HubProjectRetiredResult
   | HubLockBusyResult
   | ErrorResult;
 
@@ -349,6 +358,8 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
       projectPath: opts.projectPath,
       hubPath: opts.hubPath,
       projectIdOverride: opts.projectIdOverride,
+      ignoreRetirement: opts.ignoreRetirement,
+      opNowMs,
     });
     // The unlinked escape is the finished result, candidates and all — it
     // carries no reasons, and the warnings collected so far are discarded with

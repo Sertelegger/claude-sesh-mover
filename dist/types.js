@@ -63,6 +63,19 @@ const REASON_EXIT_CODE = {
     // Refusals: the command was understood, and declined.
     unlinked: EXIT_REFUSED,
     "no-such-project": EXIT_REFUSED,
+    // Retirement (#43), all four of them refusals rather than failures: each is a
+    // command that ran, decided, and changed nothing.
+    //
+    // `grace-period` is the one worth arguing about, because "wait and try again"
+    // sounds like class 3. It is not: class 3 is the set worth retrying UNCHANGED
+    // IN A MOMENT (an unmounted share, a busy lock), and this one is a deliberate
+    // multi-day hold whose whole purpose is that nobody retries it in a moment.
+    // Class 3 would also invite a caller to loop on it.
+    "project-retired": EXIT_REFUSED,
+    "project-gone": EXIT_REFUSED,
+    "not-owner": EXIT_REFUSED,
+    "not-retired": EXIT_REFUSED,
+    "grace-period": EXIT_REFUSED,
     // Environment-not-ready: same invocation, retry once the machine catches up.
     "hub-unreachable": EXIT_NOT_READY,
     "lock-busy": EXIT_NOT_READY,

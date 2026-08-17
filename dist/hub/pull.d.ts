@@ -1,5 +1,5 @@
 import { type SelectReport } from "./pull-select.js";
-import type { ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPullListResult, HubPullResult, HubUnlinkedResult, HubUnreachableResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPullListResult, HubPullResult, HubProjectRetiredResult, HubUnlinkedResult, HubUnreachableResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
 export interface HubPullOptions {
     configDir: string;
     projectPath: string;
@@ -22,6 +22,13 @@ export interface HubPullOptions {
     noAppend?: boolean;
     /** How to resolve a two-sided fork. Defaults to "fragment". */
     onDivergence?: OnDivergenceMode;
+    /**
+     * Pull a RETIRED project anyway (#43). See `ResolveStageInput` for why the
+     * gate has an escape hatch at all; the short version is that only the machine
+     * that retired a project can un-retire it, and everyone else may still have
+     * work on the hub they need before its bytes are deleted.
+     */
+    ignoreRetirement?: boolean;
     onProgress?: (ev: ProgressEvent) => void;
 }
 /**
@@ -84,7 +91,7 @@ export declare function reportPullResult(report: SelectReport, warnings: string[
  * making on its own, but it is not a shrinking of the body, and the margin it
  * reports is eight lines more generous than the body's own history.
  */
-export type HubPullOutcome = HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnreachableResult | HubLockBusyResult | ErrorResult;
+export type HubPullOutcome = HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnreachableResult | HubProjectRetiredResult | HubLockBusyResult | ErrorResult;
 /**
  * Sequencing over the eight pull stages. What is worth knowing before reading
  * the body is in `tests/hub-pull-invariants.test.ts`'s "hubPull is sequencing"

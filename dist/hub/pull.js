@@ -266,6 +266,8 @@ export async function hubPull(opts) {
             projectPath: opts.projectPath,
             hubPath: opts.hubPath,
             projectIdOverride: opts.projectIdOverride,
+            ignoreRetirement: opts.ignoreRetirement,
+            opNowMs,
         });
         // The unlinked escape is the finished result, candidates and all — it
         // carries no reasons, and the warnings collected so far are discarded with

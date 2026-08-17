@@ -2,7 +2,7 @@ import type { HubBackend } from "./backend.js";
 import { type HubJson } from "./layout.js";
 import { type LocalProjectId } from "./identity.js";
 import { type ResolvedThread } from "./threads.js";
-import type { HubNoSuchProjectResult, HubUnlinkedResult, HubUnreachableResult } from "../types.js";
+import type { HubNoSuchProjectResult, HubProjectRetiredResult, HubUnlinkedResult, HubUnreachableResult } from "../types.js";
 export interface ResolveStageInput {
     backend: HubBackend;
     /**
@@ -17,6 +17,28 @@ export interface ResolveStageInput {
     /** `registerMachine` builds its own backend from the path, not from `backend`. */
     hubPath: string;
     projectIdOverride?: string;
+    /**
+     * The pull's operation clock, captured once in `hubPull`.
+     *
+     * Required, not defaulted, because `tests/hub-pull-invariants.test.ts` bans a
+     * wall-clock read in any `pull-*.ts` stage file and a default would be one.
+     * The ban exists for `append.ts`'s liveness guard, which this stage has
+     * nothing to do with — the point of an unconditional rule is that nobody has
+     * to decide per site which clock reads matter.
+     */
+    opNowMs: number;
+    /**
+     * Pull even though the project is retired (#43).
+     *
+     * The escape hatch the refusal itself points at, and it is not a weakening of
+     * the gate: the tombstone exists to stop work starting against a retiring
+     * project UNWITTINGLY, and a machine that has un-pulled work on a hub whose
+     * bundles are about to be deleted needs a way to get it. Retraction is
+     * asymmetric — only the asserting machine can withdraw a tombstone — so
+     * without this the only remedy for everyone else would be to ask another
+     * person and wait.
+     */
+    ignoreRetirement?: boolean;
 }
 export interface ResolveStageValue {
     local: LocalProjectId;
@@ -52,7 +74,7 @@ export type ResolveStageOutcome = {
     reasons: string[];
 } | {
     kind: "return";
-    result: HubUnlinkedResult | HubUnreachableResult | HubNoSuchProjectResult;
+    result: HubUnlinkedResult | HubUnreachableResult | HubNoSuchProjectResult | HubProjectRetiredResult;
 };
 /**
  * The pull's first stage: settle which hub project this directory IS, announce

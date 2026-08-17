@@ -580,11 +580,15 @@ describe("resolve stage", () => {
     writeFileSync(p, JSON.stringify(body, null, 2) + "\n", "utf-8");
   }
 
-  function input(over: { projectIdOverride?: string } = {}) {
+  function input(over: { projectIdOverride?: string; ignoreRetirement?: boolean } = {}) {
     return {
       backend: createFsBackend(hubDir),
       projectPath,
       hubPath: hubDir,
+      // The stage takes the pull's operation clock rather than reading one —
+      // `tests/hub-pull-invariants.test.ts` bans a wall-clock read in any stage
+      // file, so every caller, this one included, has to supply it.
+      opNowMs: Date.now(),
       ...over,
     };
   }
