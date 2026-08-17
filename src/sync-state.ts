@@ -16,13 +16,50 @@ export function syncStatePath(projectPath: string): string {
   return join(userSeshMoverDir(), "sync-state", `${encodeProjectPath(projectPath)}.json`);
 }
 
+/**
+ * A record whose KEYS come from outside this machine, built with NO PROTOTYPE.
+ *
+ * `peers`, `lineage`, `imported` and each peer's `sent`/`received` are all keyed
+ * by strings a peer supplies — a `machineId` read off a hub index file, a
+ * `sourceMachineId` off a bundle manifest, a `sessionIdInBundle` off an index
+ * record, an `integrityHash` off the same manifest. The only filter any of them
+ * passes is `isSafeSessionId`, which answers a DIFFERENT question (path shapes):
+ * `__proto__`, `constructor`, `toString`, `valueOf` and `hasOwnProperty` all
+ * pass it.
+ *
+ * On a plain `{}` those keys are already "present". `state.peers["__proto__"]`
+ * yields `Object.prototype`, so the `state.peers[id] ??= {…}` / `if
+ * (!state.peers[id])` guards every writer here uses do NOT create the entry, and
+ * the writes that follow land on `Object.prototype` ITSELF before dying on the
+ * first nested one. Measured against shipped `dist/`: `name` and
+ * `lastReceivedAt` were added to `Object.prototype` and the operation then threw
+ * `Cannot set properties of undefined` — in `hub/pull.ts`'s `recordSplice`,
+ * which runs AFTER the user's transcript has already been extended, so the throw
+ * leaves the splice unrecorded and the next pull re-needs the same bundle.
+ *
+ * A null prototype answers the whole family at the container: every lookup is an
+ * own lookup, so a hostile key is an ordinary key and the guards mean what they
+ * say. ONE copy of the rule on purpose — `importer.ts` and `cli.ts` also index
+ * these records with peer-supplied strings, and they get the guarantee from the
+ * state object they were handed rather than from a guard each of them has to
+ * remember to write. Anything that BUILDS one of these records must use this
+ * (`hub/pull.ts` does), which is why it is exported.
+ *
+ * JSON round-trips unchanged: `JSON.stringify` reads own enumerable keys, and
+ * `JSON.parse` defines a `__proto__` key as an OWN property, which `Object.assign`
+ * then copies onto a null-prototype target as an own property too.
+ */
+export function foreignKeyedRecord<T>(from?: Record<string, T> | null): Record<string, T> {
+  return Object.assign(Object.create(null) as Record<string, T>, from);
+}
+
 function defaultState(projectPath: string): SyncState {
   return {
     projectPath,
     schemaVersion: 1,
-    peers: {},
-    lineage: {},
-    imported: {},
+    peers: foreignKeyedRecord(),
+    lineage: foreignKeyedRecord(),
+    imported: foreignKeyedRecord(),
   };
 }
 
@@ -50,12 +87,19 @@ function parseSyncState(raw: string): SyncState | null {
     // does not rename it aside, so the project never recovers and no message
     // names the file. Backfilling here means every reader downstream gets the
     // shape its types already claim.
+    //
+    // Rebuilt with no prototype rather than backfilled in place, for the reason
+    // `foreignKeyedRecord` states: every one of these is keyed by a string a
+    // peer supplied, and on a plain object a `__proto__`/`constructor` key is
+    // "present" before anything writes it.
+    parsed.peers = foreignKeyedRecord(parsed.peers);
+    parsed.lineage = foreignKeyedRecord(parsed.lineage);
     for (const peer of Object.values(parsed.peers)) {
       if (peer === null || typeof peer !== "object") continue;
-      peer.received = peer.received ?? {};
-      peer.sent = peer.sent ?? {};
+      peer.received = foreignKeyedRecord(peer.received);
+      peer.sent = foreignKeyedRecord(peer.sent);
     }
-    parsed.imported = parsed.imported ?? {};
+    parsed.imported = foreignKeyedRecord(parsed.imported);
     for (const entry of Object.values(parsed.imported)) {
       if (typeof entry.registered !== "boolean") entry.registered = true;
     }
@@ -126,8 +170,8 @@ export function recordSentFromBundle(
       name: peer.name ?? peer.id,
       lastSentAt: null,
       lastReceivedAt: null,
-      sent: {},
-      received: {},
+      sent: foreignKeyedRecord(),
+      received: foreignKeyedRecord(),
     };
   }
   const p = state.peers[peer.id];
@@ -190,8 +234,8 @@ export function recordSentToPeer(
       name: peer.name ?? peer.id,
       lastSentAt: null,
       lastReceivedAt: null,
-      sent: {},
-      received: {},
+      sent: foreignKeyedRecord(),
+      received: foreignKeyedRecord(),
     };
   }
   if (peer.name) state.peers[peer.id].name = peer.name;
@@ -230,8 +274,8 @@ export function setPeerMemoryDigest(
       name: peer.name ?? peer.id,
       lastSentAt: null,
       lastReceivedAt: null,
-      sent: {},
-      received: {},
+      sent: foreignKeyedRecord(),
+      received: foreignKeyedRecord(),
     };
   }
   state.peers[peer.id].memoryDigest = digest;
@@ -260,6 +304,22 @@ export function setThreadId(
   if (!state.hub) {
     state.hub = { hubId, threadByLocalSession: {} };
     state.schemaVersion = 2;
+  }
+  // The WRITE half of the guard `getThreadId` already carries, and the half
+  // that fails harder. `parseSyncState` shape-checks `schemaVersion`, `peers`
+  // and `lineage` and never mentions `hub` at all, so a v2 file whose hub block
+  // lost `threadByLocalSession` (an interrupted write, a hand edit) PARSES — the
+  // corrupt-file rename-aside never fires — and this line threw `Cannot set
+  // properties of undefined` on every push, pull and reindex of that project,
+  // forever. On the CLI that is a visible error; on the default-on SessionEnd
+  // auto-push `cli.ts` routes it to `writeHookDiagnostic` (stderr only, exit 0),
+  // so auto-push simply stops working with no message anywhere.
+  //
+  // Repaired HERE and not in `parseSyncState`, deliberately: the hub block is
+  // added lazily, and backfilling it at parse time would promote every plain
+  // incremental-sync user's file to a shape that implies it has a hub.
+  if (!state.hub.threadByLocalSession) {
+    state.hub.threadByLocalSession = {};
   }
   state.hub.threadByLocalSession[localSessionId] = threadId;
 }
@@ -389,7 +449,14 @@ export function setLastAutoPush(
 export function knownWorkspaceGenerations(state: SyncState): WorkspaceGenerationRef[] {
   const hub = state.hub;
   if (!hub) return [];
-  const list = hub.workspaceGenerations ?? [];
+  // `Array.isArray`, not `?? []`: the hub block is the one part of the file
+  // `parseSyncState` does not shape-check at all, so `workspaceGenerations` can
+  // be any JSON value. A string survives `??`, survives `list[0]?.bundleId`
+  // (a character has none) and is returned as-is by the `.slice()` below —
+  // `chooseMergeAncestor` then calls `.some()` on it and the pull dies with an
+  // opaque TypeError. Reading an unusable value as "no generations" degrades the
+  // way an empty intersection already does: no ancestor, so no merge.
+  const list = Array.isArray(hub.workspaceGenerations) ? hub.workspaceGenerations : [];
   const head = hub.lastWorkspace;
   if (head && list[0]?.bundleId !== head.bundleId) {
     return [head, ...list.filter((g) => g.bundleId !== head.bundleId)];

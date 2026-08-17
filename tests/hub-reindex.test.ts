@@ -9,6 +9,10 @@ import { hubPush } from "../src/hub/push.js";
 import { hubReindex } from "../src/hub/reindex.js";
 import { readMachineIndex } from "../src/hub/index-file.js";
 import { createFsBackend } from "../src/hub/backend.js";
+import { acquireProjectLock } from "../src/hub/lock.js";
+import { writeLocalProjectId } from "../src/hub/identity.js";
+import { syncStatePath } from "../src/sync-state.js";
+import { bundleDir } from "../src/hub/layout.js";
 import { createArchive, extractArchive } from "../src/archiver.js";
 import { readManifest, writeManifest } from "../src/manifest.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
@@ -327,10 +331,153 @@ describe("hub reindex", () => {
       if (result.success) return;
       expect(result.error).toMatch(/not linked/i);
       expect(result.suggestion).toMatch(/push/i);
+      // ...and the machine-readable half (#29). The two prose assertions above
+      // are exactly what a reason code replaces: "wait for the other operation"
+      // and "this project was never pushed" are two failures with nothing in
+      // common, and regexing `error` was the only way to tell them apart.
+      expect(result.reason).toBe("unlinked");
+      expect(result.command).toBe("hub-reindex");
     } finally {
       restore.restore();
       rmSync(home, { recursive: true, force: true });
       rmSync(hub, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The busy-lock refusal, and specifically the FIELDS it carries.
+   *
+   * `hub reindex` takes the same project lock push, pull and `hub unlink` take,
+   * and `commands/hub-unlink.md` already names it as one of the operations that
+   * can hold it — so this is a reachable branch, not a defensive one. It was the
+   * only one of the four that answered with a bare `ErrorResult`: `LockBusyError`
+   * carries `holderPid` and `ageMs`, its three siblings surface both, and this
+   * arm discarded them. A caller deciding whether to wait needs exactly those
+   * two, and cannot get them out of a prose string.
+   */
+  it("refuses with the shared lock-busy shape, holder fields intact, while another operation holds the lock", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const restore = overrideHome(home);
+    let held: { release(): void } | null = null;
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      // Linked, but nothing pushed: the unlinked check runs BEFORE the lock, so
+      // without a link this would refuse for the other reason entirely and the
+      // lock branch would never be reached.
+      writeLocalProjectId(projectPath, {
+        projectId: "11111111-1111-4111-8111-111111111111",
+        name: "realproj",
+        createdAt: "2026-08-01T00:00:00Z",
+        createdByMachine: "m1",
+      });
+
+      held = acquireProjectLock(projectPath);
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.command).toBe("hub-reindex");
+      expect(result.reason).toBe("lock-busy");
+      // The two fields the old shape dropped on the floor.
+      expect("holderPid" in result && result.holderPid).toBe(process.pid);
+      expect("ageSeconds" in result && typeof result.ageSeconds).toBe("number");
+      expect(result.error).toMatch(/lock/i);
+    } finally {
+      held?.release();
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The rebuild silently losing a bundle record — typed, because it is data
+   * loss rather than advice.
+   *
+   * A bundle whose session has no thread mapping in this machine's sync-state
+   * is dropped: the rebuilt index does not reference it, so no other machine
+   * can see it. That was reported only inside a warning string, and
+   * `skills/session-porter/SKILL.md` forbids branching on warning text — which
+   * left no way to notice at all.
+   */
+  it("names dropped bundles in a typed field, not only in the warning prose", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      // Lose the thread bookkeeping the way it is actually lost: the state file
+      // is renamed aside when a plugin version doesn't recognize its schema, so
+      // the bundle on the hub outlives the mapping that says which thread it is.
+      rmSync(syncStatePath(projectPath), { force: true });
+
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.droppedBundles).toHaveLength(1);
+      expect(result.droppedBundles![0].sessionId).toBe(sessionId);
+      expect(result.droppedBundles![0].file).toMatch(/\.tar\.gz$/);
+      // The prose is still there — the field replaces the need to PARSE it, not
+      // the warning itself.
+      expect(result.warnings.some((w) => w.includes(sessionId))).toBe(true);
+      // ...and the field is describing a real loss: the rebuilt index has no
+      // threads at all now.
+      expect(result.projects[0].threads).toBe(0);
+      // Absent, not empty, when the other condition didn't happen.
+      expect(result.unrecognizedBundleFiles).toBeUndefined();
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /** The sibling condition: a file in the bundle directory that isn't a bundle. */
+  it("names an unparseable bundle file in a typed field", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      const machine = loadOrCreateMachineId();
+      // The shape a synced folder actually produces beside a real bundle.
+      const stray = join(
+        hub, bundleDir(pushed.projectId, machine.id), "notes (conflicted copy).tar.gz"
+      );
+      writeFileSync(stray, "not a bundle\n");
+
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.unrecognizedBundleFiles).toHaveLength(1);
+      expect(result.unrecognizedBundleFiles![0]).toContain("conflicted copy");
+      expect(result.droppedBundles).toBeUndefined();
+      // The real bundle beside it still rebuilt — one bad name is not a refusal.
+      expect(result.projects[0].threads).toBe(1);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
     }
   });
 
@@ -484,6 +631,7 @@ describe("hub reindex", () => {
       const refused = await hubReindex({ configDir, projectPath, hubPath: hub });
       expect(refused.success).toBe(false);
       if (refused.success) return;
+      expect(refused.reason).toBe("unlinked");
       expect(refused.error).toMatch(/not linked/i);
       expect(refused.suggestion).toContain("--create-project");
 

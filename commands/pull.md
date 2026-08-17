@@ -26,6 +26,7 @@ You are running the sesh-mover pull command. Follow these steps:
 
 4. Parse the result and branch:
    - `reason: "unlinked"`: same shape as push — present `linkCandidates` as a pick-list, but point the user at `/sesh-mover:push` to link or create the hub project first (pull can also link directly via `--project-id`; offer to re-run step 3 with `--project-id <picked>` if the user prefers not to switch commands).
+   - `reason: "no-such-project"`: the `--project-id` you passed names no project on this hub (`requestedProjectId` echoes it back). Nothing was pulled and nothing was written or linked. Present `linkCandidates` as a pick-list and re-run step 3 with a corrected `--project-id`; an empty `linkCandidates` means this hub has no projects yet, so the other machine has to push first.
    - `reason: "lock-busy"`: wait a few seconds and retry the same invocation once; if still busy, stop and report it.
    - `pickRequired: true`: present `threads` as a numbered list — slug, latest machine name, `lastActiveAt`, `messageCount`, and whether `pullNeeded` is true. Ask the user which thread to pull (AskUserQuestion), or offer "pull whichever most needs updating" which maps to `--latest` instead of `--thread <id>`.
    - Any other `success: false` (no `reason` field): report `error`/`suggestion` and stop.

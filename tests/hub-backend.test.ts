@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { once, type EventEmitter } from "node:events";
 import { createFsBackend, type HubBackend } from "../src/hub/backend.js";
 
 // Contract suite: any HubBackend implementation must pass these.
@@ -74,6 +76,43 @@ export function backendContract(makeBackend: () => { backend: HubBackend; root: 
       ? readdirSync(join(root, "projects/p1/bundles/m1")).length : 0).toBe(0);
   });
 
+  it("aborted stream write leaves nothing behind AFTER the fd has closed", async () => {
+    // The test above asserts SYNCHRONOUSLY, inside the window the defect lives
+    // in, and passed 10/10 while the defect was live. `createWriteStream` opens
+    // its fd asynchronously and `destroy()` on a pending open is deferred until
+    // the open completes — so `destroy(); rmSync(tmp)` unlinked a path the file
+    // had not reached, and the open then created it. Measured on Linux (this is
+    // not the Windows-only EBUSY race it was filed as), 5/5 runs: empty on
+    // return, a full-size `.tmp-<uuid>` 100ms later — invisible to `list()`,
+    // which filters `.tmp-`, and replicated to every machine by whatever syncs
+    // the hub.
+    //
+    // Waiting on "close" rather than a timer is what makes this deterministic:
+    // close is emitted after the deferred open has created the file, so an
+    // implementation that unlinks too early is caught every run rather than
+    // most runs. With the fix, abort() has already awaited it.
+    const w = await backend.writeStreamAtomic("projects/p1/bundles/m1/orphan.tar.gz");
+    w.stream.write("partial");
+    const closed = once(w.stream as unknown as EventEmitter, "close");
+    await w.abort();
+    await closed;
+    const dir = join(root, "projects/p1/bundles/m1");
+    expect(existsSync(dir) ? readdirSync(dir) : []).toEqual([]);
+  });
+
+  it("abort() never rejects, so it cannot mask the failure that triggered it", async () => {
+    // Its callers run it from a catch block (`hub/push.ts`: `await w.abort();
+    // throw e;`), where `abort()` rejecting REPLACES the pipeline's real error
+    // — and push's error is the payload of its own disclosure machinery, so an
+    // `ENOSPC` would be recorded in the durable auto-push breadcrumb as an
+    // unlink error. Aborting twice exercises the second unlink against a path
+    // that is already gone.
+    const w = await backend.writeStreamAtomic("projects/p1/bundles/m1/twice.tar.gz");
+    w.stream.write("partial");
+    await expect(w.abort()).resolves.toBeUndefined();
+    await expect(w.abort()).resolves.toBeUndefined();
+  });
+
   it("failed stream commit rejects and cleans up its temp file", async () => {
     const w = await backend.writeStreamAtomic("projects/p1/bundles/m1/fail.tar.gz");
     w.stream.write("partial");
@@ -84,6 +123,23 @@ export function backendContract(makeBackend: () => { backend: HubBackend; root: 
     expect(await backend.exists("projects/p1/bundles/m1/fail.tar.gz")).toBe(false);
     expect(existsSync(join(root, "projects/p1/bundles/m1"))
       ? readdirSync(join(root, "projects/p1/bundles/m1")).length : 0).toBe(0);
+  });
+
+  it("list hides an in-flight temp file and nothing else", async () => {
+    // Untested in either direction until now, and both directions matter.
+    // KEEPING the filter: `hub reindex` warns about every bundle file it cannot
+    // account for and `hub status` counts `machines/` with no filtering at all,
+    // so a concurrent push's in-flight temp becomes a warning and a wrong count
+    // the moment this stops hiding one. NOT WIDENING it: the filter is a
+    // substring test on the basename, so anything it over-matches is a real
+    // bundle that silently stops existing for every reader.
+    const dir = join(root, "projects/p1/bundles/m1");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `2026-08-16T00-00-00Z-b1.tar.gz.tmp-${randomUUID()}`), "x");
+    writeFileSync(join(dir, "2026-08-16T00-00-00Z-b1.tar.gz"), "x");
+    expect(await backend.list("projects/p1/bundles/m1")).toEqual([
+      "projects/p1/bundles/m1/2026-08-16T00-00-00Z-b1.tar.gz",
+    ]);
   });
 
   it("rejects unsafe relative paths on every method", async () => {

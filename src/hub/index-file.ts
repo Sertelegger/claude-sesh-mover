@@ -95,7 +95,31 @@ export interface IndexBuildInputs {
 // B cannot fix machine A's, and nothing here should try.
 // ---------------------------------------------------------------------------
 export function buildIndexFile(inputs: IndexBuildInputs): HubIndexJson {
-  const threads: Record<string, HubThreadEntry> = {};
+  // NO PROTOTYPE, and it is enforcement rather than tidiness. Every `threadId`
+  // below comes from `getThreadId`, i.e. from this machine's sync-state, where a
+  // pull ADOPTS whatever thread id a foreign index published — and the only
+  // filter that id passed is `isSafeSessionId`, which accepts `__proto__`,
+  // `constructor` and every other `Object.prototype` name. On a plain `{}` each
+  // of the three `threads[threadId]` guards below reads a value that is already
+  // "present" (`Object.prototype`, or the `Object` constructor), so an existing
+  // thread is compared against a non-entry, a rebuilt one is skipped as a
+  // duplicate, and `threads["__proto__"] = …` re-parents the map instead of
+  // adding to it — after which `JSON.stringify` publishes an index with the
+  // thread simply missing.
+  const threads: Record<string, HubThreadEntry> = Object.create(null);
+
+  // Same hazard on the PRIOR index, which is a foreign-shaped record read off
+  // the hub. `inputs.priorIndex?.threads[threadId]?.bundles.slice()` looked
+  // guarded and was not: for a prototype key the optional chain finds a truthy
+  // value whose `.bundles` is `undefined`, and the `.slice()` threw a raw
+  // `TypeError` straight out of `hub push` (measured against shipped `dist/`).
+  // An own-property read is the whole fix — `Object.hasOwn` rather than
+  // rebuilding the map, because this projection may not mutate its inputs.
+  const priorThreads = inputs.priorIndex?.threads;
+  const priorBundles = (threadId: string): HubBundleRecord[] =>
+    priorThreads && Object.hasOwn(priorThreads, threadId)
+      ? priorThreads[threadId].bundles.slice()
+      : [];
 
   for (const s of inputs.sessions) {
     const threadId = getThreadId(inputs.state, s.sessionId);
@@ -138,7 +162,7 @@ export function buildIndexFile(inputs: IndexBuildInputs): HubIndexJson {
       headEntryUuid: s.headEntryUuid,
       messageCount: s.messageCount,
       lastActiveAt: s.lastActiveAt,
-      bundles: inputs.priorIndex?.threads[threadId]?.bundles.slice() ?? [],
+      bundles: priorBundles(threadId),
     };
   }
   // Threads whose local session vanished (deleted locally) keep their bundle

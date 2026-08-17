@@ -29,6 +29,25 @@ export interface ResolvedThread {
   latest: ThreadCopy;
 }
 
+/**
+ * Everything a `ThreadCopy` carries that `newerThreadCopy`'s named keys do NOT
+ * compare, as one string — the last resort below, and the thing that makes it a
+ * total order over CONTENT rather than over the input list.
+ *
+ * Built from an explicit tuple rather than `JSON.stringify(copy)` so it cannot
+ * quietly start depending on which order an index file happened to write the
+ * copy's own keys in. `bundles` is in it because that is the field a pull reads
+ * off the winner (`planThreadPull` fetches from `source.bundles`); `slug` and
+ * `summary` are in it because `ResolvedThread` republishes the winner's.
+ * Together with the four keys compared before it, that is every field of
+ * `ThreadCopy` — so two copies that tie all the way down here answer every
+ * question a consumer asks identically, and returning either is the SAME
+ * answer, not an arbitrary one.
+ */
+function threadCopyContentKey(c: ThreadCopy): string {
+  return JSON.stringify([c.localSessionId, c.slug, c.summary, c.bundles]);
+}
+
 // Deterministic latest-copy ordering (spec §2): max lastActiveAt, then higher
 // messageCount, then headEntryUuid lexical ascending. This tiebreak is
 // load-bearing across the whole product ("which machine has my latest
@@ -39,28 +58,59 @@ export function newerThreadCopy(a: ThreadCopy, b: ThreadCopy): ThreadCopy {
   if (a.lastActiveAt !== b.lastActiveAt) return a.lastActiveAt > b.lastActiveAt ? a : b;
   if (a.messageCount !== b.messageCount) return a.messageCount > b.messageCount ? a : b;
   if (a.headEntryUuid !== b.headEntryUuid) return a.headEntryUuid < b.headEntryUuid ? a : b;
-  // Total tie. Without this last key the answer was the reduce ACCUMULATOR,
-  // i.e. whichever index file the hub directory listed first — exactly the
-  // insertion-order dependence the comment above forbids, and it is reachable
-  // from the ordinary round trip (A pushes, B continues, A pulls the
-  // continuation back and splices it: both copies then carry the same
+  // Total tie on the three named keys. Without a further key the answer was the
+  // reduce ACCUMULATOR, i.e. whichever index file the hub directory listed
+  // first — exactly the insertion-order dependence the comment above forbids,
+  // and it is reachable from the ordinary round trip (A pushes, B continues, A
+  // pulls the continuation back and splices it: both copies then carry the same
   // lastActiveAt, messageCount and head). The two copies list DIFFERENT
   // bundles, so this decides what a third machine's pull actually fetches.
   // machineId is arbitrary as a preference and that is fine — it is stable,
   // which is the property being bought here.
-  return a.machineId <= b.machineId ? a : b;
+  if (a.machineId !== b.machineId) return a.machineId < b.machineId ? a : b;
+  // ...and machineId alone was not enough, one layer down. Two copies of one
+  // thread can carry the SAME machineId: `resolveThreads` stamps them with the
+  // id an index file DECLARES (see below), while `readAllIndexes` dedupes on the
+  // id derived from the file's NAME, so two differently-named index files that
+  // both declare `"X"` land here as two copies with every key equal — and the
+  // reduce fell through to `readdirSync` order again. Measured against shipped
+  // `dist/`: a forward listing resolved to one file's bundle list and the
+  // reversed listing to the other's, deciding what `pullSourceFor` returns and
+  // therefore what a pull fetches. Needs a damaged or hostile index (our own
+  // writers always agree: `buildIndexFile` stamps `inputs.machineId` and
+  // `writeMachineIndex` derives the path from `index.machineId`), which is why
+  // this is the last key and not the first.
+  const ka = threadCopyContentKey(a);
+  const kb = threadCopyContentKey(b);
+  return ka <= kb ? a : b;
 }
 
 export function resolveThreads(indexes: HubIndexJson[]): ResolvedThread[] {
   const byThread = new Map<string, ThreadCopy[]>();
   for (const index of indexes) {
     for (const [threadId, entry] of Object.entries(index.threads)) {
-      // Spread FIRST, then the file-derived id — never the other way round.
-      // A thread entry is peer-authored data; with the id first, an entry
-      // carrying its own `machineId` key overrides the one derived from the
-      // index file's NAME, which is the only trustworthy source. That id now
+      // Spread FIRST, then the index-level id — never the other way round.
+      // A thread ENTRY is peer-authored data; with the id first, an entry
+      // carrying its own `machineId` key overrides the index's, and that id
       // selects `state.peers[...]` and feeds `alternateSource`, i.e. it decides
-      // which machine a pull fetches from.
+      // which machine a pull fetches from. One id per index file is the fact
+      // every consumer here relies on; a per-entry override is not a fact at
+      // all.
+      //
+      // WHAT `index.machineId` IS NOT: filename-derived, and therefore not
+      // validated. This comment used to say the opposite ("derived from the
+      // index file's NAME, which is the only trustworthy source"), which was
+      // wrong in the dangerous direction — it told a reader `ThreadCopy.machineId`
+      // is path-safe. `readMachineIndex` uses its `machineId` ARGUMENT only to
+      // build the path it reads and to label warnings; the `machineId` it
+      // returns is whatever the file's CONTENT declared, and it never passes
+      // `assertSafeHubId`. `whereis.ts` states this correctly and is why
+      // `createMachineNameLookup` wraps `machinePath(id)` in a try/catch;
+      // `findUnfetchableBundles` below keys by machineId for the same reason.
+      // Every `machinePath`/`bundleDir` caller that does NOT guard is passing
+      // this machine's own identity, so nothing is broken today — but anything
+      // that starts building a hub path out of a `ThreadCopy.machineId` has to
+      // validate it first, or reconcile content against filename at the read.
       const copy: ThreadCopy = { ...entry, machineId: index.machineId };
       const list = byThread.get(threadId) ?? [];
       list.push(copy);

@@ -339,6 +339,15 @@ describe("hub whereis", () => {
       expect(result.threads).toEqual([]);
       expect(result.linkCandidates).toHaveLength(1);
       expect(result.linkCandidates![0].projectId).toBe("other-proj");
+      // ...and it is NOT the push/pull refusal shape (#29). `HubUnlinkedResult`
+      // listed `"whereis"` as a producer from the day it was written and
+      // nothing ever constructed one: whereis is a read, so an unresolved
+      // identity is a normal `success: true` answer carrying the same pick
+      // list, which `commands/whereis.md` and the skill doc both promise. The
+      // member is gone from the union; this is the runtime half of that, since
+      // the test suite is not type-checked (tsconfig excludes `tests/`).
+      expect(result.success).toBe(true);
+      expect((result as { reason?: string }).reason).toBeUndefined();
     } finally {
       restore.restore();
       for (const d of [home, hub, projectDir]) rmSync(d, { recursive: true, force: true });
