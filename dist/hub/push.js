@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { bundleDir, bundleFileName } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
-import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, scanGitRemotes, readLocalProjectId, localProjectIdPath, } from "./identity.js";
+import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, scanGitRemotes, readLocalProjectId, removeLocalProjectIdIfMatches, } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { hubUnreachableRefusal, preflightHub } from "./preflight.js";
 import { HubIoTimeoutError } from "./io-timeout.js";
@@ -91,19 +91,10 @@ function listTopLevelIgnored(projectPath) {
  * of its own inside the project.
  */
 function rollbackLocalLink(projectPath, local) {
-    try {
-        const still = readLocalProjectId(projectPath);
-        if (!still)
-            return { removed: true, detail: "" };
-        if (still.projectId !== local.projectId) {
-            return { removed: false, detail: "it now names a different hub project" };
-        }
-        rmSync(localProjectIdPath(projectPath), { force: true });
-        return { removed: true, detail: "" };
-    }
-    catch (e) {
-        return { removed: false, detail: e.message };
-    }
+    // The rule itself lives in identity.ts, shared with `hub delete`'s cleanup of
+    // a link whose hub project no longer exists. Everything the doc above says is
+    // enforced there; this function is the push's name for it.
+    return removeLocalProjectIdIfMatches(projectPath, local.projectId);
 }
 /**
  * The result for a push that threw after the identity was resolved.

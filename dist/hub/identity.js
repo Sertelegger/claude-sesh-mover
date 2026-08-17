@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, rmSync, writeFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -20,6 +20,37 @@ export function readLocalProjectId(projectPath) {
     }
     catch {
         return null;
+    }
+}
+/**
+ * Remove this directory's hub link, but ONLY while it still names `projectId`.
+ *
+ * The re-read is the whole point: a link the user (or a concurrent operation)
+ * changed underneath us is not ours to remove, so the check and the unlink are
+ * as close together as they can be made. Two callers, one rule — `hub/push.ts`
+ * rolling back a link its own failed push wrote, and `hub/delete`'s cleanup
+ * after the hub project it pointed at has been destroyed. A second hand-written
+ * copy of this is how one of them ends up unlinking a directory it did not link.
+ *
+ * It removes the FILE and nothing else — never an `rmdir` of the parent, which
+ * since 0.8.0 is the user's project root (see `rollbackLocalLink`).
+ *
+ * `removed: true` with an empty `detail` also covers "there was no link", which
+ * is the requested state either way.
+ */
+export function removeLocalProjectIdIfMatches(projectPath, projectId) {
+    try {
+        const still = readLocalProjectId(projectPath);
+        if (!still)
+            return { removed: true, detail: "" };
+        if (still.projectId !== projectId) {
+            return { removed: false, detail: "it now names a different hub project" };
+        }
+        rmSync(localProjectIdPath(projectPath), { force: true });
+        return { removed: true, detail: "" };
+    }
+    catch (e) {
+        return { removed: false, detail: e.message };
     }
 }
 export function writeLocalProjectId(projectPath, id) {

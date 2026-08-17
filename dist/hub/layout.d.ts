@@ -73,6 +73,38 @@ export interface HubIndexJson {
     projectPath: string;
     threads: Record<string, HubThreadEntry>;
 }
+/**
+ * One machine's assertion that a hub project is retired — a tombstone (#43).
+ *
+ * **A FILE OF ITS OWN, NOT A FIELD ON `HubIndexJson`**, and the reason is the
+ * index's own invariant rather than tidiness: an index file is *derivable* — it
+ * is a projection of this machine's bundles plus its local sync-state, and `hub
+ * reindex` exists to rebuild one from exactly those two inputs. A retirement is
+ * an ASSERTION; nothing on the hub or on this machine can re-derive it. Put it
+ * in the index and every writer of that index (a push through `buildIndexFile`,
+ * a `hub reindex`) becomes a writer that can silently drop it. Beside the index,
+ * owned per machine on the same rule, it cannot be.
+ *
+ * Per-machine ownership holds unchanged: `tombstones/<machineId>.json` is by
+ * construction the file machine `<machineId>` owns, so asserting retirement
+ * writes nobody else's file — which is what lets two machines assert (or
+ * retract) concurrently with no distributed lock, exactly as with indexes.
+ *
+ * `retiredAt` is the ASSERTING machine's wall clock. That is safe for the one
+ * comparison this codebase makes against it (the delete grace window) because
+ * only the asserting machine may delete, so the comparison is that machine's
+ * clock against its own earlier reading — unlike `HubBundleRecord.pushedAt`,
+ * which is cross-machine and is a diagnostic only.
+ */
+export interface HubTombstoneJson {
+    schemaVersion: 1;
+    projectId: string;
+    machineId: string;
+    /** ISO 8601, the asserting machine's clock. */
+    retiredAt: string;
+    /** Free text from `hub retire --reason`, or null. Never interpreted. */
+    reason: string | null;
+}
 export declare function assertSafeHubId(id: unknown, what: string): asserts id is string;
 export declare function assertHubRelPath(relPath: string): void;
 export declare const HUB_JSON = "hub.json";
@@ -81,6 +113,8 @@ export declare function projectDir(projectId: string): string;
 export declare function projectJsonPath(projectId: string): string;
 export declare function indexDirPath(projectId: string): string;
 export declare function indexPath(projectId: string, machineId: string): string;
+export declare function tombstoneDirPath(projectId: string): string;
+export declare function tombstonePath(projectId: string, machineId: string): string;
 export declare function bundleDir(projectId: string, machineId: string): string;
 export declare function bundleFileName(pushedAtIso: string, bundleId: string): string;
 //# sourceMappingURL=layout.d.ts.map

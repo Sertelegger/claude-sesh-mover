@@ -11,7 +11,7 @@ import { bundleDir, bundleFileName, type HubBundleRecord, type HubJson } from ".
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import {
   resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId,
-  scanGitRemotes, readLocalProjectId, localProjectIdPath,
+  scanGitRemotes, readLocalProjectId, removeLocalProjectIdIfMatches,
   type GitRemoteScan, type LocalProjectId,
 } from "./identity.js";
 import { registerMachine } from "./init.js";
@@ -205,17 +205,10 @@ function rollbackLocalLink(
   projectPath: string,
   local: LocalProjectId
 ): { removed: boolean; detail: string } {
-  try {
-    const still = readLocalProjectId(projectPath);
-    if (!still) return { removed: true, detail: "" };
-    if (still.projectId !== local.projectId) {
-      return { removed: false, detail: "it now names a different hub project" };
-    }
-    rmSync(localProjectIdPath(projectPath), { force: true });
-    return { removed: true, detail: "" };
-  } catch (e) {
-    return { removed: false, detail: (e as Error).message };
-  }
+  // The rule itself lives in identity.ts, shared with `hub delete`'s cleanup of
+  // a link whose hub project no longer exists. Everything the doc above says is
+  // enforced there; this function is the push's name for it.
+  return removeLocalProjectIdIfMatches(projectPath, local.projectId);
 }
 
 /**

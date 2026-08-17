@@ -1157,7 +1157,7 @@ export interface HubNoSuchProjectResult {
  */
 export interface HubUnreachableResult {
   success: false;
-  command: "push" | "pull" | "hub-reindex";
+  command: "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete";
   reason: "hub-unreachable";
   /**
    * Which of the two shapes it is — an enum rather than prose, because the
@@ -1186,7 +1186,7 @@ export interface HubUnreachableResult {
 
 export interface HubLockBusyResult {
   success: false;
-  command: "push" | "pull" | "hub-unlink" | "hub-reindex";
+  command: "push" | "pull" | "hub-unlink" | "hub-reindex" | "hub-retire" | "hub-delete";
   reason: "lock-busy";
   holderPid: number | null;
   ageSeconds: number | null;
@@ -1617,6 +1617,132 @@ export interface HubUnlinkResult {
   warnings: string[];
 }
 
+/**
+ * A pull refused because the project it targets is RETIRED — some machine has
+ * written a tombstone for it on the hub (#43).
+ *
+ * A refusal in the strict sense: nothing was fetched, nothing local changed, and
+ * the project's bundles are all still on the hub. It is emitted from the pull's
+ * resolve stage, before the machine registration and before any link write, so
+ * "nothing happened" is literal.
+ *
+ * **The fields exist so the skill layer never has to read the prose**, and the
+ * one that decides which advice is even possible is `retiredByThisMachine`:
+ * retraction is asymmetric — only the machine that wrote a tombstone can remove
+ * it — so "un-retire it" is actionable for exactly one of the two audiences.
+ * `deleteEligibleAt` is the other load-bearing one: it is the moment from which
+ * the retiring machine's `hub delete` stops refusing, i.e. the deadline for
+ * getting anything off the hub with `pull --ignore-retirement`.
+ */
+export interface HubProjectRetiredResult {
+  success: false;
+  command: "pull";
+  reason: "project-retired";
+  projectId: string;
+  retiredByMachineId: string;
+  /** null when the hub has no readable `machines/<id>.json` record. */
+  retiredByMachineName: string | null;
+  retiredByThisMachine: boolean;
+  retiredAt: string;
+  /** The free text `hub retire --reason` recorded, or null. Never interpreted. */
+  retirementReason: string | null;
+  /** null when `retiredAt` could not be read as a time — an unknown age. */
+  deleteEligibleAt: string | null;
+  suggestion: string;
+}
+
+/**
+ * `hub retire` succeeded: this machine's tombstone for the project was written
+ * (or, with `--undo`, removed).
+ *
+ * Phase 1 of retirement, and the result says what phase 1 is NOT: nothing was
+ * deleted, every bundle is where it was, and this is reversible from this
+ * machine. `deleteEligibleAt` is when phase 2 becomes possible.
+ */
+export interface HubRetireResult {
+  success: true;
+  command: "hub-retire";
+  projectId: string;
+  /** false = `--undo`: the assertion was withdrawn. */
+  retired: boolean;
+  /** Was there already a tombstone from this machine? Makes both verbs idempotent. */
+  wasRetired: boolean;
+  /**
+   * The assertion's timestamp — the ORIGINAL one when this run re-asserted an
+   * existing tombstone, since re-running `hub retire` must not silently restart
+   * the grace clock. null on `--undo`.
+   */
+  retiredAt: string | null;
+  /** null on `--undo`, and when `retiredAt` cannot be read as a time. */
+  deleteEligibleAt: string | null;
+  reason: string | null;
+  warnings: string[];
+}
+
+/**
+ * `hub delete` succeeded: phase 2, the project's files are gone from the hub.
+ *
+ * The one irreversible result this CLI can produce, and the only caller of
+ * `HubBackend.delete` anywhere in `src/`.
+ */
+export interface HubDeleteResult {
+  success: true;
+  command: "hub-delete";
+  projectId: string;
+  /** Files removed under `projects/<projectId>/`. */
+  deletedFiles: number;
+  /**
+   * Files the backend refused to remove, with the reason. A non-empty list still
+   * comes back `success: true` — the project is no longer linkable either way
+   * (its `project.json` is deleted first) — but the leftovers are named, because
+   * nothing else will ever mention them again.
+   */
+  failed: Array<{ path: string; error: string }>;
+  /** Was this directory's `.sesh-mover-project.json` removed too? */
+  localLinkRemoved: boolean;
+  warnings: string[];
+}
+
+/**
+ * `hub retire` / `hub delete` refused. Typed reasons rather than prose, on the
+ * rule `skills/session-porter/SKILL.md` states: a caller may branch on `reason`
+ * and never on message text.
+ *
+ * - `unlinked` — this directory is linked to no hub project and no `--project-id`
+ *   was passed, so there is nothing named to retire.
+ * - `project-gone` — the hub has no `projects/<id>/project.json`. Already
+ *   deleted, or a link to a hub this directory has never reached.
+ * - `not-owner` — this machine did not create the project. Both phases are
+ *   owner-only; see `src/hub/retire.ts` for why the "any machine may retire an
+ *   EMPTY project" escape hatch from the slice-3 design did not survive being
+ *   chained to a deletion.
+ * - `not-retired` — `hub delete` with no tombstone from this machine. Phase 2
+ *   cannot be reached without phase 1, ever: the tombstone is not a formality,
+ *   it is what starts the clock the delete is waiting on.
+ * - `grace-period` — the tombstone exists and is younger than
+ *   `RETIREMENT_GRACE_MS`. **Class 2 (refusal), not class 3
+ *   (environment-not-ready)**, and the distinction is real: class 3 means "retry
+ *   this unchanged in a moment", and this one is measured in days. The command
+ *   was understood and declined.
+ */
+export interface HubRetireFailedResult {
+  success: false;
+  command: "hub-retire" | "hub-delete";
+  reason: "unlinked" | "project-gone" | "not-owner" | "not-retired" | "grace-period";
+  /** Present once an id is known — absent for `unlinked`. */
+  projectId?: string;
+  /** `not-owner`: who may retire and delete this project. */
+  ownerMachineId?: string;
+  ownerMachineName?: string | null;
+  /** `grace-period`: the assertion this delete is waiting on. */
+  retiredAt?: string;
+  deleteEligibleAt?: string | null;
+  /** `grace-period`: whole seconds still to wait, null when `retiredAt` is unreadable. */
+  remainingSeconds?: number | null;
+  error: string;
+  suggestion: string;
+}
+
 export type CliResult =
   | ExportResult
   | ImportResult
@@ -1634,6 +1760,10 @@ export type CliResult =
   | HubUnreachableResult
   | HubUnlinkResult
   | HubLockBusyResult
+  | HubProjectRetiredResult
+  | HubRetireResult
+  | HubDeleteResult
+  | HubRetireFailedResult
   | HubPullResult
   | HubPullListResult
   | NotYetSyncedResult
@@ -1723,6 +1853,19 @@ const REASON_EXIT_CODE: Record<CliResultReason, ExitCode> = {
   // Refusals: the command was understood, and declined.
   unlinked: EXIT_REFUSED,
   "no-such-project": EXIT_REFUSED,
+  // Retirement (#43), all four of them refusals rather than failures: each is a
+  // command that ran, decided, and changed nothing.
+  //
+  // `grace-period` is the one worth arguing about, because "wait and try again"
+  // sounds like class 3. It is not: class 3 is the set worth retrying UNCHANGED
+  // IN A MOMENT (an unmounted share, a busy lock), and this one is a deliberate
+  // multi-day hold whose whole purpose is that nobody retries it in a moment.
+  // Class 3 would also invite a caller to loop on it.
+  "project-retired": EXIT_REFUSED,
+  "project-gone": EXIT_REFUSED,
+  "not-owner": EXIT_REFUSED,
+  "not-retired": EXIT_REFUSED,
+  "grace-period": EXIT_REFUSED,
   // Environment-not-ready: same invocation, retry once the machine catches up.
   "hub-unreachable": EXIT_NOT_READY,
   "lock-busy": EXIT_NOT_READY,

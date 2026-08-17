@@ -701,6 +701,71 @@ hub
         outputError("hub-unlink", e);
     }
 });
+// --- Retirement (#43): two verbs, deliberately ---
+//
+// `hub retire` writes an assertion this machine can withdraw; `hub delete`
+// destroys every machine's copy of a project. They are separate commands rather
+// than one command with a `--delete` flag because that is the difference the
+// grace window exists to protect, and a flag puts the irreversible half one
+// keystroke from the reversible one. See src/hub/retire.ts.
+hub
+    .command("retire")
+    .description("Retire this project from the hub — refuses new pulls of it, deletes nothing")
+    .option("--project-path <path>", "Override project path (default: cwd)")
+    .option("--project-id <id>", "Retire a hub project by id (for a project this directory is not linked to)")
+    .option("--reason <text>", "Free text recorded on the tombstone and shown to every machine")
+    .option("--undo", "Withdraw this machine's retirement assertion")
+    .option("--source-config-dir <path>", "Override Claude config dir")
+    .action(async (opts) => {
+    try {
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
+        const projectPath = opts.projectPath ?? process.cwd();
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { resolveHubPath } = await import("./hub/init.js");
+        const hubPath = resolveHubPath(config);
+        if (!hubPath) {
+            outputError("hub-retire", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+            return;
+        }
+        const { hubRetire } = await import("./hub/retire.js");
+        output(await hubRetire({
+            projectPath, hubPath,
+            projectIdOverride: opts.projectId,
+            reason: opts.reason,
+            undo: !!opts.undo,
+        }));
+    }
+    catch (e) {
+        outputError("hub-retire", e);
+    }
+});
+hub
+    .command("delete")
+    .description("Permanently delete a RETIRED hub project's files — owner machine only, after the grace window")
+    .option("--project-path <path>", "Override project path (default: cwd)")
+    .option("--project-id <id>", "Delete a hub project by id (for a project this directory is not linked to)")
+    .option("--source-config-dir <path>", "Override Claude config dir")
+    .action(async (opts) => {
+    try {
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
+        const projectPath = opts.projectPath ?? process.cwd();
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { resolveHubPath } = await import("./hub/init.js");
+        const hubPath = resolveHubPath(config);
+        if (!hubPath) {
+            outputError("hub-delete", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+            return;
+        }
+        const { hubDelete } = await import("./hub/retire.js");
+        output(await hubDelete({
+            projectPath, hubPath,
+            projectIdOverride: opts.projectId,
+        }));
+    }
+    catch (e) {
+        outputError("hub-delete", e);
+    }
+});
 hub
     .command("reindex")
     .description("Rebuild this machine's hub index for the current project from its own bundles")
@@ -976,6 +1041,7 @@ program
     .option("--force-append", "Append a pulled continuation even if the local session looks recently active")
     .option("--no-append", "Never append; import continuations as separate sessions")
     .option("--on-divergence <mode>", "When a thread was extended on both machines: fragment | adopt-hub | skip")
+    .option("--ignore-retirement", "Pull even though the project has been retired on the hub (its bundles may be deleted soon)")
     .option("--source-config-dir <path>", "Override Claude config dir")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
@@ -1007,6 +1073,7 @@ program
             forceAppend: !!opts.forceAppend,
             noAppend: opts.append === false || !config.hub.pullAppend,
             onDivergence,
+            ignoreRetirement: !!opts.ignoreRetirement,
             claudeVersion: getClaudeVersion(),
             onProgress,
         }));

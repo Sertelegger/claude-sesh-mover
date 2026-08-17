@@ -41,6 +41,13 @@ export function indexPath(projectId, machineId) {
     assertSafeHubId(machineId, "machineId");
     return `${indexDirPath(projectId)}/${machineId}.json`;
 }
+export function tombstoneDirPath(projectId) {
+    return `${projectDir(projectId)}/tombstones`;
+}
+export function tombstonePath(projectId, machineId) {
+    assertSafeHubId(machineId, "machineId");
+    return `${tombstoneDirPath(projectId)}/${machineId}.json`;
+}
 export function bundleDir(projectId, machineId) {
     assertSafeHubId(machineId, "machineId");
     return `${projectDir(projectId)}/bundles/${machineId}`;

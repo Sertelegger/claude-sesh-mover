@@ -18,6 +18,8 @@ Claude Code sessions are JSONL files keyed to an absolute path on the machine th
 | `/sesh-mover:pull` | Bring a project's thread down from the hub onto this machine. |
 | `/sesh-mover:whereis` | Read-only: which machines have which sessions for this project, and which is latest. |
 | `/sesh-mover:hub-unlink` | Unlink this directory from the hub: removes its `.sesh-mover-project.json` and nothing else, which disarms the automation here. Writes nothing to the hub. |
+| `/sesh-mover:hub-retire` | Retire a project from the hub: writes this machine's tombstone, which makes every machine refuse to pull it. Deletes nothing, and `--undo` takes it back. |
+| `/sesh-mover:hub-delete` | Delete a retired project's files from the hub, permanently. Only the machine that created it, and only 48h after retiring it. |
 
 The hub also runs itself once a project is linked: a session-end auto-push and a session-start "newer work elsewhere" notice — see [Automation](#automation) for what they do, how to turn them off, and how to unlink a directory entirely. Where this is heading beyond that — assembling a thread whose history is split across three machines, encryption at rest, a web service — and later other agentic CLIs, is tracked in [ROADMAP.md](./ROADMAP.md). Release history: [CHANGELOG.md](./CHANGELOG.md).
 
@@ -134,6 +136,17 @@ sesh-mover hub unlink [--project-path <dir>]      # or /sesh-mover:hub-unlink
 ```
 
 Because the link *is* the consent gate, removing `<project>/.sesh-mover-project.json` makes both hooks inert for that directory — and that file is all `hub unlink` removes. It writes nothing to the hub (it doesn't even open it), so sessions already pushed stay there and no other machine is affected, and it deliberately does **not** require a configured or reachable hub: this is the disarm path for automation that is on by default, so an unmounted share or a `hub.path` you have since removed must not be able to block it. It is idempotent (an unlinked directory reports `wasLinked: false` and succeeds), it takes the same per-project lock push and pull take (`--force` skips that, at the price of a still-running push re-creating the link when it finishes), and it keeps this machine's sync bookkeeping on purpose — the result hands you back the `projectId`, so `sesh-mover push --project-id <id>` re-links to the same hub project and carries on rather than re-uploading everything. Deleting that one root dotfile by hand does the same thing; the command adds the lock, the disclosure and the id.
+
+**Retiring a project is the hub-side counterpart, and it is deliberately two steps:**
+
+```bash
+sesh-mover hub retire [--reason "<why>"]          # or /sesh-mover:hub-retire
+sesh-mover hub delete                             # 48h later — or /sesh-mover:hub-delete
+```
+
+`hub retire` writes one small file — `projects/<id>/tombstones/<machineId>.json`, this machine's own, so no machine ever writes another's — and **removes nothing**. Its effect is that a `pull` of that project is refused, with a message naming who retired it, why, and what the reader can still do; `hub retire --undo` withdraws it, from the asserting machine only. `hub delete` is the irreversible half: it removes every file of the project from the hub, and it refuses unless this machine created the project *and* its tombstone is more than 48 hours old.
+
+That wait is the point of the design rather than caution for its own sake. A tombstone is a **new-start gate**: it cannot interrupt a pull that is already running, and on a synced hub it cannot fire on a machine the file has not reached yet — a laptop closed for the weekend learns nothing until it opens. So the safety comes from the two phases *plus* enough time for the assertion to propagate, and the constant errs long on purpose: too short, and a machine that never saw the retirement pulls bundles that are being deleted underneath it. If you need work off the hub before that deadline, `sesh-mover pull --ignore-retirement` fetches it anyway. Retirement does not block pushes — a machine still linked keeps uploading, including through the session-end auto-push — so `hub unlink` on each machine is what actually stops that.
 
 ### Storage
 
