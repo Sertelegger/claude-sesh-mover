@@ -3,11 +3,14 @@ import {
   mkdtempSync,
   rmSync,
   existsSync,
+  lstatSync,
   readFileSync,
+  readdirSync,
   mkdirSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
@@ -519,6 +522,229 @@ describe("importer", () => {
       expect(existsSync(join(targetConfigDir, "plans", "test-plan.md"))).toBe(true);
       expect(result.memoryConflicts).toBeUndefined();
       expect(result.planConflicts).toBeUndefined();
+    });
+
+    // --- #64: a destination is claimed by an EXCLUSIVE write, never by a
+    // check standing in front of one ---
+    //
+    // `existsSync` follows symlinks, so a DANGLING symlink at a destination
+    // answers "absent" and the `copyFileSync` behind it wrote THROUGH the
+    // link, landing wherever it pointed — outside the memory or plans
+    // directory entirely. `O_CREAT|O_EXCL` refuses a symlink path outright,
+    // which is why the fix is the exclusive write and not an `lstatSync` in
+    // front of the same call.
+    //
+    // Every test here plants exactly that link and asserts the escape hatch
+    // stayed empty. Each one FAILS against the pre-#64 code — a symlink test
+    // that passes against the broken version asserts nothing.
+    //
+    // #64 spelled that exclusive write `copyFileSync(..., COPYFILE_EXCL)`,
+    // which is `O_CREAT|O_EXCL` on POSIX and `CopyFileW(…, bFailIfExists)` on
+    // Windows — where it resolves a reparse point and asks about the LINK'S
+    // TARGET. These tests are the ones that caught it: green on Linux and
+    // macOS, and on `windows-latest` the bundle's file was sitting in the
+    // escape directory. They stay unguarded by platform for exactly that
+    // reason (#68), and they are the ONLY place the Windows half of the guard
+    // is observable — on POSIX the exclusive create covers it either way.
+    const escapeDir = () => join(tempDir, "escape-hatch");
+    /** Plant a symlink at `dst` pointing at a path that does not exist. */
+    const plantDanglingSymlink = (dst: string): void => {
+      mkdirSync(escapeDir(), { recursive: true });
+      mkdirSync(dirname(dst), { recursive: true });
+      symlinkSync(join(escapeDir(), `${basename(dst)}.escaped`), dst);
+    };
+    /** Nothing was written through the link, and the link itself is untouched. */
+    const expectNothingEscaped = (link: string) => {
+      expect(readdirSync(escapeDir())).toEqual([]);
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    };
+
+    // #68: the contract the four tests below rest on, asserted directly and on
+    // EVERY platform, so a failure says which half broke — the write primitive,
+    // or the reconcile logic sitting on top of it. It is `copyToNewFile` and
+    // not `copyFileSync(..., COPYFILE_EXCL)` because those two are the same
+    // call on POSIX and are NOT the same call on Windows, where the copy
+    // resolves a reparse point at the destination and asks its "already
+    // exists?" question about the link's target. On POSIX this passes on the
+    // exclusive create alone; on Windows it is the explicit `lstat` refusal
+    // inside `copyToNewFile` that has to hold it up.
+    it("refuses a symlink destination instead of following it, live or dangling", async () => {
+      const { copyToNewFile } = await import("../src/sidecar.js");
+      const dir = join(tempDir, "exclusive-create-contract");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "src"), "SRC\n");
+      writeFileSync(join(dir, "victim"), "VICTIM\n");
+      symlinkSync(join(dir, "victim"), join(dir, "live"));
+      symlinkSync(join(dir, "nothere"), join(dir, "dangling"));
+
+      for (const link of ["live", "dangling"]) {
+        expect(() => copyToNewFile(join(dir, "src"), join(dir, link))).toThrow(
+          expect.objectContaining({ code: "EEXIST" })
+        );
+      }
+      expect(readFileSync(join(dir, "victim"), "utf-8")).toBe("VICTIM\n");
+      expect(existsSync(join(dir, "nothere"))).toBe(false);
+      // A free name still works, and the bytes are the source's.
+      copyToNewFile(join(dir, "src"), join(dir, "free"));
+      expect(readFileSync(join(dir, "free"), "utf-8")).toBe("SRC\n");
+    });
+
+    it("does not write the bundle's index through a dangling symlink at MEMORY.md", async () => {
+      const link = join(targetMemDir(), "MEMORY.md");
+      plantDanglingSymlink(link);
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      expectNothingEscaped(link);
+      // The layer degrades rather than aborting: the prose memory still lands,
+      // the index is reported unreadable rather than replaced, and the session
+      // import is untouched by any of it.
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+      expect(
+        result.warnings.some((w) => w.includes("Could not read the existing memory index"))
+      ).toBe(true);
+      expect(result.importedSessions).toHaveLength(1);
+    });
+
+    it("does not write a bundle memory through a dangling symlink at its name", async () => {
+      const link = join(targetMemDir(), "test_memory.md");
+      plantDanglingSymlink(link);
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      expectNothingEscaped(link);
+      // EEXIST fell through to the compare branch, which cannot read the link
+      // and so keeps local — and did not abort the layer: the index landed.
+      expect(
+        result.warnings.some((w) =>
+          w.includes('Memory file "test_memory.md" could not be compared')
+        )
+      ).toBe(true);
+      expect(existsSync(join(targetMemDir(), "MEMORY.md"))).toBe(true);
+    });
+
+    it("does not write a bundle plan through a dangling symlink at its name", async () => {
+      const plansDir = join(targetConfigDir, "plans");
+      const link = join(plansDir, "test-plan.md");
+      plantDanglingSymlink(link);
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // `plans/` is config-dir-GLOBAL, so a link planted here is reachable
+      // from every project on the machine, not just this one.
+      expectNothingEscaped(link);
+      expect(readdirSync(plansDir)).toEqual(["test-plan.md"]);
+      expect(result.importedSessions).toHaveLength(1);
+    });
+
+    it("does not write the merged index through a dangling symlink when the bundle carries none", async () => {
+      // The index has a SECOND write site — the one that appends a pointer to
+      // a parked copy — and it is reachable with no index anywhere: not in the
+      // bundle (removed from the exported directory, which nothing verifies —
+      // see step 3b) and not locally, where the name is a dangling symlink.
+      const from = await exportWithMemory({}, "no-index-export");
+      rmSync(join(from, "memory", "MEMORY.md"), { force: true });
+
+      seedMemory("test_memory.md", "mine, and staying mine\n");
+      const link = join(targetMemDir(), "MEMORY.md");
+      plantDanglingSymlink(link);
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryConflicts" in result)) return;
+
+      expectNothingEscaped(link);
+      // Parking is unaffected — it writes a name of its own, exclusively.
+      expect(result.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming.md");
+      expect(readMemory("test_memory.md")).toBe("mine, and staying mine\n");
+      expect(readMemory("test_memory.incoming.md")).toContain("Use vitest for testing.");
+    });
+
+    // #68. The three sites above are not the only exclusive write in this step:
+    // parking goes through `sidecar.ts`'s `copyToUniqueName`, whose suffix loop
+    // uses EEXIST as its "try the next name" signal — so the SAME hazard lives
+    // there, and a link at the parked name would be written through rather than
+    // stepped over. This is also the one test that covers `copyToUniqueName` on
+    // every platform: `hub-merge.test.ts`'s sidecar symlink tests are
+    // `skipIf(isWindows)`, so the shared helper's other caller cannot see it.
+    it("does not park an incoming memory through a dangling symlink at the parked name", async () => {
+      seedMemory("test_memory.md", "mine, not theirs\n");
+      const link = join(targetMemDir(), "test_memory.incoming.md");
+      plantDanglingSymlink(link);
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryConflicts" in result)) return;
+
+      expectNothingEscaped(link);
+      // The occupied name was stepped over, not written through: the parked
+      // copy took the next name and the local file is still the local file.
+      expect(result.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming-2.md");
+      expect(readMemory("test_memory.incoming-2.md")).toContain("Use vitest for testing.");
+      expect(readMemory("test_memory.md")).toBe("mine, not theirs\n");
+      expect(readMemory("MEMORY.md")).toContain("(test_memory.incoming-2.md)");
+    });
+
+    it("treats EEXIST as an answer, not a failure: real files still compare, park and report", async () => {
+      // No symlink here. The point is the control flow: after #64 the
+      // exclusive write is the ONLY thing that decides a destination is taken,
+      // so every ordinary collision reaches the compare branch via EEXIST.
+      // Swallowing it, or letting it abort the layer, shows up here as a
+      // skipped union, an unparked memory, or a missing plan conflict.
+      seedMemory("MEMORY.md", "# Memory Index\n\n- [Local note](local-note.md) — mine\n");
+      seedMemory("test_memory.md", "mine, not theirs\n");
+      const plansDir = join(targetConfigDir, "plans");
+      mkdirSync(plansDir, { recursive: true });
+      writeFileSync(join(plansDir, "test-plan.md"), "# My own plan\n");
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryConflicts" in result)) return;
+
+      // Index: unioned, local line verbatim and still first.
+      const index = readMemory("MEMORY.md");
+      expect(index.startsWith("# Memory Index\n\n- [Local note](local-note.md) — mine\n")).toBe(
+        true
+      );
+      expect(index).toContain("(test_memory.md)");
+      expect(index).toContain("(test_memory.incoming.md)");
+      // Prose memory: local bytes untouched, incoming parked beside it.
+      expect(readMemory("test_memory.md")).toBe("mine, not theirs\n");
+      expect(result.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming.md");
+      expect(readMemory("test_memory.incoming.md")).toContain("Use vitest for testing.");
+      // Plan: local bytes untouched, conflict reported, nothing parked.
+      expect(readFileSync(join(plansDir, "test-plan.md"), "utf-8")).toBe("# My own plan\n");
+      expect(result.planConflicts?.[0].filename).toBe("test-plan.md");
+      expect(readdirSync(plansDir)).toEqual(["test-plan.md"]);
+    });
+
+    it("skips a symlinked memory in a directory-form bundle instead of reading through it", async () => {
+      // Source side, same class: a directory export is handed to the importer
+      // as-is (only `archiver.ts` rejects symlink entries, and only at
+      // extraction), so a memory file can be a link to anything on this
+      // machine. `statSync().isFile()` would have copied its CONTENT into the
+      // target's memory folder under an innocuous name.
+      const secret = join(tempDir, "secret.md");
+      writeFileSync(secret, "TOP_SECRET_MARKER\n");
+      const from = await exportWithMemory({}, "symlink-memory-export");
+      symlinkSync(secret, join(from, "memory", "borrowed.md"));
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      expect(existsSync(join(targetMemDir(), "borrowed.md"))).toBe(false);
+      expect(
+        result.warnings.some((w) => w.includes('Ignored "borrowed.md"'))
+      ).toBe(true);
+      // The real memories in the same bundle still arrive.
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
     });
 
     it("refuses a bundle whose manifest sessionId escapes the bundle (no file read outside)", async () => {

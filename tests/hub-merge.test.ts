@@ -293,8 +293,8 @@ describe("mergeWorkspaceTrees — per-file resolution", () => {
   // most once, so the uniquification branch can only fire against a sidecar
   // left by an earlier run carrying the same stamp — and the stamp has
   // millisecond precision. Written as "run two merges and assert the names
-  // differ", this test passed 8 runs in 10 with COPYFILE_EXCL deleted, because
-  // the names differed by clock rather than by the guard.
+  // differ", this test passed 8 runs in 10 with the exclusive create deleted,
+  // because the names differed by clock rather than by the guard.
   it("never overwrites an existing sidecar, it uniquifies the name", async () => {
     const { root, a, i, t } = trees();
     const stamp = "2026-01-02T03-04-05-678Z";
@@ -874,10 +874,20 @@ describe("mergeWorkspaceTrees — hostile and degenerate trees", () => {
     }
   });
 
-  // The platform contract the temp write's COPYFILE_EXCL rests on. Once the
+  // The POSIX half of the platform contract the temp write rests on. Once the
   // temp name carries random bytes no test can plant a symlink on it, so pin
   // the assumption itself: EXCL must REFUSE a symlink destination rather than
   // follow it, live or dangling. A plain copy follows it and escapes.
+  //
+  // It keeps testing `copyFileSync`'s flag rather than the `copyToNewFile` the
+  // temp write now uses (#68), and both halves of that are deliberate: this is
+  // where the equivalence "COPYFILE_EXCL === O_CREAT|O_EXCL" is true, and it is
+  // ONLY true here — on Windows the copy resolves a reparse point at the
+  // destination and wrote through it (measured), which is what `copyToNewFile`
+  // now carries an explicit `lstat` refusal for. This file's symlink tests are
+  // `skipIf(isWindows)`, so the cross-platform contract test for the primitive
+  // itself lives in `importer.test.ts` — that is the one that can fail on the
+  // platform the guard exists for.
   it.skipIf(isWindows)("COPYFILE_EXCL refuses a symlink destination instead of following it", () => {
     const dir = tmp("sesh-merge-");
     try {

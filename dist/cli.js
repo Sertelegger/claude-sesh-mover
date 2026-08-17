@@ -742,6 +742,11 @@ hub
             hubPath: gate.hubPath,
             noWorkspace: config.hub.noWorkspace,
             noCarry: !config.hub.carryDiff,
+            // ...and `export.noSummary`, for the same reason and out of the same
+            // effective config: a bundle manifest's summary is conversation text
+            // unless this is set, and THIS is the push that uploads it unattended
+            // with no channel to say what it sent.
+            noSummary: config.export.noSummary,
             budgets: resolveHubBudgets(config),
             // Nothing this push produces is read by a human: stdout is closed to it
             // and stderr only carries failures. `quiet` keeps it from computing the
@@ -880,6 +885,9 @@ program
             // matters most is the unattended SessionEnd one, which takes no flags
             // at all. Config is the lever that actually works in both cases.
             budgets: resolveHubBudgets(config),
+            // Config-only, deliberately — see HubPushOptions.noSummary for why
+            // `push` grows no `--no-summary` flag to go with it.
+            noSummary: config.export.noSummary,
             projectIdOverride: opts.projectId,
             createProject: !!opts.createProject,
             claudeVersion: getClaudeVersion(),

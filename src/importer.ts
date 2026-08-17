@@ -5,6 +5,7 @@ import {
   existsSync,
   copyFileSync,
   appendFileSync,
+  lstatSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -36,7 +37,7 @@ import {
   memoryIndexTargets,
   unionMemoryIndex,
 } from "./memory-index.js";
-import { MAX_SIDECAR_ATTEMPTS, copyToUniqueName } from "./sidecar.js";
+import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "./sidecar.js";
 import type {
   AuxiliaryConflict,
   ImportResult,
@@ -108,11 +109,88 @@ function readTextFile(path: string): string | null {
   }
 }
 
+/**
+ * `lstatSync`, never `statSync`: a symlink is not a regular file even when it
+ * points at one. Every caller is SOURCE-side (a file in the bundle), and a
+ * DIRECTORY-form bundle is the case this closes — `archiver.ts` rejects
+ * symlink entries before an archive is ever extracted, but a directory export
+ * is handed to us as-is, so `memory/notes.md` can be a link to anything on this
+ * machine and `statSync().isFile()` would read straight through it into the
+ * target's memory folder. Destination side, the same class is closed by
+ * `copyIfAbsent`.
+ */
 function isRegularFile(path: string): boolean {
   try {
-    return statSync(path).isFile();
+    return lstatSync(path).isFile();
   } catch {
     return false;
+  }
+}
+
+/**
+ * Is `path` occupied by ANYTHING — a file, a directory, or a symlink whose
+ * target does not exist? `lstatSync`, so a dangling symlink answers `true`,
+ * which is the answer `copyIfAbsent`'s `O_EXCL` gives the real run.
+ *
+ * Only plan mode needs this. A real run's answer to "is this destination
+ * taken" is the exclusive write itself; a preview writes nothing, so it has to
+ * ask, and asking with `existsSync` is what would make the plan disagree with
+ * the run about a link.
+ */
+function pathIsTaken(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Copy `src` to `dst` **only if `dst` can be created**, and answer whether it
+ * was. The create is exclusive (`O_CREAT|O_EXCL`), so the check and the write
+ * are one atomic step, and `false` (EEXIST) is an ANSWER the caller falls
+ * through on — never swallowed, never a failure, never an abort of the layer.
+ *
+ * It replaces an `existsSync(dst)` + plain `copyFileSync` pair at all three of
+ * this module's shared-layer destinations, for a reason bigger than the TOCTOU
+ * window: **`existsSync` follows symlinks.** A DANGLING symlink at `dst`
+ * resolves to nothing, so `existsSync` answers "absent" and the copy then
+ * writes THROUGH the link, landing wherever it points and outside the memory
+ * or plans directory entirely. `O_EXCL` refuses a symlink path outright,
+ * dangling or not — which is why the fix is the exclusive create rather than an
+ * `lstatSync` bolted in front of the same call, and why that create has to be
+ * the thing that decides, not a second opinion after a check already decided.
+ *
+ * That sentence is a POSIX sentence, and #68 is where it stopped being the
+ * whole story: `COPYFILE_EXCL` is `O_CREAT|O_EXCL` on POSIX and `CopyFileW`
+ * with `bFailIfExists` on Windows, which resolves a reparse point and so asks
+ * its question about the LINK'S TARGET — measured on `windows-latest`, where
+ * the bundle's file landed in the escape directory while Linux and macOS
+ * refused it. The write here now goes through `sidecar.ts`'s `copyToNewFile`,
+ * which layers an explicit `lstat` refusal over the exclusive create precisely
+ * because the exclusive create is only known to refuse a link on POSIX. Read
+ * that function before changing any of this: the three guards, and which of
+ * them is load-bearing on which platform, are argued there.
+ *
+ * Same rule and same reason as `sidecar.ts`'s `copyToUniqueName`, but
+ * deliberately NOT that helper: these three sites write the CANONICAL name.
+ * A `MEMORY-2.md`, a `notes-2.md` or a `test-plan-2.md` is not a fallback, it
+ * is clutter no reader is pointed at — parking is only safe for a prose memory
+ * because tier 1 indexes the parked copy, and that mechanism exists for
+ * nothing else here. So the answer to "taken" is the compare branch below, not
+ * a second name.
+ *
+ * Any other error still throws, exactly as the plain copy did: the layer's
+ * enclosing catch turns it into "nothing in your memory folder was changed".
+ */
+function copyIfAbsent(src: string, dst: string): boolean {
+  try {
+    copyToNewFile(src, dst);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw e;
   }
 }
 
@@ -186,21 +264,40 @@ function reconcileSharedLayers(opts: {
       const files = readdirSync(memoryDir).sort();
 
       // The local index, and whether we may write it at all. An index that
-      // exists but cannot be read (a directory in its place, a permission
-      // problem) is left alone: overwriting it would be the destructive move
-      // this whole step exists to avoid.
+      // exists but cannot be read (a directory in its place, a DANGLING
+      // SYMLINK, a permission problem) is left alone: overwriting it would be
+      // the destructive move this whole step exists to avoid.
       let indexText: string | null = null;
       let indexUsable = true;
-      const indexExists = existsSync(indexPath);
-      if (indexExists) {
+      /**
+       * A real file we have either read or created is at `indexPath`. Gates the
+       * final write's flag: `w` truncates whatever the name resolves to, which
+       * is only ours to do for a file we know we have in hand.
+       */
+      let indexOnDisk = false;
+      let indexReadAttempted = false;
+      /**
+       * Read the local index at most once. Called eagerly when something is
+       * already at the path, and again by the tier-1 fall-through when the
+       * exclusive copy answered EEXIST — the second call is a no-op, so the
+       * fall-through cannot re-warn or re-read.
+       */
+      const readLocalIndex = (): void => {
+        if (indexReadAttempted) return;
+        indexReadAttempted = true;
         indexText = readTextFile(indexPath);
         if (indexText === null) {
           indexUsable = false;
           warnings.push(
             `Could not read the existing memory index (${MEMORY_INDEX_NAME}) — left it untouched, so memories from this bundle may not be listed in it.`
           );
+        } else {
+          indexOnDisk = true;
         }
-      }
+      };
+      // `pathIsTaken`, not `existsSync`: a dangling symlink here has to count
+      // as an index we must not write, and `existsSync` reports it as absent.
+      if (pathIsTaken(indexPath)) readLocalIndex();
       let indexChanged = false;
       const added: string[] = [];
       let alreadyPresent = 0;
@@ -220,35 +317,49 @@ function reconcileSharedLayers(opts: {
           warnings.push(
             `Could not read "${MEMORY_INDEX_NAME}" from the bundle — the memory index was left as it is.`
           );
-        } else if (!indexExists) {
-          // Copied rather than written back from the decoded string, so the
-          // bytes land exactly as they were sent.
-          if (!plan) copyFileSync(incomingIndexPath, indexPath);
-          indexText = incomingText;
-          memoryPlan.push({ filename: MEMORY_INDEX_NAME, verdict: "copy" });
-        } else if (!indexUsable) {
-          memoryPlan.push({
-            filename: MEMORY_INDEX_NAME,
-            verdict: "keep-local",
-            note: "the local index could not be read",
-          });
-        } else if (indexText === incomingText) {
-          memoryPlan.push({ filename: MEMORY_INDEX_NAME, verdict: "identical" });
         } else {
-          const union = unionMemoryIndex(indexText!, incomingText);
-          added.push(...union.added);
-          alreadyPresent = union.alreadyPresent;
-          droppedProse = union.droppedProse;
-          if (union.added.length > 0) {
-            indexText = union.text;
-            indexChanged = true;
+          // The WRITE is the existence check, not a call in front of it.
+          // Copied rather than written back from the decoded string, so the
+          // bytes land exactly as they were sent; copied EXCLUSIVELY so that
+          // "there is already something at MEMORY.md" — an index, a directory,
+          // a dangling symlink pointing anywhere on this machine — is answered
+          // by the kernel at the moment of the write. See `copyIfAbsent`.
+          const copied = plan
+            ? !pathIsTaken(indexPath)
+            : copyIfAbsent(incomingIndexPath, indexPath);
+          if (copied) {
+            indexText = incomingText;
+            if (!plan) indexOnDisk = true;
+            memoryPlan.push({ filename: MEMORY_INDEX_NAME, verdict: "copy" });
+          } else {
+            // EEXIST falls THROUGH to the compare branches — the destination
+            // being taken is the ordinary case, not an error.
+            readLocalIndex();
+            if (!indexUsable) {
+              memoryPlan.push({
+                filename: MEMORY_INDEX_NAME,
+                verdict: "keep-local",
+                note: "the local index could not be read",
+              });
+            } else if (indexText === incomingText) {
+              memoryPlan.push({ filename: MEMORY_INDEX_NAME, verdict: "identical" });
+            } else {
+              const union = unionMemoryIndex(indexText!, incomingText);
+              added.push(...union.added);
+              alreadyPresent = union.alreadyPresent;
+              droppedProse = union.droppedProse;
+              if (union.added.length > 0) {
+                indexText = union.text;
+                indexChanged = true;
+              }
+              memoryPlan.push({
+                filename: MEMORY_INDEX_NAME,
+                verdict: "index-union",
+                added: union.added,
+                alreadyPresent: union.alreadyPresent,
+              });
+            }
           }
-          memoryPlan.push({
-            filename: MEMORY_INDEX_NAME,
-            verdict: "index-union",
-            added: union.added,
-            alreadyPresent: union.alreadyPresent,
-          });
         }
       }
 
@@ -263,9 +374,13 @@ function reconcileSharedLayers(opts: {
           continue;
         }
         const dst = join(targetMemDir, file);
-        if (!existsSync(dst)) {
+        // Same rule as the index above: the exclusive copy IS the "is this
+        // name free" question, so a dangling symlink at `dst` cannot be
+        // answered "absent" and then written through. A `false` here means the
+        // name is taken and the compare/park branch below owns the decision.
+        const copied = plan ? !pathIsTaken(dst) : copyIfAbsent(src, dst);
+        if (copied) {
           memoryPlan.push({ filename: file, verdict: "copy" });
-          if (!plan) copyFileSync(src, dst);
           continue;
         }
 
@@ -321,7 +436,11 @@ function reconcileSharedLayers(opts: {
         let reusedParked = false;
         for (let n = 0; n < MAX_SIDECAR_ATTEMPTS; n++) {
           const candidate = join(targetMemDir, nameFor(n));
-          if (!existsSync(candidate)) break;
+          // `pathIsTaken`, so this scan and `copyToUniqueName`'s `O_EXCL` agree
+          // about which names are free — an `existsSync` here would call a
+          // dangling symlink free, stop the scan early, and predict a parked
+          // name the exclusive copy then refuses.
+          if (!pathIsTaken(candidate)) break;
           if (readTextFile(candidate) === newContent) {
             parkedAs = nameFor(n);
             reusedParked = true;
@@ -332,7 +451,7 @@ function reconcileSharedLayers(opts: {
         if (parkedAs === null) {
           if (plan) {
             for (let n = 0; n < MAX_SIDECAR_ATTEMPTS; n++) {
-              if (!existsSync(join(targetMemDir, nameFor(n)))) {
+              if (!pathIsTaken(join(targetMemDir, nameFor(n)))) {
                 parkedAs = nameFor(n);
                 break;
               }
@@ -390,7 +509,32 @@ function reconcileSharedLayers(opts: {
 
       if (!plan && indexUsable && indexChanged && indexText !== null) {
         try {
-          writeFileSync(indexPath, indexText, "utf-8");
+          // `w` (truncate whatever this name resolves to) is only ours to use
+          // for an index we have in hand — one we read, or one we just created
+          // exclusively. The other reachable case is "no index anywhere and a
+          // parked copy needs a pointer", which is a CREATE, so it takes `wx`.
+          //
+          // **`wx` is not a symlink guard on Windows** (#68), and this site is
+          // where that was nearly mis-read. Its test — "does not write the
+          // merged index through a dangling symlink when the bundle carries
+          // none" — passed on `windows-latest` while the three `copyIfAbsent`
+          // sites failed, which reads like evidence that `wx` refuses a link.
+          // It is not. MEASURED, by instrumenting this line: across the whole
+          // importer suite it runs 13 times and takes the `w` branch every
+          // time; in that test it never runs at all. `pathIsTaken` above is an
+          // `lstat`, so the dangling link counts as an index — the read through
+          // it then fails, `indexUsable` goes false, and this whole block is
+          // skipped. Swap that `lstat` back to the pre-#64 `existsSync` and the
+          // instrumented line prints `flag=wx` in exactly that test, i.e. the
+          // write IS attempted and only POSIX's `O_EXCL` refuses it.
+          //
+          // So what protected this site on Windows was `lstatSync`, not the
+          // flag — the same conclusion `copyToNewFile` reaches for the other
+          // three. Do not "simplify" `pathIsTaken` to `existsSync` here.
+          writeFileSync(indexPath, indexText, {
+            encoding: "utf-8",
+            flag: indexOnDisk ? "w" : "wx",
+          });
         } catch (e) {
           warnings.push(
             `Could not update the memory index (${(e as Error).message}) — memories from this bundle are on disk but may not be listed in ${MEMORY_INDEX_NAME}.`
@@ -462,10 +606,13 @@ function reconcileSharedLayers(opts: {
         const src = join(plansDir, file);
         if (!isRegularFile(src)) continue;
         const dst = join(targetPlansDir, file);
-        if (!existsSync(dst)) {
-          if (!plan) copyFileSync(src, dst);
-          continue;
-        }
+        // Exclusive, for the same reason as the two memory sites — and it
+        // matters more here, because `plans/` is config-dir-global: a dangling
+        // symlink planted in it is reachable from every project on the machine.
+        // A taken name falls through to the compare/report branch; nothing is
+        // parked, deliberately (see the block comment above).
+        const copied = plan ? !pathIsTaken(dst) : copyIfAbsent(src, dst);
+        if (copied) continue;
         const existingContent = readTextFile(dst);
         const newContent = readTextFile(src);
         if (existingContent === null || newContent === null || existingContent === newContent) {
@@ -823,9 +970,16 @@ export async function importSession(
   //    spliced in; no local byte is removed or rewritten, and an appended line is
   //    one incoming `raw` line, which is newline-free by construction, so a
   //    corrupt index cannot split or forge a local line.
-  //  - A prose memory is copied only when the destination does not exist, and a
-  //    conflicting one is parked through `copyToUniqueName`'s `COPYFILE_EXCL` —
-  //    which cannot overwrite. Same for `plans/`, minus the parking.
+  //  - A prose memory is copied only when the destination can be CREATED, and a
+  //    conflicting one is parked through `copyToUniqueName`'s exclusive create
+  //    — which cannot overwrite. Same for `plans/`, minus the parking. That first
+  //    clause used to read "does not exist" and was tested with `existsSync`,
+  //    which follows symlinks: a dangling link at the destination reported
+  //    absent and the copy wrote THROUGH it, out of the directory entirely
+  //    (#64). It is now the exclusive write itself that answers — see
+  //    `copyIfAbsent` — so the premise this decision rests on is enforced by
+  //    the same flag on all three destinations rather than by a check in front
+  //    of them.
   //  - So the worst a damaged payload achieves is a bad NEW file, a bad parked
   //    copy, and a bad index line pointing at one — all of them named in the
   //    result's typed fields (`memoryIndex.added`/`unindexed`, `memoryConflicts`),

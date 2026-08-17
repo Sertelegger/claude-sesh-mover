@@ -240,7 +240,7 @@ export declare function mergeWorkspaceTrees(opts: {
      * the `MAX_SIDECAR_ATTEMPTS` exhaustion path can only fire against sidecars
      * left by an *earlier* run carrying the same millisecond-precision stamp.
      * Without a fixed stamp a test can only try to race the clock, which is not
-     * evidence: with `COPYFILE_EXCL` deleted, "two merges produce different
+     * evidence: with the exclusive create deleted, "two merges produce different
      * sidecar names" still passed 8 runs in 10, because the names differed by
      * milliseconds rather than by the guard.
      */

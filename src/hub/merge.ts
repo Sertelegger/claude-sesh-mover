@@ -1,5 +1,5 @@
 import {
-  chmodSync, closeSync, constants as fsConstants, copyFileSync,
+  chmodSync, closeSync, copyFileSync,
   mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync,
   rmSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
@@ -12,7 +12,7 @@ import {
   readIncludePatterns, type CarryDropReason, type CarryRules,
 } from "./workspace.js";
 import { gitChildEnv } from "./carry.js";
-import { MAX_SIDECAR_ATTEMPTS, copyToUniqueName } from "../sidecar.js";
+import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "../sidecar.js";
 
 /** A file was left alone and the incoming copy parked beside it. */
 export type SidecarReason =
@@ -341,12 +341,15 @@ function listTree(
  * The temp path is the one write in this module that does NOT go through
  * `classifyDestination`, so it carries its own two guards:
  *
- * - **`COPYFILE_EXCL`.** A plain `copyFileSync` follows a symlink at the
- *   destination, so a symlink planted at the temp path writes straight through
- *   it — outside the project — and then `renameSync` installs that symlink as
- *   the user's file. Verified on macOS and by libuv's `O_CREAT | O_EXCL` on
- *   Linux: `COPYFILE_EXCL` raises `EEXIST` on a symlink at the destination,
- *   live or dangling, so the escape is refused rather than followed.
+ * - **`copyToNewFile`'s refusal to write to a name a symlink holds.** A plain
+ *   `copyFileSync` follows a symlink at the destination, so a symlink planted
+ *   at the temp path writes straight through it — outside the project — and
+ *   then `renameSync` installs that symlink as the user's file. `O_CREAT |
+ *   O_EXCL` raises `EEXIST` on a symlink at the destination, live or dangling
+ *   (verified on macOS and Linux), and `copyToNewFile` adds the explicit
+ *   `lstat` refusal that carries the same guarantee on Windows, where neither
+ *   `COPYFILE_EXCL` nor an exclusive open is known to. See it and #68 — this
+ *   guarantee is one function deep for exactly that reason.
  * - **A random component in the name.** A fixed `.<name>.sesh-merge.tmp` is
  *   both predictable (so the symlink above can be planted deliberately) and
  *   shared, so two merges into one tree would fight over one path — this layer
@@ -363,13 +366,13 @@ function replaceFileAtomically(destPath: string, contentFrom: string): void {
   for (let n = 0; n < MAX_TMP_ATTEMPTS; n++) {
     const tmpPath = join(dir, `${stem}.${process.pid.toString(36)}-${randomBytes(6).toString("hex")}.tmp`);
     try {
-      copyFileSync(contentFrom, tmpPath, fsConstants.COPYFILE_EXCL);
+      copyToNewFile(contentFrom, tmpPath);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "EEXIST") continue;
-      // A failed copy leaves no partial file on the platforms measured here,
-      // but that is libuv's behaviour rather than a guarantee this code holds —
-      // and the name we would leave behind is one `snapshotWorkspace` would push
-      // to the hub. Clean up unconditionally rather than relying on it.
+      // `copyToNewFile` already removes a destination it created and then
+      // failed to fill, but the name we would leave behind is one
+      // `snapshotWorkspace` would push to the hub — so clean up here too rather
+      // than depending on a guarantee made one layer down.
       try { unlinkSync(tmpPath); } catch { /* best effort */ }
       throw e;
     }
@@ -393,10 +396,13 @@ function siblingRel(rel: string, name: string): string {
 }
 
 /**
- * Park the incoming copy beside the local file. Uses COPYFILE_EXCL so an
- * existing sidecar — from an earlier pull in the same second, or a user file
- * that happens to match — is never overwritten; the name is uniquified
- * instead.
+ * Park the incoming copy beside the local file. The write is an exclusive
+ * create, so an existing sidecar — from an earlier pull in the same second, a
+ * user file that happens to match, or a symlink planted at the name — is never
+ * overwritten or written through; the name is uniquified instead. The sidecar
+ * name is a sibling this module invents, so `classifyDestination` never saw it:
+ * that exclusive create is the only thing standing between an incoming copy and
+ * a link at `<name>.theirs-<stamp>`.
  *
  * The loop itself lives in `src/sidecar.ts` because the memory step in
  * `src/importer.ts` parks incoming files under the same rule; only the naming
@@ -471,7 +477,7 @@ export async function mergeWorkspaceTrees(opts: {
    * the `MAX_SIDECAR_ATTEMPTS` exhaustion path can only fire against sidecars
    * left by an *earlier* run carrying the same millisecond-precision stamp.
    * Without a fixed stamp a test can only try to race the clock, which is not
-   * evidence: with `COPYFILE_EXCL` deleted, "two merges produce different
+   * evidence: with the exclusive create deleted, "two merges produce different
    * sidecar names" still passed 8 runs in 10, because the names differed by
    * milliseconds rather than by the guard.
    */
@@ -604,11 +610,14 @@ export async function mergeWorkspaceTrees(opts: {
           const dest = join(opts.targetDir, rel);
           mkdirSync(dirname(dest), { recursive: true });
           try {
-            // COPYFILE_EXCL, not a plain copy: the tree scan said this path was
-            // free, so anything already there is something the scan could not
-            // see — on a case-insensitive filesystem, a differently-cased local
-            // file we would otherwise silently overwrite.
-            copyFileSync(incomingPath, dest, fsConstants.COPYFILE_EXCL);
+            // An exclusive create, not a plain copy: the tree scan said this
+            // path was free, so anything already there is something the scan
+            // could not see — on a case-insensitive filesystem, a
+            // differently-cased local file we would otherwise silently
+            // overwrite. `classifyDestination` above is what rules out a
+            // symlink here; `copyToNewFile` closes the window between that
+            // answer and this write, on Windows as well as POSIX (#68).
+            copyToNewFile(incomingPath, dest);
           } catch (e) {
             if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
             report.skipped.push({ path: rel, reason: "name-collision" });

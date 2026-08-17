@@ -340,6 +340,7 @@ export async function hubPush(opts) {
             name: "bundle",
             excludeLayers: [],
             claudeVersion: opts.claudeVersion,
+            noSummary: opts.noSummary,
             incremental: {
                 sourceMachineId: machine.id,
                 sourceMachineName: machine.name,
@@ -621,8 +622,10 @@ export async function hubPush(opts) {
             });
             pushedSessions.push({ threadId, sessionId: s.sessionId, type: s.type === "continuation" ? "continuation" : "full" });
         }
+        // No `summary` here: `buildIndexFile` derives the thread entry's from the
+        // slug, and is the only thing that writes it (see index-file.ts).
         const sessionsNow = discoverSessions(opts.configDir, opts.projectPath).map((s) => ({
-            sessionId: s.sessionId, slug: s.slug, summary: s.slug,
+            sessionId: s.sessionId, slug: s.slug,
             headEntryUuid: readLastEntryUuid(s.jsonlPath) ?? "",
             messageCount: s.messageCount, lastActiveAt: s.lastActiveAt,
         }));

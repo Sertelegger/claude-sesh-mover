@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend } from "../src/hub/backend.js";
@@ -301,5 +301,127 @@ describe("readMachineIndex degrades on a poisoned bundle record", () => {
       await backend.writeAtomic(indexPath("p", "nothreads"), JSON.stringify({ schemaVersion: 1 }));
       expect(await readMachineIndex(backend, "p", "nothreads")).toBeNull();
     } finally { rmSync(hub, { recursive: true, force: true }); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `HubThreadEntry.summary` has exactly ONE writer, and it writes the SLUG.
+//
+// An index file is plaintext by design, so everything in it is readable by
+// anything with access to the shared hub directory. Three of this field's four
+// writers put `slug` in it; the fourth — `hub reindex`'s synthetic prior, built
+// from bundle manifests — put a real `SessionManifest.summary` there, which for
+// any untitled session is up to 100 characters of the first user message
+// (discovery.ts falls back to the session id for the slug, and
+// extractSummaryFromFile rejects a UUID slug). And it stuck: a later ordinary
+// push or pull read the poisoned entry back as its own `priorIndex` and copied
+// it forward verbatim.
+// ---------------------------------------------------------------------------
+
+describe("buildIndexFile is the only writer of a thread entry's summary", () => {
+  it("writes the slug for a live session, ignoring any summary the caller supplies", () => {
+    // Shaped like the leak: a UUID slug (the untitled-session fallback) next to
+    // an excerpt of the first user message. Held in a const rather than written
+    // inline so the extra key survives to the call — it is the input a caller
+    // ought not to be able to express, and the point is that it is IGNORED.
+    const untitled = {
+      ...SESSION,
+      slug: "550e8400-e29b-41d4-a716-446655440000",
+      summary: "SECRET help me reset my banking password",
+    };
+    const built = buildIndexFile({
+      projectId: "p", machineId: "m", projectPath: "/x",
+      sessions: [untitled], state: stateWithThreads({ s1: "t1" }),
+      priorIndex: null, newBundles: [], now: "t",
+    });
+    expect(built.threads.t1.summary).toBe("550e8400-e29b-41d4-a716-446655440000");
+    expect(built.threads.t1.summary).toBe(built.threads.t1.slug);
+    expect(JSON.stringify(built)).not.toContain("SECRET");
+  });
+
+  // The sticky half. A thread whose local session has vanished is carried
+  // forward from the prior index — that is deliberate (its bundles are still
+  // pullable elsewhere) and must keep working — but it is also the one door an
+  // already-poisoned entry comes back through, on every push and pull, forever.
+  it("scrubs a poisoned summary out of a carried-forward thread, keeping its bundle history", () => {
+    const poisoned: HubIndexJson = {
+      schemaVersion: 1, agent: "claude-code", projectId: "p", machineId: "m",
+      updatedAt: "t-1", projectPath: "/x",
+      threads: {
+        gone: {
+          localSessionId: "s-gone",
+          slug: "770e8400-e29b-41d4-a716-446655440000",
+          summary: "SECRET help me reset my banking password",
+          headEntryUuid: "u-gone", messageCount: 9,
+          lastActiveAt: "2026-07-20T00:00:00Z", bundles: [RECORD],
+        },
+      },
+    };
+    // No live session claims that thread — exactly the shape reindex's synthetic
+    // prior produces, and the shape a later push reads back off the hub.
+    const built = buildIndexFile({
+      projectId: "p", machineId: "m", projectPath: "/x",
+      sessions: [], state: stateWithThreads({}),
+      priorIndex: poisoned, newBundles: [], now: "t",
+    });
+    expect(built.threads.gone).toBeDefined();
+    expect(built.threads.gone.summary).toBe("770e8400-e29b-41d4-a716-446655440000");
+    expect(built.threads.gone.summary).toBe(built.threads.gone.slug);
+    expect(JSON.stringify(built)).not.toContain("SECRET");
+    // The carry-forward itself is untouched: this is a scrub, not a drop.
+    expect(built.threads.gone.localSessionId).toBe("s-gone");
+    expect(built.threads.gone.messageCount).toBe(9);
+    expect(built.threads.gone.bundles.map((b) => b.bundleId)).toEqual(["b1"]);
+  });
+
+  /**
+   * THE STRUCTURAL HALF — this is the assertion that fails when a second writer
+   * appears, and it is deliberately about FILES rather than lines.
+   *
+   * The behavioural tests above pin the two doors `buildIndexFile` has today. A
+   * second writer would not come through either: it would be a new hub module
+   * assembling a `HubThreadEntry` of its own and handing it to
+   * `writeMachineIndex`, which is precisely how the fourth writer arrived in the
+   * first place (91869d6 added reindex's two together). So the claim under guard
+   * is module ownership: within `src/hub/`, exactly these files may name this
+   * key, and each for a different, stated reason.
+   *
+   * It reads every `.ts` in the directory ITSELF rather than trusting a search.
+   * That is not ceremony: `src/hub/threads.ts` contains a raw NUL byte
+   * (`sourcedKey`'s separator), so GNU grep classifies it as binary and a
+   * `grep -rn` over `src/` reports NOTHING for it — the file is invisible to
+   * exactly the audit someone would run before adding a writer. It is a reader
+   * here; a writer hiding there would have been just as invisible.
+   *
+   * It is a text scan, so it is a checklist and not a verifier — the same class
+   * of guard as `tests/hub-warning-flags.test.ts`, with the same limits. It
+   * cannot see a second writer added INSIDE index-file.ts, and a `summary:` in
+   * a trailing comment in another hub module will trip it. Both are the decision
+   * it exists to force: rephrase, or add the file here with a reason.
+   */
+  it("no hub module outside the declaration, the writer and the two readers names the key", () => {
+    const owners: Record<string, string> = {
+      "layout.ts": "declares HubThreadEntry.summary — the on-disk schema",
+      "index-file.ts": "buildIndexFile — the one writer, deriving it from the slug",
+      "threads.ts": "reads an index entry's onto ThreadCopy/ResolvedThread",
+      "whereis.ts": "reads a ResolvedThread's onto WhereisThread",
+    };
+    const hubDir = join(import.meta.dirname, "..", "src", "hub");
+    const named: string[] = [];
+    for (const file of readdirSync(hubDir).filter((f) => f.endsWith(".ts")).sort()) {
+      const hit = readFileSync(join(hubDir, file), "utf-8")
+        .split("\n")
+        // Cheap comment rejection: a doc-comment body starts with `*`, a line
+        // comment with `//` or `/*`. No parser, and no need for one — the
+        // failure mode is a false ALARM, which this test is allowed to have.
+        .map((l) => l.trim())
+        .filter((l) => !l.startsWith("*") && !l.startsWith("//") && !l.startsWith("/*"))
+        .some((l) => /\bsummary\s*:/.test(l));
+      if (hit) named.push(file);
+    }
+    expect(named).toEqual(Object.keys(owners).sort());
+    // ...and the scan really can see the key, so a comment filter that silently
+    // ate everything cannot pass this as "no writers found".
+    expect(named.length).toBe(4);
   });
 });
