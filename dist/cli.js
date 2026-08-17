@@ -141,6 +141,15 @@ program
     .option("--no-register", "Skip session index registration")
     .option("--allow-duplicates", "Re-import sessions even if identical content was imported before")
     .option("--include-plans", "Also write the bundle's plans/ into <config-dir>/plans, which every project on this machine shares (off by default)")
+    // The two shared-namespace layers, and their DEFAULTS ARE OPPOSITE ON PURPOSE
+    // (#36). `plans/` is opt-in because `<config-dir>/plans` is machine-global;
+    // `memory/` is opt-out because it lands in the target project's own
+    // directory, is add-only, and parks a conflict instead of overwriting it —
+    // and because it is the layer a future session reads prose out of, so making
+    // it opt-in would silently break the single-owner "my memories came with"
+    // flow. Both are DISCLOSED either way, in `memorySkipped`/`plansSkipped` and
+    // in the dry run's `writeSet`.
+    .option("--no-memory", "Do not write the bundle's memory/ into this project's memory folder (written by default — it lands in the target project's own directory)")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     let tempExtractDir;
@@ -171,6 +180,9 @@ program
             noRegister: !opts.register, // Commander.js --no-register sets opts.register to false
             allowDuplicates: !!opts.allowDuplicates,
             includePlans: !!opts.includePlans,
+            // Commander's `--no-memory` sets `opts.memory` to false; absent, it is
+            // `true`. Same shape as `--no-register` two lines up.
+            noMemory: opts.memory === false,
             onProgress,
         });
         // Container-level observations belong in the same warnings array as the
@@ -936,6 +948,29 @@ program
     .option("--project-path <path>", "Override project path (default: cwd)")
     .option("--target-path <path>", "Workspace unpack destination when the project directory doesn't exist locally yet")
     .option("--force-workspace", "Unpack the hub's workspace copy over a non-empty target directory, overwriting files of the same name (never a merge)")
+    // OPT-IN, AND THAT IS A SECURITY PROPERTY RATHER THAN A UX PREFERENCE (#36).
+    //
+    // The carry payload is arbitrary project-file content: a `git apply` of a
+    // patch plus a copy of untracked files. Nothing on the apply path filters it
+    // by name or by extension, and nothing ever will — the recorded rule is that
+    // the `NEVER_INCLUDABLE` floor is about what a name can DO (redirect the hub,
+    // rewrite what the next push ships, overwrite a VCS store), not what it
+    // contains, and it can be complete only because plugin-subverting names are a
+    // finite set this plugin defines. "Leads to code execution" is a property of
+    // the receiver's toolchain and can never close, so a denylist of
+    // executable-adjacent paths is not a boundary and must not be added here.
+    //
+    // The flag IS the consent, and it is the whole of the consent. So:
+    //   - it stays a bare boolean whose ABSENCE means "do not apply", coerced at
+    //     BOTH wiring sites — the action below and hub/pull.ts's `applyRequested`.
+    //     Never a negated `--no-` form, never a config key that turns it on,
+    //     never "the bundle carried one, so it was applied". (Deliberately not
+    //     quoting the two expressions here: `tests/apply-consent.test.ts` greps
+    //     for them, and a comment that echoes the code it pins makes the grep
+    //     pass over its own text — measured, while writing that test.)
+    //   - #47's `--apply-workspace` on `sesh-mover import` does not exist yet and
+    //     must land in exactly this shape, per payload, with no `--apply-files`
+    //     that implies both. `tests/apply-consent.test.ts` pins both halves.
     .option("--apply-carry", "Apply carried uncommitted changes (requires the same base commit and a clean tree)")
     .option("--project-id <id>", "Link to an existing hub project id")
     .option("--force-append", "Append a pulled continuation even if the local session looks recently active")

@@ -362,6 +362,107 @@ export interface MemoryPlanEntry {
     parkedAs?: string;
     note?: string;
 }
+/** A shared-namespace payload: one that lands outside the minted session id. */
+export type WriteSetLayer = "memory" | "plans";
+/**
+ * ONE path an import will write — or wrote — **outside the session id it
+ * mints**. The write set is the consent gate's input (#36): the ruling is one
+ * explicit per-import decision gating every payload that lands outside a minted
+ * session id, *with the full write set disclosed*, and this is that disclosure
+ * in a shape the skill layer can branch on rather than parse.
+ *
+ * **`display`, not `path`, is what goes in front of a human.** The final
+ * segment of `path` is BUNDLE-CONTROLLED — a `readdirSync` basename out of the
+ * bundle's `memory/` or `plans/` — so it can carry a newline, an ANSI escape or
+ * an RTL override. `display` is that string through `JSON.stringify`, which is
+ * the quoting rule stated at the top of `src/importer.ts` and taken from
+ * `hub/index-file.ts`; there is deliberately no second convention. The
+ * transport is not the defence: this rides out as JSON, where a newline is
+ * `\n` and corrupts nothing, and then `commands/import.md` relays it into a
+ * markdown list for a human — the same sink #79 closed for `MEMORY.md` pointer
+ * lines and #38 closed for `git apply --summary`. Carrying the escaped form as
+ * DATA is what stops the relay from having to remember.
+ */
+export interface WriteSetEntry {
+    layer: WriteSetLayer;
+    /** Absolute destination. For a program; never render it. */
+    path: string;
+    /** `JSON.stringify(path)` — quoted and escaped. The only form to show. */
+    display: string;
+    /**
+     * - `create` — nothing is at `path`; this import creates it.
+     * - `park` — a file of the bundle's name is already here and differs, so the
+     *   incoming copy is saved BESIDE it under this name. The local file is not
+     *   touched, which is why a park is disclosed as a write of a *new* name.
+     * - `index-append` — `MEMORY.md` is already here and lines are appended to
+     *   it. The only entry kind that modifies a file the user already had.
+     */
+    kind: "create" | "park" | "index-append";
+}
+/**
+ * A directory a bundle's payload can reach on this import, and how far its
+ * blast radius goes. Reported even when the layer is declined (`applied:
+ * false`), because "this bundle also wanted `<machine-global dir>`" is the
+ * disclosure that makes an opt-in readable rather than mysterious.
+ *
+ * `path` is NOT quoted, and that is deliberate rather than an oversight: it is
+ * built from this machine's own config dir and target project path, so quoting
+ * it would assert a distrust that is not there (same rule as the QUOTING note
+ * in `src/importer.ts`). Only `WriteSetEntry` carries bundle-chosen segments.
+ */
+export interface WriteSetRoot {
+    layer: WriteSetLayer;
+    path: string;
+    /**
+     * - `project` — the target project's own directory; nothing else reads it.
+     * - `machine` — shared by every project in this config dir. `plans/` is the
+     *   only one, and it is why that layer is opt-in.
+     */
+    scope: "project" | "machine";
+    /** Whether this run writes the layer at all. `false` = declined by a flag. */
+    applied: boolean;
+}
+/**
+ * Everything an import will write outside the session ids it mints.
+ *
+ * **SCOPE, stated so the completeness claim is checkable.** It covers exactly
+ * the shared-namespace payload — the bytes that come out of the bundle and land
+ * in a directory the target already owns. Three things are deliberately outside
+ * it, and each for a reason that is not "we forgot":
+ *
+ *  - Everything under a **minted session id** (`<newId>.jsonl`, `<newId>/`,
+ *    `file-history/<newId>/`). The id is a fresh UUID this import generated
+ *    seconds earlier, so those paths are collision-free by construction and
+ *    reconcile with nothing. That is the dividing line the ruling draws.
+ *  - This machine's own **bookkeeping** — `history.jsonl` and the sync-state
+ *    file. Neither carries a bundle-chosen byte at a bundle-chosen name; they
+ *    record what the import did.
+ *  - `.sesh-mover-project.json` in the target project, planted once when the
+ *    project has no identity of its own. Its name is fixed and on the
+ *    `NEVER_INCLUDABLE` floor, and its only bundle-derived content is a
+ *    `projectId` that `isSafeSessionId` has already cleared — so a bundle
+ *    cannot choose a path through it. It is disclosed in `warnings` instead.
+ *
+ * Within that scope the set is COMPLETE, and completeness is enforced in two
+ * places rather than asserted: every branch of `reconcileSharedLayers` that
+ * writes records at the same site it decides (one function, shared by the
+ * preview and the run, so they cannot drift), and
+ * `tests/importer.test.ts`'s filesystem-diff test compares the set against the
+ * files a real import actually created.
+ */
+export interface WriteSet {
+    /**
+     * The authoritative count. A presenter that shows the first N must state
+     * `total - N` withheld and take the number from HERE, not from a guess about
+     * how long the list is: `entries` is uncapped today, so `total ===
+     * entries.length`, and if a future payload class (a workspace tree, #47) ever
+     * truncates the enumeration, `total` must remain the count of paths that will
+     * be written or the bound stops being honest.
+     */
+    total: number;
+    entries: WriteSetEntry[];
+    roots: WriteSetRoot[];
+}
 /**
  * What a run did to the two **shared-namespace** auxiliary layers — `memory/`
  * (into the target project dir) and `plans/` (into the target config dir).
@@ -391,7 +492,9 @@ export interface SharedLayerFindings {
     memoryIndex?: MemoryIndexReport;
     /**
      * Absolute path of the target project's memory directory, present whenever
-     * the bundle carried a `memory/` layer. Every `filename`/`parkedAs` above is
+     * the bundle carried a `memory/` layer **and the run applied it** — a
+     * `--no-memory` run reports `memorySkipped` and no directory, because there
+     * is no directory it wrote to. Every `filename`/`parkedAs` above is
      * relative to it. It is reported rather than left to be derived because
      * deriving it means re-implementing `encodeProjectPath` in markdown — a
      * second copy of an encoding whose own module refuses to invert it.
@@ -431,6 +534,34 @@ export interface SharedLayerFindings {
      * field does not follow the type until those two lists name it.
      */
     plansSkipped?: number;
+    /**
+     * How many memory files the bundle carried that were **not written**, because
+     * `--no-memory` was passed. Present only when the bundle had some.
+     *
+     * The polarity is the opposite of `plansSkipped`'s and the asymmetry is the
+     * recorded decision (#36): `memory/` lands in the target PROJECT's own
+     * directory, is add-only, and parks rather than overwrites — and it is the
+     * layer a future session reads prose out of, so it keeps arriving by default.
+     * What it gained is an off switch the CLI honors, not a gate. Same REACH
+     * caveat as `plansSkipped`: populated on `import` only.
+     */
+    memorySkipped?: number;
+    /**
+     * Every path this run writes outside a minted session id (#36).
+     *
+     * **Always present on `import`, including when it is empty** — deliberately
+     * NOT subject to `sharedFindings`'s empty-is-absent rule. This field is a
+     * consent gate's input, and "nothing lands outside the session" has to be a
+     * statement the caller can read rather than an absence it has to interpret;
+     * an omitted write set and an empty one are the same JSON otherwise. Same
+     * REACH caveat as `plansSkipped`: the two hand-written projections
+     * (`migrator.ts`, `hub/pull-apply-state.ts`) do not forward it, so `migrate`
+     * and `pull` get the type and not the value. Neither has a confirm gate to
+     * feed — a pull runs unattended from a hook — so that is a scope line, not an
+     * oversight; forwarding it means concatenating one set per bundle in the
+     * chain.
+     */
+    writeSet?: WriteSet;
 }
 export interface ImportResult extends SharedLayerFindings {
     success: true;
@@ -466,6 +597,15 @@ export interface DryRunResult {
     planConflicts?: AuxiliaryConflict[];
     /** Plans the bundle carries that the real run would not write. Same rule. */
     plansSkipped?: number;
+    /** Memory files the bundle carries that `--no-memory` declined. Same rule. */
+    memorySkipped?: number;
+    /**
+     * What the real run would write outside a minted session id — the answer to
+     * the question `commands/import.md`'s confirm gate asks, computed BEFORE any
+     * byte is written. Same function as the real run, in plan mode, so the two
+     * cannot drift; `tests/importer.test.ts` pins that they are equal.
+     */
+    writeSet?: WriteSet;
 }
 export interface MigrateResult extends SharedLayerFindings {
     success: true;
