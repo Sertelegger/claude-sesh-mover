@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS, } from "./append.js";
 import { recordSharedLayers } from "./pull-apply-state.js";
-import { importSession } from "../importer.js";
+import { applySharedLayers, importSession } from "../importer.js";
 import { computeIntegrityHashFromFile } from "../manifest.js";
 import { findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
@@ -78,9 +78,15 @@ function readSessionTail(path) {
 }
 /**
  * Every local session currently mapped to `threadId`, plus the one this pull
- * has already landed content in (which isn't in the map yet — thread mappings
- * are only written once the whole chain has been applied). Sessions whose
- * file is gone are dropped: a mapping outlives the file it points at.
+ * has already landed content in. Sessions whose file is gone are dropped: a
+ * mapping outlives the file it points at.
+ *
+ * Whether `pendingSessionId` is ALREADY in that map is not this function's
+ * problem, and deliberately so — the two are unioned into a `Set`. It used to
+ * say the mapping was only written once the whole chain had been applied; that
+ * is no longer true (`pull.ts` now calls `flushThreadMapping` per applied
+ * bundle, so a mid-chain abort cannot leave applied bundles unmapped), and the
+ * union is what makes the candidate set byte-identical either way.
  */
 function threadBaseCandidates(state, threadId, pendingSessionId, targetProjectDir) {
     const ids = new Set();
@@ -191,6 +197,46 @@ export async function runApplySessionsStage(input) {
     const st = input.state;
     const i = input.bundleIndex;
     const reasons = [];
+    /**
+     * This bundle's `memory/` and `plans/`, on the two paths that handle a bundle
+     * WITHOUT calling `importSession` (#63).
+     *
+     * `reconcileSharedLayers` lives inside the importer, so for the whole of Slice
+     * 2 a spliced continuation extracted the bundle's memory and then deleted it
+     * with the extract dir. It never healed: the pushing machine credits its own
+     * hub ledger with the digest it sent, so the exporter does not ship that
+     * memory again — after a machine's first pull of a thread, memory updates
+     * reached it only when the splice was declined. Measured; see #63.
+     *
+     * **Called on BOTH splice paths, and that is a decision.** `adoptHubBranch`
+     * has the identical shape — it lands the hub's branch and returns before the
+     * import — and the layer it drops is identically un-resendable, so withholding
+     * it there would make an adopt-hub pull the one way to receive a thread's
+     * transcript without its memory. The layers are not session-scoped at all
+     * (they reconcile into the project's `memory/` and the config dir's `plans/`),
+     * so nothing about WHICH local session the transcript landed in bears on them.
+     *
+     * **No bundle reconciles twice, structurally.** Both call sites are the
+     * statement before a `return` that skips the fragment import, so a bundle
+     * reaches this or `importSession`, never both; a splice that is refused falls
+     * through untouched and the import reconciles once, exactly as before. The
+     * accumulator's value-dedupe of `memoryConflicts` would make a double-run
+     * harmless rather than correct — `alreadyPresent` is summed, not deduped — so
+     * this deliberately does not rest on it.
+     *
+     * Same fold as the fragment path's: the typed findings into
+     * `st.sharedLayers`, the prose into this bundle's `reasons`.
+     */
+    const applyBundleSharedLayers = () => {
+        const shared = applySharedLayers({
+            exportPath: extractDir,
+            targetProjectDir,
+            targetConfigDir: configDir,
+            sourceMachineName: bundleManifest.sourceMachineName,
+        });
+        recordSharedLayers(st.sharedLayers, shared);
+        reasons.push(...shared.warnings);
+    };
     // Append path: a continuation whose chain matches one of this thread's
     // local sessions splices onto that session, so the conversation stays
     // one resumable transcript. Every guard lives in append.ts and ANY
@@ -258,6 +304,9 @@ export async function runApplySessionsStage(input) {
                     catch (e) {
                         reasons.push(`Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${e.message}) — the transcript is complete; those side files are missing.`);
                     }
+                    // The shared layers this bundle carried. Nothing below imports it, so
+                    // this is the only place they can land — see `applyBundleSharedLayers`.
+                    applyBundleSharedLayers();
                     st.appended.push({
                         threadId,
                         baseSessionId,
@@ -425,6 +474,10 @@ export async function runApplySessionsStage(input) {
                             catch (e) {
                                 reasons.push(`The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${e.message}) — the transcript is complete; those side files are missing.`);
                             }
+                            // As on the plain-append path above, and for the same reason: an
+                            // adoption returns before the fragment import, so this is the
+                            // only place this bundle's memory/plans can land.
+                            applyBundleSharedLayers();
                             divergence.preservedSessionId = preservedSessionId;
                             st.appended.push({
                                 threadId,

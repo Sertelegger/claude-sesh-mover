@@ -4,8 +4,8 @@ import type { SourcedBundle } from "./pull-select.js";
 import { stageOk, type StageOutcome } from "./pull-stages.js";
 import { discoverSessions } from "../discovery.js";
 import { readLastEntryUuid } from "../jsonl.js";
-import { readSyncState, setThreadId, writeSyncState } from "../sync-state.js";
-import type { ExportManifest, HubPullResult } from "../types.js";
+import { getThreadId, readSyncState, setThreadId, writeSyncState } from "../sync-state.js";
+import type { ExportManifest, HubPullResult, SyncState } from "../types.js";
 
 /**
  * Exactly the nine apply-loop accumulators this stage READS — a structural
@@ -51,6 +51,119 @@ export interface RecordStageInput {
   apply: RecordApplyView;
 }
 
+/**
+ * Which local session a bundle's content is in, asked of ONE bundle.
+ *
+ * THREE SOURCES, IN THIS ORDER, and the order is the whole content of the
+ * function: the session this pull landed content in; failing that, the local
+ * session an earlier receipt from THAT BUNDLE'S OWN machine was recorded
+ * against; failing that, the imported-hash registry — the cross-route duplicate
+ * case, where identical content arrived earlier via a plain import (no peer
+ * bookkeeping) and the importer skipped it via `state.imported[integrityHash]`
+ * rather than `peers[...].received`.
+ *
+ * ASKED OF `last.machineId`, NEVER OF THE PULL'S RESOLVED MACHINE. The receipt
+ * was written by whoever supplied that bundle, so on a chain that spans machines
+ * the resolved machine's ledger simply does not hold it.
+ *
+ * ONE COPY, TWO CALLERS, and they differ in exactly one thing: WHICH bundle they
+ * call `last`. That choice is the caller's and is stated at each call site,
+ * because the two are asking different questions — `flushThreadMapping` asks
+ * about a bundle this pull has already applied, `runRecordStage` about the last
+ * bundle it handled at all. Copying the resolution to say that would let the two
+ * drift, and a mapping written from a bundle nobody opened is the failure this
+ * whole path exists to avoid.
+ */
+function threadSessionFor(
+  state: SyncState,
+  last: SourcedBundle,
+  st: Pick<RecordApplyView, "threadLandedSessionId" | "lastBundleManifest">
+): string | null {
+  const lastSessionManifest =
+    st.lastBundleManifest?.sessions.find((s) => s.sessionId === last.record.sessionIdInBundle) ?? null;
+  const hashRegistryFallback = lastSessionManifest
+    ? state.imported[lastSessionManifest.integrityHash]?.localSessionId
+    : undefined;
+  return (
+    st.threadLandedSessionId ??
+    state.peers[last.machineId]?.received?.[last.record.sessionIdInBundle]?.localSessionId ??
+    hashRegistryFallback ??
+    null
+  );
+}
+
+/** Exactly the three accumulators the mid-loop flush reads. */
+export type FlushApplyView = Pick<
+  RecordApplyView,
+  "lastAppliedIndex" | "lastBundleManifest" | "threadLandedSessionId"
+>;
+
+export interface FlushThreadMappingInput {
+  effectiveProjectPath: string;
+  hubId: string;
+  threadId: string;
+  /** The same fetch plan `runRecordStage` gets — indexed by `lastAppliedIndex`. */
+  needed: SourcedBundle[];
+  apply: FlushApplyView;
+}
+
+/**
+ * Persist the thread mapping for what this pull has applied SO FAR, from inside
+ * the per-bundle loop.
+ *
+ * **Why this exists at all, given `runRecordStage` writes the same mapping.**
+ * The receipts — `peers[...].received` from `importSession`, and the hub ledger
+ * `recordSentToPeer` credits — are written INSIDE the loop, one bundle at a
+ * time. `runRecordStage` runs only after it. Three hard returns in that loop (a
+ * fetch abort, a workspace abort, an import failure) leave bundles `0..i-1`
+ * applied and credited and never reach the record stage at all, so the mapping
+ * they earned was never written. That is not a crash window — #28's filed shape,
+ * fixed by `backfillThreadMappings` — it is a deterministic route into the same
+ * end state on an ordinary trigger (a bundle only partly delivered to a synced
+ * hub folder), and `backfillThreadMappings` cannot repair it: that repair runs
+ * only on exits where `needed` is EMPTY, and the deferred bundle was never
+ * recorded as received, so the re-run's plan is non-empty and aborts again.
+ *
+ * WHAT IT COSTS WHEN IT IS MISSING. The next push finds a local session with no
+ * thread id and MINTS A NEW THREAD for it (`push.ts`), and because the hub
+ * ledger was already credited that push ships only a DELTA — a continuation
+ * chain on the hub with no base bundle to anchor it, which is the
+ * unreconstructable thread `recordSentToPeer`'s own invariant forbids by name.
+ * `hub reindex` does not repair it either: it reads `getThreadId`, finds
+ * nothing, and drops the session from the index with a warning. The auto-push is
+ * default-on and unattended, so it routinely fires before the user retries.
+ *
+ * **It may never map a bundle that was not applied**, which is what the
+ * `lastAppliedIndex < 0` gate is for and why the gate is on THAT and not on
+ * `needed.length`. `lastAppliedIndex` is written by the sessions stage only once
+ * a bundle has been spliced, adopted or imported, so `needed[lastAppliedIndex]`
+ * is by construction a bundle this pull really handled. `runRecordStage`'s own
+ * index expression deliberately falls back to `needed.length - 1` when nothing
+ * was applied; reusing that here would ask the receipt ledger about a bundle
+ * nobody opened.
+ *
+ * Idempotent, and quiet when there is nothing to do: it writes at most once per
+ * pull per session, and returns without touching the state file when the mapping
+ * it would write is already there. `runRecordStage` still writes the mapping at
+ * the end of a pull that gets that far — this makes the mapping as durable as
+ * the receipt written beside it, it does not replace the projection.
+ */
+export function flushThreadMapping(input: FlushThreadMappingInput): boolean {
+  const { effectiveProjectPath, hubId, threadId, needed, apply: st } = input;
+  if (st.lastAppliedIndex < 0) return false;
+  const state = readSyncState(effectiveProjectPath);
+  const localSessionId = threadSessionFor(state, needed[st.lastAppliedIndex], st);
+  // Never map a thread to a fabricated id — same rule as the record stage. The
+  // silence is deliberate: this is a durability step inside a loop, and the
+  // "its session could not be identified" sentence belongs to the one stage
+  // that knows the pull is over.
+  if (localSessionId === null) return false;
+  if (getThreadId(state, localSessionId) === threadId) return false;
+  setThreadId(state, hubId, localSessionId, threadId);
+  writeSyncState(state);
+  return true;
+}
+
 export interface RecordStageResult {
   /** The local session this thread now maps to, or null when none was found. */
   localSessionId: string | null;
@@ -82,14 +195,10 @@ export async function runRecordStage(
   } = input;
   const reasons: string[] = [];
 
-  // Thread mapping: prefer the session this pull actually landed content
-  // in (an imported fragment or an appended base); if every bundle in the
-  // chain was skipped, fall back to (1) the local session id an earlier
-  // receipt from this peer was recorded against, then (2) the imported-hash
-  // registry — the cross-route duplicate case, where identical content
-  // arrived earlier via a plain import (no peer bookkeeping) and the
-  // importer skipped it via state.imported[integrityHash] rather than
-  // peers[...].received.
+  // Thread mapping, resolved by `threadSessionFor` — see it for the three
+  // sources and their order. What is decided HERE is only WHICH bundle to ask
+  // about, and that choice is this stage's alone (`flushThreadMapping` makes the
+  // opposite one, for a stated reason).
   //
   // `lastRecord` is the last bundle this pull actually FETCHED, which stopped
   // being `needed[needed.length - 1]` the moment a divergence could break the
@@ -110,16 +219,7 @@ export async function runRecordStage(
   const last =
     needed[st.lastAppliedIndex >= 0 ? st.lastAppliedIndex : st.divergenceAborted ? st.abortIndex : needed.length - 1];
   const stateAfter = readSyncState(effectiveProjectPath);
-  const lastSessionManifest =
-    st.lastBundleManifest?.sessions.find((s) => s.sessionId === last.record.sessionIdInBundle) ?? null;
-  const hashRegistryFallback = lastSessionManifest
-    ? stateAfter.imported[lastSessionManifest.integrityHash]?.localSessionId
-    : undefined;
-  const localSessionId: string | null =
-    st.threadLandedSessionId ??
-    stateAfter.peers[last.machineId]?.received?.[last.record.sessionIdInBundle]?.localSessionId ??
-    hashRegistryFallback ??
-    null;
+  const localSessionId: string | null = threadSessionFor(stateAfter, last, st);
 
   if (localSessionId !== null) {
     setThreadId(stateAfter, hubId, localSessionId, threadId);

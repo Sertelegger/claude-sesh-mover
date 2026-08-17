@@ -32,6 +32,60 @@ export function readManifest(exportDir) {
     assertSafeManifestIds(manifest);
     return manifest;
 }
+/**
+ * Minimal structural check that a parsed `manifest.json` is a sesh-mover bundle
+ * manifest at all: the plugin marker, and a `sessions` value that really is an
+ * array. Deliberately NOT a schema validator — no field types, no required
+ * keys beyond those two.
+ *
+ * ## Why those two clauses and not more
+ *
+ * They are the two facts a caller states about a bundle it never opened
+ * further: that it is one of ours, and a `sessionCount` derived from a value
+ * that really is a session list. Without the second, `sessions: "abc"` parses
+ * fine, survives `assertSafeManifestIds` (iterating a string yields
+ * characters, whose `.sessionId` is `undefined`, so every check passes) and
+ * `browse` then reports `sessionCount: 3` — the string's length, presented as
+ * a session count, in the code path whose whole point is never inventing
+ * metadata. That is the case worth remembering: this predicate and
+ * `assertSafeManifestIds` catch disjoint things, so neither substitutes for
+ * the other.
+ *
+ * ## Why it lives in manifest.ts
+ *
+ * This module is not only the hashing module. It already owns the trust
+ * boundary a parsed manifest crosses, in three steps that run in this order:
+ * *is this a manifest at all* (here), *are its ids path-safe*
+ * (`assertSafeManifestIds`), *is its session list the one the exporter wrote*
+ * (`verifySessionsDigest`). Splitting step one into a module of its own would
+ * put a five-line predicate behind its own file, its own export line and its
+ * own test file, and would hide the ordering relationship between the three.
+ *
+ * ## One copy, on purpose
+ *
+ * This used to exist twice — privately in `archiver.ts` (archive path, v0.5.1)
+ * and privately in `cli.ts` (directory path, #33) — and the two paths had
+ * already drifted once: the store directory scan checked no plugin marker at
+ * all until #33, while the archive path had checked it since v0.5.1. Both call
+ * sites import this now. `tests/manifest.test.ts` fails if a second copy of
+ * the comparison reappears under `src/` (see the guard's own doc comment for
+ * what that check can and cannot see).
+ *
+ * `readManifest` deliberately does not call this: its contract is to throw,
+ * and the two readers that must DEGRADE rather than throw — `browse`'s
+ * directory scan and `readManifestFromArchive` — call it themselves against
+ * their own parse. Folding it into `readManifest` would change what the import
+ * and hub-pull paths throw, which is a larger decision than this predicate.
+ *
+ * Returns `boolean`, not a type predicate: narrowing to `ExportManifest` would
+ * claim a validation of the other fields that this does not perform.
+ */
+export function isBundleManifestShape(value) {
+    if (typeof value !== "object" || value === null)
+        return false;
+    const m = value;
+    return m.plugin === "sesh-mover" && Array.isArray(m.sessions);
+}
 // A session id is safe iff it is a non-empty string with no path separators,
 // no NUL byte, and isn't "." or "..". Real Claude session ids are UUIDs, so
 // this accepts them while rejecting anything path-traversal-shaped. Any value

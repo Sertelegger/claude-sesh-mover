@@ -14,6 +14,7 @@ import { hubPush } from "../src/hub/push.js";
 import {
   hubPull, selectNeededBundles, selectThreadBase, describeUnfetchable, type HubPullOptions,
 } from "../src/hub/pull.js";
+import { flushThreadMapping } from "../src/hub/pull-record.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes, writeMachineIndex } from "../src/hub/index-file.js";
@@ -92,6 +93,102 @@ describe("selectNeededBundles (pure)", () => {
 
     const keptWhenFileMissing = selectNeededBundles(bundles, received, () => false);
     expect(keptWhenFileMissing.map((b) => b.bundleId)).toEqual(["full-new", "cont-new"]);
+  });
+});
+
+/**
+ * The mid-chain durability step, at its own level.
+ *
+ * The end-to-end case is "a mid-chain abort maps the thread for the bundles it
+ * DID apply" below. What is asserted HERE is the half that end-to-end coverage
+ * cannot reach: the rule that it may never map a bundle this pull did not apply.
+ * `runRecordStage` asks about `needed[needed.length - 1]` when nothing was
+ * applied — a deliberate choice for the end of a pull, and the wrong one from
+ * inside the loop, where it would credit a bundle nobody opened. Nothing else in
+ * the suite fails when that gate is removed (measured), so it is pinned here.
+ */
+describe("flushThreadMapping (the mid-chain durability step)", () => {
+  const bundle0 = { machineId: "m-a", record: rec({ bundleId: "b0", sessionIdInBundle: "s0" }) };
+  const bundle1 = { machineId: "m-a", record: rec({ bundleId: "b1", sessionIdInBundle: "s1" }) };
+
+  function arrange(label: string): { projectPath: string; cleanup: () => void } {
+    const home = mkdtempSync(join(tmpdir(), `${label}-home-`));
+    const restore = overrideHome(home);
+    return {
+      projectPath: join(home, "proj"),
+      cleanup: () => {
+        restore.restore();
+        rmSync(home, { recursive: true, force: true });
+      },
+    };
+  }
+
+  /** A receipt for `s1`, i.e. for the bundle a `needed.length - 1` fallback asks about. */
+  function plantReceipt(projectPath: string): void {
+    const st = readSyncState(projectPath);
+    st.peers["m-a"] = {
+      name: "A", lastSentAt: null, lastReceivedAt: null, sent: {},
+      received: { s1: { localSessionId: "local-1", type: "full", importedAt: "2026-08-01T00:00:00Z" } },
+    };
+    writeSyncState(st);
+  }
+
+  it("writes nothing when the pull applied no bundle, even though the plan's last bundle has a receipt", () => {
+    const a = arrange("sesh-flush-none");
+    try {
+      plantReceipt(a.projectPath);
+      expect(
+        flushThreadMapping({
+          effectiveProjectPath: a.projectPath, hubId: "hub-1", threadId: "t-1",
+          needed: [bundle0, bundle1],
+          apply: { lastAppliedIndex: -1, lastBundleManifest: null, threadLandedSessionId: null },
+        })
+      ).toBe(false);
+      expect(readSyncState(a.projectPath).hub?.threadByLocalSession ?? {}).toEqual({});
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("maps the session an applied bundle landed in, and the second call writes nothing", () => {
+    const a = arrange("sesh-flush-once");
+    try {
+      const args = {
+        effectiveProjectPath: a.projectPath, hubId: "hub-1", threadId: "t-1",
+        needed: [bundle0, bundle1],
+        apply: { lastAppliedIndex: 0, lastBundleManifest: null, threadLandedSessionId: "local-0" },
+      };
+      expect(flushThreadMapping(args)).toBe(true);
+      expect(getThreadId(readSyncState(a.projectPath), "local-0")).toBe("t-1");
+      // Called once per bundle of the chain: the mapping is already what it
+      // would write, so it must not touch the state file again.
+      const before = readFileSync(syncStatePath(a.projectPath), "utf-8");
+      expect(flushThreadMapping(args)).toBe(false);
+      expect(readFileSync(syncStatePath(a.projectPath), "utf-8")).toBe(before);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("falls back to the applied bundle's own receipt when nothing landed in this pull", () => {
+    // The skipped-as-duplicate shape: `importSession` recorded the receipt and
+    // imported nothing, so `threadLandedSessionId` is null while the content is
+    // demonstrably here. `lastAppliedIndex` names the bundle that was handled,
+    // and the receipt is read from THAT bundle's own machine.
+    const a = arrange("sesh-flush-receipt");
+    try {
+      plantReceipt(a.projectPath);
+      expect(
+        flushThreadMapping({
+          effectiveProjectPath: a.projectPath, hubId: "hub-1", threadId: "t-1",
+          needed: [bundle0, bundle1],
+          apply: { lastAppliedIndex: 1, lastBundleManifest: null, threadLandedSessionId: null },
+        })
+      ).toBe(true);
+      expect(getThreadId(readSyncState(a.projectPath), "local-1")).toBe("t-1");
+    } finally {
+      a.cleanup();
+    }
   });
 });
 
@@ -4612,6 +4709,136 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
       expect(w.threads.map((t) => t.threadId)).toEqual([threadId]);
     } finally {
       f.cleanup();
+    }
+  });
+
+  /**
+   * The same end state as the crash window above, reached WITHOUT a crash — and
+   * the reason `backfillThreadMappings` cannot repair it.
+   *
+   * The receipts (`peers[...].received`, and the hub ledger `recordSentToPeer`
+   * credits) are written INSIDE the per-bundle loop; the thread mapping used to
+   * be written only after it. Three hard returns in that loop — a fetch abort, a
+   * workspace abort, an import failure — leave bundles `0..i-1` applied and
+   * credited and never reach the record stage. That is deliberate for the
+   * bundles themselves ("the re-run resumes at this bundle, not at the start of
+   * the chain"), and it is exactly why the mapping has to keep up with them.
+   *
+   * The trigger is ordinary rather than hostile: a bundle that arrived on this
+   * machine's copy of the synced hub folder without the session it declares —
+   * the condition the abort's own suggestion names.
+   *
+   * `backfillThreadMappings` is unreachable here, which is the whole point: it
+   * runs only on exits where `needed` is EMPTY, and after a mid-chain abort the
+   * deferred bundle was never recorded as received, so the re-run's `needed` is
+   * non-empty and aborts at the same bundle again. The damage therefore persists
+   * for as long as the hub copy does — and `hub reindex` does not repair it
+   * either (`reindex.ts` drops a session with no thread mapping, with a warning).
+   */
+  it("a mid-chain abort maps the thread for the bundles it DID apply, so the next push does not fork it", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-midchain-homeA-"));
+    const homeC = mkdtempSync(join(tmpdir(), "sesh-midchain-homeC-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-midchain-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-midchain-fix-"));
+    let projectC: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushOpts = {
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        noWorkspace: true, claudeVersion: "2.1.81",
+      };
+      const full = await hubPush({ ...pushOpts, createProject: true });
+      expect(full.success).toBe(true);
+      if (!full.success) return;
+      const threadId = full.pushedSessions[0].threadId;
+      const aJsonl = join(configDirA, "projects", encodeProjectPath(projectA), `${FIXTURE_SESSION_ID}.jsonl`);
+      appendEntries(aJsonl, plainEntries(FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID, projectA));
+      expect((await hubPush(pushOpts)).success).toBe(true);
+
+      // Bundle 1 of the chain: present on the hub, declaring a session it does
+      // not carry. The fetch stage aborts on it, after bundle 0 is applied.
+      await mutateContinuationBundle(hub, full.projectId, (dir) => {
+        const m = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf-8")) as ExportManifest;
+        rmSync(join(dir, "sessions", `${m.sessions[0].sessionId}.jsonl`));
+      });
+
+      restore.restore();
+      restore = overrideHome(homeC);
+      const configDirC = join(homeC, ".claude");
+      projectC = mkdtempSync(join(tmpdir(), "sesh-midchain-projC-"));
+      writeLocalProjectId(projectC, {
+        projectId: full.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      const pulled = await hubPull({
+        configDir: configDirC, projectPath: projectC, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(pulled.success).toBe(false);
+      expect((pulled as ErrorResult).error).toMatch(/does not contain it/);
+
+      // Bundle 0 really was applied and credited — the abort is not a rollback,
+      // and this is the half the abort's message promises.
+      const projectDirC = join(configDirC, "projects", encodeProjectPath(projectC));
+      const landedFiles = readdirSync(projectDirC).filter((f) => f.endsWith(".jsonl"));
+      expect(landedFiles).toHaveLength(1);
+      const landed = landedFiles[0].replace(/\.jsonl$/, "");
+      const stateC = readSyncState(projectC);
+      expect(
+        Object.values(stateC.peers).some((p) => Object.keys(p.received ?? {}).length > 0)
+      ).toBe(true);
+      // ...and the hub's own ledger was credited too, which is what makes the
+      // missing mapping cost more than a duplicate: the forking push below ships
+      // a DELTA, leaving a continuation chain with no base bundle to anchor it.
+      expect(
+        Object.entries(stateC.peers).some(
+          ([id, p]) => id.startsWith("hub:") && Object.keys(p.sent ?? {}).length > 0
+        )
+      ).toBe(true);
+
+      // The mapping has to be exactly as durable as those receipts.
+      expect(getThreadId(readSyncState(projectC), landed)).toBe(threadId);
+
+      // The re-run lands on the SAME abort (the deferred bundle was never
+      // recorded, so `needed` is non-empty) — the backfill exit is unreachable.
+      const again = await hubPull({
+        configDir: configDirC, projectPath: projectC, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+      expect(again.success).toBe(false);
+      expect((again as ErrorResult).error).toMatch(/does not contain it/);
+
+      // The consequence, and the reason this is data loss rather than untidiness:
+      // C's next push continues A's thread instead of minting a second one.
+      appendEntries(join(projectDirC, `${landed}.jsonl`), [
+        {
+          uuid: "c-new-1", parentUuid: readLastEntryUuid(join(projectDirC, `${landed}.jsonl`)),
+          timestamp: "2026-07-22T10:00:00Z", sessionId: landed, cwd: projectC,
+          version: "2.1.81", type: "user", message: { role: "user", content: "more from C" },
+        },
+      ]);
+      const pushedC = await hubPush({
+        configDir: configDirC, projectPath: projectC, hubPath: hub,
+        noWorkspace: true, claudeVersion: "2.1.81",
+      });
+      expect(pushedC.success).toBe(true);
+      if (!pushedC.success) return;
+      // Measured before the fix: a SECOND thread whose only bundle is a
+      // `continuation` — a delta with no base bundle anywhere in its own chain,
+      // which is the unreconstructable thread `recordSentToPeer`'s invariant
+      // names. The delta is right; the thread it is filed under is the defect.
+      expect(pushedC.pushedSessions[0].type).toBe("continuation");
+      expect(pushedC.pushedSessions[0].threadId).toBe(threadId);
+      const w = await hubWhereis({ configDir: configDirC, projectPath: projectC, hubPath: hub });
+      expect(w.threads.map((t) => t.threadId)).toEqual([threadId]);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeC, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectC) rmSync(projectC, { recursive: true, force: true });
     }
   });
 

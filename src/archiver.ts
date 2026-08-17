@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
-import { assertSafeManifestIds } from "./manifest.js";
+import { assertSafeManifestIds, isBundleManifestShape } from "./manifest.js";
 import type { ExportManifest } from "./types.js";
 
 export type CompressionType = "gzip" | "zstd";
@@ -261,10 +261,9 @@ export async function readManifestFromArchive(
     }
     // Valid JSON is not yet a manifest. Everything below is surfaced to the
     // user as fact, so a wrong-shaped `sessions` must degrade rather than
-    // fabricate: `sessions: "abc"` would otherwise report sessionCount 3
-    // (string length) — an invented number, in the code path whose whole
-    // point is never inventing metadata. Deliberately minimal, not a schema
-    // validator: the plugin marker plus the one field a count is derived from.
+    // fabricate a count from it. The predicate is shared with the directory
+    // path in cli.ts and lives in manifest.ts — see it for why those two
+    // clauses, and for what `assertSafeManifestIds` below does not catch.
     if (!isBundleManifestShape(parsed)) {
       return {
         ok: false,
@@ -296,19 +295,6 @@ export async function readManifestFromArchive(
       }
     }
   }
-}
-
-/**
- * Minimal structural check that a parsed manifest.json is a sesh-mover bundle
- * manifest — the plugin marker (the same one the directory-export path in
- * cli.ts checks) and a real `sessions` array. Field-level validation is
- * deliberately out of scope; this only guards against reporting numbers
- * derived from a value that was never a session list.
- */
-function isBundleManifestShape(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const m = value as { plugin?: unknown; sessions?: unknown };
-  return m.plugin === "sesh-mover" && Array.isArray(m.sessions);
 }
 
 /**

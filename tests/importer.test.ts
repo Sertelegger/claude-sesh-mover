@@ -747,6 +747,106 @@ describe("importer", () => {
       expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
     });
 
+    // --- #68 part 1: the layer ROOT is probed with lstat too ---
+    //
+    // #64 closed every per-FILE read (`isRegularFile`) and every destination
+    // write, but the two probes that decide whether to WALK a layer at all were
+    // still `existsSync`, which resolves links. A directory-form bundle whose
+    // `memory/` is itself a symlink to `~/.ssh` therefore had its real files
+    // enumerated and copied into the target's memory folder — a read-side
+    // gather into the directory a later session reads prose out of.
+    //
+    // `"junction"` as the link type so these run on Windows as well as POSIX:
+    // a directory symlink needs elevation there, a junction does not, and
+    // `lstat` reports both as symbolic links. A `skipIf(isWindows)` here would
+    // turn a real hole into a green check on the one platform whose primitives
+    // differ (see `copyToNewFile`).
+    const secretLayerDir = (name: string, files: Record<string, string>): string => {
+      const dir = join(tempDir, name);
+      mkdirSync(dir, { recursive: true });
+      for (const [f, content] of Object.entries(files)) {
+        writeFileSync(join(dir, f), content);
+      }
+      return dir;
+    };
+
+    it("refuses a symlinked memory ROOT in a directory-form bundle instead of walking it", async () => {
+      const secret = secretLayerDir("memory-root-secrets", {
+        "id_rsa.md": "TOP_SECRET_MARKER\n",
+        "MEMORY.md": "- [Theirs](id_rsa.md) — planted\n",
+      });
+      const from = await exportWithMemory({}, "symlink-memory-root-export");
+      rmSync(join(from, "memory"), { recursive: true, force: true });
+      symlinkSync(secret, join(from, "memory"), "junction");
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      // Nothing was enumerated through the link. The target memory directory is
+      // not even created, so no file behind it can have landed under any name.
+      expect(existsSync(targetMemDir())).toBe(false);
+      expect(result.memoryDir).toBeUndefined();
+      expect(result.memoryIndex).toBeUndefined();
+      expect(
+        result.warnings.some((w) => w.includes("memory folder in this bundle is a symlink"))
+      ).toBe(true);
+      // The layer degrades; it does not abort the import.
+      expect(result.importedSessions).toHaveLength(1);
+    });
+
+    it("refuses a symlinked plans ROOT in a directory-form bundle instead of walking it", async () => {
+      // `plans/` is config-dir-GLOBAL, so files gathered through a symlinked
+      // bundle root land in a directory every project on this machine shares.
+      const secret = secretLayerDir("plans-root-secrets", {
+        "stolen.md": "TOP_SECRET_MARKER\n",
+      });
+      const from = await exportWithMemory({}, "symlink-plans-root-export");
+      rmSync(join(from, "plans"), { recursive: true, force: true });
+      symlinkSync(secret, join(from, "plans"), "junction");
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      expect(existsSync(join(targetConfigDir, "plans"))).toBe(false);
+      expect(result.planConflicts).toBeUndefined();
+      expect(
+        result.warnings.some((w) => w.includes("plans folder in this bundle is a symlink"))
+      ).toBe(true);
+      expect(result.importedSessions).toHaveLength(1);
+      // The bundle's OTHER shared layer is untouched by the refusal.
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+    });
+
+    // --- #68 part 2: an unreadable plans destination is disclosed ---
+    it("says so when a plans destination cannot be read, instead of delivering nothing in silence", async () => {
+      // A directory standing where the incoming plan's name goes: the exclusive
+      // create answers EEXIST, and the compare then cannot read it (EISDIR).
+      // Before #68 that fell straight through to `continue` — no warning, no
+      // `planConflicts`, nothing at all in a result the skill layer branches on
+      // since #59. The memory side already warns in exactly this situation.
+      const plansDir = join(targetConfigDir, "plans");
+      mkdirSync(join(plansDir, "test-plan.md"), { recursive: true });
+
+      const result = await runImport();
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      expect(
+        result.warnings.some((w) =>
+          w.includes('Plan "test-plan.md" could not be compared with the incoming copy')
+        )
+      ).toBe(true);
+      // A warning and NOT a `planConflicts` entry — the same class the memory
+      // side produces. An `AuxiliaryConflict` asserts the two copies differ and
+      // carries a hash of each, and here one of them could not be read at all.
+      expect(result.planConflicts).toBeUndefined();
+      // Nothing was written into the directory occupying the name.
+      expect(readdirSync(join(plansDir, "test-plan.md"))).toEqual([]);
+      expect(result.importedSessions).toHaveLength(1);
+    });
+
     it("refuses a bundle whose manifest sessionId escapes the bundle (no file read outside)", async () => {
       const { importSession } = await import("../src/importer.js");
       const { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readdirSync } =

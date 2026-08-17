@@ -9,7 +9,7 @@ import { readConfig, readConfigOverrides, writeConfigOverrides, setConfigOverrid
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
-import { readManifest, assertSafeManifestIds } from "./manifest.js";
+import { readManifest, assertSafeManifestIds, isBundleManifestShape, } from "./manifest.js";
 import { loadOrCreateMachineId } from "./machine.js";
 import { readSyncState, recordSentFromBundle, setLastAutoPush, writeSyncState, } from "./sync-state.js";
 import { acquireProjectLock } from "./hub/lock.js";
@@ -283,27 +283,6 @@ async function archiveBrowseEntry(archivePath, name, storage) {
         : degradedBrowseEntry(name, archivePath, storage, r.detail);
 }
 /**
- * Minimal structural check that a parsed manifest.json is a sesh-mover bundle
- * manifest: the plugin marker plus a real `sessions` array. Deliberately not a
- * schema validator — it guards exactly the two things `browse` states as fact
- * about a bundle it never opened further: that it is one of ours at all, and a
- * `sessionCount` derived from a value that really is a session list. Without
- * it, `sessions: "abc"` reports `sessionCount: 3` (string length) — an invented
- * number in the code path whose whole point is never inventing metadata, and
- * one `assertSafeManifestIds` does NOT catch (iterating a string yields
- * characters whose `.sessionId` is `undefined`, which passes).
- *
- * `archiver.ts` applies the identical predicate to a manifest read out of an
- * archive. The two must agree; a third caller should be the trigger to give it
- * one home in `manifest.ts` rather than a third copy.
- */
-function isBundleManifestShape(value) {
-    if (typeof value !== "object" || value === null)
-        return false;
-    const m = value;
-    return m.plugin === "sesh-mover" && Array.isArray(m.sessions);
-}
-/**
  * Read `<dir>/manifest.json` without throwing, mirroring
  * `readManifestFromArchive`'s result contract so both halves of `browse` work
  * from the same kind of value.
@@ -323,6 +302,9 @@ function readDirectoryManifest(dir) {
     catch (e) {
         return { ok: false, detail: e.message };
     }
+    // Shape before content, using the SAME predicate the archive path applies
+    // (manifest.ts) — a `sessions` that is not an array is what turns a listing
+    // into a fabricated `sessionCount`, and readManifest above does not see it.
     if (!isBundleManifestShape(manifest)) {
         return {
             ok: false,

@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  readdirSync,
+  readFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExportManifest } from "../src/types.js";
@@ -434,5 +441,191 @@ describe("manifest", () => {
       readBack.sessions[0].messageCount = 11;
       expect(verifySessionsDigest(readBack)).toMatch(/hashes to sha256:/);
     });
+  });
+});
+
+/**
+ * The shape predicate. It answers a question NO other check in this module
+ * answers — "is this parsed JSON a bundle manifest at all" — and the two
+ * entry-point suites (`tests/archiver.test.ts` for the archive path,
+ * `tests/cli.test.ts` for both directory paths) assert the same fabrication
+ * case end to end. These are the unit-level statements of it.
+ */
+describe("isBundleManifestShape", () => {
+  /** A manifest whose ONLY defect is that `sessions` is a string. */
+  const shapeless = {
+    version: 1,
+    plugin: "sesh-mover",
+    exportedAt: "2026-08-14T00:00:00Z",
+    sourcePlatform: "linux",
+    sourceProjectPath: "/x",
+    sourceConfigDir: "/y",
+    sourceClaudeVersion: "1.0.0",
+    sessionScope: "current",
+    includedLayers: [],
+    sessions: "abc",
+  };
+
+  it("accepts the plugin marker plus a real sessions array", async () => {
+    const { isBundleManifestShape } = await import("../src/manifest.js");
+    expect(isBundleManifestShape({ ...shapeless, sessions: [] })).toBe(true);
+    expect(
+      isBundleManifestShape({ plugin: "sesh-mover", sessions: [{ sessionId: "a" }] })
+    ).toBe(true);
+  });
+
+  it('rejects `sessions: "abc"` — the case assertSafeManifestIds does NOT catch', async () => {
+    const { isBundleManifestShape, assertSafeManifestIds } = await import(
+      "../src/manifest.js"
+    );
+    expect(isBundleManifestShape(shapeless)).toBe(false);
+
+    // Why this predicate has to exist at all: the id chokepoint is blind to a
+    // wrong-shaped session list. Iterating a string yields characters, whose
+    // `.sessionId` is undefined, so every id check passes...
+    expect(() =>
+      assertSafeManifestIds(shapeless as unknown as ExportManifest)
+    ).not.toThrow();
+    // ...and the number a listing would then have reported as a session count
+    // is the string's length. The two checks are disjoint, not redundant.
+    expect(shapeless.sessions.length).toBe(3);
+  });
+
+  it("rejects the shapes a stranger's manifest.json arrives in", async () => {
+    const { isBundleManifestShape } = await import("../src/manifest.js");
+    // Not an object at all.
+    for (const v of [null, undefined, "manifest", 42, true]) {
+      expect(isBundleManifestShape(v)).toBe(false);
+    }
+    // An array is `typeof "object"` — it has no plugin marker.
+    expect(isBundleManifestShape([{ plugin: "sesh-mover", sessions: [] }])).toBe(false);
+    // Another tool's bundle, or ours with the marker stripped.
+    expect(isBundleManifestShape({ some: "other tool" })).toBe(false);
+    expect(isBundleManifestShape({ ...shapeless, plugin: undefined, sessions: [] })).toBe(
+      false
+    );
+    expect(
+      isBundleManifestShape({ ...shapeless, plugin: "other-tool", sessions: [] })
+    ).toBe(false);
+    // Every non-array `sessions`.
+    for (const sessions of [undefined, null, 5, {}, "", { length: 3 }]) {
+      expect(isBundleManifestShape({ plugin: "sesh-mover", sessions })).toBe(false);
+    }
+  });
+});
+
+/**
+ * ANTI-DUPLICATION GUARD for `isBundleManifestShape` (#60) — a text sweep, not
+ * a verifier.
+ *
+ * ## Why a guard at all
+ *
+ * The predicate existed as two private copies that had to agree — `archiver.ts`
+ * (archive path, v0.5.1) and `cli.ts` (directory path, #33) — and they had
+ * already drifted once: the store directory scan checked no plugin marker at
+ * all until #33, while the archive path had checked it since v0.5.1. The
+ * failure mode is silent. The path with the weaker copy keeps listing bundles;
+ * it just believes a manifest the other path refuses.
+ *
+ * ## What this DOES check
+ *
+ * It enumerates every `.ts` under `src/` and fails unless: exactly one file
+ * DECLARES `isBundleManifestShape` and it is `manifest.ts`; exactly one file
+ * spells the marker comparison (either `plugin === "sesh-mover"` or the
+ * `["plugin"]` bracket form) and it is `manifest.ts`; and both readers name it
+ * in an import from `./manifest.js`, so the consolidation cannot be undone by
+ * quietly dropping a call site.
+ *
+ * ## What it CANNOT check — read this before trusting it
+ *
+ * It reads characters, not meaning. A second copy written any other way walks
+ * straight past it: a `PLUGIN_MARKER` constant, a destructured
+ * `const { plugin } = m`, a `startsWith`, a schema library, a JSON-pointer
+ * lookup. It says nothing about whether the surviving copy is CORRECT. And it
+ * cannot see the hole that actually matters most — a *new* manifest reader that
+ * never calls the predicate at all is exactly the #33 defect, and nothing here
+ * would notice, because there is no second copy to find. It is the same class
+ * of artifact as `tests/hub-warning-flags.test.ts`: a checklist that forces a
+ * decision, not a proof. Conversely it is deliberately trigger-happy in one
+ * direction — a doc comment elsewhere that quotes the comparison verbatim fails
+ * this test. That is the cheap direction to be wrong in; reword the comment.
+ *
+ * ## Why it does not shell out to grep
+ *
+ * `src/hub/threads.ts` contains a literal NUL byte, so GNU grep classifies it
+ * as binary and a recursive search reports nothing in it, silently — that has
+ * already hidden a real reader from two sweeps in this repo. This sweep
+ * enumerates with `readdirSync` and reads with `readFileSync`, and the third
+ * test below asserts that the file with the NUL byte is genuinely in the swept
+ * set and genuinely read.
+ */
+describe("isBundleManifestShape — one home (#60)", () => {
+  const ROOT = join(import.meta.dirname, "..");
+
+  /** Every `.ts` under `src/`, repo-relative, `/`-separated. */
+  function srcFiles(): string[] {
+    const walk = (rel: string): string[] =>
+      readdirSync(join(ROOT, rel), { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .flatMap((e) =>
+          e.isDirectory()
+            ? walk(`${rel}/${e.name}`)
+            : e.name.endsWith(".ts")
+              ? [`${rel}/${e.name}`]
+              : []
+        );
+    return walk("src");
+  }
+
+  const DECLARES = /(?:function|const|let|var)\s+isBundleManifestShape\b/;
+  /** Both spellings of the marker comparison, whitespace-tolerant. */
+  const MARKER =
+    /(?:\bplugin\b|\[\s*["'`]plugin["'`]\s*\])\s*[!=]==\s*["'`]sesh-mover["'`]/;
+
+  it("declares the predicate, and the marker comparison, in exactly one file", () => {
+    const declares: string[] = [];
+    const compares: string[] = [];
+    for (const f of srcFiles()) {
+      const text = readFileSync(join(ROOT, f), "utf-8");
+      if (DECLARES.test(text)) declares.push(f);
+      if (MARKER.test(text)) compares.push(f);
+    }
+    expect(declares).toEqual(["src/manifest.ts"]);
+    expect(compares).toEqual(["src/manifest.ts"]);
+  });
+
+  it("has both readers importing it rather than re-deriving it", () => {
+    for (const f of ["src/archiver.ts", "src/cli.ts"]) {
+      const text = readFileSync(join(ROOT, f), "utf-8");
+      const imported = [
+        ...text.matchAll(/import\s*\{([^}]*)\}\s*from\s*["']\.\/manifest\.js["']/g),
+      ].flatMap((m) => m[1].split(",").map((s) => s.trim()));
+      expect(imported).toContain("isBundleManifestShape");
+    }
+  });
+
+  it("really reads every file it sweeps, NUL bytes included", () => {
+    const files = srcFiles();
+    // The file `grep -r` goes silent on. If a future refactor moves it, move
+    // this assertion to wherever the NUL byte lives rather than deleting it.
+    expect(files).toContain("src/hub/threads.ts");
+    expect(files.length).toBeGreaterThan(20);
+    for (const f of files) {
+      expect(readFileSync(join(ROOT, f), "utf-8").length).toBeGreaterThan(0);
+    }
+  });
+
+  it("is on the library surface, via the manifest.js re-export index.ts already has", async () => {
+    // The export question the issue asks: yes, it should be public, and it is
+    // — `src/index.ts` already re-exports every member of `manifest.js`, so
+    // filing the predicate there put it on the surface with no edit to
+    // index.ts. It belongs there because a consumer parsing a manifest.json
+    // itself meets the identical fabrication case, and the chokepoint that IS
+    // exported and documented as such (`assertSafeManifestIds`) does not catch it.
+    const lib = await import("../src/index.js");
+    expect(typeof lib.isBundleManifestShape).toBe("function");
+    expect(lib.isBundleManifestShape({ plugin: "sesh-mover", sessions: "abc" })).toBe(
+      false
+    );
   });
 });
