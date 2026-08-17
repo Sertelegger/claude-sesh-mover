@@ -57,9 +57,10 @@ export declare function buildIndexFile(inputs: IndexBuildInputs): HubIndexJson;
  * Read one machine's index file.
  *
  * `null` means the file is absent or structurally unusable (missing, not JSON,
- * wrong schemaVersion, no threads map). Everything finer-grained DEGRADES: a
- * record whose ids or `file` path are unsafe is dropped and reported through
- * `warnings`, and the rest of the index survives.
+ * wrong schemaVersion, no threads map, or an identity that disagrees with its
+ * own filename — see below). Everything finer-grained DEGRADES: a record whose
+ * ids or `file` path are unsafe is dropped and reported through `warnings`, and
+ * the rest of the index survives.
  *
  * That degradation is the point. `file` was never validated at all, so a single
  * poisoned record reached `backend.exists(record.file)` in hub/pull.ts and threw
@@ -69,6 +70,35 @@ export declare function buildIndexFile(inputs: IndexBuildInputs): HubIndexJson;
  * inside the try, the catch returned null, and the whole index was discarded as
  * "unreadable". Both are the same mistake — the blast radius of a poisoned
  * record must be that record.
+ *
+ * THE FILENAME IS THE IDENTITY; A DISAGREEING `machineId` FIELD IS DAMAGE
+ * (#28). Two things encode which machine wrote an index — the path
+ * `index/<machineId>.json` and the `machineId` INSIDE it — and they could
+ * disagree. The filename wins: it is what this machine controls, what
+ * `indexPath` builds, what `readAllIndexes` dedupes on, and the only one of the
+ * two that has passed `assertSafeHubId` (via `indexPath`) by the time the file
+ * is read. Per-machine ownership is what makes that a rule rather than a
+ * preference — `index/<id>.json` is BY CONSTRUCTION the file machine `<id>`
+ * owns and the only one it ever writes, so a content field naming someone else
+ * is a copied, hand-edited or corrupt file, never a legitimate state.
+ *
+ * SKIP-AND-WARN, not fatal, and not a repair. Not fatal because a sync client's
+ * conflict copy must not turn into a failed pull, and because it is the same
+ * degradation this reader already applies to hostile input — the difference is
+ * that here the poisoned unit is the whole FILE, since its identity is what is
+ * in question. Not a repair (overwriting the field from the filename) because
+ * this machine does not own that file, and a silent rewrite in memory would
+ * publish an id no writer stands behind. Fatal-on-mismatch is the right answer
+ * once a second person's machine can write to this hub; that is not today.
+ *
+ * WHAT IT BUYS DOWNSTREAM: `HubIndexJson.machineId`, and therefore
+ * `ThreadCopy.machineId` in threads.ts, is filename-reconciled for every index
+ * that reached a consumer through this function — which is every one of them in
+ * production (`readAllIndexes` is the only door). Two copies of one thread can
+ * no longer carry the same `machineId` from two different files, and an
+ * internal `machineId` can no longer be a path-unsafe string. Both of those had
+ * accommodations built for them; see the notes in threads.ts, which say why
+ * they stay.
  *
  * `warnings` is optional so the existing callers (pull.ts, push.ts, reindex.ts)
  * that only want the index need no change; readAllIndexes passes its own array.

@@ -97,6 +97,50 @@ See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
   report a local-state summary (ids and timestamps only, never content), and every
   rendering of it carries an as-of stamp or it lies.
 
+### Decisions taken 2026-08-17
+
+Five design questions that had been blocking implementation, settled by the owner. Recorded
+here because the reasoning matters more than the choice, and an issue comment is easy to lose.
+
+- **#36 — the apply-path boundary is one per-import consent gate, with per-machine bundle
+  signing as the stated destination, not a fallback.** The two are complementary rather than
+  alternatives: consent answers *"do you want this payload applied?"*, signing answers *"who
+  authored it?"*, and neither subsumes the other — a signed bundle from your own machine
+  still writes outside the session directory and you should still be told what. **No path
+  filter, ever**, which upholds the existing rule that the floor is about what a name can
+  *do*: the floor can be complete because plugin-subverting names are finite, whereas "leads
+  to code execution" is a property of the receiver's toolchain and can never close. Stated
+  limit, not to be oversold in UI copy: consent kills unconsented channels, not hostile
+  bundles. This unblocks **#47**.
+- **#43 — a hub project is retired by tombstone, then physically deleted by the owner machine
+  after a grace period.** A tombstone is an assertion a machine writes into *its own* index,
+  so per-machine ownership holds. It refuses new pulls — but it is a **new-start gate, not a
+  mutual-exclusion primitive**, because a pull already in flight keeps going and, on a synced
+  folder, the tombstone may not have propagated to the pulling machine yet. The grace window
+  is what closes that, so it must be sized against sync propagation (hours, not seconds) and
+  the delete must refuse a tombstone younger than it. `backend.delete` has no callers today;
+  this is the first and should stay the only one.
+- **#71 — fix the cause: make backend reads non-blocking, rather than bounding the symptom at
+  the lock.** Reproduced: the wedge is a real blocking syscall (`readFileSync`'s `open()` on
+  a hard mount), inside the push's critical section, so a timeout-capable read means a wedged
+  push fails fast, exits, and releases its lock — the orphan is never created. Explicitly
+  chosen over the cheaper options despite being the larger change. **Residual to state, not
+  imply:** this removes the trigger, not the mechanism — `acquireProjectLock` still steals
+  from a live holder, so any push that legitimately outruns the staleness window is still
+  stolen from. That is a separate follow-up. Note the issue's own trigger description is
+  wrong: an *absent* share accrues nothing (it refuses cleanly); the bug needs one that
+  **blocks**.
+- **#76 — distinct exit codes per class:** `0` success, `1` bad invocation, `2` refusal,
+  `3` environment-not-ready. The environment class is exactly the retryable set, which is the
+  property that makes it worth distinguishing. The two hook endpoints remain a hard exception
+  and **always exit 0** — a Claude Code protocol requirement.
+- **#28 — index identity: the filename wins, and a disagreeing in-file `machineId` is a
+  warning, not a fatal.** The filename is what this machine controls and what every hub path
+  is built from. Skip-and-warn matches how the reader already treats malformed files and
+  avoids turning a sync client's conflict copy into a failed pull. Fatal-on-mismatch is right
+  once someone else's machine can write to the hub; dropping the redundant field is the clean
+  end state but is an index schema change for slice 4.
+
 **Why build it (landscape as of 2026-07):** Claude Code local CLI sessions are machine-local
 with no native sync; Remote Control steers live sessions but transfers nothing and requires
 the origin machine online; teleport is cloud→CLI only; `claude session export/import` is a

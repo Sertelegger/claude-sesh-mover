@@ -42,6 +42,24 @@ export function createMachineNameLookup(
         const raw = await backend.read(machinePath(id));
         names.set(id, (JSON.parse(raw.toString()) as HubMachineJson).name);
       } catch {
+        // **The live reason for this catch is an ABSENT record, not a hostile
+        // id** — and that changed under it, so it is worth stating rather than
+        // leaving the older rationale to be inferred.
+        //
+        // It was written when a machine id could reach `machinePath` straight
+        // out of an index file's *contents*. `readMachineIndex` now reconciles
+        // the declared id against the filename and skips the file on a
+        // mismatch, so every id arriving here has already passed
+        // `assertSafeHubId` via `indexPath` and that half is unreachable
+        // through the real pipeline.
+        //
+        // What remains is ordinary and permanent: `machines/<id>.json` is
+        // routinely missing — a machine that pushed before its record landed,
+        // a pruned or partially-synced hub — and `backend.read` throws for a
+        // missing file. Removing this would turn a nameless copy, which
+        // `whereis` renders perfectly well as `machineName: null`, into a
+        // thrown command. Pinned by a test that gives a second index file an
+        // agreeing identity and no machine record.
         names.set(id, null);
       }
     }

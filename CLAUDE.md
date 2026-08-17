@@ -27,11 +27,32 @@ claude-sesh-mover is a Claude Code **plugin** (not a standalone app) that export
 
 The design is **hybrid: deterministic Node.js core + conversational skill layer.**
 
-- `src/` compiles to `dist/cli.js`, a Commander-based CLI with subcommands: `export`, `import`, `migrate`, `browse`, `configure`, `push`, `pull`, `whereis`, and the nested `hub init` / `hub status` / `hub reindex`. Every command returns structured JSON keyed by `success` and `command` (see `src/types.ts` for result shapes — `ExportResult`, `ImportResult`, `MigrateResult`, `BrowseResult`, `ConfigureResult`, `ErrorResult`, and the hub shapes `HubInitResult`, `HubStatusResult`, `HubPushResult`, `HubPullResult`/`HubPullListResult`, `WhereisResult`, `HubReindexResult`, plus the shared `HubUnlinkedResult`/`HubLockBusyResult`/`NotYetSyncedResult` error shapes). The two internal hook endpoints — `hub hook-session-end` and `hub hook-session-start` — are the sanctioned exception to that contract: they speak Claude Code's hook protocol instead (nothing on stdout, or for SessionStart exactly one hook-JSON object, and **always** exit 0). See "Hook registration" below.
+- `src/` compiles to `dist/cli.js`, a Commander-based CLI with subcommands: `export`, `import`, `migrate`, `browse`, `configure`, `push`, `pull`, `whereis`, and the nested `hub init` / `hub status` / `hub reindex`. Every command returns structured JSON keyed by `success` and `command` (see `src/types.ts` for result shapes — `ExportResult`, `ImportResult`, `MigrateResult`, `BrowseResult`, `ConfigureResult`, `ErrorResult`, and the hub shapes `HubInitResult`, `HubStatusResult`, `HubPushResult`, `HubPullResult`/`HubPullListResult`, `WhereisResult`, `HubReindexResult`, plus the shared `HubUnlinkedResult`/`HubLockBusyResult`/`NotYetSyncedResult` error shapes). Alongside the JSON it exits with a code naming the outcome CLASS — see "CLI exit codes" below. The two internal hook endpoints — `hub hook-session-end` and `hub hook-session-start` — are the sanctioned exception to both contracts: they speak Claude Code's hook protocol instead (nothing on stdout, or for SessionStart exactly one hook-JSON object, and **always** exit 0). See "Hook registration" below.
 - `commands/*.md` + `skills/session-porter/SKILL.md` are markdown-based slash commands loaded by Claude Code when the plugin is installed. They shell out to the CLI, parse the JSON, and drive UX (confirmations, path-collision handling, prune prompts, registration fallback when Claude Code rejects an imported session).
 - `.claude-plugin/plugin.json` is the plugin manifest consumed by Claude Code's plugin cache — its `commands` array must list every `commands/*.md` doc (a doc not listed there never loads as a slash command, even if the file exists); `.claude-plugin/marketplace.json` sits alongside it for marketplace listing.
 - `hooks/hooks.json` registers the plugin's Claude Code lifecycle hooks. See "Hook registration" below — this file is **auto-loaded by path**, so it must not also be referenced from `plugin.json`.
 - `src/index.ts` is the library entrypoint — it re-exports every core module so the package can also be consumed programmatically. It deliberately does **not** export a `decodeProjectPath`: project-folder encoding (`-` for path separators) is lossy for hyphenated paths and cannot be reliably reversed. Read `cwd` from JSONL entries, or use `readProjectPathFromJsonl` in `discovery.ts`, instead of trying to decode the folder name.
+
+### CLI exit codes
+
+**One code per CLASS of outcome, and the class is a property of the result SHAPE — never of which code path printed it** (#76). The JSON body stays the contract for detail; the exit code is what a shell caller gets to branch on without parsing it.
+
+| code | class | meaning |
+|---|---|---|
+| `0` | success | it happened |
+| `1` | the command did not run | a bad invocation (Commander's own validation, `--on-divergence bogus`, `--set` type errors) or an unexpected failure — anything that reached a command's `catch` |
+| `2` | refusal | understood and declined; nothing was done and the body says why (`unlinked`, `no-such-project`, "already up to date", the pick-required listing) |
+| `3` | environment-not-ready | the invocation was fine and the machine is not (`hub-unreachable`, `lock-busy`, `not-yet-synced`). **This is exactly the retryable set** — the property that earns it a code of its own |
+
+`exitCodeForResult` in `src/types.ts` is the single mapping, and it lives beside `CliResult` on purpose: its `Record<CliResultReason, ExitCode>` table is *exhaustive* over the union, so a new result type carrying a new `reason` fails to compile until someone assigns it a class. `src/cli.ts` has exactly two output chokepoints — `output()` (the shape decides) and `outputError()` (a throw, always 1) — and there must not be a third. The defect this replaced was precisely that the code was decided by whichever helper a site happened to call, so every typed refusal exited 0 next to every success and `sesh-mover hub pull || handle_failure` was a silent no-op for the whole refusal class.
+
+Three things about it that look like mistakes and are not:
+
+- **`pickRequired` is `success: true` and exits 2.** `pull` with neither `--thread` nor `--latest` pulls nothing — it lists the threads and waits to be told which. "Success means 0" is the simplification that would undo it.
+- **A `success: false` result with no `reason` defaults to 2, not 1.** What reaches that default is an `ErrorResult` a command *returned* as a value, having got far enough to describe the outcome. A thrown failure never reaches it. The residual imprecision is known and stated at the function: a few of those returned `ErrorResult`s are caught exceptions (`hubInit`'s mkdir failure, `importSession`'s unreadable bundle) and are really class 1 — fixing that needs a `reason` on the producing module, not a smarter classifier, because matching on `error` text is forbidden.
+- **Both helpers set `process.exitCode` rather than calling `process.exit()`.** `process.exit()` truncates a large JSON body still queued on a piped stdout and skips pending `finally` blocks — `import`'s `finally` removes its archive extract dir, which a failing import used to leak.
+
+**The two hook endpoints are outside this scheme entirely and ALWAYS exit 0** — Claude Code's hook protocol, not a style choice. They call neither helper, which is what keeps the two schemes from meeting; `tests/hub-hooks.test.ts` pins each endpoint against a failure path that is *proved* to make the ordinary verbs exit non-zero.
 
 ### Core module responsibilities
 
@@ -117,7 +138,8 @@ Two traps in doing that here. **A CLI-level test cannot be mutation-tested by ed
 1. Extend `src/cli.ts` with the Commander subcommand/option.
 2. Add the matching result shape to `src/types.ts` (every CLI result is typed).
 3. Update `commands/<name>.md` and (if the behavior needs explanation for the skill layer) `skills/session-porter/SKILL.md`. If the command is new (not just a new option on an existing one), add its `./commands/<name>.md` path to `.claude-plugin/plugin.json`'s `commands` array too — Claude Code only loads slash commands listed there, so a new doc file with no matching entry silently never appears as a slash command.
-4. Rebuild with `npm run build` **and stage the updated `dist/`** — it's committed so installed plugins pick up the change. A commit that touches `src/` without a corresponding `dist/` update will ship a stale binary.
+4. If the new result shape carries a `reason`, `exitCodeForResult`'s table in `src/types.ts` will not compile until you assign it an exit class — do that deliberately (see "CLI exit codes"), and state the code in `commands/<name>.md`. A shape with no `reason` compiles either way and silently takes the default, so check it lands in the class you meant.
+5. Rebuild with `npm run build` **and stage the updated `dist/`** — it's committed so installed plugins pick up the change. A commit that touches `src/` without a corresponding `dist/` update will ship a stale binary.
 
 ## graphify (optional, local-only — never a dependency)
 

@@ -74,4 +74,6 @@ You are running the sesh-mover export command. Follow these steps:
 
 **See also:** for ongoing cross-machine sync through a shared hub folder instead of a one-off export/import round-trip, use `/sesh-mover:push` (requires `/sesh-mover:hub-init` once).
 
+**Exit codes:** keep branching on the parsed JSON, not on `$?`. `export` exits `0` when it produced a bundle — **and also for the `collision: true` case**, which produced nothing and is recognizable only from the body, so never read a zero exit as "the export was written". `1` is a bad invocation (an unknown `--format` or `--scope`, `--incremental` without `--to`/`--since`) or a failure partway through, and `2` is a refusal reported as a result, of which `No sessions found for this project` is the common one. See "Exit Codes" in the skill doc for the full four-class table.
+
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and any conditional/retry branches, e.g. `--suffix`/`--overwrite` for collision handling) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.
