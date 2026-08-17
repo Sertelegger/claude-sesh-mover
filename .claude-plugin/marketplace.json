@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Single-plugin marketplace for claude-sesh-mover",
-    "version": "0.8.0"
+    "version": "0.9.0"
   },
   "plugins": [
     {

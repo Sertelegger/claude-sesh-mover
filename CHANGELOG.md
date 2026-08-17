@@ -2,6 +2,155 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.9.0] — 2026-08-17
+
+> [!IMPORTANT]
+> **Upgrade if you use the hub.** This release closes two measured security holes in the
+> carry apply path, a privacy defect that put conversation text into every hub bundle
+> manifest regardless of your `noSummary` setting, and a bug that meant **no hub bundle
+> has ever carried your `memory/` directory**. None of these announce themselves.
+
+Not breaking in the 0.8.0 sense — nothing is renamed and no file is abandoned — but three
+behaviours change. See **Changed** below before upgrading if you script against the CLI.
+
+### Security
+
+- **Two measured bypasses in the carry floor, both closed.** The apply path re-implemented
+  git's patch-header parsing to decide which files a payload may write. It is now read from
+  git's own parse — `git apply --numstat -z --summary`, read **once**, because git parses a
+  patch into one entry list and then walks *that same list* to print both and to write the
+  files, so two invocations differing only in mode cannot disagree.
+
+  Both holes were reproduced, not theorised. A patch that **copied** `.sesh-mover-include`
+  to an unprotected name applied cleanly, because `--numstat` prints only a copy's
+  destination and the old scan read `rename from` but never `copy from` — and the stolen
+  file was then re-uploaded by the next push. Separately, a destination containing a newline
+  split the only `--summary` line carrying the rename source, and a floor-protected file was
+  **deleted**. `--summary` is now read against a closed grammar, so an unaccounted line
+  refuses the whole payload rather than being skipped. ([#38])
+
+- **An empty `.git` directory is no longer trusted as a repository.** The three-way git scan
+  decides whether a project ships a diff-based carry or a whole-tree snapshot, and
+  `unknown` — git present but unable to answer — must take neither. A bare `.git` directory
+  with no `HEAD` previously read as a repo. An unreadable one (EACCES) now counts as a
+  marker too: unreadable is not absent. ([#50])
+
+- **`MEMORY.md` pointer injection.** The importer built an index line by raw interpolation of
+  a bundle-supplied machine name and bundle filenames, so a newline injected arbitrary
+  entries into your `MEMORY.md`. Titles and descriptions are now sanitised; a target that
+  cannot be expressed is refused rather than rewritten, because the target is also the key
+  the index dedups on. ([#79])
+
+- **Writes through dangling symlinks.** Three shared-layer destinations tested for absence
+  with `existsSync`, which follows links — so a dangling symlink at the destination read as
+  absent and the copy landed **outside** the memory or plans directory. All create-only
+  writes now go through one primitive.
+
+  **Windows was never covered by the guarantee the docs claimed.** libuv maps
+  `O_CREAT|O_EXCL` to `CREATE_NEW` without `FILE_FLAG_OPEN_REPARSE_POINT` — this is
+  CVE-2025-0913, which Go patched and libuv has not — so `COPYFILE_EXCL` follows a dangling
+  link there. An `lstat` refusal is now the load-bearing guard, with the residual race
+  documented rather than papered over. This was a pre-existing gap, not a new one. ([#64])
+
+- **An unbounded `browse` could fill your disk.** Reading a `.tar.zst` manifest shelled out
+  to `zstd` with no size cap: a 16 KB archive wrote **512 MB**, with eight such reads running
+  concurrently. Bounded by counting bytes as they arrive rather than by asking the archive
+  how big it is — a frame piped in on stdin carries no content size at all and `zstd -l`
+  reports blank and exits 0. The ratio is node-tar's own, so what `browse` will open no
+  longer depends on which format it meets. ([#32])
+
+### Fixed
+
+- **Memory never reached the hub, and the manifest said otherwise.** A gate that was correct
+  for `export --incremental` was inherited by `hub push`, which passes `incremental`
+  unconditionally — so **no hub bundle ever carried `memory/`**, while its manifest declared
+  it. Memory now ships with a digest check, and `includedLayers`/`exportedLayers` mean
+  *content* rather than policy. `plans/` deliberately still does not travel to the hub: its
+  source directory is config-dir-global with no project filter, so it would ship every plan
+  on the machine over an unattended push. ([#49], [#53])
+
+- **Memory was also dropped on the most common receive path.** When a pulled continuation
+  spliced onto an existing transcript, the code returned before the importer ran, so the
+  bundle's `memory/` was discarded — and because the sender had already credited the hub
+  ledger, it was never re-sent. It hid behind a near-perfect false negative: inside the
+  5-minute liveness window the splice is declined and the bundle imports normally, which
+  *does* apply the memory. ([#63])
+
+- **A thread split across two other machines can now be pulled whole.** Assembly walks the
+  `fromEntryUuid`/`headEntryUuid` links across every machine's index; a gap, a fork, multiple
+  roots or an advertised-but-unshipped head each produce a named, truthful result instead of
+  a silent truncation or an indefinite "newer work elsewhere" nag. ([#35])
+
+- **`--latest` and `--thread` asked different questions**, so one could report "nothing to
+  pull" while the other fetched. Both now use the same receipt-based predicate. ([#44])
+
+- **`hub push` ignored `noSummary`.** A setting documented as functional — it skips the
+  parse so no conversation text reaches the manifest — did not hold on the transport where
+  it matters most: the default-on, unattended auto-push, which has no channel to disclose
+  what it uploaded. Separately, one of four writers of the index `summary` field wrote a real
+  100-character excerpt of your first message where the others wrote a slug, and a later push
+  copied the poisoned entry forward rather than healing it. ([#65])
+
+- **A mid-chain abort lost the thread mapping**, after which the next auto-push minted a
+  *duplicate* thread shipping only a delta — a continuation with no base bundle to anchor it.
+  Triggered by an ordinary partially-synced bundle, not by a crash. ([#28])
+
+- **A project left linked by a failed push** now says so, and `hub unlink` disarms one
+  directory without touching the hub. Linking is the consent gate for the default-on hooks,
+  so a push that reported failure must not silently arm them. ([#43], local half)
+
+- **A malformed directory export vanished from `browse`** instead of degrading like an
+  archive does, and the store scan never checked the `plugin` marker at all. ([#33])
+
+- Typed shared-layer findings now reach `pull` and `migrate`, so a parked memory file is
+  machine-readable there and not just described in prose ([#59]); a corrupt or hostile bundle
+  manifest, archive or carry block produces a typed refusal instead of an uncaught throw
+  ([#72]); peer-supplied keys can no longer collide with `Object.prototype` ([#28]); and the
+  latest-copy tiebreak no longer depends on directory iteration order ([#28]).
+
+### Changed
+
+- **`plans/` is opt-in on import** (`--include-plans`, default off). A bundle wrote into
+  `<config-dir>/plans`, which is machine-global and escapes the project entirely, with no
+  flag and no gate. Not destructive — cleanup never touches the source plans — but a
+  cross-config-dir `migrate` no longer carries them.
+
+- **An unreachable hub is a typed refusal that exits 0**, not an untyped error exiting 1.
+  The invocation was fine; the environment is not ready. `hub status` and `whereis` *report*
+  the condition inside their normal result rather than refusing, because refusing would fail
+  the command in the situation it exists to describe. Both were previously wrong about it:
+  `status.reachable` meant "`hub.json` exists", and `whereis` on an unmounted share returned
+  `linked: true, threads: []` — byte-identical to a project nobody has pushed to.
+
+- **`pull --progress` now emits a matched pair.** Once the lock is acquired you get exactly
+  one `0` and one `100` on every outcome, including refusals and aborts — `100` means "over",
+  not "succeeded". Previously three exits emitted `0` and never `100`, leaving a consumer
+  waiting forever. `push` gets the same contract.
+
+### Internal
+
+`hubPull` was decomposed from a 1,438-line function into nine stage modules with a shared
+outcome contract ([#51]). Failure results now carry the disclosures collected before the
+failure, which the failure contract requires and the type previously could not express.
+
+[#28]: https://github.com/Sertelegger/claude-sesh-mover/issues/28
+[#32]: https://github.com/Sertelegger/claude-sesh-mover/issues/32
+[#33]: https://github.com/Sertelegger/claude-sesh-mover/issues/33
+[#35]: https://github.com/Sertelegger/claude-sesh-mover/issues/35
+[#38]: https://github.com/Sertelegger/claude-sesh-mover/issues/38
+[#43]: https://github.com/Sertelegger/claude-sesh-mover/issues/43
+[#44]: https://github.com/Sertelegger/claude-sesh-mover/issues/44
+[#49]: https://github.com/Sertelegger/claude-sesh-mover/issues/49
+[#50]: https://github.com/Sertelegger/claude-sesh-mover/issues/50
+[#51]: https://github.com/Sertelegger/claude-sesh-mover/pull/51
+[#53]: https://github.com/Sertelegger/claude-sesh-mover/issues/53
+[#59]: https://github.com/Sertelegger/claude-sesh-mover/issues/59
+[#63]: https://github.com/Sertelegger/claude-sesh-mover/issues/63
+[#64]: https://github.com/Sertelegger/claude-sesh-mover/issues/64
+[#65]: https://github.com/Sertelegger/claude-sesh-mover/issues/65
+[#72]: https://github.com/Sertelegger/claude-sesh-mover/issues/72
+[#79]: https://github.com/Sertelegger/claude-sesh-mover/pull/79
+
 ## [0.8.0] — 2026-08-08
 
 > [!WARNING]
