@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync,
-  utimesSync, writeFileSync,
+  symlinkSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1019,6 +1019,140 @@ describe("fetch stage", () => {
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
   });
+
+  /**
+   * The DOWNLOAD, which was the first of this stage's five untrusted-input
+   * calls and the last one still able to leave `hubPull` as a throw.
+   *
+   * The arrangement is the race the select stage cannot close: its
+   * `backend.exists` sweep saw the file, and by the time the fetch reads it, it
+   * is gone. `createFsBackend`'s `readStream` is `createReadStream`, which is
+   * lazy — the ENOENT is a stream error, not a throw out of `readStream` — so a
+   * `try` around the call alone would have caught nothing.
+   */
+  it("aborts, rather than throwing, when the bundle cannot be read from the hub", async () => {
+    const record = await writeHealthyBundle({ basedOn: "gen-1", carry: true });
+    const st = initApplyState({ needed: [record] });
+    // Present for the select stage's existence sweep, absent by the time the
+    // chain reaches it — a hub file removed, renamed or de-hydrated mid-pull.
+    await backend.delete(record.file);
+
+    const out = await runFetchStage({
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
+    });
+
+    expect(out.status).toBe("aborted");
+    expect(out.value).toBeNull();
+    expect(out.terminal).toMatchObject({ success: false, command: "pull" });
+    expect(out.terminal?.error).toContain(
+      `Bundle ${record.bundleId} could not be read from the hub`
+    );
+    // The hub path, because that is the file the user can go and look at, and
+    // the thrown message whole, because it is what says WHICH failure this is.
+    expect(out.terminal?.error).toContain(record.file);
+    expect(out.terminal?.error).toMatch(/ENOENT|no such file/);
+    expect(out.terminal?.suggestion).toContain("Nothing from this bundle was applied.");
+    expect(out.terminal?.suggestion).toContain("will not be refetched");
+    // Named rather than duplicated: `not-yet-synced` is the select stage's
+    // BEFORE-anything-is-applied answer for a file that has not arrived here,
+    // and a user who meets both inside a minute must be able to tell that it is
+    // one file arriving rather than two faults.
+    expect(out.terminal?.suggestion).toContain("not-yet-synced");
+    // It never got as far as unpacking: no extraction directory was created,
+    // so this is the download guard firing and not one of the three below it.
+    expect(existsSync(join(tempRoot, record.bundleId))).toBe(false);
+    // Refused before either accumulator was written, even though this bundle's
+    // manifest declares a workspace generation and a carry.
+    expect(st.chainWorkspaceBases).toEqual([]);
+    expect(st.lastCarry).toBeNull();
+  });
+
+  /**
+   * The UNPACK, whose two situations share one abort because telling them apart
+   * would mean matching on node-tar's message text.
+   *
+   * Both damage shapes are here because both are measured facts about the
+   * format rather than assumptions (archiver.ts): gzip's CRC32 is what makes a
+   * truncated AND a bit-flipped `.tar.gz` throw, and a `.tar.gz` that decoded
+   * quietly to different bytes would sail past this guard into the manifest
+   * checks below.
+   */
+  it.each([
+    ["a truncated archive", (bytes: Buffer): Buffer => bytes.subarray(0, Math.floor(bytes.length / 2))],
+    ["a bit-flipped archive", (bytes: Buffer): Buffer => {
+      const copy = Buffer.from(bytes);
+      const at = Math.floor(copy.length / 2);
+      copy[at] = copy[at] ^ 0xff;
+      return copy;
+    }],
+  ])("aborts, rather than throwing, on %s", async (_label, damage) => {
+    const record = await writeHealthyBundle({ basedOn: "gen-1", carry: true });
+    const st = initApplyState({ needed: [record] });
+    await backend.writeAtomic(record.file, damage(await backend.read(record.file)));
+
+    const out = await runFetchStage({
+      backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
+    });
+
+    expect(out.status).toBe("aborted");
+    expect(out.value).toBeNull();
+    expect(out.terminal).toMatchObject({ success: false, command: "pull" });
+    expect(out.terminal?.error).toContain(`Bundle ${record.bundleId} could not be unpacked`);
+    expect(out.terminal?.error).toContain(record.file);
+    expect(out.terminal?.suggestion).toContain("Nothing from this bundle was applied.");
+    expect(out.terminal?.suggestion).toContain("will not be refetched");
+    // Both halves of the answer, because the message alone says which applies:
+    // damage a re-push fixes, and an entry no re-push fixes.
+    expect(out.terminal?.suggestion).toContain("push again");
+    expect(out.terminal?.suggestion).toContain("refuses to extract");
+
+    // The download DID succeed — the archive is on disk — and the manifest
+    // never appeared, so this is the unpack guard and not the download above it
+    // or the manifest parse below it.
+    expect(existsSync(join(tempRoot, `${record.bundleId}.tar.gz`))).toBe(true);
+    expect(existsSync(join(tempRoot, record.bundleId, "manifest.json"))).toBe(false);
+    expect(st.chainWorkspaceBases).toEqual([]);
+    expect(st.lastCarry).toBeNull();
+  });
+
+  /**
+   * The other half of the unpack abort, and the reason its suggestion carries a
+   * second remedy: a perfectly intact archive that `assertSafeEntries` REFUSES.
+   *
+   * Not damage and not fixable by a re-push — no bundle sesh-mover produces
+   * holds a symlink entry — so an abort that only said "ask the pushing machine
+   * to push again" would send the user round a loop that cannot terminate.
+   */
+  it.skipIf(process.platform === "win32")(
+    "aborts on an archive holding an entry the extractor refuses",
+    async () => {
+      const record = await writeHealthyBundle();
+      const st = initApplyState({ needed: [record] });
+
+      // Rebuild the bundle with a symlink beside the transcript. The archive is
+      // intact: it decompresses, and every checksum in it is right.
+      const stage = mkdtempSync(join(root, "hostile-"));
+      const dir = join(stage, "bundle");
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      writeFileSync(join(dir, "manifest.json"), "{}\n", "utf-8");
+      symlinkSync("/etc/passwd", join(dir, "sessions", "escape.jsonl"));
+      const archivePath = join(stage, "hostile.tar.gz");
+      await createArchive(dir, archivePath, "gzip");
+      await backend.writeAtomic(record.file, readFileSync(archivePath));
+
+      const out = await runFetchStage({
+        backend, record, machineId: MACHINE_ID, bundleIndex: 0, chainLength: 1, tempRoot, state: st,
+      });
+
+      expect(out.status).toBe("aborted");
+      expect(out.terminal?.error).toContain(`Bundle ${record.bundleId} could not be unpacked`);
+      // The archiver's own words survive: they are what distinguishes a refused
+      // entry from a damaged archive, and the suggestion says to read them.
+      expect(out.terminal?.error).toMatch(/Unsafe archive entries.*SymbolicLink/);
+      expect(out.terminal?.suggestion).toContain("no retry and no re-push helps");
+      expect(existsSync(join(tempRoot, record.bundleId, "sessions", "escape.jsonl"))).toBe(false);
+    }
+  );
 
   /**
    * The digest guard, reached the long way round.

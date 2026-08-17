@@ -433,6 +433,19 @@ const REGISTRY: FlagUse[] = [
       reruns: "importSession",
     },
   },
+  {
+    file: "src/importer.ts",
+    // The escaped backticks are real: the shipped string is a template literal,
+    // so the source text carries `\\``\`` where the message shows a backtick.
+    match: "re-run with \\`sesh-mover import --include-plans\\`",
+    klass: "retry-works",
+    why: "The plans layer is opt-in on the receive side because <configDir>/plans is config-dir-GLOBAL, so applying it writes files every project on this machine shares. Nothing about the payload is consumed by declining it — the bundle still holds every plan — and the re-run applies them even when it is a fully-duplicate import, which is the branch that returns before the session write loop. Names the command because migrate and pull re-emit this warning verbatim and neither declares --include-plans.",
+    provenBy: {
+      test: "importer.test.ts",
+      name: "does not write a bundle's plans by default, and --include-plans on the re-run lands them",
+      reruns: "runImport",
+    },
+  },
   // The post-rewrite validation failure at src/importer.ts:~930 used to advise
   // `--no-register` and had an entry here reading `retry-works`. Writing the
   // proof test is what disproved it: the second run returns the IDENTICAL

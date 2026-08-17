@@ -37,6 +37,7 @@ function sharedFindings(shared) {
         memoryIndex: shared.memoryIndex,
         memoryDir: shared.memoryDir,
         planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
+        plansSkipped: shared.plansSkipped,
     };
 }
 function readTextFile(path) {
@@ -205,6 +206,7 @@ function memoryStem(filename) {
  */
 function reconcileSharedLayers(opts) {
     const { exportPath, targetProjectDir, targetConfigDir, plan } = opts;
+    const includePlans = opts.includePlans === true;
     const sourceName = opts.sourceMachineName ?? "another machine";
     const warnings = [];
     const memoryConflicts = [];
@@ -212,6 +214,7 @@ function reconcileSharedLayers(opts) {
     const memoryPlan = [];
     let memoryIndex;
     let reportedMemoryDir;
+    let plansSkipped;
     const memoryDir = join(exportPath, "memory");
     // `layerRootStatus`, not `existsSync`: the probe that decides whether to walk
     // this layer must not resolve a link (#68). A symlinked root is refused and
@@ -445,13 +448,41 @@ function reconcileSharedLayers(opts) {
                 // One pointer per parked file, ever: keyed off the index's own targets,
                 // so a reused copy adds no second line and a user who deleted the line
                 // by hand gets it back rather than a duplicate.
+                //
+                // EVERY argument below is bundle-supplied and validated by nothing:
+                // `stem` and `parkedAs` derive from a filename inside the bundle, and
+                // `sourceName` is the manifest's self-declared machine name. Raw
+                // interpolation here let any of them carry a newline and append
+                // arbitrary entries to the user's index — `formatMemoryPointer` is the
+                // chokepoint that closed it, and `null` is its answer for a target it
+                // cannot express as a link. See memory-index.ts for why the target is
+                // refused rather than escaped.
                 const base = indexText ?? "";
                 if (indexUsable && !memoryIndexTargets(base).includes(parkedAs)) {
                     const pointer = formatMemoryPointer(`${stem} (incoming copy)`, parkedAs, `incoming version of ${file} from ${sourceName} — differs from your copy, not merged`);
-                    const next = appendIndexLines(base, [pointer]);
-                    if (next !== base) {
-                        indexText = next;
-                        indexChanged = true;
+                    if (pointer === null) {
+                        // The parked copy is on disk and named in `memoryConflicts`, so it
+                        // is not lost — only unreferenced, which is the same outcome
+                        // `memoryIndex.unindexed` already reports for a file the sender
+                        // never indexed. Better than the alternative the raw template gave:
+                        // a line whose key does not read back as `parkedAs`, so this very
+                        // check misses it and appends another copy on EVERY later import.
+                        // `JSON.stringify`, not bare `"${…}"` like the warnings above it
+                        // (#28's rule, stated at the dedup filter below): those two names
+                        // are ordinary in every case but THIS one — the branch is reached
+                        // precisely because the name carries something a link cannot hold,
+                        // so it is the one message guaranteed to interpolate a hostile
+                        // string. Quoting is what escapes the control characters that let a
+                        // name redraw the line it is printed on. For an ordinary name the
+                        // rendering is identical.
+                        warnings.push(`Saved the incoming copy of ${JSON.stringify(file)} beside yours as ${JSON.stringify(parkedAs)}, but could not list it in ${MEMORY_INDEX_NAME}: that name cannot be written as a markdown link target. The file is on disk (see memoryConflicts) and your index was not changed.`);
+                    }
+                    else {
+                        const next = appendIndexLines(base, [pointer]);
+                        if (next !== base) {
+                            indexText = next;
+                            indexChanged = true;
+                        }
                     }
                 }
             }
@@ -536,7 +567,30 @@ function reconcileSharedLayers(opts) {
     if (plansRoot === "symlink") {
         warnings.push(`The plans folder in this bundle is a symlink, not a directory — nothing was read through it, and nothing in your plans folder was changed.`);
     }
-    if (plansRoot === "present") {
+    // OPT-IN, and the asymmetry with `memory/` is the point (#74). A memory lands
+    // in the target PROJECT's own directory; a plan lands in `<configDir>/plans`,
+    // which every project on this machine shares — so accepting one writes
+    // machine-global files on the say-so of a bundle that may have come from
+    // anywhere. CLAUDE.md already records the send-side half of this decision
+    // ("`plans/` deliberately does NOT travel to the hub … fix the payload's
+    // scope before widening its transport"); the receive side has the same scope
+    // problem and now the same answer. The layer is disclosed either way: silence
+    // about a payload we chose not to write is what makes an opt-in feel like a
+    // bug.
+    if (plansRoot === "present" && !includePlans) {
+        try {
+            // Safe to enumerate: the root is not a symlink (checked above), and this
+            // reads names only — no file in it is opened and nothing is written.
+            plansSkipped = readdirSync(plansDir).filter((f) => isRegularFile(join(plansDir, f))).length;
+        }
+        catch {
+            plansSkipped = undefined;
+        }
+        if (plansSkipped !== undefined && plansSkipped > 0) {
+            warnings.push(`This bundle carries ${plansSkipped} plan file(s), and they were NOT written. Plans go to ${join(targetConfigDir, "plans")}, a directory every project on this machine shares, so an import writes them only when asked: re-run with \`sesh-mover import --include-plans\` if you want them.`);
+        }
+    }
+    if (plansRoot === "present" && includePlans) {
         try {
             const targetPlansDir = join(targetConfigDir, "plans");
             if (!plan)
@@ -596,6 +650,7 @@ function reconcileSharedLayers(opts) {
         memoryPlan: plan ? memoryPlan : undefined,
         memoryDir: reportedMemoryDir,
         planConflicts,
+        plansSkipped,
     };
 }
 /**
@@ -648,7 +703,7 @@ export function applySharedLayers(opts) {
     return { warnings: shared.warnings, ...sharedFindings(shared) };
 }
 export async function importSession(options) {
-    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, onProgress, } = options;
+    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, includePlans, onProgress, } = options;
     const warnings = [];
     // Step 1: Read manifest
     let manifest;
@@ -799,6 +854,7 @@ export async function importSession(options) {
             targetProjectDir,
             targetConfigDir,
             sourceMachineName: manifest.sourceMachineName,
+            includePlans,
             plan: dryRun,
         });
         warnings.push(...shared.warnings);
@@ -814,6 +870,7 @@ export async function importSession(options) {
                 memoryPlan: shared.memoryPlan,
                 memoryDir: shared.memoryDir,
                 planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
+                plansSkipped: shared.plansSkipped,
             };
         }
         return {
@@ -958,6 +1015,7 @@ export async function importSession(options) {
             targetProjectDir,
             targetConfigDir,
             sourceMachineName: manifest.sourceMachineName,
+            includePlans,
             plan: true,
         });
         return {
@@ -973,6 +1031,7 @@ export async function importSession(options) {
             memoryPlan: shared.memoryPlan,
             memoryDir: shared.memoryDir,
             planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
+            plansSkipped: shared.plansSkipped,
         };
     }
     // Step 4: Write session files
@@ -1174,6 +1233,7 @@ export async function importSession(options) {
         targetProjectDir,
         targetConfigDir,
         sourceMachineName: manifest.sourceMachineName,
+        includePlans,
         plan: false,
     });
     warnings.push(...shared.warnings);

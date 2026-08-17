@@ -17,8 +17,9 @@ import { encodeProjectPath } from "../src/platform.js";
 import { extractArchive } from "../src/archiver.js";
 import { readSyncState } from "../src/sync-state.js";
 import { WORKSPACE_MAX_BYTES } from "../src/hub/workspace.js";
+import { acquireProjectLock } from "../src/hub/lock.js";
 import { projectJsonFilePath } from "../src/paths.js";
-import type { HubPushFailedResult } from "../src/types.js";
+import type { HubPushFailedResult, ProgressEvent } from "../src/types.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
@@ -1399,6 +1400,173 @@ describe("hub push — a failure after the identity is resolved", () => {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
     }
+  });
+
+  /**
+   * #74/#78's paired-event contract, applied to push — nested HERE, inside the
+   * failure fixtures, because the hole was exactly the failing exits: three of
+   * them emitted `{percent: 0}` and never the matching `100`, so a consumer
+   * that renders on the first event and closes on the terminal one waited
+   * forever. `blockIndexDir` and the seam test above are the arrangements those
+   * exits need; duplicating them below would be a second copy of a fixture.
+   */
+  describe("--progress events", () => {
+    function recorder(): { events: ProgressEvent[]; onProgress: (ev: ProgressEvent) => void } {
+      const events: ProgressEvent[] = [];
+      return { events, onProgress: (ev) => events.push(ev) };
+    }
+
+    const pushPhase = (events: ProgressEvent[]): Array<number | undefined> =>
+      events.filter((e) => e.phase === "hub-push").map((e) => e.percent);
+
+    /**
+     * THE bug, in the shape push actually has it: the failure is reported as a
+     * typed `failedAfterLink` result, so nothing ever threw and nothing ever
+     * closed the pair either.
+     */
+    it("still emits the terminal event when the push fails after the link is committed", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-push-prog-fail-home-"));
+      const hub = mkdtempSync(join(tmpdir(), "sesh-push-prog-fail-hub-"));
+      const base = mkdtempSync(join(tmpdir(), "sesh-push-prog-fail-fix-"));
+      const restore = overrideHome(home);
+      const { events, onProgress } = recorder();
+      try {
+        const { configDir } = createFixtureTree(base);
+        const projectPath = createRealProject(base, configDir);
+        await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+        seedHubProject(hub);
+        blockIndexDir(hub);
+
+        const r = await hubPush({
+          configDir, projectPath, hubPath: hub,
+          projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81", onProgress,
+        });
+
+        // Precondition: this really is the failing exit and not some refusal.
+        const f = asFailed(r);
+        expect(f.error).toMatch(/EEXIST|ENOTDIR/);
+        expect(pushPhase(events)[0]).toBe(0);
+        expect(events.at(-1)).toEqual({ phase: "hub-push", percent: 100 });
+      } finally {
+        restore.restore();
+        for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * The opening event moved above the preflight, so the two refusals that
+     * stop a push before it does anything are inside the pair rather than
+     * silent. Exactly two events, because nothing between them ran.
+     */
+    it("emits a matched pair on a refusal that happens before anything is sent", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-push-prog-pre-home-"));
+      const base = mkdtempSync(join(tmpdir(), "sesh-push-prog-pre-fix-"));
+      const restore = overrideHome(home);
+      const { events, onProgress } = recorder();
+      try {
+        const { configDir } = createFixtureTree(base);
+        const projectPath = createRealProject(base, configDir);
+
+        const r = await hubPush({
+          configDir, projectPath, hubPath: join(base, "not-mounted"),
+          claudeVersion: "2.1.81", onProgress,
+        });
+
+        expect(r.success).toBe(false);
+        expect("reason" in r && r.reason).toBe("hub-unreachable");
+        expect(events).toEqual([
+          { phase: "hub-push", percent: 0 },
+          { phase: "hub-push", percent: 100 },
+        ]);
+      } finally {
+        restore.restore();
+        for (const d of [home, base]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * The other half of the contract, and a decision rather than an oversight:
+     * the ONE exit above the lock emits nothing, so a consumer gets either no
+     * events at all or a matched pair — never an opening event with no close.
+     */
+    it("emits nothing at all when the project lock is already held", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-push-prog-lock-home-"));
+      const hub = mkdtempSync(join(tmpdir(), "sesh-push-prog-lock-hub-"));
+      const base = mkdtempSync(join(tmpdir(), "sesh-push-prog-lock-fix-"));
+      const restore = overrideHome(home);
+      const { events, onProgress } = recorder();
+      try {
+        const { configDir } = createFixtureTree(base);
+        const projectPath = createRealProject(base, configDir);
+        await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+        seedHubProject(hub);
+        const held = acquireProjectLock(projectPath);
+        try {
+          const r = await hubPush({
+            configDir, projectPath, hubPath: hub,
+            projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81", onProgress,
+          });
+
+          expect(r.success).toBe(false);
+          expect("reason" in r && r.reason).toBe("lock-busy");
+          expect(events).toEqual([]);
+        } finally {
+          held.release();
+        }
+      } finally {
+        restore.restore();
+        for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * The one case push swallows, and the reason it does not simply copy
+     * `hubPull`'s blanket `catch`.
+     *
+     * A throwing callback at the terminal event IS a push failure here — that
+     * is the seam the link-rollback test above depends on, and it is consistent
+     * with every other progress emission in this function, all of which can
+     * already fail a push. But a callback that throws while a real failure is
+     * already propagating must not REPLACE it: `failedAfterLink` would then
+     * report the consumer's message as the cause of a push that actually died
+     * of an ENOTDIR at the index write, and the remedy the user needs would be
+     * gone.
+     */
+    it("does not let a throwing terminal callback replace a failure already in flight", async () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-push-prog-throw-home-"));
+      const hub = mkdtempSync(join(tmpdir(), "sesh-push-prog-throw-hub-"));
+      const base = mkdtempSync(join(tmpdir(), "sesh-push-prog-throw-fix-"));
+      const restore = overrideHome(home);
+      let calls = 0;
+      try {
+        const { configDir } = createFixtureTree(base);
+        const projectPath = createRealProject(base, configDir);
+        await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+        seedHubProject(hub);
+        blockIndexDir(hub);
+
+        const r = await hubPush({
+          configDir, projectPath, hubPath: hub,
+          projectIdOverride: PROJECT_ID, claudeVersion: "2.1.81",
+          onProgress: (ev) => {
+            calls++;
+            if (ev.phase === "hub-push" && ev.percent === 100) throw new Error("consumer blew up");
+          },
+        });
+
+        expect(calls).toBeGreaterThan(0);
+        const f = asFailed(r);
+        expect(f.error).toMatch(/EEXIST|ENOTDIR/);
+        expect(f.error).not.toMatch(/consumer blew up/);
+        // ...and the disclosure is still the real one: the bundle reached the
+        // hub, the link this push wrote was rolled back.
+        expect(f.orphanBundle).toBe(true);
+        expect(f.linkRolledBack).toBe(true);
+      } finally {
+        restore.restore();
+        for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+      }
+    });
   });
 
   // --- #53: memory on the hub path -------------------------------------

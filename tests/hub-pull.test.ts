@@ -32,7 +32,7 @@ import { encodeProjectPath } from "../src/platform.js";
 import type {
   ErrorResult, ExportManifest, HubPullListResult, HubPullResult, NotYetSyncedResult, ProgressEvent,
 } from "../src/types.js";
-import { isPluginStateName } from "../src/paths.js";
+import { isPluginStateName, userSeshMoverDir } from "../src/paths.js";
 
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 const FIXTURE_SESSION_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -4631,6 +4631,14 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
     }
   }
 
+  /** The hub-relative path of this project's one bundle, as the index names it. */
+  async function firstBundleFile(hubPath: string, projectId: string): Promise<string> {
+    const { indexes } = await readAllIndexes(createFsBackend(hubPath), projectId);
+    const record = indexes.flatMap((i) => Object.values(i.threads)).flatMap((t) => t.bundles)[0];
+    if (!record) throw new Error("no bundle on the hub");
+    return record.file;
+  }
+
   it("refuses a bundle whose manifest session list no longer hashes to its own digest", async () => {
     const f = await twoMachines("sesh-pull-digest");
     try {
@@ -4665,6 +4673,114 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
       expect(result.success).toBe(false);
       expect((result as ErrorResult).error).toMatch(/does not contain it/);
       expect(existsSync(f.projectDirB) ? readdirSync(f.projectDirB) : []).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  /**
+   * The two damage shapes the fetch stage could still only answer by THROWING:
+   * an archive that will not unpack, and a hub file that cannot be read.
+   *
+   * Both used to leave `hubPull` for the CLI's outer catch — exit 1, no
+   * `suggestion`, and a shape no caller can tell apart from an internal fault —
+   * while their three siblings in the same function (the manifest parse, its
+   * digest, the transcript it declares) were already typed refusals.
+   *
+   * Note what the download case is NOT: a file that is simply absent never
+   * reaches the fetch stage at all, because `runSelectStage` sweeps every
+   * needed record with `backend.exists` first and answers `not-yet-synced`.
+   * What gets here is a path that exists and is not a readable file — the
+   * genuine remainder of that race, and the reason the abort's wording is about
+   * "was here, is not readable now" rather than "has not arrived yet".
+   */
+  it.each([
+    [
+      "an archive that cannot be unpacked",
+      "unpack",
+      /could not be unpacked/,
+      (hub: string, file: string) => {
+        const abs = join(hub, file);
+        const bytes = readFileSync(abs);
+        writeFileSync(abs, bytes.subarray(0, Math.floor(bytes.length / 2)));
+      },
+    ],
+    [
+      "a hub path that exists but cannot be read as a file",
+      "download",
+      /could not be read from the hub/,
+      (hub: string, file: string) => {
+        const abs = join(hub, file);
+        rmSync(abs, { force: true });
+        mkdirSync(abs, { recursive: true });
+      },
+    ],
+  ])("refuses, rather than throwing, on %s", async (_label, tag, matcher, damage) => {
+    const f = await twoMachines(`sesh-pull-fetch-${tag}`);
+    try {
+      damage(f.hub, await firstBundleFile(f.hub, f.projectId));
+
+      const result = await f.pull();
+
+      expect(result.success).toBe(false);
+      const e = result as ErrorResult;
+      expect(e.command).toBe("pull");
+      expect(e.error).toMatch(matcher);
+      // A refusal, which is the whole difference from a throw: the CLI's outer
+      // catch builds an ErrorResult out of the exception alone and has no
+      // remedy to put here.
+      expect(e.suggestion).toBeTruthy();
+      expect(e.suggestion).toContain("Nothing from this bundle was applied.");
+      // Nothing was applied, so nothing was imported.
+      expect(existsSync(f.projectDirB) ? readdirSync(f.projectDirB) : []).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  /**
+   * `ErrorResult.warnings` (#78) on the two aborts that did not exist when it
+   * was added.
+   *
+   * A mid-chain abort is not a pull that did nothing, and the accumulator these
+   * carry is the same one every applied bundle writes its disclosure into — so
+   * a terminal returned bare, without `withPriorWarnings`, is untruthful about
+   * what the command did. A stolen stale lock is the earliest and most
+   * deterministic thing that puts a sentence in that list; the mechanism it
+   * proves is the single helper, not the sentence.
+   */
+  it.each([
+    ["unpack", /could not be unpacked/, (hub: string, file: string) => {
+      const abs = join(hub, file);
+      const bytes = readFileSync(abs);
+      writeFileSync(abs, bytes.subarray(0, Math.floor(bytes.length / 2)));
+    }],
+    ["download", /could not be read from the hub/, (hub: string, file: string) => {
+      const abs = join(hub, file);
+      rmSync(abs, { force: true });
+      mkdirSync(abs, { recursive: true });
+    }],
+  ])("keeps the disclosures collected before a %s abort", async (label, matcher, damage) => {
+    const f = await twoMachines(`sesh-pull-fetchwarn-${label}`);
+    try {
+      damage(f.hub, await firstBundleFile(f.hub, f.projectId));
+
+      // A lock left behind by a crashed operation, old enough to steal. The
+      // steal is disclosed as a warning before the first bundle is fetched.
+      const locks = join(userSeshMoverDir(), "locks");
+      mkdirSync(locks, { recursive: true });
+      writeFileSync(
+        join(locks, `${encodeProjectPath(f.projectB)}.lock`),
+        JSON.stringify({ pid: 999999, acquiredAt: "2020-01-01T00:00:00.000Z", token: "stale" })
+      );
+
+      const result = await f.pull();
+
+      expect(result.success).toBe(false);
+      const e = result as ErrorResult;
+      expect(e.error).toMatch(matcher);
+      // The abort's own words AND everything collected before it.
+      expect(e.warnings ?? []).toEqual([expect.stringContaining("Stole a stale project lock")]);
     } finally {
       f.cleanup();
     }

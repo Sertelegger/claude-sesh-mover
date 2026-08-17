@@ -75,5 +75,56 @@ export interface HubPushOptions {
  * preflight (#75) and are the two that used to be a raw throw.
  */
 export type HubPushOutcome = HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | HubUnreachableResult | HubNoSuchProjectResult | ErrorResult;
+/**
+ * `onProgress`'s contract, which is invisible from any single call site — the
+ * same note `hubPull` carries, and deliberately the same shape (#74, #78).
+ *
+ * **`{percent: 0}` is emitted as the first statement inside the outer `try`,
+ * and `{percent: 100}` from the inner `finally` that wraps the whole body.**
+ * Before that pairing, three exits emitted `0` and never `100` — the export's
+ * own failure return, the `failedAfterLink` disclosure, and the rethrow above
+ * it — so a consumer waiting for the terminal event waited forever. The close
+ * therefore also fires on a typed refusal, on a failed push and on a thrown
+ * exception, and `percent: 100` accordingly means *"the operation is over"*,
+ * never *"it succeeded"*; the returned result says which.
+ *
+ * **The exits BEFORE the lock emit nothing at all, and that is the contract
+ * rather than an oversight**: `lock-busy` — and a non-busy throw out of
+ * `acquireProjectLock` — return above the `try`, so there is no `finally` to
+ * close a pair they never opened. A consumer gets either no events or a matched
+ * pair. The opening event moved here from just after `registerMachine` for the
+ * same reason it moved in `hubPull`: it used to sit below the preflight, so the
+ * two refusals that gate a push before it does anything (`hub-unreachable`,
+ * `no-such-project`) emitted nothing while the failures emitted an unclosed `0`.
+ *
+ * **Where push DIFFERS from pull, and why it is not drift.** `hubPull` wraps its
+ * terminal emit in a bare `catch` and swallows a throwing callback outright. It
+ * has to: it has no `catch` of its own, so a throw from that `finally` would
+ * escape as an untyped crash and destroy the typed refusal it was returning.
+ * `hubPush` does have one, and that `catch` is the whole disclosure machinery —
+ * `failedAfterLink`, which answers the only question that matters after a failed
+ * push (*is this directory linked now, and whose link is it?*). So the terminal
+ * emit sits INSIDE the region that `catch` guards, and a throw out of the
+ * callback is routed through it rather than swallowed. Two things follow, both
+ * intended:
+ *
+ * - It is consistent. Every other progress emission in this function is already
+ *   able to fail a push that way — the `0` above, and every event
+ *   `exportAllSessions` forwards — so swallowing the terminal one would make it
+ *   the single special event rather than the rule.
+ * - It preserves a documented, load-bearing behaviour: a callback that throws
+ *   right after the link is committed is the deterministic seam
+ *   `tests/hub-push.test.ts`'s "refuses to remove a link that now names a
+ *   different project" uses to reproduce the concurrent-link-modification race.
+ *   The obvious pull-shaped fix (swallow in a `finally`) silently deletes it,
+ *   which is why this went unfixed once already.
+ *
+ * The one case that IS swallowed is a callback throwing while the body is
+ * already failing — see the inner `finally`.
+ *
+ * Between the two events, granularity comes from `exportAllSessions`, which is
+ * handed this same callback. The archive step is the hole: `createArchive` takes
+ * no callback at all, the same gap `runFetchStage` documents on the pull side.
+ */
 export declare function hubPush(opts: HubPushOptions): Promise<HubPushOutcome>;
 //# sourceMappingURL=push.d.ts.map
