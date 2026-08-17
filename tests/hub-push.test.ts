@@ -1001,9 +1001,19 @@ describe("hub push — a failure after the identity is resolved", () => {
 
   /**
    * The same trick one step later: the bundle uploads fine and the INDEX write
-   * behind it is the ENOTDIR. This is the only injectable failure that lands
-   * past the link commit, so it is the arrangement every rollback assertion in
-   * this block is built on.
+   * behind it fails. This is the only injectable failure that lands past the
+   * link commit, so it is the arrangement every rollback assertion in this
+   * block is built on.
+   *
+   * **It is an `EEXIST`, not an `ENOTDIR`** — MEASURED, and the difference from
+   * `blockBundleDir` above is structural rather than incidental. `writeAtomic`
+   * mkdirs `dirname(relPath)`, so for `index/<machineId>.json` the blocked path
+   * IS the directory being created and POSIX `mkdir` on an existing name
+   * answers `EEXIST: file already exists, mkdir '<hub>/projects/<id>/index'`;
+   * for `bundles/<machineId>/<file>` the blocked name is a PARENT COMPONENT of
+   * it, which is the only shape that answers `ENOTDIR`. That is why the two
+   * assertions in this block read `/EEXIST|ENOTDIR/` while `blockBundleDir`'s
+   * reads `/ENOTDIR|not a directory/`.
    */
   function blockIndexDir(hub: string, projectId = PROJECT_ID): void {
     writeFileSync(join(hub, "projects", projectId, "index"), "not a directory\n");
@@ -1262,8 +1272,9 @@ describe("hub push — a failure after the identity is resolved", () => {
       const projectPath = createRealProject(base, configDir);
       await hubInit({ hubPath: hub, configScope: "user", cwd: home });
       seedHubProject(hub);
-      // Bundle upload fine; the index write behind it is the ENOTDIR. The
-      // bundle is atomic, so it really is on the hub when this throws.
+      // Bundle upload fine; the index write behind it is the EEXIST (see
+      // `blockIndexDir` for why it is that and not an ENOTDIR). The bundle is
+      // atomic, so it really is on the hub when this throws.
       blockIndexDir(hub);
 
       const r = await hubPush({
@@ -1529,8 +1540,8 @@ describe("hub push — a failure after the identity is resolved", () => {
      * already fail a push. But a callback that throws while a real failure is
      * already propagating must not REPLACE it: `failedAfterLink` would then
      * report the consumer's message as the cause of a push that actually died
-     * of an ENOTDIR at the index write, and the remedy the user needs would be
-     * gone.
+     * of the blocked index write (an `EEXIST` — see `blockIndexDir`), and the
+     * remedy the user needs would be gone.
      */
     it("does not let a throwing terminal callback replace a failure already in flight", async () => {
       const home = mkdtempSync(join(tmpdir(), "sesh-push-prog-throw-home-"));
