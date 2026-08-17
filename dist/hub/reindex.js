@@ -6,6 +6,7 @@ import { createFsBackend } from "./backend.js";
 import { bundleDir } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { readLocalProjectId } from "./identity.js";
+import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, writeMachineIndex, } from "./index-file.js";
 import { extractArchive } from "../archiver.js";
@@ -43,11 +44,20 @@ function parseBundleFileName(fileName) {
 // machine's local sync-state (which thread each local session belongs to).
 // A repair tool for a lost/corrupt index.json, not a sync primitive.
 //
-// Both refusals below carry a machine-readable `reason` (#29). They were plain
+// Every refusal below carries a machine-readable `reason` (#29). They were plain
 // `ErrorResult`s, so the only way to tell "wait for the other operation" from
 // "this project was never pushed" — two failures whose remedies share nothing —
 // was to regex the prose, which `skills/session-porter/SKILL.md` forbids for
 // exactly this reason.
+//
+// `hub-unreachable` is the third, and reindex takes the same PLAIN REFUSAL push
+// and pull take rather than the reporting treatment `hub status` and `whereis`
+// get, because reindex is on their side of the line: it is a repair verb that
+// WRITES. There is nothing diagnostic for it to salvage from an unreachable hub
+// — an index rebuilt from bundles it could not read is not a degraded answer,
+// it is a wrong one — and the write it would otherwise reach is the sharp part
+// (see `hubUnreachableRefusal`'s note on `registerMachine` mkdir -p'ing a
+// phantom hub into an unmounted mount point).
 export async function hubReindex(opts) {
     const local = readLocalProjectId(opts.projectPath);
     if (!local) {
@@ -58,6 +68,26 @@ export async function hubReindex(opts) {
             error: "This project is not linked to a hub project — there is nothing to reindex from.",
             suggestion: "Run push (with --create-project or --project-id) to link and publish this project to the hub first.",
         };
+    }
+    // AFTER the unlinked check and BEFORE the lock, and both halves of that
+    // position are deliberate.
+    //
+    // After: push and pull run their reachability gate first because on an
+    // unreachable hub their identity read fails too, so `no-such-project` there
+    // would be a confident wrong diagnosis. That argument does not transfer —
+    // reindex's identity check is `readLocalProjectId`, a read of a file in the
+    // user's own project directory, whose answer is unaffected by whether the hub
+    // is mounted. It can never be the wrong diagnosis, so the narrower fact keeps
+    // its place at the front.
+    //
+    // Before: the lock is this machine's, but taking it to discover the hub is
+    // gone means a wedged concurrent operation turns an "unmounted share" answer
+    // into a `lock-busy` one, which sends the user to wait for something that
+    // would not have helped. Being before `registerMachine` is the load-bearing
+    // half — that call writes.
+    const probe = await probeHubReachable(opts.hubPath, createFsBackend(opts.hubPath));
+    if (probe.state !== "ok") {
+        return hubUnreachableRefusal("hub-reindex", probe.state);
     }
     // Reindex only ever (re)writes THIS machine's own index file, but a
     // concurrent push (or another reindex) could be rebuilding/writing that

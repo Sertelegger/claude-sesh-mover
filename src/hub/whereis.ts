@@ -1,7 +1,8 @@
 import { join } from "node:path";
 import { createFsBackend, type HubBackend } from "./backend.js";
 import { machinePath, type HubMachineJson } from "./layout.js";
-import { resolveProjectIdentity } from "./identity.js";
+import { readLocalProjectId, resolveProjectIdentity } from "./identity.js";
+import { describeHubUnreachable, probeHubReachable } from "./preflight.js";
 import { readAllIndexes } from "./index-file.js";
 // #44: `pullNeeded` is the same question `pull` asks, so it goes through the
 // same function. The import direction makes this module and pull-select
@@ -160,6 +161,21 @@ export async function shapeThreads(
 // links this project directory to one — linking happens on push/pull, not
 // on a read. An unresolved identity (no local link, or only a git-remote
 // "match") reports linked:false with candidates instead of guessing.
+//
+// AN UNREACHABLE HUB IS REPORTED, NOT REFUSED, and the precedent is this
+// function's own `linked: false` (see HubUnlinkedResult's note on why `whereis`
+// is not a member of it): a read answers with fields, not with a refusal, and
+// `commands/whereis.md` plus the skill doc both promise there is no error case
+// to catch here. Push and pull refuse the same condition because they were
+// about to write; nothing here writes.
+//
+// What that costs if it is left implicit is measured rather than theoretical.
+// `backend.list` returns `[]` for a directory that is not there, so on an
+// unmounted share `readAllIndexes` found no indexes, `resolveThreads` shaped no
+// threads, and a linked project came back `linked: true, threads: []` —
+// character-for-character what a linked project nobody has pushed yet returns.
+// The SessionStart notice reads exactly this result, so it also went quiet for
+// the one reason it should have been loudest about.
 export async function hubWhereis(opts: {
   configDir: string;
   projectPath: string;
@@ -167,6 +183,34 @@ export async function hubWhereis(opts: {
 }): Promise<WhereisResult> {
   const backend = createFsBackend(opts.hubPath);
   const warnings: string[] = [];
+
+  const probe = await probeHubReachable(opts.hubPath, backend);
+  if (probe.state !== "ok") {
+    // `linked` still answers, because it is a LOCAL fact — the presence of
+    // `.sesh-mover-project.json` — and withholding it would lose the one thing
+    // this result can still say truthfully. `readLocalProjectId` rather than
+    // `resolveProjectIdentity`: the latter's other two arms are decided by
+    // listing the hub's projects, which is the read that just failed.
+    const local = readLocalProjectId(opts.projectPath);
+    warnings.push(describeHubUnreachable(probe.state));
+    warnings.push(
+      "No thread information could be read, so the empty thread list here means UNKNOWN rather than none — this project may well have threads on the hub. The link state below is a local fact and says nothing about whether the hub still has that project."
+    );
+    return {
+      success: true,
+      command: "whereis",
+      linked: local !== null,
+      projectId: local?.projectId ?? null,
+      // NO `linkCandidates` KEY AT ALL, not an empty one. An empty pick list is
+      // documented to mean "this hub lists no projects", and the projects
+      // listing is precisely the read that failed — an absent field is the only
+      // honest spelling of "could not ask".
+      threads: [],
+      reachable: false,
+      hubState: probe.state,
+      warnings,
+    };
+  }
 
   const resolution = await resolveProjectIdentity(backend, opts.projectPath);
   if (resolution.kind !== "linked") {
@@ -192,6 +236,8 @@ export async function hubWhereis(opts: {
       projectId: null,
       linkCandidates: candidates,
       threads: [],
+      reachable: true,
+      hubState: "ok",
       warnings,
     };
   }
@@ -213,5 +259,8 @@ export async function hubWhereis(opts: {
     backend, resolved, me.id, peekSyncState(opts.projectPath), targetProjectDir
   );
 
-  return { success: true, command: "whereis", linked: true, projectId, threads, warnings };
+  return {
+    success: true, command: "whereis", linked: true, projectId, threads,
+    reachable: true, hubState: "ok", warnings,
+  };
 }

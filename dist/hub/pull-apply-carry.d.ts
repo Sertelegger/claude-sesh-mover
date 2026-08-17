@@ -29,9 +29,16 @@ export interface ApplyCarryStageInput {
 }
 export interface ApplyCarryStageResult {
     /**
-     * The payload the bundle DECLARED, identity and never a copy. Present even
-     * when `carryApplied` is not: a bundle that declares a carry it does not
-     * contain still reports what it claimed.
+     * The payload the bundle DECLARED. Present even when `carryApplied` is not: a
+     * bundle that declares a carry it does not contain still reports what it
+     * claimed.
+     *
+     * Identity, never a copy — for every block a sesh-mover push wrote. It passes
+     * through `normalizeCarryMeta`, which hands back the manifest's own object
+     * untouched unless a field was not of its declared type; only then is this a
+     * repaired copy, and the stage's reasons say which fields were repaired. That
+     * is what makes the `CarryMeta` on `HubPullResult` a type rather than a hope
+     * (see the module doc below).
      */
     carryAvailable: CarryMeta;
     /** What became of it, or `undefined` when the bundle held nothing to act on. */
@@ -68,6 +75,18 @@ export interface ApplyCarryStageResult {
  * `carryAvailable` is the SENDER's claim, read from the manifest before the
  * bundle is inspected, and it reaches `HubPullResult` even when nothing could
  * be done with it.
+ *
+ * A `carry` block this version could not read adds ONE reason to whichever of
+ * those rows applies and changes none of them — it is not a fifth row, and
+ * deliberately not an abort. The argument is the one the third row already
+ * makes: "the manifest says something about this bundle that does not hold" is
+ * a statement about the bundle, apply-safe by construction, and the sessions
+ * and workspace this pull already applied are not made wrong by it. Aborting
+ * would also be the one outcome that guarantees data loss — a fetch abort stops
+ * the pull *before* this stage runs at all, so the payload would go with the
+ * extraction directory. See `normalizeCarryMeta` for how fail-closed is
+ * expressed instead: as a `baseCommit` no HEAD can match, which declines the
+ * apply and keeps the save.
  *
  * **No `try`/`catch` here, on purpose.** `applyCarry` can reject
  * (`listPayloadFiles` sits outside its own try). Today that propagates past

@@ -9,7 +9,9 @@ import { join } from "node:path";
 import { overrideHome, overridePath } from "./helpers/env.js";
 import { copyTreeSync } from "./helpers/copy-tree.js";
 import { readBytesLf, readTextLf } from "./helpers/eol.js";
-import { applyCarry, captureCarry, CARRY_MAX_BYTES, type CarryMeta } from "../src/hub/carry.js";
+import {
+  applyCarry, captureCarry, CARRY_MAX_BYTES, normalizeCarryMeta, orNotRecorded, type CarryMeta,
+} from "../src/hub/carry.js";
 
 /** A throwaway repo with one commit and a remote. NEVER run git against the checkout. */
 function gitRepo(name = "carry"): string {
@@ -3203,6 +3205,227 @@ describe("applyCarry", () => {
       expect(ok.savedCommands).toBe(true);
       expect(readFileSync(join(ok.savedTo!, "README.md"), "utf-8"))
         .toContain("git -c apply.ignoreWhitespace=no apply");
+    } finally {
+      cleanup(repo, payload?.dir ?? "", twin ?? "");
+    }
+  });
+});
+
+/**
+ * The trust boundary a bundle manifest's `carry` block crosses.
+ *
+ * `ExportManifest.carry` is typed `CarryMeta` and was never checked to be one —
+ * it is parsed straight out of a `manifest.json` fetched from the hub. A bundle
+ * carrying `carry: {}` therefore reached `meta.baseCommit.slice(0, 8)` in the
+ * pull's disclosure prose and threw a `TypeError` out of `hubPull`.
+ */
+describe("normalizeCarryMeta", () => {
+  const healthy = (over: Partial<CarryMeta> = {}): CarryMeta => ({
+    baseCommit: "0123456789abcdef0123456789abcdef01234567",
+    branch: "main",
+    detached: false,
+    inProgress: null,
+    capturedAt: "2026-08-13T10:00:00.000Z",
+    untrackedCount: 2,
+    untrackedBytes: 40,
+    patchBytes: 128,
+    reIncludedCount: 1,
+    reIncluded: ["docs/notes.md"],
+    trackedIgnoredCount: 0,
+    trackedIgnored: [],
+    repoPrefix: "pkg/app/",
+    ...over,
+  });
+
+  /**
+   * The routine case, and the one an assertion elsewhere depends on:
+   * `carryAvailable` on `HubPullResult` is the SENDER's claim, so a well-formed
+   * block has to come back as the same object rather than as our copy of it.
+   */
+  it("hands a well-formed block back by identity, with nothing to disclose", () => {
+    const raw = healthy();
+    const out = normalizeCarryMeta(raw);
+    expect(out.unreadable).toEqual([]);
+    expect(out.meta).toBe(raw);
+  });
+
+  it("keeps a detached HEAD and an in-progress operation, which are legal values", () => {
+    const raw = healthy({ detached: true, inProgress: "rebase" });
+    const out = normalizeCarryMeta(raw);
+    expect(out.unreadable).toEqual([]);
+    expect(out.meta).toBe(raw);
+  });
+
+  /** The measured crash: `carry: {}`, every field absent. */
+  it("names every field of an empty block, in CarryMeta's own declaration order", () => {
+    const out = normalizeCarryMeta({});
+    expect(out.unreadable).toEqual([
+      "baseCommit", "branch", "detached", "inProgress", "capturedAt",
+      "untrackedCount", "untrackedBytes", "patchBytes",
+      "reIncludedCount", "reIncluded", "trackedIgnoredCount", "trackedIgnored", "repoPrefix",
+    ]);
+    // Total, not partial: every field is its declared type, so the two prose
+    // sites and `applyCarry`'s HEAD comparison all have something to read.
+    expect(out.meta).toEqual({
+      baseCommit: "", branch: "", detached: false, inProgress: null, capturedAt: "",
+      untrackedCount: 0, untrackedBytes: 0, patchBytes: 0,
+      reIncludedCount: 0, reIncluded: [], trackedIgnoredCount: 0, trackedIgnored: [],
+      repoPrefix: "",
+    });
+    // Fail-closed comes out of this value: no `git rev-parse HEAD` can equal it,
+    // so `applyCarry` declines wrong-base and SAVES.
+    expect(out.meta.baseCommit).toBe("");
+  });
+
+  it("treats a carry block that is not an object at all as supplying no field", () => {
+    // `null` is in here for `typeof null === "object"`: without the explicit
+    // null check the property reads below are a TypeError of their own.
+    for (const raw of ["a string", 7, true, [], null]) {
+      const out = normalizeCarryMeta(raw);
+      expect(out.unreadable).toHaveLength(13);
+      expect(out.meta.baseCommit).toBe("");
+      expect(out.meta.inProgress).toBeNull();
+    }
+  });
+
+  it("names only the fields that are wrong, and keeps the ones that are not", () => {
+    const out = normalizeCarryMeta(healthy({ branch: 42 as unknown as string }));
+    expect(out.unreadable).toEqual(["branch"]);
+    expect(out.meta.branch).toBe("");
+    expect(out.meta.baseCommit).toBe("0123456789abcdef0123456789abcdef01234567");
+    // A repair is a copy; identity is only promised for a block read as written.
+    expect(out.meta).not.toBe(out);
+  });
+
+  it("rejects an inProgress value outside the four git operations", () => {
+    expect(normalizeCarryMeta(healthy({ inProgress: "bisect" as never })).unreadable)
+      .toEqual(["inProgress"]);
+    expect(normalizeCarryMeta(healthy({ inProgress: undefined as never })).unreadable)
+      .toEqual(["inProgress"]);
+    for (const op of ["merge", "rebase", "cherry-pick", "revert"] as const) {
+      expect(normalizeCarryMeta(healthy({ inProgress: op })).unreadable).toEqual([]);
+    }
+  });
+
+  /** `NaN` is a number that `formatBytes` renders as "NaN bytes". */
+  it("rejects a non-finite number where a byte count belongs", () => {
+    expect(normalizeCarryMeta(healthy({ patchBytes: NaN })).unreadable).toEqual(["patchBytes"]);
+    expect(normalizeCarryMeta(healthy({ untrackedBytes: Infinity })).unreadable)
+      .toEqual(["untrackedBytes"]);
+    expect(normalizeCarryMeta(healthy({ patchBytes: "128" as unknown as number })).unreadable)
+      .toEqual(["patchBytes"]);
+    expect(normalizeCarryMeta(healthy({ patchBytes: NaN })).meta.patchBytes).toBe(0);
+  });
+
+  /** Whole-array: a list with one non-string in it cannot be `join`ed honestly. */
+  it("drops a path list that is not a list of strings, rather than the bad element", () => {
+    const out = normalizeCarryMeta(healthy({ reIncluded: ["ok", 1] as unknown as string[] }));
+    expect(out.unreadable).toEqual(["reIncluded"]);
+    expect(out.meta.reIncluded).toEqual([]);
+    expect(normalizeCarryMeta(healthy({ trackedIgnored: "x" as unknown as string[] })).unreadable)
+      .toEqual(["trackedIgnored"]);
+  });
+
+  it("rejects a truthy non-boolean where detached belongs", () => {
+    const out = normalizeCarryMeta(healthy({ detached: "yes" as unknown as boolean }));
+    expect(out.unreadable).toEqual(["detached"]);
+    // The consequence: the saved README would otherwise say "(detached HEAD)".
+    expect(out.meta.detached).toBe(false);
+  });
+
+  it("is not fooled by a prototype-supplied field", () => {
+    const out = normalizeCarryMeta(
+      Object.create({ baseCommit: "inherited" }) as Record<string, unknown>
+    );
+    // Inherited or own makes no difference to what the prose will print, so the
+    // check is `typeof`, not `hasOwnProperty` — this pins which one it is.
+    expect(out.meta.baseCommit).toBe("inherited");
+    expect(out.unreadable).not.toContain("baseCommit");
+  });
+
+  it("renders an unreadable string field as (not recorded) and a real one verbatim", () => {
+    expect(orNotRecorded("")).toBe("(not recorded)");
+    expect(orNotRecorded("main")).toBe("main");
+    expect(orNotRecorded(" ")).toBe(" ");
+  });
+});
+
+describe("applyCarry — a carry block that could not be read", () => {
+  /**
+   * The fail-closed direction, measured against its own control.
+   *
+   * The SAME payload, on the SAME tree, at the SAME commit: with the meta the
+   * sender wrote it applies, and with a meta `normalizeCarryMeta` had to repair
+   * it does not — because `baseCommit` is then `""` and no HEAD can equal it.
+   * Without the control this test would pass against a tree that simply refuses
+   * everything.
+   */
+  it("declines wrong-base and saves the payload, where the real meta would have applied", async () => {
+    const repo = gitRepo("apply-unreadable-meta");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let control: string | undefined;
+    let twin: string | undefined;
+    try {
+      writeFileSync(join(repo, "tracked.txt"), "v2\n");
+      writeFileSync(join(repo, "new.txt"), "brand new\n");
+      payload = await capturePayload(repo);
+
+      // Control: the sender's own meta applies cleanly here.
+      control = cleanTwin(repo);
+      const applied = await applyCarry({
+        carryDir: payload.dir, targetPath: control, meta: payload.meta,
+      });
+      expect(applied.applied).toBe(true);
+      expect(readTextLf(join(control, "tracked.txt"))).toBe("v2\n");
+
+      // Same payload, same commit, a `carry: {}` block instead.
+      twin = cleanTwin(repo);
+      const { meta, unreadable } = normalizeCarryMeta({});
+      expect(unreadable).toContain("baseCommit");
+      const r = await applyCarry({ carryDir: payload.dir, targetPath: twin, meta });
+
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("wrong-base");
+      // The working tree is untouched — this is the half a TypeError skipped.
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\n");
+      expect(existsSync(join(twin, "new.txt"))).toBe(false);
+      // ...and the payload is SAVED, which is the half a refusal would have cost.
+      expect(r.savedTo).toBeTruthy();
+      expect(readTextLf(join(r.savedTo!, "untracked", "new.txt"))).toBe("brand new\n");
+      expect(existsSync(join(r.savedTo!, "changes.patch"))).toBe(true);
+      const readme = readFileSync(join(r.savedTo!, "README.md"), "utf-8");
+      // The note beside the payload says what it does not know, rather than
+      // rendering "on branch  at commit  on ".
+      expect(readme).toContain("Captured on branch `(not recorded)` at commit `(not recorded)`");
+      expect(readme).toContain("on (not recorded).");
+      expect(r.detail).toContain("captured at (not recorded) on branch (not recorded)");
+    } finally {
+      cleanup(repo, payload?.dir ?? "", control ?? "", twin ?? "");
+    }
+  });
+
+  /** `saveOnly` is the routine path, and it may not depend on the meta at all. */
+  it("still saves a payload with an unreadable meta when the pull did not ask to apply", async () => {
+    const repo = gitRepo("save-unreadable-meta");
+    let payload: { dir: string; meta: CarryMeta } | undefined;
+    let twin: string | undefined;
+    try {
+      writeFileSync(join(repo, "new.txt"), "brand new\n");
+      payload = await capturePayload(repo);
+      twin = cleanTwin(repo);
+
+      const r = await applyCarry({
+        carryDir: payload.dir,
+        targetPath: twin,
+        meta: normalizeCarryMeta({}).meta,
+        saveOnly: true,
+      });
+
+      expect(r.applied).toBe(false);
+      if (r.applied) return;
+      expect(r.reason).toBe("not-requested");
+      expect(readTextLf(join(r.savedTo!, "untracked", "new.txt"))).toBe("brand new\n");
     } finally {
       cleanup(repo, payload?.dir ?? "", twin ?? "");
     }

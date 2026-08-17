@@ -12,11 +12,19 @@ You are running the sesh-mover whereis command. This is a read-only view — it 
 
 2. If the result is `success: false`, report the `error` — most commonly "no hub configured", in which case point the user at `/sesh-mover:hub-init` — and stop.
 
-3. If `linked: false`: tell the user this project isn't linked to a hub project yet.
+2b. If `reachable: false` (a `success: true` result — `whereis` reports an unreachable hub, it does not refuse on one): **stop here and report that, before reading any other field.** `hubState` says which case it is — `"no-directory"` (an unmounted share, a synced folder that hasn't appeared on this machine yet, or a typo in `hub.path`) or `"not-a-hub"` (a directory is there but carries no `hub.json`, so it was never `hub init`-ed or points at the wrong folder). Three things not to do with the rest of the result, because none of them were read from the hub:
+
+   - **`threads: []` means UNKNOWN, never "this project has no sessions elsewhere."** Do not render an empty table, and do not say the project is only on this machine.
+   - **`linked` is a purely local fact** (the presence of `<project>/.sesh-mover-project.json`). `linked: true` here says nothing about whether the hub still has that project, and `linked: false` is not evidence that it doesn't.
+   - **`linkCandidates` is absent, not empty** — don't offer a pick list, and don't fall through to step 3's "never been pushed from any machine" wording, which is what an empty list means when the hub *was* readable.
+
+   Ask the user to mount/connect the share or check `hub.path` (`configure --show`), then offer to re-run — nothing was written, so a re-run is always safe. The result deliberately does not echo the path back; `hub status` is where the configured path is reported.
+
+3. If `linked: false` (and `reachable: true`): tell the user this project isn't linked to a hub project yet.
    - If `linkCandidates` is non-empty, list the candidate(s) (name + gitRemotes) that this project's git remote matches, and point the user at `/sesh-mover:push` to link to one of them (or create a new hub project) — `whereis` itself cannot link.
    - If `linkCandidates` is empty, just say this project has never been pushed from any machine, and point at `/sesh-mover:push`.
 
-4. If `linked: true`: render `threads` as a table. Columns:
+4. If `linked: true` (and `reachable: true`): render `threads` as a table. Columns:
    - **Thread** — `slug`
    - **Machines** — the distinct machine names across `copies` (fall back to machine id if `machineName` is null)
    - **Latest** — `latest.machineName` (or id) and `latest.lastActiveAt`

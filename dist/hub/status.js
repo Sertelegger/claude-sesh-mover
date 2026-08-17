@@ -1,5 +1,6 @@
 import { createFsBackend } from "./backend.js";
-import { HUB_JSON, machinePath } from "./layout.js";
+import { machinePath } from "./layout.js";
+import { describeHubUnreachable, probeHubReachable } from "./preflight.js";
 import { resolveHubPath } from "./init.js";
 import { readMachineId } from "../machine.js";
 import { computeEffectiveConfig } from "../config.js";
@@ -48,6 +49,28 @@ async function countKnownMachines(backend) {
     }
     return seen.size;
 }
+/**
+ * Report the hub's state; never refuse on it.
+ *
+ * **`hub status` deliberately does NOT return `hub-unreachable`** (#75's gate is
+ * wired into push, pull and `hub reindex` instead). The argument is not that
+ * status is unimportant — it is that the refusal would answer a different
+ * question than the one asked. A user runs this command *to find out* whether
+ * the hub is reachable; a `success: false` whose whole content is "the hub is
+ * unreachable" would make the command fail in exactly the situation it exists
+ * to describe, and would take `hubPath`, `machineRegistered`, `project.linked`
+ * and `lastAutoPush` down with it — every one of which is still knowable, and
+ * three of which are answers the user needs precisely *then*. `lastAutoPush` is
+ * the sharpest: an unreachable hub is the commonest cause of a failed unattended
+ * push, and this result is the only surviving record of one.
+ *
+ * What it takes from the gate is the CLASSIFICATION, not the refusal
+ * (`probeHubReachable`). That is not tidiness either: `reachable` used to mean
+ * "hub.json exists", so a `hub.json` carrying no `hubId` — what a sync client
+ * mid-copy actually leaves behind — reported `reachable: true, hubId: undefined`
+ * here while push and pull refused the same directory as `not-a-hub`. The two
+ * now answer from one probe and cannot disagree.
+ */
 export async function hubStatus(opts) {
     const warnings = [];
     const config = computeEffectiveConfig(userSeshMoverDir(), projectSeshMoverDir(opts.cwd));
@@ -58,6 +81,10 @@ export async function hubStatus(opts) {
             command: "hub-status",
             hubPath: null,
             reachable: false,
+            // Not `no-directory`: nothing was probed, because no path was configured.
+            // Telling a user who has never run `hub init` to check whether a share is
+            // mounted is the wrong remedy for the right-sounding word.
+            hubState: null,
             hubId: null,
             machineRegistered: false,
             machinesKnown: 0,
@@ -66,19 +93,17 @@ export async function hubStatus(opts) {
         };
     }
     const backend = createFsBackend(hubPath);
-    let hubId = null;
-    let reachable = false;
-    try {
-        if (await backend.exists(HUB_JSON)) {
-            hubId = JSON.parse((await backend.read(HUB_JSON)).toString()).hubId;
-            reachable = true;
-        }
-        else {
-            warnings.push(`hub.path is set (${hubPath}) but hub.json is missing — run hub init.`);
-        }
-    }
-    catch (e) {
-        warnings.push(`hub not reachable: ${e.message}`);
+    const probe = await probeHubReachable(hubPath, backend);
+    const reachable = probe.state === "ok";
+    const hubId = probe.hub?.hubId ?? null;
+    if (!reachable) {
+        // The gate's own wording, verbatim, so the diagnosis a refused push gave
+        // and the one `hub status` gives are the same sentence about the same
+        // directory. Deliberately no "run hub init" here, which the message it
+        // replaces said for BOTH states: for `no-directory` that advice would have
+        // the user mint a brand-new hub at an unmounted mount point — a different
+        // hubId, shadowing the real hub the moment it mounts.
+        warnings.push(describeHubUnreachable(probe.state));
     }
     const identity = readMachineId();
     const machineRegistered = reachable && identity !== null && (await backend.exists(machinePath(identity.id)));
@@ -103,6 +128,7 @@ export async function hubStatus(opts) {
         command: "hub-status",
         hubPath,
         reachable,
+        hubState: probe.state,
         hubId,
         machineRegistered,
         machinesKnown,

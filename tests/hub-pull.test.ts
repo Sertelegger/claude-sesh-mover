@@ -4845,6 +4845,88 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
     }
   });
 
+  /**
+   * The same mid-chain shape, on the guard that used to have no `try`.
+   *
+   * `readManifest` throws — on an absent, unparseable or foreign `manifest.json`
+   * — and the throw went straight past `hubPull` into the CLI's outer catch:
+   * `outputError` prints `{success, command, error}` and exits **1**, where
+   * every typed hub refusal goes through `output` and exits 0. So a damaged
+   * bundle was reported in the shape of an internal fault, and the `suggestion`
+   * that tells the user what to do about it — and that the bundles already
+   * applied stay applied — did not exist at all.
+   *
+   * This asserts the refusal is a VALUE, on a pull that had already applied
+   * bundle 0: the two facts a throw could not carry are the suggestion and the
+   * intact half of the pull.
+   */
+  it("refuses, as a value with a suggestion, a mid-chain bundle whose manifest cannot be read", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-badmanifest-homeA-"));
+    const homeC = mkdtempSync(join(tmpdir(), "sesh-badmanifest-homeC-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-badmanifest-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-badmanifest-fix-"));
+    let projectC: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+      const pushOpts = {
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        noWorkspace: true, claudeVersion: "2.1.81",
+      };
+      const full = await hubPush({ ...pushOpts, createProject: true });
+      expect(full.success).toBe(true);
+      if (!full.success) return;
+      const aJsonl = join(configDirA, "projects", encodeProjectPath(projectA), `${FIXTURE_SESSION_ID}.jsonl`);
+      appendEntries(aJsonl, plainEntries(FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID, projectA));
+      expect((await hubPush(pushOpts)).success).toBe(true);
+
+      // Bundle 1 of the chain: an archive that unpacks perfectly and whose
+      // manifest.json is not one this plugin can read.
+      await mutateContinuationBundle(hub, full.projectId, (dir) => {
+        writeFileSync(join(dir, "manifest.json"), "{ truncated in transit", "utf-8");
+      });
+
+      restore.restore();
+      restore = overrideHome(homeC);
+      const configDirC = join(homeC, ".claude");
+      projectC = mkdtempSync(join(tmpdir(), "sesh-badmanifest-projC-"));
+      writeLocalProjectId(projectC, {
+        projectId: full.projectId, name: "projA",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+
+      // A THROW would fail this call, not return from it.
+      const pulled = await hubPull({
+        configDir: configDirC, projectPath: projectC, hubPath: hub,
+        latest: true, claudeVersion: "2.1.81",
+      });
+
+      expect(pulled.success).toBe(false);
+      expect((pulled as ErrorResult).command).toBe("pull");
+      expect((pulled as ErrorResult).error).toMatch(/does not carry a readable sesh-mover manifest/);
+      // The half a throw structurally cannot carry, and the reason the exit code
+      // matters: this is what tells the user the pull is re-runnable and what
+      // it already kept.
+      expect((pulled as ErrorResult).suggestion).toContain("Nothing from this bundle was applied.");
+      expect((pulled as ErrorResult).suggestion).toContain("will not be refetched");
+
+      // Bundle 0 really was applied and recorded before the refusal — so the
+      // refusal describes a partly-completed pull, not a crash.
+      const projectDirC = join(configDirC, "projects", encodeProjectPath(projectC));
+      expect(readdirSync(projectDirC).filter((f) => f.endsWith(".jsonl"))).toHaveLength(1);
+      expect(
+        Object.values(readSyncState(projectC).peers)
+          .some((p) => Object.keys(p.received ?? {}).length > 0)
+      ).toBe(true);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeC, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectC) rmSync(projectC, { recursive: true, force: true });
+    }
+  });
+
   it("stops a re-hashed continuation BEFORE the splice, where the per-session hash cannot help", async () => {
     // The case the bundle-level digest exists for, and the reason it is checked
     // in pull.ts rather than left to importSession: edit the delta AND the

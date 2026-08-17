@@ -28,6 +28,15 @@ You are running the sesh-mover hub init command. Follow these steps:
    ```
    Report `hubPath`, `reachable`, `machineRegistered`, and `project.linked` from the result. If `reachable` is false or there are `warnings`, surface them — a hub that was just created should normally come back reachable and registered.
 
+   `hub status` is a **diagnostic** and always returns `success: true`: unlike `push`, `pull` and `hub reindex`, it reports an unreachable hub instead of refusing, because reporting it is the question it was asked. `hubState` says which state, and the remedies differ:
+
+   - `"ok"` — `reachable: true`. The normal case.
+   - `"no-directory"` — nothing is at `hub.path`: an unmounted share, a synced folder that hasn't reached this machine, or a typo. **Do not offer `hub init` here** — running it at an unmounted mount point mints a *different* hub in a directory that will be shadowed the moment the real one mounts. Offer to check the path (`configure --show`) or to mount the share.
+   - `"not-a-hub"` — a directory is there but carries no usable `hub.json`. If it's a synced folder the first sync may still be in flight, so offer to wait and re-check; otherwise the path names some other directory and `hub init` (at the right path) or `configure --set hub.path=<dir>` is the fix.
+   - `null` — no hub is configured at all (`hubPath` is also `null`). This is not a failure: point at `/sesh-mover:hub-init` and say nothing about mounts.
+
+   `hub status` is also the one hub result that reports the configured path; the `hub-unreachable` refusals from `push`/`pull`/`hub reindex` withhold it on purpose and point here instead.
+
 7. Report to the user: hub path, created-vs-joined, machine registration confirmed, and point them at `/sesh-mover:push` to start sharing this project's sessions through the hub (linking happens automatically on the first push/pull, not during init).
 
 8. State the automation consent, once, in the same breath — **linking a project is what turns it on**, so say it before the user runs their first push rather than after: linking a project enables automatic push when a session ends and a startup notice when another machine has newer work; disable with `configure --set hub.autoPush=false` / `hub.startupNotice=false` (add `--scope project` to limit either to this project). Both are inert until a project is actually linked, so `hub init` on its own changes nothing about how sessions end or start. Mention what the automatic push carries, because it is the same payload as a manual one: this project's sessions, plus — depending on the project — a workspace snapshot (no git remote) or a `git diff HEAD` patch and untracked files (git remote); `hub.noWorkspace` / `hub.carryDiff` are the opt-outs for those two, and the hook takes no flags, so config is the only place to express them.

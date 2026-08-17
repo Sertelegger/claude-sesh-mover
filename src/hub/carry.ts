@@ -330,6 +330,142 @@ export interface CarryMeta {
   repoPrefix: string;
 }
 
+/**
+ * How an unreadable `CarryMeta` string field reads inside a sentence.
+ *
+ * `normalizeCarryMeta` replaces one with `""`, and an empty string interpolated
+ * into prose reads as a missing WORD rather than as missing information — "the
+ * changes were captured at  on branch " is indistinguishable from a rendering
+ * bug, and a user who cannot tell those apart cannot act on either. Every
+ * message that names one of those fields — here and in `pull-apply-carry.ts`,
+ * which is why this is exported — goes through this, so the substitution is
+ * decided in one place rather than per sentence.
+ */
+export function orNotRecorded(value: string): string {
+  return value === "" ? "(not recorded)" : value;
+}
+
+/** The closed set `CarryMeta.inProgress` may name, beside `null`. */
+const IN_PROGRESS_VALUES: readonly string[] = Object.freeze([
+  "merge", "rebase", "cherry-pick", "revert",
+]);
+
+/** `normalizeCarryMeta`'s answer: a usable meta, plus what had to be replaced. */
+export interface NormalizedCarryMeta {
+  /**
+   * A `CarryMeta` whose every field really is its declared type.
+   *
+   * IDENTICAL to the input — the same object, not a copy — whenever nothing had
+   * to be replaced. That is deliberate: the routine case is a manifest a
+   * sesh-mover push wrote, callers hand this straight to `HubPullResult` as
+   * "what the bundle declared", and a copy there would quietly turn the sender's
+   * claim into ours.
+   */
+  meta: CarryMeta;
+  /**
+   * The field names that were not of their declared type, in `CarryMeta`'s own
+   * declaration order. Empty means the block was read exactly as written.
+   */
+  unreadable: string[];
+}
+
+/**
+ * Read a bundle manifest's `carry` block into a `CarryMeta` that can be used.
+ *
+ * **This is the trust boundary for that block, and it had none.** `carry` is
+ * parsed out of a `manifest.json` fetched from the hub — the same untrusted
+ * surface `isBundleManifestShape`/`assertSafeManifestIds` guard on the session
+ * list — and `ExportManifest` merely *declares* it a `CarryMeta`. Nothing
+ * checked it, so a bundle carrying `carry: {}` reached
+ * `meta.baseCommit.slice(0, 8)` in the pull's disclosure prose and threw a
+ * `TypeError` out of `hubPull` into the CLI's outer catch: exit 1, no
+ * suggestion, and the carried payload dropped along with the extraction
+ * directory the pull's `finally` removes.
+ *
+ * **Total rather than a predicate, and that is the whole design.** A boolean
+ * `isCarryMetaShape` has exactly one usable answer for a malformed block —
+ * refuse it — and refusing means not reaching `applyCarry`, which is what SAVES
+ * a payload the pull will never be able to offer again. So every field degrades
+ * to its type's empty value instead, and the caller discloses which ones.
+ * Fail-closed comes out of the values, not out of a refusal: `baseCommit`
+ * becomes `""`, which no `git rev-parse HEAD` can ever equal, so `applyCarry`
+ * declines `wrong-base` and saves. A malformed block therefore costs the apply
+ * and never the payload.
+ *
+ * Strictness has a false-positive cost that is deliberately accepted: a bundle
+ * from an older version that predates one of these fields lists it as
+ * unreadable. That is one extra disclosure sentence and no behavioural change,
+ * and the caller's wording names an older version first among the causes.
+ */
+export function normalizeCarryMeta(raw: unknown): NormalizedCarryMeta {
+  // A non-object `carry` (a string, a number, `true`) is not a special case: it
+  // simply supplies no field, so every one is unreadable and the disclosure
+  // lists them all.
+  const src: Record<string, unknown> =
+    typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
+  const unreadable: string[] = [];
+  const str = (name: string): string => {
+    const v = src[name];
+    if (typeof v === "string") return v;
+    unreadable.push(name);
+    return "";
+  };
+  // `Number.isFinite` rather than `typeof === "number"`: `NaN` and `Infinity`
+  // are numbers that `formatBytes` renders as "NaN bytes".
+  const num = (name: string): number => {
+    const v = src[name];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    unreadable.push(name);
+    return 0;
+  };
+  // Whole-array, never per-element: a list with one non-string in it is a list
+  // this module cannot `join` honestly, and keeping the readable half would
+  // report a sample that is not a sample of anything.
+  const list = (name: string): string[] => {
+    const v = src[name];
+    if (Array.isArray(v) && v.every((e) => typeof e === "string")) return v as string[];
+    unreadable.push(name);
+    return [];
+  };
+  const bool = (name: string): boolean => {
+    const v = src[name];
+    if (typeof v === "boolean") return v;
+    unreadable.push(name);
+    return false;
+  };
+  const inProgress = ((): GitOperationInProgress | null => {
+    const v = src.inProgress;
+    if (v === null) return null;
+    if (typeof v === "string" && IN_PROGRESS_VALUES.includes(v)) {
+      return v as GitOperationInProgress;
+    }
+    unreadable.push("inProgress");
+    return null;
+  })();
+  // Built in CarryMeta's declaration order so `unreadable` reads in it too.
+  const meta: CarryMeta = {
+    baseCommit: str("baseCommit"),
+    branch: str("branch"),
+    detached: bool("detached"),
+    inProgress,
+    capturedAt: str("capturedAt"),
+    untrackedCount: num("untrackedCount"),
+    untrackedBytes: num("untrackedBytes"),
+    patchBytes: num("patchBytes"),
+    reIncludedCount: num("reIncludedCount"),
+    reIncluded: list("reIncluded"),
+    trackedIgnoredCount: num("trackedIgnoredCount"),
+    trackedIgnored: list("trackedIgnored"),
+    repoPrefix: str("repoPrefix"),
+  };
+  // `inProgress` is evaluated above the object literal, so its name would sort
+  // ahead of `baseCommit` without this.
+  unreadable.sort(
+    (a, b) => Object.keys(meta).indexOf(a) - Object.keys(meta).indexOf(b)
+  );
+  return { meta: unreadable.length === 0 ? (raw as CarryMeta) : meta, unreadable };
+}
+
 export type CaptureResult =
   | { captured: false; reason: CarryDeclineReason; detail?: string }
   | { captured: true; meta: CarryMeta };
@@ -1979,7 +2115,10 @@ function renderSavedReadme(opts: {
     "",
     `Reason: ${opts.detail}`,
     "",
-    `Captured on branch \`${meta.branch}\`${meta.detached ? " (detached HEAD)" : ""} at commit \`${meta.baseCommit}\` on ${meta.capturedAt}.`,
+    // Every one of the three through `orNotRecorded`: a manifest whose carry
+    // block could not be read reaches here with empty strings, and this note is
+    // the ONLY thing the user has to identify the payload sitting beside it.
+    `Captured on branch \`${orNotRecorded(meta.branch)}\`${meta.detached ? " (detached HEAD)" : ""} at commit \`${orNotRecorded(meta.baseCommit)}\` on ${orNotRecorded(meta.capturedAt)}.`,
     `It holds a ${formatBytes(meta.patchBytes)} patch and ${opts.untrackedSaved} untracked file(s).`,
     "",
   ];
@@ -2354,10 +2493,15 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
   }
   const headSha = head.stdout.toString("utf-8").trim();
 
+  // Also the gate a carry block that could not be read falls through:
+  // `normalizeCarryMeta` leaves `baseCommit` as `""`, which no `rev-parse HEAD`
+  // can equal, so an unreadable base declines here and SAVES rather than
+  // applying an unanchored patch. See that function for why fail-closed is
+  // expressed as a value instead of a refusal.
   if (headSha !== meta.baseCommit) {
     return decline(
       "wrong-base",
-      `this machine is at commit ${headSha.slice(0, 8)}, the changes were captured at ${meta.baseCommit.slice(0, 8)} on branch ${meta.branch}`
+      `this machine is at commit ${headSha.slice(0, 8)}, the changes were captured at ${orNotRecorded(meta.baseCommit.slice(0, 8))} on branch ${orNotRecorded(meta.branch)}`
     );
   }
   const inProgress = gitDir ? detectInProgress(gitDir) : null;

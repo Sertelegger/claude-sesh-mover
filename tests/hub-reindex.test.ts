@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, cpSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, cpSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome } from "./helpers/env.js";
@@ -747,6 +747,115 @@ describe("hub reindex", () => {
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * `hub reindex` takes the PLAIN REFUSAL for an unreachable hub — push and pull's
+ * treatment, not `hub status`'s and `whereis`'s.
+ *
+ * The line between the two is what the verb does, not how it is spelled.
+ * `hub status` and `whereis` are reads, so they report the state inside a
+ * `success: true` result; reindex WRITES — it is the repair tool for a lost
+ * index — and there is nothing diagnostic for it to salvage: an index rebuilt
+ * from bundles it could not read is not a degraded answer, it is a wrong one
+ * that every other machine then reads.
+ *
+ * The write is also the sharp part. `registerMachine` is reindex's third
+ * statement and goes through `writeAtomic`, which mkdir -p's its way to
+ * `machines/<id>.json` — so a reindex against an unmounted mount point
+ * MATERIALIZED a half-built "hub" at that path and rebuilt an index into it,
+ * which every later command would then have treated as real.
+ */
+describe("hub reindex: an unreachable hub", () => {
+  it("refuses before registerMachine, and builds nothing at the path", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-gone-home-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-gone-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      // LINKED, so the `unlinked` refusal cannot be what this test observes.
+      writeLocalProjectId(projectPath, {
+        projectId: "proj-gone", name: "proj",
+        createdAt: "2026-07-01T00:00:00Z", createdByMachine: "m1",
+      });
+      const gone = join(base, "not-mounted");
+
+      const r = await hubReindex({ configDir, projectPath, hubPath: gone });
+
+      expect(r.success).toBe(false);
+      expect("reason" in r && r.reason).toBe("hub-unreachable");
+      expect("hubState" in r && r.hubState).toBe("no-directory");
+      expect(r.command).toBe("hub-reindex");
+      // Same withholding as push and pull: the ENOENT this replaces named the
+      // hub's absolute path, and `hub status` is where a user asks which path
+      // is configured.
+      expect(JSON.stringify(r)).not.toContain(gone);
+      // THE assertion. Nothing was created at the mistyped path.
+      expect(existsSync(gone)).toBe(false);
+    } finally {
+      restore.restore();
+      for (const d of [home, base] ) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a directory that is not a hub, and leaves it untouched", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-nothub-home-"));
+    const notAHub = mkdtempSync(join(tmpdir(), "sesh-reindex-nothub-dir-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-nothub-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      writeLocalProjectId(projectPath, {
+        projectId: "proj-nothub", name: "proj",
+        createdAt: "2026-07-01T00:00:00Z", createdByMachine: "m1",
+      });
+      writeFileSync(join(notAHub, "notes.txt"), "not a hub\n");
+
+      const r = await hubReindex({ configDir, projectPath, hubPath: notAHub });
+
+      expect(r.success).toBe(false);
+      expect("reason" in r && r.reason).toBe("hub-unreachable");
+      expect("hubState" in r && r.hubState).toBe("not-a-hub");
+      expect(readdirSync(notAHub)).toEqual(["notes.txt"]);
+    } finally {
+      restore.restore();
+      for (const d of [home, notAHub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * ORDER, and it deliberately differs from push and pull's.
+   *
+   * They run reachability FIRST because on an unreachable hub their identity
+   * read fails too, so `no-such-project` there would be a confident wrong
+   * diagnosis. That argument does not transfer: reindex's identity check is
+   * `readLocalProjectId`, a read of a file in the user's own project directory,
+   * whose answer is unaffected by whether the hub is mounted. It can never be
+   * the wrong diagnosis, so the narrower fact keeps its place at the front —
+   * and "you have never pushed this project" is the more useful thing to hear
+   * than "the share is not mounted" when both are true.
+   */
+  it("still answers unlinked first when the project is unlinked AND the hub is gone", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-both-home-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-both-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+
+      const r = await hubReindex({
+        configDir, projectPath, hubPath: join(base, "not-mounted"),
+      });
+
+      expect(r.success).toBe(false);
+      expect("reason" in r && r.reason).toBe("unlinked");
+    } finally {
+      restore.restore();
+      for (const d of [home, base]) rmSync(d, { recursive: true, force: true });
     }
   });
 });

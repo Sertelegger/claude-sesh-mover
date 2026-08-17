@@ -667,6 +667,90 @@ describe("cli", () => {
         rmSync(home, { recursive: true, force: true });
       }
     });
+
+    /**
+     * THE DISARM-PATH GUARANTEE, and the reason this change stopped short of
+     * `hub unlink`.
+     *
+     * `skills/session-porter/SKILL.md` states it outright: unlink "is the one
+     * hub verb that works with no hub configured or reachable (it is the disarm
+     * path for the default-on hooks, so it must not depend on the thing it is
+     * disarming from)". Extending the `hub-unreachable` gate to every hub verb
+     * uniformly would have broken exactly that — and broken it in the situation
+     * a user reaches for the command in, since a push wedged on an unreachable
+     * share is the motivating case for `--force` in the same file.
+     *
+     * Asserted through the BUILT CLI with `hub.path` really configured and
+     * really absent, because the guarantee is about the wiring: `src/hub/unlink.ts`
+     * constructs no backend, and `src/cli.ts`'s action resolves no hub path, so
+     * either one growing a gate is what this catches. Nothing about the module's
+     * internals is inspected.
+     */
+    it("still unlinks when hub.path is configured and unreachable", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-cli-unlink-gone-home-"));
+      const projectPath = join(tempDir, "unlinkgoneproj");
+      mkdirSync(projectPath, { recursive: true });
+      const linkPath = join(projectPath, ".sesh-mover-project.json");
+      writeFileSync(
+        linkPath,
+        JSON.stringify(
+          {
+            projectId: "22222222-2222-4222-8222-222222222222",
+            name: "unlinkgoneproj",
+            createdAt: "2026-07-21T00:00:00Z",
+            createdByMachine: "m1",
+          },
+          null,
+          2
+        ) + "\n"
+      );
+      try {
+        const gone = join(home, "not-mounted");
+        runCli(["configure", "--scope", "user", "--set", `hub.path=${gone}`], homeEnv(home));
+
+        // The three verbs that DO consult the hub say so first, so this test
+        // shows the unlink succeeding in a state the others decline in rather
+        // than in a vacuum.
+        const status = JSON.parse(sharedRunCli(["hub", "status"], {
+          env: homeEnv(home), cwd: projectPath,
+        }).stdout);
+        expect(status.success).toBe(true); // diagnostic: reports, never refuses
+        expect(status.reachable).toBe(false);
+        expect(status.hubState).toBe("no-directory");
+
+        const whereis = JSON.parse(sharedRunCli(
+          ["whereis", "--project-path", projectPath, "--source-config-dir", configDir],
+          { env: homeEnv(home), cwd: projectPath }
+        ).stdout);
+        expect(whereis.success).toBe(true); // read: reports, never refuses
+        expect(whereis.reachable).toBe(false);
+        expect(whereis.linkCandidates).toBeUndefined();
+
+        const reindex = JSON.parse(sharedRunCli(
+          ["hub", "reindex", "--project-path", projectPath, "--source-config-dir", configDir],
+          { env: homeEnv(home), cwd: projectPath }
+        ).stdout);
+        expect(reindex.success).toBe(false); // writes: refuses
+        expect(reindex.reason).toBe("hub-unreachable");
+
+        // ...and the disarm path is unaffected by every one of them.
+        const { stdout, status: exit } = sharedRunCli(["hub", "unlink"], {
+          env: homeEnv(home),
+          cwd: projectPath,
+        });
+        expect(exit).toBe(0);
+        const result = JSON.parse(stdout);
+        expect(result.success).toBe(true);
+        expect(result.wasLinked).toBe(true);
+        expect(result.automationDisarmed).toBe(true);
+        expect(existsSync(linkPath)).toBe(false);
+        // No verb in that sequence built a hub at the mistyped path — including
+        // the unlink, which constructs no backend at all.
+        expect(existsSync(gone)).toBe(false);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("--progress", () => {

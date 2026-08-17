@@ -118,6 +118,65 @@ export interface CarryMeta {
      */
     repoPrefix: string;
 }
+/**
+ * How an unreadable `CarryMeta` string field reads inside a sentence.
+ *
+ * `normalizeCarryMeta` replaces one with `""`, and an empty string interpolated
+ * into prose reads as a missing WORD rather than as missing information — "the
+ * changes were captured at  on branch " is indistinguishable from a rendering
+ * bug, and a user who cannot tell those apart cannot act on either. Every
+ * message that names one of those fields — here and in `pull-apply-carry.ts`,
+ * which is why this is exported — goes through this, so the substitution is
+ * decided in one place rather than per sentence.
+ */
+export declare function orNotRecorded(value: string): string;
+/** `normalizeCarryMeta`'s answer: a usable meta, plus what had to be replaced. */
+export interface NormalizedCarryMeta {
+    /**
+     * A `CarryMeta` whose every field really is its declared type.
+     *
+     * IDENTICAL to the input — the same object, not a copy — whenever nothing had
+     * to be replaced. That is deliberate: the routine case is a manifest a
+     * sesh-mover push wrote, callers hand this straight to `HubPullResult` as
+     * "what the bundle declared", and a copy there would quietly turn the sender's
+     * claim into ours.
+     */
+    meta: CarryMeta;
+    /**
+     * The field names that were not of their declared type, in `CarryMeta`'s own
+     * declaration order. Empty means the block was read exactly as written.
+     */
+    unreadable: string[];
+}
+/**
+ * Read a bundle manifest's `carry` block into a `CarryMeta` that can be used.
+ *
+ * **This is the trust boundary for that block, and it had none.** `carry` is
+ * parsed out of a `manifest.json` fetched from the hub — the same untrusted
+ * surface `isBundleManifestShape`/`assertSafeManifestIds` guard on the session
+ * list — and `ExportManifest` merely *declares* it a `CarryMeta`. Nothing
+ * checked it, so a bundle carrying `carry: {}` reached
+ * `meta.baseCommit.slice(0, 8)` in the pull's disclosure prose and threw a
+ * `TypeError` out of `hubPull` into the CLI's outer catch: exit 1, no
+ * suggestion, and the carried payload dropped along with the extraction
+ * directory the pull's `finally` removes.
+ *
+ * **Total rather than a predicate, and that is the whole design.** A boolean
+ * `isCarryMetaShape` has exactly one usable answer for a malformed block —
+ * refuse it — and refusing means not reaching `applyCarry`, which is what SAVES
+ * a payload the pull will never be able to offer again. So every field degrades
+ * to its type's empty value instead, and the caller discloses which ones.
+ * Fail-closed comes out of the values, not out of a refusal: `baseCommit`
+ * becomes `""`, which no `git rev-parse HEAD` can ever equal, so `applyCarry`
+ * declines `wrong-base` and saves. A malformed block therefore costs the apply
+ * and never the payload.
+ *
+ * Strictness has a false-positive cost that is deliberately accepted: a bundle
+ * from an older version that predates one of these fields lists it as
+ * unreadable. That is one extra disclosure sentence and no behavioural change,
+ * and the caller's wording names an older version first among the causes.
+ */
+export declare function normalizeCarryMeta(raw: unknown): NormalizedCarryMeta;
 export type CaptureResult = {
     captured: false;
     reason: CarryDeclineReason;

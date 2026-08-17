@@ -66,7 +66,40 @@ export async function runFetchStage(input) {
     // etc. land directly under extractDir, the same way cli.ts's import
     // action treats its own tempExtractDir as the exportPath (no nested
     // "bundle/" to join).
-    const bundleManifest = readManifest(extractDir);
+    /**
+     * The manifest parse is a GUARD, and it has to answer like one.
+     *
+     * `readManifest` runs the trust boundary's first two steps (`is this a
+     * sesh-mover manifest at all`, `are its ids path-safe`) and THROWS on either,
+     * plus on a missing or unparseable `manifest.json`. This is the call that
+     * meets those steps with hub-fetched bytes — the hostile-input surface the
+     * checks exist for — so failing early here is right; propagating the throw
+     * was not. Uncaught it left `hubPull` for the CLI's outer catch, which prints
+     * `{error}` and exits 1: no `suggestion`, the exit code of a crash rather
+     * than of a refusal, and the same damaged bundle reported in a shape no
+     * caller can tell apart from an internal fault.
+     *
+     * So it is a `stageAbort`, like its two siblings below and for the identical
+     * reason: bundle N+1 is anchored on bundle N's head, so an unreadable link
+     * cannot be skipped past. The bundles applied before it stay applied and
+     * recorded.
+     */
+    let bundleManifest;
+    try {
+        bundleManifest = readManifest(extractDir);
+    }
+    catch (e) {
+        return stageAbort({
+            success: false,
+            command: "pull",
+            // `record.file` is the hub path the user can actually go and look at; the
+            // thrown message is kept whole after it because it is the only thing that
+            // distinguishes "no manifest.json" from "not one of ours" from a JSON
+            // syntax error.
+            error: `Bundle ${record.bundleId} does not carry a readable sesh-mover manifest (${record.file}): ${e.message}`,
+            suggestion: "Nothing from this bundle was applied. Its manifest.json is missing, unreadable, or not a sesh-mover bundle manifest — the archive on the hub is damaged, was only partially written, or was not produced by sesh-mover. If the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again. The bundles applied before it in this chain are recorded and will not be refetched.",
+        });
+    }
     /**
      * Nothing in this bundle is trusted until the manifest is shown to be the
      * one the pushing machine's exporter wrote, and nothing it declares is
@@ -131,6 +164,11 @@ export async function runFetchStage(input) {
     // recorded — the re-run will never see it, and dropping it deleted the
     // only reachable copy of someone's uncommitted work while the warning
     // said it had been "left in its bundle". See the gate after the loop.
+    // Stored as the manifest wrote it. `CarryMeta` is what `ExportManifest`
+    // DECLARES this to be, not what a hub-fetched manifest is checked to hold —
+    // `normalizeCarryMeta` in `pull-apply-carry.ts` is where it becomes true, and
+    // it is done there rather than here so the fields it had to repair can be
+    // disclosed (this stage's `reasons` are not spread into the pull's warnings).
     if (bundleManifest.carry) {
         st.lastCarry = {
             dir: join(extractDir, "carry"),

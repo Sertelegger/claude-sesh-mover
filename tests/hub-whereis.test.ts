@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { overrideHome } from "./helpers/env.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
-import { indexPath, machinePath, projectJsonPath, type HubMachineJson, type HubProjectJson } from "../src/hub/layout.js";
+import { HUB_JSON, indexPath, machinePath, projectJsonPath, type HubMachineJson, type HubProjectJson } from "../src/hub/layout.js";
 import { writeMachineIndex } from "../src/hub/index-file.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { encodeProjectPath } from "../src/platform.js";
@@ -20,6 +20,34 @@ function writeMachineFile(backend: ReturnType<typeof createFsBackend>, id: strin
   return backend.writeAtomic(machinePath(id), JSON.stringify(record, null, 2) + "\n");
 }
 
+/**
+ * Make the fixture directory an actual hub.
+ *
+ * A FIXTURE REPAIR, and worth reading before assuming it is boilerplate. Every
+ * test below built its hub with `mkdtempSync` and then wrote machine records and
+ * index files straight into it, never a `hub.json` — so all eight were
+ * exercising `whereis` against a directory `push` and `pull` refuse outright as
+ * `not-a-hub`, and that no real flow can produce (`hub init` writes this file
+ * before anything else). It went unnoticed because `whereis` had no reachability
+ * gate at all: the only hub file it read was `index/<id>.json`, which the
+ * fixtures did supply.
+ *
+ * Not one assertion below moved. The one test whose MEANING depended on this is
+ * "does not touch a corrupt sync-state file": without a `hub.json` the new gate
+ * returns before `peekSyncState` is ever called, so it would still have passed
+ * while proving nothing about the read-only reader it exists to pin.
+ */
+function makeHub(hubPath: string): void {
+  writeFileSync(
+    join(hubPath, HUB_JSON),
+    JSON.stringify(
+      { schemaVersion: 1, hubId: "hub-fixture-1", createdAt: "2026-07-01T00:00:00Z" },
+      null,
+      2
+    ) + "\n"
+  );
+}
+
 describe("hub whereis", () => {
   it("linked project with threads from two machines: latest on remote with no local copy -> pullNeeded true", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-whereis-home-"));
@@ -31,6 +59,7 @@ describe("hub whereis", () => {
       writeLocalProjectId(projectDir, {
         projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
       });
+      makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
       await writeMachineFile(backend, "remote-1", "office-desktop");
@@ -98,6 +127,7 @@ describe("hub whereis", () => {
       writeLocalProjectId(projectDir, {
         projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
       });
+      makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
       await writeMachineFile(backend, "remote-1", "office-desktop");
@@ -178,6 +208,7 @@ describe("hub whereis", () => {
       writeLocalProjectId(projectDir, {
         projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
       });
+      makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
       await writeMachineFile(backend, "remote-1", "office-desktop");
@@ -241,6 +272,7 @@ describe("hub whereis", () => {
       writeLocalProjectId(projectDir, {
         projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
       });
+      makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
       await writeMachineFile(backend, "remote-a", "the-first-machine");
@@ -325,6 +357,7 @@ describe("hub whereis", () => {
     const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-proj-")); // no .sesh-mover-project.json, no .git
     const restore = overrideHome(home);
     try {
+      makeHub(hub);
       const backend = createFsBackend(hub);
       const hubProject: HubProjectJson = {
         schemaVersion: 1, projectId: "other-proj", name: "other-proj",
@@ -364,6 +397,7 @@ describe("hub whereis", () => {
       writeLocalProjectId(projectDir, {
         projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
       });
+      makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
 
@@ -404,6 +438,7 @@ describe("hub whereis", () => {
       writeLocalProjectId(projectDir, {
         projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
       });
+      makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
 
@@ -443,6 +478,7 @@ describe("hub whereis", () => {
       writeLocalProjectId(projectDir, {
         projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
       });
+      makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
       await writeMachineIndex(backend, {
@@ -459,6 +495,150 @@ describe("hub whereis", () => {
       expect(existsSync(statePath)).toBe(true);
       expect(readFileSync(statePath, "utf-8")).toBe("{not json");
       expect(readdirSync(dirname(statePath))).toHaveLength(1); // nothing renamed aside either
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, projectDir]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * An unreachable hub is REPORTED here, not refused — and the fields it re-reads
+ * are the point.
+ *
+ * `whereis` already had this precedent for `linked: false` (see
+ * `HubUnlinkedResult`'s note on why whereis is deliberately not a member): it is
+ * a read, so an unresolved identity is a normal `success: true` answer carrying
+ * a pick list, and `commands/whereis.md` plus the skill doc both promise there
+ * is no error case to catch. An unreachable hub follows it. Push and pull refuse
+ * the same condition because they were about to write; nothing here writes.
+ *
+ * Left implicit it was not neutral, and this is measurable rather than
+ * stylistic: `backend.list` answers `[]` for a directory that is not there, so
+ * `readAllIndexes` found nothing and a LINKED project on an unmounted share came
+ * back `linked: true, threads: []` — character-for-character what a linked
+ * project nobody has pushed yet returns. The SessionStart notice reads exactly
+ * this result.
+ */
+describe("hub whereis: an unreachable hub", () => {
+  it("reports it on a linked project instead of an empty thread list that reads as 'none'", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-whereis-gone-home-"));
+    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-gone-proj-"));
+    const restore = overrideHome(home);
+    try {
+      const me = loadOrCreateMachineId();
+      writeLocalProjectId(projectDir, {
+        projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
+      });
+      // Never created: an unmounted share, or a synced folder that has not
+      // appeared on this machine.
+      const gone = join(home, "not-mounted");
+
+      const result = await hubWhereis({ configDir: home, projectPath: projectDir, hubPath: gone });
+
+      expect(result.success).toBe(true);
+      expect(result.command).toBe("whereis");
+      expect(result.reachable).toBe(false);
+      expect(result.hubState).toBe("no-directory");
+      // The local half still answers, because it is a local FILE and its truth
+      // does not depend on the share being mounted.
+      expect(result.linked).toBe(true);
+      expect(result.projectId).toBe(PROJECT_ID);
+      expect(result.threads).toEqual([]);
+      // ...and the empty list is labelled as unknown rather than left to be
+      // read as "this project has nothing on the hub".
+      expect(result.warnings.join(" ")).toContain("cannot see");
+      expect(result.warnings.join(" ")).toContain("UNKNOWN");
+      // Read-only: `whereis` builds no hub at a path that has none.
+      expect(existsSync(gone)).toBe(false);
+    } finally {
+      restore.restore();
+      for (const d of [home, projectDir]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * THE SHARP ONE. `linkCandidates: []` is documented — in `commands/whereis.md`
+   * step 3 and in the skill doc — to mean "this project has never been pushed
+   * from any machine", and the model is told to say so. On an unreachable hub
+   * the projects listing is precisely the read that failed, so an empty array
+   * there is a confident wrong answer. The key has to be ABSENT.
+   */
+  it("omits linkCandidates entirely rather than offering an empty pick list", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-whereis-gone2-home-"));
+    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-gone2-proj-")); // no link file
+    const restore = overrideHome(home);
+    try {
+      const result = await hubWhereis({
+        configDir: home, projectPath: projectDir, hubPath: join(home, "not-mounted"),
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.reachable).toBe(false);
+      expect(result.linked).toBe(false);
+      expect(result.projectId).toBeNull();
+      // Not `toEqual([])` and not `toBeUndefined()` on the value — the claim is
+      // about the KEY, and a serialized result is what the skill layer reads.
+      expect("linkCandidates" in result).toBe(false);
+      expect(Object.keys(JSON.parse(JSON.stringify(result)))).not.toContain("linkCandidates");
+    } finally {
+      restore.restore();
+      for (const d of [home, projectDir]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes a directory that is not a hub from one that is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-whereis-nothub-home-"));
+    const notAHub = mkdtempSync(join(tmpdir(), "sesh-whereis-nothub-dir-"));
+    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-nothub-proj-"));
+    const restore = overrideHome(home);
+    try {
+      writeFileSync(join(notAHub, "notes.txt"), "not a hub\n");
+
+      const result = await hubWhereis({
+        configDir: home, projectPath: projectDir, hubPath: notAHub,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.reachable).toBe(false);
+      expect(result.hubState).toBe("not-a-hub");
+      expect(result.warnings.join(" ")).toContain("no usable hub.json");
+      // The directory the user pointed at is untouched.
+      expect(readdirSync(notAHub)).toEqual(["notes.txt"]);
+    } finally {
+      restore.restore();
+      for (const d of [home, notAHub, projectDir]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * And the positive half, so `reachable` is not a field that is only ever
+   * observed false: a real hub answers `true`/`"ok"` on both shapes of result —
+   * the linked one and the pick-list one.
+   */
+  it("reports reachable: true on a real hub, linked or not", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-whereis-ok-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-whereis-ok-hub-"));
+    const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-ok-proj-"));
+    const restore = overrideHome(home);
+    try {
+      makeHub(hub);
+
+      const unlinked = await hubWhereis({ configDir: home, projectPath: projectDir, hubPath: hub });
+      expect(unlinked.linked).toBe(false);
+      expect(unlinked.reachable).toBe(true);
+      expect(unlinked.hubState).toBe("ok");
+      // Reachable, so the empty pick list is a real answer and IS present.
+      expect(unlinked.linkCandidates).toEqual([]);
+
+      const me = loadOrCreateMachineId();
+      writeLocalProjectId(projectDir, {
+        projectId: PROJECT_ID, name: "proj", createdAt: "2026-07-01T00:00:00Z", createdByMachine: me.id,
+      });
+      const linked = await hubWhereis({ configDir: home, projectPath: projectDir, hubPath: hub });
+      expect(linked.linked).toBe(true);
+      expect(linked.reachable).toBe(true);
+      expect(linked.hubState).toBe("ok");
     } finally {
       restore.restore();
       for (const d of [home, hub, projectDir]) rmSync(d, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome, homeEnv, type HomeOverrideHandle } from "./helpers/env.js";
@@ -30,6 +30,32 @@ function createRealProject(base: string, configDir: string, name: string): strin
     { recursive: true }
   );
   return proj;
+}
+
+/**
+ * Make the fixture hub directory an actual hub.
+ *
+ * A FIXTURE REPAIR, and the same one `tests/hub-whereis.test.ts` needed. The
+ * SessionStart fixtures wrote `machines/<id>.json` and `index/<id>.json` into a
+ * bare `mkdirSync` directory and never a `hub.json` — a directory `push` and
+ * `pull` refuse outright as `not-a-hub`, and that `hub init` cannot produce. It
+ * went unnoticed because the only hub files this endpoint reads are the index
+ * and machine records, which the fixtures did supply.
+ *
+ * It matters more here than in the whereis suite because of what these tests
+ * assert: half of them expect the endpoint to print NOTHING, which an
+ * unreachable hub also produces. Without this the negative cases would keep
+ * passing for a reason that has nothing to do with the rule they pin.
+ */
+function makeHub(hubPath: string): void {
+  writeFileSync(
+    join(hubPath, "hub.json"),
+    JSON.stringify(
+      { schemaVersion: 1, hubId: "hub-fixture-1", createdAt: "2026-07-21T00:00:00Z" },
+      null,
+      2
+    ) + "\n"
+  );
 }
 
 function writeSeshMoverConfig(dir: string, hub: Record<string, unknown>): void {
@@ -564,6 +590,120 @@ describe("hub hook-session-end (CLI)", () => {
     expect(status.warnings.join(" ")).toMatch(/could not show you/);
   });
 
+  /**
+   * The breadcrumb has to be READABLE, and #75's refusal is what broke that.
+   *
+   * `recordAutoPushOutcome` (cli.ts) renders a failed push as
+   * `error + " " + suggestion`, falling back to `JSON.stringify(result)` when
+   * there is no `error` field. Every failure shape that could reach it carried
+   * one — until `HubUnreachableResult`, which deliberately carries `reason` +
+   * `hubState` + `suggestion` and nothing else. An unreachable hub is also the
+   * single likeliest way for an unattended session-end push to fail, so the
+   * fallback went from unreachable-in-practice to the ordinary path, and wrote a
+   * wall of escaped JSON into the note a human reads out of `hub status`.
+   *
+   * The gate is why the note exists at all here: before #75 this push THREW,
+   * the hook's outer catch wrote a stderr line nobody sees, and nothing was
+   * recorded. So both halves are asserted — that a note is written, and that it
+   * reads as a sentence.
+   */
+  it("records an unreachable-hub auto-push as a readable note, not as raw JSON", async () => {
+    const gone = join(tempDir, "not-mounted");
+    writeSeshMoverConfig(home, { path: gone });
+    linkProject(project);
+    // A project that HAS pushed through a hub before, which is the only shape
+    // that gets a breadcrumb at all: `setLastAutoPush` is a documented no-op
+    // without this block, and the reachability refusal returns before the
+    // thread-minting that would create one. See the note below the assertions.
+    // The REAL path on EVERY side — the same rule as the two tests above, and
+    // seeding the fixture for both spellings is not a substitute for it. The
+    // breadcrumb is written at RUN time, so a hook told the unresolved path
+    // writes one key while a `hub status` child (whose own cwd is always
+    // resolved) reads the other, and no amount of pre-seeding reconciles that.
+    // On macOS /var is a symlink to /private/var, so this failed there while
+    // passing on Linux and Windows.
+    const { realpathSync } = await import("node:fs");
+    const projectReal = realpathSync(project);
+    const syncDir = join(home, ".sesh-mover", "sync-state");
+    mkdirSync(syncDir, { recursive: true });
+    writeFileSync(
+      join(syncDir, `${encodeProjectPath(projectReal)}.json`),
+      JSON.stringify({
+        schemaVersion: 2,
+        projectPath: projectReal,
+        lineage: {},
+        imported: {},
+        peers: {},
+        hub: { hubId: "hub-fixture-1", threadByLocalSession: {} },
+      }) + "\n"
+    );
+
+    const r = runHook(JSON.stringify({ cwd: projectReal, session_id: sessionId }));
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(""); // the hook contract is unchanged by any of this
+
+    const status = JSON.parse(
+      runCli(["hub", "status"], {
+        env: { ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
+        cwd: projectReal,
+      }).stdout
+    );
+    const note = status.lastAutoPush?.notes.join(" ") ?? "";
+    expect(status.lastAutoPush?.ok).toBe(false);
+    // The refusal is named, and its diagnosis (the `suggestion`) is carried.
+    expect(note).toContain("hub-unreachable");
+    expect(note).toContain("no-directory");
+    expect(note).toContain("this machine cannot see");
+    // ...and NOT the object. These are what `JSON.stringify(result)` produces
+    // and a sentence does not.
+    expect(note).not.toContain('"success"');
+    expect(note).not.toContain('"reason":');
+    expect(note).not.toContain("{");
+    // The hub was unreachable, so `hub status` says so in the same breath —
+    // which is the pairing that makes the note actionable.
+    expect(status.reachable).toBe(false);
+    expect(status.hubState).toBe("no-directory");
+    // Nothing was built at the mistyped path by the push, the breadcrumb or
+    // the status read.
+    expect(existsSync(gone)).toBe(false);
+  });
+
+  /**
+   * THE GAP THIS TEST'S FIXTURE EXPOSES, recorded rather than fixed.
+   *
+   * The breadcrumb above needs a `hub` block in sync-state, because
+   * `setLastAutoPush` returns early without one — deliberately, so that the
+   * breadcrumb is never the thing that bumps a `schemaVersion: 1` file to 2.
+   * That held while every failure happened AFTER the push had minted a thread
+   * id (which creates the block), and the reachability gate is before it. So a
+   * project that has never completed a push through a hub records NOTHING when
+   * its auto-push is refused for an unreachable hub — the stderr line is
+   * invisible at a clean exit and `hub status` has nothing to show.
+   *
+   * Asserted so the state is pinned rather than assumed. Closing it is a
+   * `src/sync-state.ts` decision (is a breadcrumb worth a schema bump for a
+   * project that has never pushed?), not a rendering one.
+   */
+  it("records nothing for a project whose sync-state has no hub block yet", () => {
+    const gone = join(tempDir, "not-mounted");
+    writeSeshMoverConfig(home, { path: gone });
+    linkProject(project);
+
+    const r = runHook(JSON.stringify({ cwd: project, session_id: sessionId }));
+    expect(r.status).toBe(0);
+
+    const status = JSON.parse(
+      runCli(["hub", "status"], {
+        env: { ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
+        cwd: project,
+      }).stdout
+    );
+    expect(status.lastAutoPush).toBeUndefined();
+    // `hub status` is still the place the user finds out, via the state itself.
+    expect(status.reachable).toBe(false);
+    expect(status.hubState).toBe("no-directory");
+  });
+
   it("stays completely silent when another hub operation holds the project lock", async () => {
     writeSeshMoverConfig(home, { path: hubDir });
     linkProject(project);
@@ -702,6 +842,7 @@ describe("hub hook-session-start (CLI)", () => {
     base = join(tempDir, "base");
     hubDir = join(tempDir, "hub");
     for (const d of [home, base, hubDir]) mkdirSync(d, { recursive: true });
+    makeHub(hubDir);
     const fixture = createFixtureTree(base);
     configDir = fixture.configDir;
     project = createRealProject(base, configDir, "proj");
