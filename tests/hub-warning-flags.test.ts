@@ -458,6 +458,19 @@ const REGISTRY: FlagUse[] = [
       reruns: "runImport",
     },
   },
+  {
+    file: "src/importer.ts",
+    // The escaped backticks are real: the shipped string is a template literal,
+    // so the source text carries `\`` where the message shows a backtick.
+    match: "\\`sesh-mover import --no-memory\\` was passed",
+    klass: "retry-works",
+    why: "The memory layer is opt-OUT (#36) — the opposite default from plans, because it lands in the target project's own directory and is add-only. Declining consumes nothing: every file stays in the bundle, and the re-run reconciles the shared layers even when the sessions are now all duplicates, which is the branch that returns before the session write loop. Names the command because migrate and pull re-emit this warning verbatim and neither declares --no-memory (neither can reach it either — both leave noMemory unset — but the sweep's rule is about what a reader of the sentence can follow).",
+    provenBy: {
+      test: "importer.test.ts",
+      name: "does not write a bundle's memory when --no-memory is passed, and the re-run without it lands them",
+      reruns: "runImport",
+    },
+  },
   // The post-rewrite validation failure at src/importer.ts:~930 used to advise
   // `--no-register` and had an entry here reading `retry-works`. Writing the
   // proof test is what disproved it: the second run returns the IDENTICAL

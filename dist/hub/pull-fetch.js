@@ -1,5 +1,5 @@
 import { createWriteStream, existsSync, mkdirSync } from "node:fs";
-import { pipeline } from "node:stream/promises";
+import { finished, pipeline } from "node:stream/promises";
 import { join } from "node:path";
 import { stageAbort, stageOk } from "./pull-stages.js";
 import { extractArchive } from "../archiver.js";
@@ -83,6 +83,25 @@ export async function runFetchStage(input) {
         await pipeline(await backend.readStream(record.file), out);
     }
     catch (e) {
+        // ABSORB THE DESTINATION'S LATE ERROR before returning, or it lands on a
+        // stream nobody is listening to any more and Node reports it as an
+        // unhandled error — which vitest fails the whole run for, and which in
+        // production is a crash on a path whose entire purpose is to fail politely.
+        //
+        // `createWriteStream` opens lazily and ASYNCHRONOUSLY, and `out` is created
+        // above the `try` (it has to be — `pipeline` needs it). So when the SOURCE
+        // errors first, which is the common case here because a missing hub file
+        // fails fast, `pipeline` rejects and detaches while `out`'s `open()` is
+        // still in flight. That open then resolves against a temp directory the
+        // caller may already have torn down. Observed as an intermittent
+        // `ENOENT … temp/<bundleId>.tar.gz` on a loaded CI runner, never locally.
+        //
+        // Same shape, same reason as `FsBackend.abort()`: destroy, then AWAIT the
+        // close, swallowing whatever it reports. The error being discarded here is
+        // never the one worth reporting — `e` already describes why the download
+        // failed, and this one only says the scratch copy could not be finished.
+        out.destroy();
+        await finished(out).catch(() => { });
         return stageAbort({
             success: false,
             command: "pull",

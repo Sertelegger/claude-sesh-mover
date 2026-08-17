@@ -1030,6 +1030,57 @@ describe("fetch stage", () => {
    * lazy — the ENOENT is a stream error, not a throw out of `readStream` — so a
    * `try` around the call alone would have caught nothing.
    */
+  /**
+   * The DOWNLOAD's other half: aborting must not leave an error behind it.
+   *
+   * `out` is created above the `try` because `pipeline` needs it, and
+   * `createWriteStream` opens lazily and ASYNCHRONOUSLY. So when the source
+   * errors first — the common case, since a missing hub file fails fast —
+   * `pipeline` rejects and detaches its listeners while `out`'s `open()` is
+   * still in flight. That open lands afterwards, on a stream nobody is
+   * listening to, and Node reports it as an unhandled error: vitest fails the
+   * whole run for one, and in production it is a crash on the path whose entire
+   * job is to fail politely.
+   *
+   * It surfaced as an intermittent `ENOENT … temp/<bundleId>.tar.gz` on a
+   * loaded CI runner — the temp root already torn down by the time the open
+   * resolved — and never once locally, including six consecutive runs of this
+   * file alone.
+   *
+   * Both ends are made to fail here so the late error is guaranteed to exist
+   * rather than merely likely. This is still a RACE and the assertion is on the
+   * process, not on a return value: `unhandledRejection`/`uncaughtException`
+   * during the awaited settle. Mutation-checked against the unfixed source.
+   */
+  it("leaves no unhandled error behind when the download aborts", async () => {
+    const record = await writeHealthyBundle({ basedOn: "gen-1", carry: true });
+    const st = initApplyState({ needed: [record] });
+    await backend.delete(record.file); // source fails
+    // ...and the destination cannot be opened either: a FILE where the stage
+    // will try to create `<tempRoot>/<bundleId>.tar.gz`, so the open fails with
+    // ENOTDIR rather than depending on a teardown winning a footrace.
+    const deadRoot = join(root, "not-a-dir");
+    writeFileSync(deadRoot, "");
+
+    const seen: unknown[] = [];
+    const onUnhandled = (e: unknown): void => void seen.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    process.on("uncaughtException", onUnhandled);
+    try {
+      const out = await runFetchStage({
+        backend, record, machineId: MACHINE_ID, bundleIndex: 0,
+        chainLength: 1, tempRoot: deadRoot, state: st,
+      });
+      expect(out.status).toBe("aborted");
+      // Let any late open() land while the handlers are still attached.
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      process.off("uncaughtException", onUnhandled);
+    }
+    expect(seen).toEqual([]);
+  });
+
   it("aborts, rather than throwing, when the bundle cannot be read from the hub", async () => {
     const record = await writeHealthyBundle({ basedOn: "gen-1", carry: true });
     const st = initApplyState({ needed: [record] });

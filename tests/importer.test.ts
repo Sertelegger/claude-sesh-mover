@@ -189,6 +189,7 @@ describe("importer", () => {
       dryRun?: boolean;
       from?: string;
       includePlans?: boolean;
+      noMemory?: boolean;
     }) => {
       const { importSession } = await import("../src/importer.js");
       return importSession({
@@ -198,6 +199,7 @@ describe("importer", () => {
         targetClaudeVersion: "2.1.81",
         dryRun: opts?.dryRun ?? false,
         includePlans: opts?.includePlans,
+        noMemory: opts?.noMemory,
       });
     };
     /**
@@ -583,6 +585,281 @@ describe("importer", () => {
       expect(preview.plansSkipped).toBe(1);
       expect(existsSync(join(targetConfigDir, "plans"))).toBe(false);
     });
+
+    // --- memory/ is opt-OUT, and the opposite default is the decision (#36) ---
+    //
+    // The ruling on the apply boundary is one explicit per-import decision over
+    // every payload that lands outside a minted session id — not a path filter,
+    // now or ever. `plans/` answers that with an opt-in because its destination
+    // is machine-global; `memory/` answers it with an off switch and keeps its
+    // default, because it lands in the target project's OWN directory, is
+    // add-only, parks conflicts rather than overwriting them, and is the layer a
+    // future session reads prose out of. What was actually missing was that the
+    // CLI honored no way to decline it at all.
+    it("does not write a bundle's memory when --no-memory is passed, and the re-run without it lands them", async () => {
+      const first = await runImport({ noMemory: true });
+      expect(first.success).toBe(true);
+      if (!first.success || !("memorySkipped" in first)) return;
+
+      // Not written — and the directory is not even created, so nothing about
+      // the target project's memory folder changed.
+      expect(existsSync(targetMemDir())).toBe(false);
+      expect(first.memorySkipped).toBe(2);
+      expect(first.memoryConflicts).toBeUndefined();
+      expect(
+        first.warnings.some((w) =>
+          w.includes("carries 2 memory file(s), and they were NOT written")
+        )
+      ).toBe(true);
+      // The OTHER shared layer is unaffected by this flag: plans were already
+      // skipped for their own (opt-in) reason, and stay that way.
+      expect(first.plansSkipped).toBe(1);
+
+      // The remedy the warning names reaches the payload. The re-run is a
+      // fully-duplicate import — the branch that returns before the session
+      // write loop — so this also pins that `noMemory` is threaded through THAT
+      // branch and not only the main one.
+      const second = await runImport();
+      expect(second.success).toBe(true);
+      if (!second.success || !("memorySkipped" in second)) return;
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+      expect(existsSync(join(targetMemDir(), "MEMORY.md"))).toBe(true);
+      expect(second.memorySkipped).toBeUndefined();
+      expect(second.importedSessions).toEqual([]);
+    });
+
+    it("previews the memory skip on a dry run with the same count the real run reports", async () => {
+      const preview = await runImport({ dryRun: true, noMemory: true });
+      expect(preview.success).toBe(true);
+      if (!preview.success || !("memorySkipped" in preview)) return;
+      expect(preview.memorySkipped).toBe(2);
+      expect(preview.memoryPlan).toEqual([]);
+      expect(preview.memoryDir).toBeUndefined();
+      expect(existsSync(targetMemDir())).toBe(false);
+    });
+
+    // --- the write set: the consent gate's input (#36) ---
+    //
+    // The gate `commands/import.md` step 8 runs is only worth anything if the
+    // set is COMPLETE. "Complete" is not a claim a reader can check by reading
+    // `reconcileSharedLayers`, so it is checked against the filesystem: snapshot
+    // the target config dir, run a real import, and compare what actually
+    // changed with what the result promised. Content hashes rather than a
+    // name list, because `index-append` MODIFIES a file that was already there
+    // and a created-files diff cannot see it.
+    /** Every file under `dir`, absolute, with its bytes. Directories excluded. */
+    const snapshotTree = (dir: string): Map<string, string> => {
+      const out = new Map<string, string>();
+      const walk = (d: string): void => {
+        if (!existsSync(d)) return;
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          const p = join(d, e.name);
+          if (e.isDirectory()) walk(p);
+          else out.set(p, readFileSync(p).toString("base64"));
+        }
+      };
+      walk(dir);
+      return out;
+    };
+
+    it("discloses a write set that is exactly the files it touched outside the minted sessions", async () => {
+      // A bundle exercising BOTH shared layers and all three entry kinds:
+      //  - MEMORY.md exists locally and differs      -> index-append
+      //  - test_memory.md exists locally and differs -> park
+      //  - fresh_note.md is absent locally           -> create (memory)
+      //  - plans/test-plan.md is absent              -> create (plans)
+      const from = await exportWithMemory(
+        { "fresh_note.md": "arrived with the bundle\n" },
+        "write-set-export"
+      );
+      seedMemory("MEMORY.md", "# Memory Index\n\n- [Local note](local-note.md) — mine\n");
+      seedMemory("local-note.md", "local\n");
+      seedMemory("test_memory.md", "a different local version\n");
+
+      const before = snapshotTree(targetConfigDir);
+      const result = await runImport({ from, includePlans: true });
+      expect(result.success).toBe(true);
+      if (!result.success || !("writeSet" in result) || result.dryRun) return;
+      const after = snapshotTree(targetConfigDir);
+
+      const minted = result.importedSessions.map((s) => s.newId);
+      expect(minted.length).toBeGreaterThan(0);
+      const touched = [...after]
+        .filter(([p, bytes]) => before.get(p) !== bytes)
+        .map(([p]) => p)
+        // The two documented exclusions from the write set's SCOPE, and nothing
+        // else: everything under an id this import minted seconds ago (which
+        // collides with nothing by construction), and this machine's own
+        // resume-list bookkeeping (which carries no bundle-chosen byte at a
+        // bundle-chosen name).
+        .filter((p) => !minted.some((id) => p.includes(id)))
+        .filter((p) => basename(p) !== "history.jsonl")
+        .sort();
+
+      expect(touched.length).toBeGreaterThan(0);
+      expect(result.writeSet!.entries.map((e) => e.path).sort()).toEqual(touched);
+      expect(result.writeSet!.total).toBe(result.writeSet!.entries.length);
+
+      // The kinds are the part a human is asked to consent to, so pin them by
+      // value rather than by count. `index-append` is the only kind that edits a
+      // file the user already had.
+      const byName = new Map(result.writeSet!.entries.map((e) => [basename(e.path), e.kind]));
+      expect(byName.get("MEMORY.md")).toBe("index-append");
+      expect(byName.get("test_memory.incoming.md")).toBe("park");
+      expect(byName.get("fresh_note.md")).toBe("create");
+      expect(byName.get("test-plan.md")).toBe("create");
+      // The local file a park sits beside is NOT in the set — it is not written.
+      expect(byName.has("test_memory.md")).toBe(false);
+      expect(byName.has("local-note.md")).toBe(false);
+
+      // Roots carry the blast radius, which is the whole reason the two layers
+      // have opposite defaults.
+      expect(
+        result.writeSet!.roots.map((r) => [r.layer, r.scope, r.applied])
+      ).toEqual([
+        ["memory", "project", true],
+        ["plans", "machine", true],
+      ]);
+    });
+
+    it("previews exactly the write set the real run produces", async () => {
+      seedMemory("test_memory.md", "a different local version\n");
+
+      const preview = await runImport({ dryRun: true, includePlans: true });
+      expect(preview.success).toBe(true);
+      if (!preview.success || !("writeSet" in preview)) return;
+      // Nothing was written by the preview — the set is a prediction.
+      expect(existsSync(join(targetMemDir(), "test_memory.incoming.md"))).toBe(false);
+      expect(existsSync(join(targetConfigDir, "plans"))).toBe(false);
+
+      const real = await runImport({ includePlans: true });
+      expect(real.success).toBe(true);
+      if (!real.success || !("writeSet" in real)) return;
+
+      expect(preview.writeSet).toEqual(real.writeSet);
+      expect(preview.writeSet!.total).toBeGreaterThan(0);
+      // The other direction of the `create` / `index-append` split: no local
+      // index was seeded here, so the bundle's own MEMORY.md lands as a NEW
+      // file. Pinned in both tests so a kind hard-coded either way is caught.
+      const index = preview.writeSet!.entries.find((e) => basename(e.path) === "MEMORY.md");
+      expect(index?.kind).toBe("create");
+    });
+
+    it("does not list a parked copy that was already on disk with the same bytes", async () => {
+      seedMemory("test_memory.md", "a different local version\n");
+      const first = await runImport();
+      expect(first.success).toBe(true);
+      if (!first.success || !("writeSet" in first)) return;
+      expect(
+        first.writeSet!.entries.some((e) => basename(e.path) === "test_memory.incoming.md")
+      ).toBe(true);
+
+      // The second import is the chain-pull shape the reuse branch exists for:
+      // the same conflicting memory, already parked with these exact bytes. It
+      // writes NOTHING, and the write set has to say nothing — a set that
+      // over-reports is as wrong as one that under-reports, because the gate's
+      // whole claim is that it is what the run does.
+      const before = snapshotTree(targetConfigDir);
+      const second = await runImport();
+      expect(second.success).toBe(true);
+      if (!second.success || !("writeSet" in second)) return;
+      const touched = [...snapshotTree(targetConfigDir)]
+        .filter(([p, bytes]) => before.get(p) !== bytes)
+        .map(([p]) => p)
+        .filter((p) => basename(p) !== "history.jsonl");
+
+      expect(touched).toEqual([]);
+      expect(second.writeSet!.entries).toEqual([]);
+      expect(second.writeSet!.total).toBe(0);
+      // Still a conflict, still parked, still reported — the reuse is about the
+      // WRITE, not about the finding.
+      expect(second.memoryConflicts?.[0].parkedAs).toBe("test_memory.incoming.md");
+    });
+
+    it("reports an empty write set rather than omitting it when nothing lands outside the session", async () => {
+      const result = await runImport({ noMemory: true });
+      expect(result.success).toBe(true);
+      if (!result.success || !("writeSet" in result)) return;
+      // Present, not absent: an omitted write set and an empty one are the same
+      // JSON, so a gate could not tell "nothing lands outside the session" from
+      // "nobody computed it".
+      expect(result.writeSet).toBeDefined();
+      expect(result.writeSet!.total).toBe(0);
+      expect(result.writeSet!.entries).toEqual([]);
+      // Both layers are still DISCLOSED, with the flag-declined state and the
+      // scope that explains why each has the default it has.
+      expect(
+        result.writeSet!.roots.map((r) => [r.layer, r.scope, r.applied])
+      ).toEqual([
+        ["memory", "project", false],
+        ["plans", "machine", false],
+      ]);
+    });
+
+    // `applySharedLayers` is the fifth caller of `reconcileSharedLayers` — the
+    // hub-pull splice path, which handles a bundle without importing a session.
+    // It is a one-line delegation on purpose, so a rule added to the reconcile
+    // reaches it with no edit. The delegation itself was unpinned: no shipped
+    // caller passes either layer flag, so dropping one from its signature would
+    // be a type error for nobody, and the flag would silently stop crossing.
+    it("threads both layer flags through applySharedLayers, the splice path's entry point", async () => {
+      const { applySharedLayers } = await import("../src/importer.js");
+      const targetProjectDir = join(
+        targetConfigDir,
+        "projects",
+        "-Users-newuser-Projects-newproject"
+      );
+      mkdirSync(targetProjectDir, { recursive: true });
+
+      const declined = applySharedLayers({
+        exportPath,
+        targetProjectDir,
+        targetConfigDir,
+        noMemory: true,
+      });
+      expect(existsSync(targetMemDir())).toBe(false);
+      expect(declined.memorySkipped).toBe(2);
+      expect(declined.writeSet!.total).toBe(0);
+
+      const applied = applySharedLayers({ exportPath, targetProjectDir, targetConfigDir });
+      expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+      expect(applied.memorySkipped).toBeUndefined();
+      expect(applied.writeSet!.entries.length).toBeGreaterThan(0);
+      // Plans stay opt-in through this entry point too, and it matters MORE
+      // here than on import: this path runs unattended from a hook, which has
+      // no channel to disclose a machine-global write.
+      expect(existsSync(join(targetConfigDir, "plans"))).toBe(false);
+      expect(applied.plansSkipped).toBe(1);
+    });
+
+    it.skipIf(isWindows)(
+      "quotes a bundle-chosen path in the write set instead of relaying it raw",
+      async () => {
+        // The write set interpolates a `readdirSync` basename out of the bundle
+        // into a list `commands/import.md` renders as markdown. That is the same
+        // sink #79 closed for MEMORY.md pointer lines and #38 closed for
+        // `git apply --summary`, and a newline is legal in a Linux filename.
+        const hostile = "note\n## Injected heading\n.md";
+        const from = await exportWithMemory({ [hostile]: "planted\n" }, "hostile-memory");
+
+        const result = await runImport({ from, dryRun: true });
+        expect(result.success).toBe(true);
+        if (!result.success || !("writeSet" in result)) return;
+
+        const entry = result.writeSet!.entries.find((e) => e.path.includes("Injected"));
+        expect(entry).toBeDefined();
+        // The fixture really is hostile — otherwise the assertion below passes
+        // for a reason that has nothing to do with escaping.
+        expect(entry!.path).toContain("\n");
+        expect(entry!.display).not.toContain("\n");
+        expect(entry!.display).toBe(JSON.stringify(entry!.path));
+        // The rule is per entry and not per hostile entry: an ordinary name has
+        // to carry the same escaped form, or a renderer learns to use `path`.
+        for (const e of result.writeSet!.entries) {
+          expect(e.display).toBe(JSON.stringify(e.path));
+        }
+      }
+    );
 
     // --- MEMORY.md pointer injection ---
     //

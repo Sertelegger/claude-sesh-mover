@@ -61,6 +61,15 @@ export declare function applySharedLayers(opts: {
      * machine-global write.
      */
     includePlans?: boolean;
+    /**
+     * Same default as `ImportOptions.noMemory`: OFF, i.e. the memory layer is
+     * applied. Omitting it is the correct call for the hub — `memory/` is the one
+     * shared layer that DOES travel there, and a pull that silently dropped it
+     * would reinstate #53. It is threaded rather than hard-coded so this wrapper
+     * and `importSession` cannot come to disagree about what a declined memory
+     * layer does.
+     */
+    noMemory?: boolean;
 }): SharedLayerApplication;
 export interface ImportOptions {
     exportPath: string;
@@ -79,6 +88,15 @@ export interface ImportOptions {
      * `false`, a bundle's plans are counted, disclosed and left in the bundle.
      */
     includePlans?: boolean;
+    /**
+     * Decline the bundle's `memory/` (`--no-memory` on `sesh-mover import`).
+     * **Default off**, i.e. memory is written: it lands in the target PROJECT's
+     * own directory, is add-only and parks conflicts rather than overwriting
+     * them, and it is the layer a future session reads prose out of. Absent or
+     * `false`, a bundle's memory is reconciled as before; `true` counts it,
+     * discloses it in `memorySkipped`, and leaves every file in the bundle.
+     */
+    noMemory?: boolean;
     onProgress?: (ev: ProgressEvent) => void;
 }
 export declare function importSession(options: ImportOptions): Promise<ImportResult | DryRunResult | ErrorResult>;

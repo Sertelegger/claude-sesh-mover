@@ -74,6 +74,14 @@ function sharedFindings(shared) {
         memoryDir: shared.memoryDir,
         planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
         plansSkipped: shared.plansSkipped,
+        memorySkipped: shared.memorySkipped,
+        // The ONE field this projection does not apply the empty-is-absent rule to,
+        // and the exception is the point (#36). Every other field here answers
+        // "did something notable happen"; this one is a consent gate's INPUT, and
+        // an absent write set and an empty one are the same JSON — so a reader
+        // could not tell "nothing lands outside the session" from "nobody asked".
+        // Always present, `total: 0` when there is nothing.
+        writeSet: shared.writeSet,
     };
 }
 function readTextFile(path) {
@@ -243,6 +251,7 @@ function memoryStem(filename) {
 function reconcileSharedLayers(opts) {
     const { exportPath, targetProjectDir, targetConfigDir, plan } = opts;
     const includePlans = opts.includePlans === true;
+    const includeMemory = opts.noMemory !== true;
     const sourceName = opts.sourceMachineName ?? "another machine";
     const warnings = [];
     const memoryConflicts = [];
@@ -251,6 +260,37 @@ function reconcileSharedLayers(opts) {
     let memoryIndex;
     let reportedMemoryDir;
     let plansSkipped;
+    let memorySkipped;
+    /**
+     * THE WRITE SET (#36) — every path this step writes outside the session id
+     * the import minted, recorded AT THE SITE THAT DECIDES IT.
+     *
+     * Completeness is the whole value, so it is structural rather than asserted.
+     * Two properties do the work:
+     *
+     *  - **Recorded where the verdict is taken**, never by a second walk over the
+     *    bundle. A second walk is a second implementation of "what will be
+     *    written", and this module already carries the argument for why there is
+     *    exactly one (`memoryPlan` in plan mode is the run's own function, not a
+     *    preview of it). So a branch that writes and forgets to record is a
+     *    branch that also forgot its verdict, which is visible in review.
+     *  - **The preview and the run share it.** `plan: true` runs the same code
+     *    with the writes suppressed, so a disclosure the gate shows and the bytes
+     *    the run lands come off one set of decisions.
+     *
+     * What that still cannot catch is a *new* write added without a record, which
+     * is why `tests/importer.test.ts` diffs the target config dir across a real
+     * import and asserts the created files are exactly this set.
+     */
+    const writeEntries = [];
+    const writeRoots = [];
+    const recordWrite = (layer, path, kind) => {
+        // `display` is computed HERE and never by the consumer: the final segment
+        // is a bundle-chosen basename, and the sink is a markdown list in
+        // `commands/import.md`. See `WriteSetEntry` in types.ts, and QUOTING at the
+        // top of this file for the rule it follows.
+        writeEntries.push({ layer, path, display: JSON.stringify(path), kind });
+    };
     const memoryDir = join(exportPath, "memory");
     // `layerRootStatus`, not `existsSync`: the probe that decides whether to walk
     // this layer must not resolve a link (#68). A symlinked root is refused and
@@ -259,10 +299,40 @@ function reconcileSharedLayers(opts) {
     if (memoryRoot === "symlink") {
         warnings.push(`The memory folder in this bundle is a symlink, not a directory — nothing was read through it, and nothing in your memory folder was changed.`);
     }
-    if (memoryRoot === "present") {
+    // OPT-OUT, where `plans/` below is opt-in. Both halves are DISCLOSED either
+    // way — silence about a payload we chose not to write is what makes a flag
+    // feel like a bug — and both count the files rather than reporting a boolean,
+    // because "this bundle wanted to write 14 files here" is a different sentence
+    // from "it wanted to write 1".
+    if (memoryRoot === "present" && !includeMemory) {
+        writeRoots.push({
+            layer: "memory",
+            path: join(targetProjectDir, "memory"),
+            scope: "project",
+            applied: false,
+        });
+        try {
+            // Names only: the root is not a symlink (checked above), no file in it is
+            // opened, and nothing is written.
+            memorySkipped = readdirSync(memoryDir).filter((f) => isRegularFile(join(memoryDir, f))).length;
+        }
+        catch {
+            memorySkipped = undefined;
+        }
+        if (memorySkipped !== undefined && memorySkipped > 0) {
+            warnings.push(`This bundle carries ${memorySkipped} memory file(s), and they were NOT written, because \`sesh-mover import --no-memory\` was passed. Every one of them is still in the bundle, so nothing was consumed by declining: re-run the same import without that flag to land them.`);
+        }
+    }
+    if (memoryRoot === "present" && includeMemory) {
         try {
             const targetMemDir = join(targetProjectDir, "memory");
             reportedMemoryDir = targetMemDir;
+            writeRoots.push({
+                layer: "memory",
+                path: targetMemDir,
+                scope: "project",
+                applied: true,
+            });
             const indexPath = join(targetMemDir, MEMORY_INDEX_NAME);
             if (!plan)
                 mkdirSync(targetMemDir, { recursive: true });
@@ -301,9 +371,17 @@ function reconcileSharedLayers(opts) {
             };
             // `pathIsTaken`, not `existsSync`: a dangling symlink here has to count
             // as an index we must not write, and `existsSync` reports it as absent.
-            if (pathIsTaken(indexPath))
+            //
+            // Captured rather than re-asked, because the write set needs the answer
+            // as it stood BEFORE this import: it is what separates `create` from
+            // `index-append`, i.e. whether the user already had the one file in this
+            // layer that a write modifies rather than adds.
+            const indexExistedBefore = pathIsTaken(indexPath);
+            if (indexExistedBefore)
                 readLocalIndex();
             let indexChanged = false;
+            /** Does `indexPath` get written at all, by any of the three routes? */
+            let indexWillBeWritten = false;
             const added = [];
             let alreadyPresent = 0;
             let droppedProse = false;
@@ -334,6 +412,10 @@ function reconcileSharedLayers(opts) {
                         indexText = incomingText;
                         if (!plan)
                             indexOnDisk = true;
+                        // Route 1 of 3 to a written index: the bundle's own MEMORY.md
+                        // landing on a free name. Recorded once, at the end of this block,
+                        // so the three routes cannot produce three entries for one path.
+                        indexWillBeWritten = true;
                         memoryPlan.push({ filename: MEMORY_INDEX_NAME, verdict: "copy" });
                     }
                     else {
@@ -388,6 +470,7 @@ function reconcileSharedLayers(opts) {
                 const copied = plan ? !pathIsTaken(dst) : copyIfAbsent(src, dst);
                 if (copied) {
                     memoryPlan.push({ filename: file, verdict: "copy" });
+                    recordWrite("memory", dst, "create");
                     continue;
                 }
                 const existingContent = readTextFile(dst);
@@ -488,6 +571,13 @@ function reconcileSharedLayers(opts) {
                     continue;
                 }
                 memoryPlan.push({ filename: file, verdict: "park", parkedAs });
+                // `!reusedParked` is load-bearing, not a tidy-up: a reused park is a
+                // copy that was ALREADY on disk with these exact bytes (a chain pull
+                // re-applying an unchanged memory), so nothing is written for it and
+                // listing it would put a path in the write set that the run does not
+                // touch. The set has to be exactly the writes, in both directions.
+                if (!reusedParked)
+                    recordWrite("memory", join(targetMemDir, parkedAs), "park");
                 memoryConflicts.push({ filename: file, existingHash, incomingHash, parkedAs });
                 warnings.push(reusedParked
                     ? `Memory file ${JSON.stringify(file)} differs from the copy in this bundle — kept yours; theirs was already saved here as ${JSON.stringify(parkedAs)}.`
@@ -535,7 +625,20 @@ function reconcileSharedLayers(opts) {
                     }
                 }
             }
-            if (!plan && indexUsable && indexChanged && indexText !== null) {
+            // ONE boolean decides both the write and its disclosure. Route 2 (the
+            // union appended entries) and route 3 (a parked copy needed a pointer and
+            // there was no index) both land here, and both are `indexChanged`.
+            const indexNeedsWrite = indexUsable && indexChanged && indexText !== null;
+            if (indexNeedsWrite)
+                indexWillBeWritten = true;
+            if (indexWillBeWritten) {
+                // `create` vs `index-append` is decided by whether the user ALREADY had
+                // this file, which is the only distinction that matters to someone
+                // being asked to consent: one of these adds a file, the other edits the
+                // file that decides what a future session reads.
+                recordWrite("memory", indexPath, indexExistedBefore ? "index-append" : "create");
+            }
+            if (!plan && indexNeedsWrite) {
                 try {
                     // `w` (truncate whatever this name resolves to) is only ours to use
                     // for an index we have in hand — one we read, or one we just created
@@ -559,6 +662,9 @@ function reconcileSharedLayers(opts) {
                     // So what protected this site on Windows was `lstatSync`, not the
                     // flag — the same conclusion `copyToNewFile` reaches for the other
                     // three. Do not "simplify" `pathIsTaken` to `existsSync` here.
+                    // `indexText!`: the null check moved into `indexNeedsWrite` above, so
+                    // the narrowing is no longer inline. Same idiom as `unionMemoryIndex`
+                    // higher in this block.
                     writeFileSync(indexPath, indexText, {
                         encoding: "utf-8",
                         flag: indexOnDisk ? "w" : "wx",
@@ -637,6 +743,12 @@ function reconcileSharedLayers(opts) {
     // about a payload we chose not to write is what makes an opt-in feel like a
     // bug.
     if (plansRoot === "present" && !includePlans) {
+        writeRoots.push({
+            layer: "plans",
+            path: join(targetConfigDir, "plans"),
+            scope: "machine",
+            applied: false,
+        });
         try {
             // Safe to enumerate: the root is not a symlink (checked above), and this
             // reads names only — no file in it is opened and nothing is written.
@@ -652,6 +764,14 @@ function reconcileSharedLayers(opts) {
     if (plansRoot === "present" && includePlans) {
         try {
             const targetPlansDir = join(targetConfigDir, "plans");
+            // `scope: "machine"` is the whole reason this layer is opt-in, and the
+            // gate has to be able to SAY it rather than infer it from the path.
+            writeRoots.push({
+                layer: "plans",
+                path: targetPlansDir,
+                scope: "machine",
+                applied: true,
+            });
             if (!plan)
                 mkdirSync(targetPlansDir, { recursive: true });
             for (const file of readdirSync(plansDir).sort()) {
@@ -665,8 +785,10 @@ function reconcileSharedLayers(opts) {
                 // A taken name falls through to the compare/report branch; nothing is
                 // parked, deliberately (see the block comment above).
                 const copied = plan ? !pathIsTaken(dst) : copyIfAbsent(src, dst);
-                if (copied)
+                if (copied) {
+                    recordWrite("plans", dst, "create");
                     continue;
+                }
                 const existingContent = readTextFile(dst);
                 const newContent = readTextFile(src);
                 // #68's second half. This used to fold "one of the two could not be
@@ -710,6 +832,13 @@ function reconcileSharedLayers(opts) {
         memoryDir: reportedMemoryDir,
         planConflicts,
         plansSkipped,
+        memorySkipped,
+        // `total` is `entries.length` because nothing truncates the enumeration
+        // here. It is a separate field anyway, so a bounded PRESENTATION (see
+        // `commands/import.md` step 8) takes its "and N more" from the data rather
+        // than from counting a list it has already cut down — and so a future
+        // payload class that does truncate has somewhere honest to put the count.
+        writeSet: { total: writeEntries.length, entries: writeEntries, roots: writeRoots },
     };
 }
 /**
@@ -762,7 +891,7 @@ export function applySharedLayers(opts) {
     return { warnings: shared.warnings, ...sharedFindings(shared) };
 }
 export async function importSession(options) {
-    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, includePlans, onProgress, } = options;
+    const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, includePlans, noMemory, onProgress, } = options;
     const warnings = [];
     // Step 1: Read manifest
     let manifest;
@@ -933,6 +1062,7 @@ export async function importSession(options) {
             targetConfigDir,
             sourceMachineName: manifest.sourceMachineName,
             includePlans,
+            noMemory,
             plan: dryRun,
         });
         warnings.push(...shared.warnings);
@@ -949,6 +1079,8 @@ export async function importSession(options) {
                 memoryDir: shared.memoryDir,
                 planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
                 plansSkipped: shared.plansSkipped,
+                memorySkipped: shared.memorySkipped,
+                writeSet: shared.writeSet,
             };
         }
         return {
@@ -1100,6 +1232,7 @@ export async function importSession(options) {
             targetConfigDir,
             sourceMachineName: manifest.sourceMachineName,
             includePlans,
+            noMemory,
             plan: true,
         });
         return {
@@ -1116,6 +1249,8 @@ export async function importSession(options) {
             memoryDir: shared.memoryDir,
             planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
             plansSkipped: shared.plansSkipped,
+            memorySkipped: shared.memorySkipped,
+            writeSet: shared.writeSet,
         };
     }
     // Step 4: Write session files
@@ -1318,6 +1453,7 @@ export async function importSession(options) {
         targetConfigDir,
         sourceMachineName: manifest.sourceMachineName,
         includePlans,
+        noMemory,
         plan: false,
     });
     warnings.push(...shared.warnings);

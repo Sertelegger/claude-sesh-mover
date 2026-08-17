@@ -574,6 +574,8 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
     }
     // `applyRequested: false` is NOT a skip — the stage still SAVES the
     // payload beside the project. See the module doc before changing this.
+    // `=== true`, never `!== false`: this default is a security property rather
+    // than a UX preference (#36) — argued at cli.ts's `--apply-carry`.
     const carryStage = await runApplyCarryStage({
       targetPath: effectiveProjectPath,
       applyRequested: opts.applyCarry === true,
