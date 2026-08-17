@@ -671,14 +671,25 @@ export interface HubInitResult {
  * What this machine can see at the configured `hub.path`, as one answer shared
  * by every verb that asks (`src/hub/preflight.ts`'s `probeHubReachable`).
  *
- * The two failing members are the ones `HubUnreachableResult` is built from —
- * they are declared here rather than there so that the diagnostic verbs, which
+ * The failing members are the ones `HubUnreachableResult` is built from — they
+ * are declared here rather than there so that the diagnostic verbs, which
  * report the state instead of refusing on it, cannot drift into a second,
  * differently-spelled opinion about what "reachable" means. `hub status` saying
  * `reachable: true` for a directory `push` refuses as `not-a-hub` is exactly the
  * disagreement this type exists to make impossible.
+ *
+ * **`unresponsive` is a third condition, not a shade of the other two (#71),**
+ * and folding it into either would be a confident wrong diagnosis. The path IS
+ * there and it may well be a perfectly good hub; the filesystem underneath it
+ * has stopped answering — a hard-mounted NFS/CIFS share whose server is gone, a
+ * FUSE mount whose daemon died. `no-directory` would send the user to check
+ * that the share is mounted, which it is; `not-a-hub` would send them to check
+ * `hub.path`, which is fine. Neither remedy applies: nothing the user can edit
+ * fixes it, and the honest instruction is to unstick or unmount the filesystem.
+ * It is also the only one of the three whose *detection* costs wall-clock time
+ * (`HUB_IO_TIMEOUT_MS`), because it is defined by a syscall that never returned.
  */
-export type HubReachabilityState = "ok" | "no-directory" | "not-a-hub";
+export type HubReachabilityState = "ok" | "no-directory" | "not-a-hub" | "unresponsive";
 
 export interface HubStatusResult {
   success: true;
@@ -1015,7 +1026,11 @@ export interface HubUnreachableResult {
    * - `not-a-hub` — the directory is there but carries no usable `hub.json`. A
    *   synced folder whose first sync is still in flight looks exactly like a
    *   directory that is simply not a hub, so this arm covers both.
+   * - `unresponsive` — a single filesystem call against the path did not return
+   *   within `HUB_IO_TIMEOUT_MS`. The mount is hung, not absent and not
+   *   mis-configured; see `HubReachabilityState` for why it is its own arm.
    *
+
    * Spelled as the non-`ok` half of `HubReachabilityState` rather than as its
    * own pair of literals: the diagnostic verbs report the SAME probe's answer,
    * and one declaration is what stops a renamed (or third) state reaching `hub

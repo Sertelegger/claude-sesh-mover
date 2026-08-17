@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync,
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync,
   existsSync, readdirSync, realpathSync, openSync, writeSync, closeSync, constants, cpSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,52 +14,73 @@ import { encodeProjectPath } from "../src/platform.js";
 import { LOCK_STALE_MS } from "../src/hub/lock.js";
 
 /**
- * ISSUE #71 — reproduction, not a fix.
+ * ISSUE #71 — THE FIX, on the reproduction that used to pin the defect.
  *
- * The claim is a composition of three individually-correct facts: the SessionEnd
- * hook is spawned detached with `async: true` and no `timeout` (so Claude Code
- * cannot bound it), and `acquireProjectLock` steals a lock older than
- * `LOCK_STALE_MS` **without checking whether the holder is alive**. A push
- * wedged on an unreachable share therefore runs forever, the next session's push
- * steals its lock ten minutes later and wedges too, and nothing reaps any of
- * them.
+ * ## What this file used to assert, and why every one of those assertions is inverted
  *
- * ## How the wedge is produced, and what it does and does not stand in for
+ * It was written as a reproduction. It pinned that a `hub push` reaching a hub
+ * whose filesystem BLOCKS never returns: `createFsBackend().read()` was
+ * `readFileSync`, so `preflightHub` — which `hubPush` runs INSIDE the project
+ * lock — parked the process in the kernel forever. Its four tests measured, in
+ * order: that the lock was then stolen from a live holder, that the stolen-from
+ * push went on to write hub state with no lock at all, that one such live
+ * lock-holding process accrued per `LOCK_STALE_MS` window without bound, and —
+ * the feasibility question for the alternative remedy — that **no timer could
+ * fire while the read was blocked**, because a sync read blocks the whole event
+ * loop rather than one threadpool thread.
  *
- * A `sleep` would not be evidence: a sleeping process is interruptible by
- * anything the event loop can service, and the whole question is what the
- * process can still do while it is stuck. So the blocker here is a **real
- * blocking filesystem call**: `hub.json` on the hub is a FIFO, and
- * `createFsBackend().read()` is `readFileSync`, whose `open(…, O_RDONLY)` on a
- * FIFO blocks in the kernel until a writer appears (`wchan: wait_for_partner`).
- * That is the same class of stall as a hard-mounted NFS/CIFS share or a FUSE
- * mount whose daemon died — a syscall that never returns — and it lands at
- * exactly the place a real push reaches it: `preflightHub`, INSIDE the project
- * lock (`hubPush` acquires the lock, then preflights).
+ * The fix took the cause rather than the symptom: `hub/backend.ts` is now
+ * `node:fs/promises` with a per-syscall bound (`hub/io-timeout.ts`), and
+ * `preflight.ts`'s root `statSync` went the same way. So the wedge still
+ * happens — a FIFO open still blocks a pool thread, and nothing in userspace can
+ * cancel it (measured: an `AbortSignal` does not interrupt a blocked `open()`;
+ * it rejects only when the filesystem finally answers) — but it no longer
+ * reaches the event loop, the lock, or the next session.
  *
- * What the substitution does NOT prove:
- *   - It does not reproduce a network filesystem's own timeouts. A soft-mounted
- *     NFS share returns EIO after `retrans*timeo` and a push there fails rather
- *     than wedging; only a hard mount (the default) hangs indefinitely.
- *   - It does not prove the hang is *permanent* in the field, only that nothing
- *     in this codebase bounds it: no timer, signal or deadline in the push path
- *     can end a `readFileSync` (see the fourth test, which measures that).
- *   - It does not reproduce a share that DISAPPEARS (an unmounted path, a synced
- *     folder that never arrived). That case is already bounded and does not
- *     accrue anything: `probeHubReachable`'s `statSync` returns ENOENT
- *     immediately and the push refuses with `hub-unreachable`
- *     (`tests/hub-hooks.test.ts` pins it). The accrual needs a share that
- *     BLOCKS, not one that is absent — a materially narrower blast radius than
- *     the issue's "unreachable network share" wording suggests.
+ * The reproduction machinery below is UNCHANGED, deliberately: same FIFO at
+ * `hub.json`, same real SessionEnd hook endpoint, same reaping. Only the
+ * expectations moved, and they moved to the opposite side:
+ *
+ *   | was pinned as the defect                    | is pinned now                          |
+ *   | ------------------------------------------- | -------------------------------------- |
+ *   | the push holds the lock forever             | it refuses and releases the lock       |
+ *   | its staging dir is never reaped             | its `finally` runs and removes it      |
+ *   | one live orphan per staleness window        | zero survivors after N session ends    |
+ *   | no timer fires while the read is blocked    | the timer fires ON TIME, mid-read      |
+ *
+ * ## The one thing that did NOT invert, and is asserted as a residual
+ *
+ * `acquireProjectLock` still steals from a holder it can see is alive — the
+ * decision is `ageMs > LOCK_STALE_MS` and the recorded pid is read only to
+ * decorate `LockBusyError`. #71 removed that mechanism's TRIGGER, not the
+ * mechanism, and the last test here keeps that fact under test so the issue is
+ * not read as fully closed by this work. See the comment on
+ * `acquireProjectLock` for what still gets stolen from (a push that legitimately
+ * outruns the window on a slow-but-working share).
+ *
+ * ## Two properties of the wedge that shape every test below
+ *
+ * **The bound is a race, not a cancellation.** After the timeout the FIFO open
+ * is still outstanding on a libuv threadpool thread. That request keeps the loop
+ * ref'd, and — measured, 3/3 runs, and identically for the callback API — the
+ * process then cannot exit: not naturally, not via `process.exit(0)`, not via
+ * `process.reallyExit(0)`. Only a signal ends it. `cli.ts`'s
+ * `leaveEvenIfHubIoWedged` is that signal, which is why the children here exit
+ * on SIGKILL rather than with code 0, and why `expectGone` asserts on liveness
+ * rather than on an exit code.
+ *
+ * **`SESH_MOVER_HUB_IO_TIMEOUT_MS` is what makes this file fast.** The shipped
+ * bound is 30s; these tests set it to a second or so. That env var is the
+ * product's own documented override, not a test seam — a hub read is bounded
+ * here by the same code path a user gets.
  *
  * ## Reaping
  *
  * Every child spawned here is registered in `spawned` and killed in an
- * `afterEach` that runs even when a test times out or throws mid-way. Each test
- * ALSO reaps gracefully first — writing to the FIFO releases every blocked
- * reader — so the normal path exercises the real exit and the `afterEach` is a
- * backstop. A test in this file that leaves a stuck `node` behind fails the
- * suite loudly rather than quietly polluting the runner.
+ * `afterEach` that runs even when a test times out or throws mid-way. A test in
+ * this file that leaves a stuck `node` behind fails the suite loudly rather than
+ * quietly polluting the runner — and since the whole claim of this file is now
+ * "these processes stop existing", that backstop is also the assertion.
  */
 
 const isWindows = process.platform === "win32";
@@ -81,6 +102,15 @@ const canMkfifo = ((): boolean => {
 const MACHINE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const FIXTURE_ENCODED = "-Users-testuser-Projects-testproject";
 
+/**
+ * The hub-read bound the spawned CLI runs under.
+ *
+ * Comfortably longer than the fixture's local work (so nothing here fails for
+ * being slow) and far shorter than the 15s `waitFor` budget, so a test that
+ * waits for the refusal is waiting on the product, not on the clock.
+ */
+const IO_TIMEOUT_MS = 1_000;
+
 interface Spawned {
   proc: ChildProcess;
   pid: number;
@@ -89,6 +119,7 @@ interface Spawned {
   exit: Promise<number | null>;
   exited: boolean;
   code: number | null;
+  signal: NodeJS.Signals | null;
 }
 
 const spawned: Spawned[] = [];
@@ -141,10 +172,12 @@ function spawnHook(env: Record<string, string>, payload: string): Spawned {
     stderr: "",
     exited: false,
     code: null,
+    signal: null,
     exit: new Promise<number | null>((resolve) => {
-      proc.on("close", (code) => {
+      proc.on("close", (code, signal) => {
         rec.exited = true;
         rec.code = code;
+        rec.signal = signal;
         resolve(code);
       });
     }),
@@ -159,12 +192,34 @@ function spawnHook(env: Record<string, string>, payload: string): Spawned {
 }
 
 /**
+ * The whole point of the fix, as one assertion: this process ENDED on its own.
+ *
+ * Not `code === 0`. The process is holding an abandoned FIFO open on a pool
+ * thread, and in that state the runtime will not let it return an exit code at
+ * all — `process.exit(0)` blocks (measured). `cli.ts` escalates to a self-signal
+ * precisely so that something happens instead of nothing, so SIGKILL here is the
+ * SUCCESS path and is asserted as such rather than tolerated.
+ */
+async function expectGone(child: Spawned, label: string): Promise<void> {
+  await Promise.race([child.exit, sleep(15_000)]);
+  expect(child.exited, `${label}: still running — stderr=${JSON.stringify(child.stderr)}`).toBe(true);
+  expect(isAlive(child.pid), `${label}: pid survived`).toBe(false);
+  // Either the ordinary exit or the wedged-process escalation; never neither.
+  expect(
+    child.code === 0 || child.signal === "SIGKILL",
+    `${label}: unexpected exit (code=${child.code} signal=${child.signal}) stderr=${JSON.stringify(child.stderr)}`
+  ).toBe(true);
+}
+
+/**
  * Release every reader blocked on `fifo`, handing them `contents` (empty =>
  * they read zero bytes).
  *
  * O_NONBLOCK matters: a plain `open(…, "w")` on a FIFO blocks until a READER
  * arrives, so if the wedged child had already died this helper would hang the
- * test runner instead of the child. Non-blocking, it fails with ENXIO instead.
+ * test runner instead of the child. Non-blocking, it fails with ENXIO instead —
+ * which after the fix is the ORDINARY outcome, since the children no longer
+ * survive long enough to be waiting.
  */
 function unblockFifo(fifo: string, contents = ""): boolean {
   let fd: number;
@@ -208,7 +263,7 @@ afterEach(async () => {
   expect(survivors, "hook children survived the test").toEqual([]);
 });
 
-describe.skipIf(!canMkfifo)("issue #71: a wedged auto-push and the unconditional stale-lock steal", () => {
+describe.skipIf(!canMkfifo)("issue #71: a hub that blocks no longer wedges the auto-push", () => {
   let tempDir: string;
   let home: string;
   let base: string;
@@ -251,16 +306,20 @@ describe.skipIf(!canMkfifo)("issue #71: a wedged auto-push and the unconditional
       join(home, ".sesh-mover", "machine-id.json"),
       JSON.stringify({ id: MACHINE_ID, name: "my-laptop", createdAt: "2026-07-21T00:00:00Z" }) + "\n"
     );
-    mkdirSync(join(home, ".sesh-mover"), { recursive: true });
     writeFileSync(
       join(home, ".sesh-mover", "config.json"),
       JSON.stringify({ hub: { path: hubDir } }, null, 2) + "\n"
     );
 
     // TMPDIR is redirected so the push's `mkdtemp` staging dirs are countable:
-    // one per wedged process, and they are only removed by a `finally` the
-    // process has to survive to run.
-    childEnv = { ...homeEnv(home), ...tmpEnv(tmpRoot), CLAUDE_CONFIG_DIR: configDir };
+    // one per push, and they are only removed by a `finally` the process has to
+    // survive to run — which, after the fix, it does.
+    childEnv = {
+      ...homeEnv(home),
+      ...tmpEnv(tmpRoot),
+      CLAUDE_CONFIG_DIR: configDir,
+      SESH_MOVER_HUB_IO_TIMEOUT_MS: String(IO_TIMEOUT_MS),
+    };
     lockFile = join(home, ".sesh-mover", "locks", `${encodeProjectPath(project)}.lock`);
     fifo = join(hubDir, "hub.json");
   });
@@ -277,280 +336,170 @@ describe.skipIf(!canMkfifo)("issue #71: a wedged auto-push and the unconditional
     execFileSync("mkfifo", [fifo]);
   }
 
-  function readLock(): { pid?: number; acquiredAt?: string; token?: string } {
-    return JSON.parse(readFileSync(lockFile, "utf-8"));
-  }
-
-  /**
-   * Same read, but tolerant — for POLLING predicates only.
-   *
-   * `acquireProjectLock`'s exclusive create and its JSON write are two
-   * syscalls, so a reader can legitimately catch a live holder at zero bytes
-   * (`lock.ts`'s release() documents the same window). A predicate that parses
-   * strictly turns that into a flaky test; every ASSERTION below still uses the
-   * strict read, which by then is guaranteed to have a parseable record because
-   * the predicate only returned once it saw one.
-   */
-  function peekLock(): { pid?: number } {
-    try {
-      return readLock();
-    } catch {
-      return {};
-    }
-  }
-
-  /** Age the CURRENT lock past LOCK_STALE_MS without disturbing its owner. */
-  function backdateLock(): void {
-    const record = readLock();
-    writeFileSync(
-      lockFile,
-      JSON.stringify({ ...record, acquiredAt: new Date(Date.now() - LOCK_STALE_MS - 1_000).toISOString() })
-    );
-  }
+  const staging = (): string[] =>
+    readdirSync(tmpRoot).filter((n) => n.startsWith("sesh-hub-push-"));
 
   const payload = (): string => JSON.stringify({ cwd: project, session_id: sessionId });
 
-  it("steals the project lock from a holder it can see is alive", async () => {
-    // FACT 3 of the issue, measured. The steal decision is `ageMs >
-    // LOCK_STALE_MS` and nothing else: the record's `pid` is read, but only to
-    // decorate `LockBusyError`. Nothing consults it before the `rmSync`.
+  it("refuses a blocking hub read, releases the project lock, and the process ends", async () => {
+    // THE INVERSION of the first two tests this file used to carry. The wedge
+    // still happens in the kernel — `hub.json` is a FIFO and its `open` blocks
+    // in `wait_for_partner` exactly as before — but it is now reached by an
+    // ASYNC read under `withHubIoTimeout`, so the push declines instead of
+    // parking inside its own critical section.
     linkProject();
     wedgeHub();
 
     const child = spawnHook(childEnv, payload());
-    await waitFor(
-      "the wedged push to take the project lock",
-      () => existsSync(lockFile) && peekLock().pid === child.pid,
-      child
-    );
 
-    // It is really the child's lock, and the child is really alive...
-    const held = readLock();
-    expect(held.pid).toBe(child.pid);
-    expect(isAlive(child.pid)).toBe(true);
-    expect(child.exited).toBe(false);
-    // ...and really stuck INSIDE the critical section, before the first hub
-    // write (`registerMachine` writes `machines/<id>.json` after the
-    // preflight). The only thing on the hub is the FIFO it is blocked on.
-    expect(readdirSync(hubDir)).toEqual(["hub.json"]);
-
-    // On Linux this is directly observable rather than inferred: the child's
-    // `/proc/<pid>/wchan` reads `wait_for_partner` (blocked in the FIFO open),
-    // it has one `sesh-hub-push-*` staging dir under its TMPDIR, and it holds
-    // no descriptor on the lock file — `acquireProjectLock` writes and closes.
-    // Measured cost of one such orphan: ~67 MB RSS, 7 threads, 21 fds.
-    if (existsSync(`/proc/${child.pid}/wchan`)) {
-      expect(readFileSync(`/proc/${child.pid}/wchan`, "utf-8")).toContain("wait_for_partner");
-      // Polled, not read once: `mkdtemp` runs just AFTER the lock is written,
-      // so the lock file appearing does not yet imply the staging dir exists.
+    // It really did block on the FIFO, on a threadpool thread, while its main
+    // thread stayed in the event loop. Without this the test could pass against
+    // a hub that was simply never read.
+    if (existsSync("/proc")) {
       await waitFor(
-        "the wedged push to create its staging dir",
-        () => readdirSync(tmpRoot).filter((n) => n.startsWith("sesh-hub-push-")).length === 1,
+        "the push to block on the FIFO open",
+        () => {
+          try {
+            return readdirSync(`/proc/${child.pid}/task`).some((t) =>
+              readFileSync(`/proc/${child.pid}/task/${t}/wchan`, "utf-8").includes("wait_for_partner")
+            );
+          } catch {
+            return false; // raced with exit, or /proc unreadable
+          }
+        },
         child
       );
     }
 
-    // Ten minutes pass (compressed by rewriting the timestamp — no source seam
-    // needed, and the holder is untouched).
-    backdateLock();
+    await expectGone(child, "the wedged push");
 
-    const restore = overrideHome(home);
-    let thief;
-    try {
-      const { acquireProjectLock } = await import("../src/hub/lock.js");
-      thief = acquireProjectLock(project);
-      // THE FINDING: stolen, from a holder whose pid is recorded in the file
-      // being deleted and is trivially checkable.
-      expect(thief.stoleStale).toBe(true);
-      expect(isAlive(held.pid as number), "the pid the steal ignored").toBe(true);
-      // The victim is neither signalled nor told: it still exists, still runs,
-      // and the lock file now names the thief.
-      expect(child.exited).toBe(false);
-      expect(readLock().pid).toBe(process.pid);
-    } finally {
-      // Reap gracefully: releasing every blocked reader with a zero-byte read
-      // makes `hub.json` unparseable, so the push refuses with `not-a-hub` and
-      // exits 0 through its normal path. No assertions in here — a failing
-      // expectation in a `finally` would replace the real failure above it.
-      unblockFifo(fifo);
-      thief?.release();
-      restore.restore();
-    }
-    expect(await child.exit).toBe(0);
-    expect(child.stdout).toBe(""); // the hook contract holds even here
-    expect(isAlive(child.pid)).toBe(false);
-  }, 30_000);
+    // THE FINDING, inverted. Every one of these was false before the fix.
+    //
+    // 1. No lock is left behind. The push took it, hit the bound, and released
+    //    it in `hubPush`'s outer `finally` — so the next session's push has
+    //    nothing to steal, which is what ends the accrual at its source.
+    expect(existsSync(lockFile), "a lock file survived the refused push").toBe(false);
+    // 2. The staging directory is reaped. It is removed only by that same
+    //    `finally`, so this is independent evidence that the push RETURNED
+    //    rather than being killed somewhere in the middle of its body.
+    expect(staging(), "the refused push left a staging directory").toEqual([]);
+    // 3. Nothing was written to the hub. `registerMachine` writes
+    //    `machines/<id>.json` after the preflight, and the preflight is what
+    //    declined — so the FIFO is still the only thing here.
+    expect(readdirSync(hubDir)).toEqual(["hub.json"]);
+    // 4. The hook contract survives the new exit path: stdout stays empty even
+    //    though the process is now torn down by a signal.
+    expect(child.stdout).toBe("");
+    // 5. And it said why, on its one available channel. This is the typed
+    //    refusal, with the THIRD reachability state — not `no-directory` (the
+    //    directory is plainly there) and not `not-a-hub` (nothing was read, so
+    //    nothing is known about its contents).
+    expect(child.stderr).toContain("hub-unreachable");
+    expect(child.stderr).toContain("unresponsive");
+  }, 40_000);
 
-  it("lets the stolen-from push write hub state while another party holds the lock", async () => {
-    // Stealing is only harmful if the victim keeps going. It does: the lock is
-    // taken ONCE, at the top of hubPush, and never re-checked — so after the
-    // steal the victim runs the entire push (bundle upload, the machine's own
-    // index file, sync-state) with no mutual exclusion at all. Here the thief
-    // is the test process holding the lock for the whole of that; in the field
-    // it is the next session's auto-push doing its own writes.
-    const restore0 = overrideHome(home);
-    let projectId: string;
-    try {
-      const { hubInit } = await import("../src/hub/init.js");
-      expect((await hubInit({ hubPath: hubDir, configScope: "user", cwd: home })).success).toBe(true);
-      const { createFsBackend } = await import("../src/hub/backend.js");
-      const { createHubProject } = await import("../src/hub/identity.js");
-      // Links the project locally too, which is what arms the auto-push.
-      projectId = (await createHubProject(createFsBackend(hubDir), project, MACHINE_ID)).projectId;
-    } finally {
-      restore0.restore();
-    }
-    // hubInit rewrote the user config; put the hub path back under our own key
-    // set (it also writes `hub.path`, so re-assert rather than assume).
-    writeFileSync(
-      join(home, ".sesh-mover", "config.json"),
-      JSON.stringify({ hub: { path: hubDir } }, null, 2) + "\n"
-    );
+  it("an interactive push emits the typed refusal on stdout and still ends", async () => {
+    // The hook endpoint and the ordinary CLI leave through DIFFERENT code:
+    // `hub hook-session-end` escalates from its `finally` and writes nothing to
+    // stdout, while `push` goes through `output()`, which writes the whole
+    // result first. Both are wedged; only one of them was covered above, and a
+    // user watching a hung terminal is the case the other one is about.
+    linkProject();
+    wedgeHub();
 
-    // Swap the real hub.json for a FIFO. Keep the bytes: this is a share that
-    // HANGS, not one that lost its contents, so the push must complete normally
-    // once it unblocks.
-    const realHubJson = readFileSync(fifo, "utf-8");
-    const parked = join(tempDir, "hub.json.parked");
-    rmSync(fifo);
-    execFileSync("mkfifo", [fifo]);
+    const proc = spawn("node", [cliPath(), "push", "--project-path", project], {
+      env: { ...process.env, ...childEnv },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const rec: Spawned = {
+      proc, pid: proc.pid as number, stdout: "", stderr: "", exited: false, code: null, signal: null,
+      exit: new Promise<number | null>((resolve) => {
+        proc.on("close", (code, signal) => { rec.exited = true; rec.code = code; rec.signal = signal; resolve(code); });
+      }),
+    };
+    proc.stdout.setEncoding("utf-8");
+    proc.stdout.on("data", (d: string) => { rec.stdout += d; });
+    proc.stderr.setEncoding("utf-8");
+    proc.stderr.on("data", (d: string) => { rec.stderr += d; });
+    spawned.push(rec);
 
-    const child = spawnHook(childEnv, payload());
-    await waitFor(
-      "the wedged push to take the project lock",
-      () => existsSync(lockFile) && peekLock().pid === child.pid,
-      child
-    );
-    expect(readLock().pid).toBe(child.pid);
-    const bundles = join(hubDir, "projects", projectId, "bundles", MACHINE_ID);
-    expect(existsSync(bundles)).toBe(false); // nothing uploaded yet
+    await expectGone(rec, "the interactive push");
 
-    backdateLock();
-    const restore = overrideHome(home);
-    let thief;
-    try {
-      const { acquireProjectLock } = await import("../src/hub/lock.js");
-      thief = acquireProjectLock(project);
-      expect(thief.stoleStale).toBe(true);
-      const thiefRecord = readFileSync(lockFile, "utf-8");
+    // The ENTIRE result survived the signal, asserted by parsing so that a
+    // truncation fails here rather than passing a substring check.
+    //
+    // CHARACTERIZATION, NOT A GUARD, for the flush barrier specifically: this
+    // still passes with `leaveEvenIfHubIoWedged`'s barrier removed (mutation
+    // tested). A `hub-unreachable` refusal is a few hundred bytes and fits in
+    // the pipe buffer, so it survives an immediate SIGKILL anyway; the barrier
+    // only bites above ~64 KB (measured — see the doc on that function). What
+    // this test DOES pin is that the process ends at all, which the same
+    // mutation exercise shows it does not without the escalation.
+    const result = JSON.parse(rec.stdout) as {
+      success: boolean; command: string; reason: string; hubState: string; suggestion: string;
+    };
+    expect(result.success).toBe(false);
+    expect(result.command).toBe("push");
+    expect(result.reason).toBe("hub-unreachable");
+    expect(result.hubState).toBe("unresponsive");
+    // The refusal withholds the hub's absolute path, the same as its two
+    // siblings (#75) — a new arm must not be the one that leaks it.
+    expect(result.suggestion).not.toContain(hubDir);
+    expect(existsSync(lockFile)).toBe(false);
+    expect(staging()).toEqual([]);
+  }, 40_000);
 
-      // The share comes back WHILE the thief holds the lock. Renaming the FIFO
-      // aside first is not cosmetic: the victim is blocked on the inode, so the
-      // path is free for the real file and every later read gets it.
-      renameSync(fifo, parked);
-      writeFileSync(fifo, realHubJson);
-      expect(unblockFifo(parked, realHubJson)).toBe(true);
-
-      expect(await child.exit).toBe(0);
-      expect(child.stdout).toBe("");
-      expect(child.stderr).toBe(""); // it SUCCEEDED — no diagnostic
-
-      // THE BLAST RADIUS: every one of these writes happened after the victim's
-      // lock was taken away, while a different process held it.
-      const uploaded = readdirSync(bundles);
-      expect(uploaded.length, "the victim uploaded a bundle with no lock").toBe(1);
-      expect(
-        existsSync(join(hubDir, "projects", projectId, "index", `${MACHINE_ID}.json`)),
-        "the victim rewrote this machine's own index file with no lock"
-      ).toBe(true);
-      // Per-machine ownership is what makes concurrent hub access safe WITHOUT
-      // a distributed lock, and the same-machine lock is its only enforcement:
-      // two processes on one machine writing `index/<machineId>.json` is
-      // precisely what it exists to prevent.
-
-      // And the victim never noticed. Its own release() is a no-op (token
-      // mismatch), so the thief's lock is intact — the victim simply had no
-      // lock for the whole second half of its push.
-      expect(readFileSync(lockFile, "utf-8")).toBe(thiefRecord);
-
-      // The one trace it could have left is dropped PRECISELY here.
-      // `recordAutoPushOutcome` (cli.ts) re-takes the same project lock after
-      // the push returns and "gives up silently on a busy lock" — which, after
-      // a steal, it always is. So the `hub status` breadcrumb is missing in the
-      // single case where a user most needs it. (That a successful auto-push
-      // normally DOES record one is pinned by tests/hub-hooks.test.ts, so this
-      // is an absence caused by the steal, not by pushes never recording.)
-      const { peekSyncState } = await import("../src/sync-state.js");
-      expect(peekSyncState(project).hub).toBeDefined();
-      expect(peekSyncState(project).hub?.lastAutoPush).toBeUndefined();
-    } finally {
-      thief?.release();
-      restore.restore();
-    }
-  }, 30_000);
-
-  it("accrues one more live, lock-holding push per staleness window, unbounded", async () => {
-    // The accrual claim itself. Each round is one LOCK_STALE_MS window: the
-    // sitting holder is aged, the next session's auto-push steals from it, and
-    // the previous one keeps running. Nothing anywhere reduces the count.
+  it("does not accrue: N session ends against a blocking hub leave zero survivors", async () => {
+    // THE INVERSION of "accrues one more live, lock-holding push per staleness
+    // window, unbounded". Same shape as that loop — one hook per session end —
+    // but with no `backdateLock` step, because there is no longer a sitting
+    // holder for the next push to have to wait out or steal from.
     linkProject();
     wedgeHub();
 
     const rounds = 3;
     const children: Spawned[] = [];
     for (let i = 0; i < rounds; i++) {
-      if (i > 0) {
-        // CONTROL, once: inside the window the lock does its job. A session
-        // ending while the wedged push is still "fresh" declines with
-        // `lock-busy` and exits — so the accrual is not "one orphan per session
-        // end", it is one per staleness window, and the steal is what produces
-        // it. Without this the loop below could pass for the wrong reason.
-        if (i === 1) {
-          const declined = spawnHook(childEnv, payload());
-          expect(await declined.exit).toBe(0);
-          expect(declined.stdout).toBe("");
-          expect(declined.stderr).toBe("");
-          expect(readLock().pid).toBe(children[0]!.pid); // untouched
-          expect(children[0]!.exited).toBe(false);
-        }
-        backdateLock(); // ...ten minutes later
-      }
       const child = spawnHook(childEnv, payload());
       children.push(child);
-      await waitFor(
-        `push #${i + 1} to take the lock`,
-        () => existsSync(lockFile) && peekLock().pid === child.pid,
-        child
-      );
-      // Every earlier push is still alive, still inside the critical section.
-      for (const earlier of children) expect(earlier.exited).toBe(false);
+      await expectGone(child, `push #${i + 1}`);
+      // Checked every round rather than once at the end: an accrual that
+      // started and then self-corrected would still be an accrual.
+      expect(children.filter((c) => isAlive(c.pid)).length, `after round ${i + 1}`).toBe(0);
+      expect(existsSync(lockFile), `a lock survived round ${i + 1}`).toBe(false);
+      expect(staging(), `a staging dir survived round ${i + 1}`).toEqual([]);
     }
 
-    // MEASURED: 3 windows -> 3 live processes, all of which acquired the
-    // project lock for the same project and none of which released it.
-    expect(children.filter((c) => isAlive(c.pid)).length).toBe(rounds);
-    expect(children.filter((c) => c.exited).length).toBe(0);
-    // Each also holds an un-reaped push staging directory. On the graceful path
-    // below a `finally` removes it; a SIGKILL (the only way to end a wedged
-    // process) does not run that `finally`, so each orphan also leaks a temp
-    // tree — which for a wedge later in the push holds a full bundle copy.
-    const staging = (): string[] =>
-      readdirSync(tmpRoot).filter((n) => n.startsWith("sesh-hub-push-"));
-    // Polled: `mkdtemp` runs just after the lock write, so the newest push may
-    // not have created its staging dir at the instant it took the lock.
-    await waitFor(`${rounds} staging dirs`, () => staging().length === rounds);
+    // MEASURED: 3 session ends -> 0 live processes, 0 held locks, 0 leaked temp
+    // trees. Before the fix the same loop produced 3 of each, none of which
+    // anything in the product ever reduced.
+    expect(children.filter((c) => c.exited).length).toBe(rounds);
+    // None of them ever reached the point of stealing: `stoleStale` is reported
+    // as a push warning, and no push here had a predecessor to steal from.
+    for (const c of children) expect(c.stderr).not.toContain("Stole a stale project lock");
 
-    // Nothing in the product ends any of them: no timeout on the hook (by
-    // design — a `timeout` here raises Claude Code's SHARED SessionEnd budget),
-    // no deadline in the push, no reaper on the lock. The share coming back is
-    // the only thing that does.
-    expect(unblockFifo(fifo)).toBe(true);
-    for (const c of children) expect(await c.exit).toBe(0);
-    expect(children.every((c) => !isAlive(c.pid))).toBe(true);
-    expect(staging(), "the graceful exit cleans up its staging dir").toEqual([]);
-  }, 45_000);
+    // Nobody is left waiting on the FIFO. Before the fix this returned true —
+    // the share coming back was the only thing that could end those processes.
+    expect(unblockFifo(fifo), "a reader was still blocked on the hub FIFO").toBe(false);
+  }, 60_000);
 
-  it("cannot be bounded from inside: no timer fires while the hub read is blocked", async () => {
-    // Feasibility evidence for the issue's second remedy ("a self-imposed
-    // deadline in `hub hook-session-end`"). It cannot be a timer: `HubBackend`'s
-    // fs implementation is `readFileSync`, so a blocked hub read blocks the
-    // whole event loop, not just a threadpool thread. A `setTimeout` watchdog
-    // armed before the read does not fire until the read returns — i.e. exactly
-    // when it is no longer needed. A working deadline needs either an async fs
-    // path or an out-of-process watchdog.
-    wedgeHub();
+  it("CAN now be bounded from inside: a timer fires on time while the hub read is blocked", async () => {
+    // THE INVERSION of "cannot be bounded from inside: no timer fires while the
+    // hub read is blocked", and the measurement the whole fix rests on.
+    //
+    // Before: `HubBackend`'s fs implementation was `readFileSync`, so a blocked
+    // hub read blocked the whole event loop and a `setTimeout` armed before it
+    // fired only AFTER the read returned — measured at 1053ms for a 200ms
+    // deadline, i.e. exactly when it was no longer needed. That is why a
+    // self-imposed deadline was impossible and why the remedy had to be the
+    // backend rather than a watchdog.
+    //
+    // After: libuv runs the open on a threadpool thread, the loop stays free,
+    // and the timer fires on schedule with the read still outstanding.
+    //
     // Written against the BUILT backend, so this measures our own read path
-    // rather than a synthetic `readFileSync`.
+    // rather than a synthetic `fs.promises.readFile`.
+    wedgeHub();
     const script = join(tempDir, "watchdog.mjs");
     const backendUrl = pathToFileURL(join(cliPath(), "..", "hub", "backend.js")).href;
     writeFileSync(
@@ -559,15 +508,25 @@ describe.skipIf(!canMkfifo)("issue #71: a wedged auto-push and the unconditional
         `const t0 = Date.now();\n` +
         `setTimeout(() => console.log("DEADLINE " + (Date.now() - t0)), 200);\n` +
         `console.log("ARMED");\n` +
-        `await createFsBackend(${JSON.stringify(hubDir)}).read("hub.json");\n` +
-        `console.log("READ_RETURNED " + (Date.now() - t0));\n`
+        `try {\n` +
+        `  await createFsBackend(${JSON.stringify(hubDir)}).read("hub.json");\n` +
+        `  console.log("READ_RETURNED " + (Date.now() - t0));\n` +
+        `} catch (e) {\n` +
+        `  console.log("READ_REJECTED " + (Date.now() - t0) + " " + e.name);\n` +
+        `}\n`
     );
 
-    const proc = spawn("node", [script], { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn("node", [script], {
+      stdio: ["ignore", "pipe", "pipe"],
+      // The bound applies to this script too — it is reading through the same
+      // backend — so give it one long enough that the 200ms deadline below is
+      // unambiguously measuring the event loop and not the timeout.
+      env: { ...process.env, SESH_MOVER_HUB_IO_TIMEOUT_MS: "5000" },
+    });
     const rec: Spawned = {
-      proc, pid: proc.pid as number, stdout: "", stderr: "", exited: false, code: null,
+      proc, pid: proc.pid as number, stdout: "", stderr: "", exited: false, code: null, signal: null,
       exit: new Promise<number | null>((resolve) => {
-        proc.on("close", (code) => { rec.exited = true; rec.code = code; resolve(code); });
+        proc.on("close", (code, signal) => { rec.exited = true; rec.code = code; rec.signal = signal; resolve(code); });
       }),
     };
     proc.stdout.setEncoding("utf-8");
@@ -577,18 +536,74 @@ describe.skipIf(!canMkfifo)("issue #71: a wedged auto-push and the unconditional
     spawned.push(rec);
 
     await waitFor("the watchdog to arm", () => rec.stdout.includes("ARMED"), rec);
-    await sleep(1000); // five times the 200ms deadline
-    expect(rec.exited, rec.stderr).toBe(false);
-    expect(rec.stdout).not.toContain("DEADLINE");
+    // The deadline fires WHILE the read is still outstanding — the assertion
+    // that used to be its exact opposite.
+    await waitFor("the 200ms deadline to fire mid-read", () => rec.stdout.includes("DEADLINE"), rec);
+    expect(rec.stdout).not.toContain("READ_RETURNED");
+    expect(rec.stdout).not.toContain("READ_REJECTED");
+    expect(rec.exited).toBe(false);
 
+    const fired = Number(/DEADLINE (\d+)/.exec(rec.stdout)?.[1]);
+    expect(Number.isFinite(fired)).toBe(true);
+    // Generous upper bound — this is a loaded CI box, not a latency benchmark.
+    // The claim is "on schedule, not blocked behind a 5s syscall", and the old
+    // behaviour would land at 5000+ here rather than anywhere near 200.
+    expect(fired).toBeGreaterThanOrEqual(190);
+    expect(fired).toBeLessThan(3_000);
+
+    // Reap gracefully: releasing the reader lets the read complete and the
+    // script exit on its own, which also demonstrates the non-abandoned path.
     expect(unblockFifo(fifo, '{"hubId":"x"}')).toBe(true);
     expect(await rec.exit).toBe(0);
-    // It fires only once the read returns — an order that makes it useless as a
-    // bound on the read.
-    const fired = Number(/DEADLINE (\d+)/.exec(rec.stdout)?.[1]);
-    const returned = Number(/READ_RETURNED (\d+)/.exec(rec.stdout)?.[1]);
-    expect(Number.isFinite(fired)).toBe(true);
-    expect(fired).toBeGreaterThan(900);
-    expect(fired).toBeGreaterThanOrEqual(returned);
+    expect(rec.stdout).toContain("READ_RETURNED");
   }, 30_000);
+
+  it("still steals the project lock from a holder it can see is alive (RESIDUAL, not fixed here)", async () => {
+    // NOT an inversion — this is the half of the issue #71 did not close, kept
+    // under test so the issue is not read as fully closed.
+    //
+    // The steal decision is `ageMs > LOCK_STALE_MS` and nothing else. The
+    // record's `pid` is read, but only to decorate `LockBusyError`; nothing
+    // consults it, or any other liveness signal, before the `rmSync`. The
+    // blocking hub read was merely the easiest way to PRODUCE a long-lived
+    // holder, and it is gone — but any push that legitimately outruns the
+    // window (a large bundle over a slow-but-working share, which is
+    // deliberately not bounded) is still stolen from, still never told, and
+    // still runs on concurrently with the thief.
+    //
+    // No FIFO needed: the holder here is this very process, whose liveness is
+    // not in question, which is the whole point.
+    const restore = overrideHome(home);
+    try {
+      const { acquireProjectLock } = await import("../src/hub/lock.js");
+      const holder = acquireProjectLock(project);
+      expect(holder.stoleStale).toBe(false);
+      const held = JSON.parse(readFileSync(lockFile, "utf-8")) as { pid?: number };
+      expect(held.pid).toBe(process.pid);
+      expect(isAlive(held.pid as number)).toBe(true);
+
+      // Ten minutes pass (compressed by rewriting the timestamp — no source
+      // seam needed, and the holder is untouched).
+      writeFileSync(
+        lockFile,
+        JSON.stringify({ ...held, acquiredAt: new Date(Date.now() - LOCK_STALE_MS - 1_000).toISOString() })
+      );
+
+      const thief = acquireProjectLock(project);
+      try {
+        // THE RESIDUAL: stolen, from a holder whose pid is recorded in the file
+        // being deleted and is trivially checkable.
+        expect(thief.stoleStale).toBe(true);
+        expect(isAlive(held.pid as number), "the pid the steal ignored").toBe(true);
+        // And the victim is not told: its own release() is a no-op (token
+        // mismatch), so it cannot even discover the loss by releasing.
+        holder.release();
+        expect(existsSync(lockFile), "the victim's release freed the thief's lock").toBe(true);
+      } finally {
+        thief.release();
+      }
+    } finally {
+      restore.restore();
+    }
+  }, 15_000);
 });

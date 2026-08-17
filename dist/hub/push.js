@@ -9,7 +9,8 @@ import { bundleDir, bundleFileName } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, scanGitRemotes, readLocalProjectId, localProjectIdPath, } from "./identity.js";
 import { registerMachine } from "./init.js";
-import { preflightHub } from "./preflight.js";
+import { hubUnreachableRefusal, preflightHub } from "./preflight.js";
+import { HubIoTimeoutError } from "./io-timeout.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
 import { snapshotWorkspace, isNeverIncludable } from "./workspace.js";
 import { captureCarry, gitChildEnv } from "./carry.js";
@@ -756,6 +757,21 @@ export async function hubPush(opts) {
         // exception. It is also what the SessionEnd hook records: it calls
         // `recordAutoPushOutcome` on a RETURNED result, and a throw skips it, so a
         // rethrow here would erase the failure of every unattended push.
+        // The hub stopped answering PART WAY THROUGH — it was reachable at the
+        // preflight (which is two syscalls earlier) and is not now. Nothing was
+        // committed, so it is the same fact `preflightHub` would have reported a
+        // moment sooner, and it gets the same typed refusal rather than escaping as
+        // an untyped `ErrorResult` (#71). Returning rather than throwing also keeps
+        // the unattended path's breadcrumb: `recordAutoPushOutcome` reads a RETURNED
+        // result and a throw skips it, so this is the difference between `hub
+        // status` explaining a wedged share and saying nothing at all.
+        //
+        // Past `commits` the disclosure wins instead: which of the link, the hub
+        // project and the bundle survived is more urgent than which errno ended it,
+        // and `failedAfterLink` carries the message anyway.
+        if (e instanceof HubIoTimeoutError && !commits) {
+            return hubUnreachableRefusal("push", "unresponsive");
+        }
         if (!commits)
             throw e;
         return failedAfterLink(opts.projectPath, commits, e);
