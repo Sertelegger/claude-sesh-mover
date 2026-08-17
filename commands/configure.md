@@ -39,7 +39,7 @@ Configurable keys:
 - `export.format` — "dir", "archive", or "zstd"
 - `export.exclude` — JSON array like `["file-history","plans"]`
 - `export.scope` — "current" or "all"
-- `export.noSummary` — true or false (functional: when true, exports use a slug-only manifest summary and skip parsing conversation text for it; the exported session JSONL itself is unaffected)
+- `export.noSummary` — true or false (functional: when true, exports use a slug-only manifest summary and skip parsing conversation text for it; the exported session JSONL itself is unaffected). It governs `push` too — including the session-end auto-push, which takes no flags — so it is the switch for a user who does not want a line of their conversation sitting in a bundle manifest on the hub. Worth naming when a user asks what leaves their machine: it is the *manifest* summary only, never the transcript, which travels in full either way.
 - `import.dryRunFirst` — true or false
 - `migrate.scope` — "current" or "all"
 - `hub.path` — absolute path to the hub directory ("" = not configured; normally set via `/sesh-mover:hub-init` rather than by hand)

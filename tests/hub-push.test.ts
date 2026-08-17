@@ -1609,3 +1609,268 @@ describe("hub push — a failure after the identity is resolved", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// What a hub bundle and a hub index say about the CONVERSATION.
+//
+// Both halves of #65. A bundle manifest and an index file are the two things a
+// push uploads that are not the transcript itself, and both used to carry a
+// line of the conversation that nothing asked them to.
+// ---------------------------------------------------------------------------
+
+/**
+ * An UNTITLED session: a transcript whose first entry has no `slug`.
+ *
+ * Not exotic — `discovery.ts` falls back to the session id, and
+ * `extractSummaryFromFile` refuses a UUID slug, so the manifest summary for such
+ * a session is an excerpt of the first user message rather than a title. That is
+ * what makes this fixture, and not the suite's ordinary `test-session` one, able
+ * to tell a slug and a summary apart at all.
+ */
+const UNTITLED_ID = "770e8400-e29b-41d4-a716-446655440000";
+const UNTITLED_SECRET = "SECRET help me reset my banking password";
+function writeUntitledSession(configDir: string, projectPath: string): string {
+  const jsonlPath = join(
+    configDir, "projects", encodeProjectPath(projectPath), `${UNTITLED_ID}.jsonl`
+  );
+  writeFileSync(
+    jsonlPath,
+    [
+      {
+        uuid: "u-entry-1", timestamp: "2026-04-12T08:00:00Z", sessionId: UNTITLED_ID,
+        cwd: projectPath, version: "2.1.81", gitBranch: "main", userType: "external",
+        entrypoint: "cli", type: "user",
+        message: { role: "user", content: UNTITLED_SECRET },
+      },
+      {
+        uuid: "u-entry-2", parentUuid: "u-entry-1", timestamp: "2026-04-12T08:00:05Z",
+        sessionId: UNTITLED_ID, cwd: projectPath, version: "2.1.81", type: "assistant",
+        message: { model: "claude-opus-4-6", id: "msg_u", content: [{ type: "text", text: "Sure." }] },
+      },
+    ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+    "utf-8"
+  );
+  return jsonlPath;
+}
+
+/** Extend a session in place so the next push has something to ship. */
+function appendToSession(
+  configDir: string, projectPath: string, sessionId: string, tag: string
+): void {
+  const jsonlPath = join(
+    configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+  );
+  const existing = readFileSync(jsonlPath, "utf-8");
+  const lines = existing.split("\n").filter((l) => l !== "");
+  const anchorUuid = (JSON.parse(lines[lines.length - 1]) as { uuid: string }).uuid;
+  writeFileSync(
+    jsonlPath,
+    existing +
+      [
+        {
+          uuid: `${tag}-1`, parentUuid: anchorUuid, timestamp: "2026-04-11T09:00:00Z",
+          sessionId, cwd: projectPath, version: "2.1.81", type: "user",
+          message: { role: "user", content: "more" },
+        },
+        {
+          uuid: `${tag}-2`, parentUuid: `${tag}-1`, timestamp: "2026-04-11T09:00:05Z",
+          sessionId, cwd: projectPath, version: "2.1.81", type: "assistant",
+          message: {
+            model: "claude-opus-4-6", id: `msg_${tag}`,
+            content: [{ type: "text", text: "ok" }],
+          },
+        },
+      ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+    "utf-8"
+  );
+}
+
+/** Fetch the first bundle this project has on the hub and extract it. */
+async function extractFirstBundle(
+  hub: string, projectId: string, base: string, tag: string
+): Promise<string> {
+  const backend = createFsBackend(hub);
+  const { indexes } = await readAllIndexes(backend, projectId);
+  const bundles = Object.values(indexes[0].threads).flatMap((t) => t.bundles);
+  const archiveTmp = join(base, `${tag}.tar.gz`);
+  writeFileSync(archiveTmp, await backend.read(bundles[0].file));
+  const dir = join(base, `${tag}-extracted`);
+  mkdirSync(dir, { recursive: true });
+  await extractArchive(archiveTmp, dir);
+  return dir;
+}
+
+describe("hub push — export.noSummary", () => {
+  /**
+   * `--no-summary` / `export.noSummary` is documented as FUNCTIONAL, not
+   * cosmetic: it skips parsing the transcript for a summary at all, so no
+   * conversation text reaches the manifest. `hub push` dropped it on the floor,
+   * and the hub is the transport where it matters most — the manifest is
+   * uploaded to a shared directory by a default-on, unattended SessionEnd
+   * auto-push that has no channel to disclose what it just sent.
+   *
+   * Through a real `hubPush` and the archive it actually uploaded, never a unit
+   * call on the exporter: the defect was entirely in the wiring between them.
+   */
+  it("set: the uploaded bundle's manifest carries the slug, not a line of the conversation", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      writeUntitledSession(configDir, projectPath);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true,
+        noSummary: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      const dir = await extractFirstBundle(hub, pushed.projectId, base, "nosummary");
+      const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf-8")) as {
+        sessions: Array<{ sessionId: string; slug: string; summary: string }>;
+      };
+      const untitled = manifest.sessions.find((s) => s.sessionId === UNTITLED_ID);
+      expect(untitled).toBeDefined();
+      expect(untitled!.summary).toBe(UNTITLED_ID);
+      expect(untitled!.summary).toBe(untitled!.slug);
+      // Asserted over the whole manifest, not just the one field: the promise is
+      // that no conversation text reaches it, and there are other string fields.
+      expect(readFileSync(join(dir, "manifest.json"), "utf-8")).not.toContain("SECRET");
+
+      // ...and the setting is about the MANIFEST. The transcript is the payload
+      // the user asked to sync, and it travels in full either way.
+      expect(
+        readFileSync(join(dir, "sessions", `${UNTITLED_ID}.jsonl`), "utf-8")
+      ).toContain(UNTITLED_SECRET);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The control arm, and the reason the test above is not vacuous: without the
+   * setting the excerpt really is in the manifest, so the assertion above is
+   * measuring the setting rather than a fixture that never had a summary.
+   *
+   * It also pins the default. `noSummary` is opt-in; a change that made
+   * slug-only the default would silently retire a documented setting, and this
+   * fails when it does.
+   */
+  it("unset: the manifest carries the excerpt, which is what the setting turns off", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      writeUntitledSession(configDir, projectPath);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      const dir = await extractFirstBundle(hub, pushed.projectId, base, "summary");
+      const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf-8")) as {
+        sessions: Array<{ sessionId: string; summary: string }>;
+      };
+      const untitled = manifest.sessions.find((s) => s.sessionId === UNTITLED_ID);
+      expect(untitled!.summary).toBe(UNTITLED_SECRET);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("hub push — an index poisoned by an older version", () => {
+  /**
+   * The stickiness half of #65, end to end.
+   *
+   * A thread whose local session has vanished is carried forward from the prior
+   * index, and `hub reindex` used to reconstruct that entry's `summary` from the
+   * bundle manifest — an excerpt. Nothing self-healed afterwards: every later
+   * ordinary push read the poisoned entry back as its own `priorIndex` and
+   * copied it forward verbatim, so the excerpt outlived the fix that stopped
+   * producing it.
+   *
+   * The poisoned index here is hand-written rather than produced by
+   * `hub reindex`, because reindex no longer produces one — this is the
+   * "existing hub data" case, an index left behind by a version that did.
+   *
+   * SCOPE, and it is structural: this scrubs THIS machine's own index file.
+   * Per-machine ownership means a machine never writes another's, so every
+   * machine that has pushed has to run one push/pull/reindex of its own.
+   */
+  it("scrubs the poisoned entry on the next ordinary push, keeping its bundle history", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      const untitledPath = writeUntitledSession(configDir, projectPath);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      expect(first.pushedSessions).toHaveLength(2);
+
+      // The untitled session is gone locally: its thread now survives only
+      // through the prior index, which is the door under test.
+      rmSync(untitledPath, { force: true });
+
+      const machine = loadOrCreateMachineId();
+      const indexFile = join(hub, "projects", first.projectId, "index", `${machine.id}.json`);
+      const poisoned = JSON.parse(readFileSync(indexFile, "utf-8")) as {
+        threads: Record<string, { localSessionId: string; slug: string; summary: string; bundles: unknown[] }>;
+      };
+      const [poisonedThreadId, poisonedEntry] = Object.entries(poisoned.threads).find(
+        ([, t]) => t.localSessionId === UNTITLED_ID
+      )!;
+      poisonedEntry.summary = UNTITLED_SECRET;
+      writeFileSync(indexFile, JSON.stringify(poisoned, null, 2) + "\n", "utf-8");
+      const bundlesBefore = poisonedEntry.bundles.length;
+      expect(bundlesBefore).toBeGreaterThan(0);
+
+      // An ORDINARY push — nothing about it is aimed at the index; it just has
+      // new session content to ship, which is the whole point.
+      appendToSession(configDir, projectPath, sessionId, "more");
+      const second = await hubPush({
+        configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81",
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+
+      const after = JSON.parse(readFileSync(indexFile, "utf-8")) as {
+        threads: Record<string, { slug: string; summary: string; bundles: unknown[] }>;
+      };
+      const scrubbed = after.threads[poisonedThreadId];
+      expect(scrubbed).toBeDefined();
+      expect(scrubbed.summary).toBe(scrubbed.slug);
+      expect(scrubbed.summary).toBe(UNTITLED_ID);
+      // A scrub, not a drop: the vanished thread and its history are still there
+      // for another machine to pull.
+      expect(scrubbed.bundles).toHaveLength(bundlesBefore);
+      // On the BYTES, because the entry is carried forward with a spread — a
+      // copy landing under any other key is the same disclosure.
+      expect(readFileSync(indexFile, "utf-8")).not.toContain("SECRET");
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+});

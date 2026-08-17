@@ -63,6 +63,41 @@ function continueSession(jsonlPath: string, sessionId: string, projectPath: stri
 }
 
 /**
+ * An UNTITLED session: a transcript with no `slug` on its first entry.
+ *
+ * That is the shape the index leak needed, and it is ordinary rather than
+ * exotic. `discovery.ts` falls back to the session id for the slug, and
+ * `extractSummaryFromFile` refuses a UUID slug, so the manifest summary for such
+ * a session is an excerpt of the first user message — which is what the bundle
+ * carries, and what a rebuild used to lift straight into a plaintext index file.
+ */
+const UNTITLED_ID = "770e8400-e29b-41d4-a716-446655440000";
+const UNTITLED_SECRET = "SECRET help me reset my banking password";
+function writeUntitledSession(configDir: string, projectPath: string): string {
+  const jsonlPath = join(
+    configDir, "projects", encodeProjectPath(projectPath), `${UNTITLED_ID}.jsonl`
+  );
+  writeFileSync(
+    jsonlPath,
+    [
+      {
+        uuid: "u-entry-1", timestamp: "2026-04-12T08:00:00Z", sessionId: UNTITLED_ID,
+        cwd: projectPath, version: "2.1.81", gitBranch: "main", userType: "external",
+        entrypoint: "cli", type: "user",
+        message: { role: "user", content: UNTITLED_SECRET },
+      },
+      {
+        uuid: "u-entry-2", parentUuid: "u-entry-1", timestamp: "2026-04-12T08:00:05Z",
+        sessionId: UNTITLED_ID, cwd: projectPath, version: "2.1.81", type: "assistant",
+        message: { model: "claude-opus-4-6", id: "msg_u", content: [{ type: "text", text: "Sure." }] },
+      },
+    ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+    "utf-8"
+  );
+  return jsonlPath;
+}
+
+/**
  * Rewrite a bundle already on the hub through `mutate`, restamping the manifest
  * with the REAL writer so the result is indistinguishable from a bundle that was
  * always shaped that way (`writeManifest` recomputes `sessionsDigest`, which is
@@ -350,6 +385,69 @@ describe("hub reindex", () => {
       expect(rebuilt.threads[threadId].bundles[0].sessionIdInBundle).toBe(
         originalEntry.bundles[0].sessionIdInBundle
       );
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * ...and it carries the SLUG forward, never a line of the conversation.
+   *
+   * The sibling test above proves the carry-forward happens; this one is about
+   * what it carries. A vanished thread is rebuilt from its bundle MANIFEST,
+   * which is the one place a real summary lives — up to 100 characters of the
+   * first user message for an untitled session. That went into `index/<machine>.json`,
+   * which is plaintext by design and readable by anything with access to the
+   * shared hub directory. Worse, it stuck: the next ordinary push or pull read
+   * the entry back as its own `priorIndex` and copied it forward, so nothing
+   * self-healed.
+   *
+   * Asserted on the index file's BYTES, not just the field, because the entry is
+   * spread wholesale (`{ ...entry }`) and a copy landing under some other key
+   * would be the same disclosure.
+   */
+  it("carries the slug forward for a vanished thread, never the message excerpt", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      const untitledPath = writeUntitledSession(configDir, projectPath);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+      expect(pushed.pushedSessions).toHaveLength(2);
+
+      // The untitled session is gone locally, so only the bundle manifest can
+      // describe its thread — the `:165` path.
+      rmSync(untitledPath, { force: true });
+
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const rebuilt = await readMachineIndex(backend, pushed.projectId, machine.id);
+      expect(rebuilt).not.toBeNull();
+      if (!rebuilt) return;
+      const vanished = Object.values(rebuilt.threads).find(
+        (t) => t.localSessionId === UNTITLED_ID
+      );
+      expect(vanished).toBeDefined();
+      expect(vanished!.slug).toBe(UNTITLED_ID);
+      expect(vanished!.summary).toBe(UNTITLED_ID);
+      const raw = readFileSync(join(hub, indexPath(pushed.projectId, machine.id)), "utf-8");
+      expect(raw).not.toContain("SECRET");
+      // The bundle itself still carries the excerpt in its manifest — that is a
+      // separate decision (`export.noSummary`), and this test is about the index.
+      expect(vanished!.bundles).toHaveLength(1);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });

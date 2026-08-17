@@ -4,6 +4,45 @@ import { isSafeSessionId } from "../manifest.js";
 // Pure projection: local sessions (with thread mappings) + prior bundle
 // history + this push's new bundle records. Sessions never pushed (no thread
 // mapping) are omitted — the hub only knows what was shared with it.
+//
+// ---------------------------------------------------------------------------
+// `HubThreadEntry.summary` IS WRITTEN HERE, AND NOWHERE ELSE — and what it
+// holds is the SLUG.
+//
+// An index file is plaintext by design (it is the one thing a hub reader has to
+// be able to project without opening a bundle), so whatever it carries is
+// readable by anything with access to the shared directory. The field's NAME
+// promised a session summary; three of its four writers wrote `slug` anyway,
+// and the fourth — `hub reindex`, building a synthetic prior out of bundle
+// manifests — wrote a genuine `SessionManifest.summary`: up to 100 characters
+// of the first user message. Not an exotic path either. `discovery.ts` falls
+// back to the session id when a transcript carries no slug, and
+// `extractSummaryFromFile` rejects a UUID slug, so an untitled session's
+// manifest summary is an excerpt by construction.
+//
+// Deriving the value here instead of accepting it makes "one writer" a property
+// of the TYPE rather than a convention three call sites happened to share.
+// Neither door can carry an excerpt now:
+//
+//   - the SESSIONS door has no `summary` field to supply (`IndexBuildInputs`);
+//   - the PRIOR-INDEX door is overwritten from the entry's own `slug` below,
+//     which SCRUBS an index an older version poisoned rather than copying it
+//     forward. That mattered: a poisoned entry survived every later ordinary
+//     push and pull, because both read the prior index back and carried a
+//     vanished thread's entry over verbatim. There was no self-healing.
+//
+// The scrub cannot discard anything legitimate. The only value that has ever
+// differed from `slug` here is the excerpt, and the replacement is not a
+// disclosure of its own: `slug` is Claude Code's own session title (or the
+// session id), it is already published in the very same entry, and it is
+// written from the same source on the same line.
+//
+// LIMIT, and it is structural rather than an oversight: this scrubs THIS
+// MACHINE'S OWN index. Per-machine ownership means a machine never writes
+// another machine's index file, so every machine that has ever pushed has to
+// run one push, pull or `hub reindex` of its own to clean its own copy. Machine
+// B cannot fix machine A's, and nothing here should try.
+// ---------------------------------------------------------------------------
 export function buildIndexFile(inputs) {
     const threads = {};
     for (const s of inputs.sessions) {
@@ -43,7 +82,8 @@ export function buildIndexFile(inputs) {
         threads[threadId] = {
             localSessionId: s.sessionId,
             slug: s.slug,
-            summary: s.summary,
+            // Derived, never supplied — the sessions door. See the block above.
+            summary: s.slug,
             headEntryUuid: s.headEntryUuid,
             messageCount: s.messageCount,
             lastActiveAt: s.lastActiveAt,
@@ -52,10 +92,16 @@ export function buildIndexFile(inputs) {
     }
     // Threads whose local session vanished (deleted locally) keep their bundle
     // history from the prior index — the hub copy is still pullable elsewhere.
+    //
+    // This is the ONLY door a summary an older version wrote can come back
+    // through, and `summary: entry.slug` (after the spread, so it wins over the
+    // copied key) is what closes it. Everything else about the entry is carried
+    // over verbatim, as before.
     if (inputs.priorIndex) {
         for (const [threadId, entry] of Object.entries(inputs.priorIndex.threads)) {
-            if (!threads[threadId])
-                threads[threadId] = { ...entry, bundles: entry.bundles.slice() };
+            if (!threads[threadId]) {
+                threads[threadId] = { ...entry, summary: entry.slug, bundles: entry.bundles.slice() };
+            }
         }
     }
     for (const nb of inputs.newBundles) {

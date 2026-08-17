@@ -101,10 +101,11 @@ export async function runRecordStage(input) {
         // Listed HERE, after the apply loop, so the index publishes the sessions
         // this pull just imported or spliced. A list computed by the caller before
         // the loop publishes a stale head.
+        // No `summary` here: `buildIndexFile` derives the thread entry's from the
+        // slug, and is the only thing that writes it (see index-file.ts).
         const sessionsNow = discoverSessions(configDir, effectiveProjectPath).map((s) => ({
             sessionId: s.sessionId,
             slug: s.slug,
-            summary: s.slug,
             headEntryUuid: readLastEntryUuid(s.jsonlPath) ?? "",
             messageCount: s.messageCount,
             lastActiveAt: s.lastActiveAt,

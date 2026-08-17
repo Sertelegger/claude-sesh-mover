@@ -1,20 +1,51 @@
 import type { HubBackend } from "./backend.js";
-import { type HubBundleRecord, type HubIndexJson } from "./layout.js";
+import { type HubBundleRecord, type HubIndexJson, type HubThreadEntry } from "./layout.js";
 import type { SyncState } from "../types.js";
+/**
+ * What this projection reads out of a prior index: every `HubThreadEntry` field
+ * EXCEPT `summary`.
+ *
+ * The omission is the enforcement, not documentation of one. `summary` is
+ * derived from `slug` inside `buildIndexFile` and nowhere else, so a caller that
+ * wants to hand one in — `hub reindex`'s synthetic prior did, straight out of a
+ * bundle manifest, which is where the message excerpt lived — has no field to
+ * hand it in through.
+ *
+ * A real `HubIndexJson` read off the hub satisfies this structurally, so
+ * `readMachineIndex`'s return value is passed unchanged.
+ */
+export type PriorThreadEntry = Omit<HubThreadEntry, "summary">;
+/**
+ * The prior index as a projection INPUT.
+ *
+ * Only `threads` is read, which is also why `hub reindex` can hand over a
+ * synthetic one without inventing an index envelope (`machineId`, `updatedAt`,
+ * …) that the rebuild would then have to keep consistent with the real thing.
+ */
+export interface PriorIndexView {
+    threads: Record<string, PriorThreadEntry>;
+}
 export interface IndexBuildInputs {
     projectId: string;
     machineId: string;
     projectPath: string;
+    /**
+     * The project's live local sessions.
+     *
+     * NO `summary` FIELD, deliberately — see the block above `buildIndexFile`.
+     * Every caller used to pass `summary: s.slug` here, three copies of one
+     * decision, and the fourth writer (through `priorIndex`) passed something
+     * else entirely.
+     */
     sessions: Array<{
         sessionId: string;
         slug: string;
-        summary: string;
         headEntryUuid: string;
         messageCount: number;
         lastActiveAt: string;
     }>;
     state: SyncState;
-    priorIndex: HubIndexJson | null;
+    priorIndex: PriorIndexView | null;
     newBundles: Array<{
         threadId: string;
         record: HubBundleRecord;

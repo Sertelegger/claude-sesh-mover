@@ -3,11 +3,13 @@ import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend } from "./backend.js";
-import { bundleDir, type HubBundleRecord, type HubIndexJson } from "./layout.js";
+import { bundleDir, type HubBundleRecord } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { readLocalProjectId } from "./identity.js";
 import { registerMachine } from "./init.js";
-import { buildIndexFile, writeMachineIndex } from "./index-file.js";
+import {
+  buildIndexFile, writeMachineIndex, type PriorIndexView, type PriorThreadEntry,
+} from "./index-file.js";
 import { extractArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
@@ -102,7 +104,19 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
     // wins). Used below to build a synthetic priorIndex so a thread whose
     // local session has since vanished (JSONL deleted) still survives the
     // rebuild — see the comment at its use site.
-    const threadMeta = new Map<string, HubIndexJson["threads"][string]>();
+    //
+    // `PriorThreadEntry`, not `HubThreadEntry`: it has no `summary`, and that is
+    // the point. This map used to carry `SessionManifest.summary` — a real
+    // excerpt of the first user message for any untitled session — and it was
+    // the one thread-entry field on the hub that was not a slug. Only a thread
+    // whose local session had vanished reached it (a live one is rebuilt from
+    // `sessionsNow` below), and only when its latest bundle was `full`, since a
+    // continuation manifest's summary is `continuation of <slug>`. But once
+    // written it stuck: the next ordinary push or pull read it back as its own
+    // priorIndex and copied it forward. `buildIndexFile` now derives the field
+    // from the slug at both doors, and the missing key here is what stops it
+    // being re-supplied.
+    const threadMeta = new Map<string, PriorThreadEntry>();
 
     for (const [i, file] of files.entries()) {
       const fileName = file.split("/").pop() ?? file;
@@ -162,7 +176,6 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
         threadMeta.set(threadId, {
           localSessionId,
           slug: s.slug,
-          summary: s.summary,
           headEntryUuid,
           messageCount: s.messageCount,
           lastActiveAt: s.lastActiveAt,
@@ -171,10 +184,11 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
       }
     }
 
+    // No `summary` here: `buildIndexFile` derives the thread entry's from the
+    // slug, and is the only thing that writes it (see index-file.ts).
     const sessionsNow = discoverSessions(opts.configDir, opts.projectPath).map((s) => ({
       sessionId: s.sessionId,
       slug: s.slug,
-      summary: s.slug,
       headEntryUuid: readLastEntryUuid(s.jsonlPath) ?? "",
       messageCount: s.messageCount,
       lastActiveAt: s.lastActiveAt,
@@ -188,8 +202,8 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
     // carried it forward from ITS priorIndex). We can't ask the hub for
     // that (index files are exactly what we're rebuilding), but we CAN
     // reconstruct equivalent thread metadata from the bundle manifests
-    // scanned above (slug/summary/headEntryUuid/messageCount/lastActiveAt
-    // all live in SessionManifest). Feeding that as a synthetic priorIndex
+    // scanned above (slug/headEntryUuid/messageCount/lastActiveAt all live
+    // in SessionManifest). Feeding that as a synthetic priorIndex
     // (bundles: [] — the real bundle history is supplied separately via
     // `newBundles`, same as a live thread's) carries vanished threads
     // forward without disturbing live ones: for a thread that IS live,
@@ -198,15 +212,11 @@ export async function hubReindex(opts: HubReindexOptions): Promise<HubReindexRes
     // this can never diverge from a true no-prior rebuild for live
     // threads — only adds back what a strict `priorIndex: null` would
     // have dropped.
-    const syntheticPrior: HubIndexJson = {
-      schemaVersion: 1,
-      agent: "claude-code",
-      projectId: local.projectId,
-      machineId: machine.id,
-      updatedAt: "",
-      projectPath: opts.projectPath,
-      threads: Object.fromEntries(threadMeta),
-    };
+    //
+    // `PriorIndexView` is exactly the part of a prior index the projection
+    // reads, so the synthetic one is the `threads` map and nothing else — no
+    // index envelope invented here to be kept in step with the real writer's.
+    const syntheticPrior: PriorIndexView = { threads: Object.fromEntries(threadMeta) };
 
     const built = buildIndexFile({
       projectId: local.projectId,
