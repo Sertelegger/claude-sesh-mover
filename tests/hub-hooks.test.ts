@@ -615,39 +615,37 @@ describe("hub hook-session-end (CLI)", () => {
     // that gets a breadcrumb at all: `setLastAutoPush` is a documented no-op
     // without this block, and the reachability refusal returns before the
     // thread-minting that would create one. See the note below the assertions.
-    // Keyed by the REAL path, and written for both spellings when they differ —
-    // the same rule as the two tests above, for the same measured reason: a
-    // child process's cwd is always resolved, and on macOS /var is a symlink to
-    // /private/var. Keying only the unresolved path made this pass on Linux and
-    // Windows and fail on macOS, because the CLI then looked for a differently
-    // named file and found none, which is indistinguishable from the no-hub-
-    // block gap this test exists to pin the far side of.
+    // The REAL path on EVERY side — the same rule as the two tests above, and
+    // seeding the fixture for both spellings is not a substitute for it. The
+    // breadcrumb is written at RUN time, so a hook told the unresolved path
+    // writes one key while a `hub status` child (whose own cwd is always
+    // resolved) reads the other, and no amount of pre-seeding reconciles that.
+    // On macOS /var is a symlink to /private/var, so this failed there while
+    // passing on Linux and Windows.
     const { realpathSync } = await import("node:fs");
     const projectReal = realpathSync(project);
     const syncDir = join(home, ".sesh-mover", "sync-state");
     mkdirSync(syncDir, { recursive: true });
-    const stateFor = (p: string) =>
+    writeFileSync(
+      join(syncDir, `${encodeProjectPath(projectReal)}.json`),
       JSON.stringify({
         schemaVersion: 2,
-        projectPath: p,
+        projectPath: projectReal,
         lineage: {},
         imported: {},
         peers: {},
         hub: { hubId: "hub-fixture-1", threadByLocalSession: {} },
-      }) + "\n";
-    writeFileSync(join(syncDir, `${encodeProjectPath(project)}.json`), stateFor(project));
-    if (projectReal !== project) {
-      writeFileSync(join(syncDir, `${encodeProjectPath(projectReal)}.json`), stateFor(projectReal));
-    }
+      }) + "\n"
+    );
 
-    const r = runHook(JSON.stringify({ cwd: project, session_id: sessionId }));
+    const r = runHook(JSON.stringify({ cwd: projectReal, session_id: sessionId }));
     expect(r.status).toBe(0);
     expect(r.stdout).toBe(""); // the hook contract is unchanged by any of this
 
     const status = JSON.parse(
       runCli(["hub", "status"], {
         env: { ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },
-        cwd: project,
+        cwd: projectReal,
       }).stdout
     );
     const note = status.lastAutoPush?.notes.join(" ") ?? "";
