@@ -9,7 +9,7 @@ import { runApplySessionsStage } from "./pull-apply-sessions.js";
 import { runApplyWorkspaceStage } from "./pull-apply-workspace.js";
 import { initApplyState, isCarrySuppressed, sharedLayerFindings } from "./pull-apply-state.js";
 import { runFetchStage } from "./pull-fetch.js";
-import { runRecordStage } from "./pull-record.js";
+import { flushThreadMapping, runRecordStage } from "./pull-record.js";
 import { runResolveStage } from "./pull-resolve.js";
 import { runSelectStage } from "./pull-select.js";
 import { loadOrCreateMachineId } from "../machine.js";
@@ -377,6 +377,10 @@ export async function hubPull(opts) {
             // workspace stage's reasons: the three in-loop stages are phases of one
             // loop body and their reasons interleave per bundle.
             warnings.push(...ss.reasons);
+            // The thread mapping, made exactly as durable as the receipts written
+            // beside it in this same loop: the three hard returns here bypass the
+            // record stage entirely. See flushThreadMapping for what that costs.
+            flushThreadMapping({ effectiveProjectPath, hubId: hub.hubId, threadId, needed, apply: st });
             // Forwarded VERBATIM, `command: "import"` and all — it is the importer's
             // own diagnosis carrying the importer's own suggestion, and the
             // importer's warnings are dropped with it exactly as before.

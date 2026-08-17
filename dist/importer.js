@@ -66,6 +66,35 @@ function isRegularFile(path) {
     }
 }
 /**
+ * How a BUNDLE's shared-layer ROOT (`memory/`, `plans/`) presents itself.
+ *
+ * `lstatSync`, never `existsSync`, and that distinction is the whole of #68's
+ * first half. #64 closed every per-FILE read with `isRegularFile` and every
+ * destination write with an exclusive create, but the two probes that decide
+ * whether to WALK a layer at all still resolved links — so a directory-form
+ * bundle whose `memory/` was itself a symlink to, say, `~/.ssh` had its real
+ * files enumerated and copied into the target's memory folder, under names of
+ * the attacker's choosing, in the one directory a later session reads prose
+ * out of and can then repeat. A read-side gather rather than a write outside
+ * the tree, and none the better for it.
+ *
+ * Same bound as `isRegularFile`: `archiver.ts` rejects symlink and hardlink
+ * tar entries at extraction, so every hub bundle (`bundle.tar.gz`) is already
+ * immune and the case this closes is a hand-placed DIRECTORY-form bundle.
+ *
+ * `"symlink"` is refused rather than followed, and it deliberately covers a
+ * DANGLING link too — `existsSync` answered "absent" for one and said nothing
+ * at all, which is the same silence #68's second half is about.
+ */
+function layerRootStatus(path) {
+    try {
+        return lstatSync(path).isSymbolicLink() ? "symlink" : "present";
+    }
+    catch {
+        return "absent";
+    }
+}
+/**
  * Is `path` occupied by ANYTHING — a file, a directory, or a symlink whose
  * target does not exist? `lstatSync`, so a dangling symlink answers `true`,
  * which is the answer `copyIfAbsent`'s `O_EXCL` gives the real run.
@@ -184,7 +213,14 @@ function reconcileSharedLayers(opts) {
     let memoryIndex;
     let reportedMemoryDir;
     const memoryDir = join(exportPath, "memory");
-    if (existsSync(memoryDir)) {
+    // `layerRootStatus`, not `existsSync`: the probe that decides whether to walk
+    // this layer must not resolve a link (#68). A symlinked root is refused and
+    // SAID — never enumerated, and never passed over in silence.
+    const memoryRoot = layerRootStatus(memoryDir);
+    if (memoryRoot === "symlink") {
+        warnings.push(`The memory folder in this bundle is a symlink, not a directory — nothing was read through it, and nothing in your memory folder was changed.`);
+    }
+    if (memoryRoot === "present") {
         try {
             const targetMemDir = join(targetProjectDir, "memory");
             reportedMemoryDir = targetMemDir;
@@ -493,7 +529,14 @@ function reconcileSharedLayers(opts) {
     // exist here. Until `plans/` is re-scoped, writing MORE files into a shared
     // directory is the wrong direction. The incoming plan stays in the bundle.
     const plansDir = join(exportPath, "plans");
-    if (existsSync(plansDir)) {
+    // Same rule as the memory root above, and it bites harder here: `plans/` is
+    // config-dir-GLOBAL, so files gathered through a symlinked bundle root land
+    // in a directory every project on this machine shares.
+    const plansRoot = layerRootStatus(plansDir);
+    if (plansRoot === "symlink") {
+        warnings.push(`The plans folder in this bundle is a symlink, not a directory — nothing was read through it, and nothing in your plans folder was changed.`);
+    }
+    if (plansRoot === "present") {
         try {
             const targetPlansDir = join(targetConfigDir, "plans");
             if (!plan)
@@ -513,9 +556,27 @@ function reconcileSharedLayers(opts) {
                     continue;
                 const existingContent = readTextFile(dst);
                 const newContent = readTextFile(src);
-                if (existingContent === null || newContent === null || existingContent === newContent) {
+                // #68's second half. This used to fold "one of the two could not be
+                // read" into the identical-bytes `continue`, so a plans destination the
+                // exclusive create refused and the read then could not open — a dangling
+                // symlink, a directory in its place, a permission problem — delivered
+                // nothing and reported NOTHING: no warning, no `planConflicts` entry,
+                // no field in the result the skill layer branches on since #59. The
+                // memory side already warns in exactly this situation; the asymmetry
+                // was not a decision, it is what the older check-then-write shape
+                // happened to produce.
+                //
+                // A warning and NOT a `planConflicts` entry, matching the memory side
+                // rather than out-doing it: an `AuxiliaryConflict` asserts that the two
+                // copies differ and carries a hash of each, and here at least one of
+                // them could not be read at all — so both the claim and the hashes
+                // would have to be invented.
+                if (existingContent === null || newContent === null) {
+                    warnings.push(`Plan "${file}" could not be compared with the incoming copy — kept the existing version, and the incoming plan was not written (it is only in the bundle).`);
                     continue;
                 }
+                if (existingContent === newContent)
+                    continue;
                 planConflicts.push({
                     filename: file,
                     existingHash: computeIntegrityHash([existingContent]),
@@ -536,6 +597,55 @@ function reconcileSharedLayers(opts) {
         memoryDir: reportedMemoryDir,
         planConflicts,
     };
+}
+/**
+ * Reconcile a bundle's `memory/` and `plans/` **without importing a session**.
+ *
+ * ## Why this exists (#63)
+ *
+ * `reconcileSharedLayers` runs inside `importSession`, and a hub pull does not
+ * always call it: when `tryAppendContinuation` splices a continuation onto an
+ * existing transcript — or `adoptHubBranch` adopts one — the bundle is handled
+ * and `pull-apply-sessions.ts` returns before the fragment import. The two
+ * shared layers were extracted and then discarded with the extract dir.
+ *
+ * That was not a slow leak, it was permanent: the pushing machine credits its
+ * own hub ledger with the `memoryDigest` it sent (`hub/push.ts` ->
+ * `setPeerMemoryDigest`), so the exporter never ships that memory again. After
+ * a machine's first pull of a thread, every later memory update reached it only
+ * on the paths where the splice was DECLINED — which is why it looked like it
+ * worked when tested seconds after a push (inside the 5-minute liveness window
+ * the splice declines and the fragment import applies the memory) and silently
+ * did not on the quiet path, which is also the common one.
+ *
+ * ## Why it is a wrapper and not a second implementation
+ *
+ * `reconcileSharedLayers` stays private with FOUR internal callers precisely so
+ * the dry-run preview cannot drift from the run — the preview is the same
+ * function in `plan: true` mode, never a parallel implementation. This fifth
+ * caller preserves that: it is a one-line delegation, so a rule added there
+ * reaches the splice path with no edit here, and the projection to
+ * `SharedLayerFindings` still goes through `sharedFindings`, the single site
+ * that decides an empty array is reported as absent.
+ *
+ * There is deliberately no `plan` parameter: the two splice paths write to a
+ * transcript the user already owns before they get here, so there is no preview
+ * of them to keep honest, and offering the mode would invite a caller to preview
+ * one half of an operation whose other half already happened.
+ *
+ * ## Double-running is prevented STRUCTURALLY, not by dedupe
+ *
+ * Both call sites sit immediately before a `return` that skips the fragment
+ * import, so a bundle reaches either this function or `importSession`, never
+ * both — and a splice that is refused falls through untouched to the import,
+ * which reconciles exactly once as it always did. `SharedLayerAccumulator`
+ * dedupes `memoryConflicts` by value, which would make a double-run *harmless*;
+ * it would not make it correct (the index union's `alreadyPresent` is summed,
+ * not deduped), so nothing here leans on it.
+ */
+export function applySharedLayers(opts) {
+    const shared = reconcileSharedLayers({ ...opts, plan: false });
+    return { warnings: shared.warnings, ...sharedFindings(shared) };
 }
 export async function importSession(options) {
     const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, onProgress, } = options;
