@@ -82,6 +82,25 @@ export interface InitApplyStateInput {
     needed: readonly HubBundleRecord[];
 }
 /**
+ * One bundle's declared workspace ancestry, ATTRIBUTED to the machine that
+ * declared it.
+ *
+ * The machine id is not bookkeeping. `basedOn` is a self-report about ONE
+ * machine's own generation history, and since #35 a pull's chain is assembled
+ * across machines and ordered by session-continuation links — so an earlier
+ * entry in this list can come from a machine whose tree has nothing to do with
+ * the payload being applied. Stripping the attribution is what let
+ * `chooseMergeAncestor` merge one machine's tree against another machine's
+ * generation, which `mergeWorkspaceTrees` then classifies `taken`: an atomic
+ * overwrite with no sidecar and no backup, reported as a clean merge.
+ */
+export interface ChainWorkspaceBase {
+    /** The machine whose index listed the bundle that declared this base. */
+    machineId: string;
+    /** `null` when that bundle was its machine's first workspace push. */
+    bundleId: string | null;
+}
+/**
  * Everything `hubPull`'s per-bundle loop accumulates, in one object.
  *
  * **This object is mutable and is passed by reference on purpose.**
@@ -107,7 +126,7 @@ export interface ApplyState {
     workspaceDeclaredMissing: boolean | undefined;
     /** Which bundle in this chain carries the workspace generation to apply. */
     readonly workspaceBundleIndex: number;
-    readonly chainWorkspaceBases: Array<string | null>;
+    readonly chainWorkspaceBases: Array<ChainWorkspaceBase>;
     readonly importedSessions: HubPullResult["importedSessions"];
     readonly skippedSessions: HubPullResult["skippedSessions"];
     readonly appended: NonNullable<HubPullResult["appended"]>;

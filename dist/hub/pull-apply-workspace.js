@@ -104,18 +104,31 @@ async function fetchAncestorWorkspace(backend, ref, tempRoot) {
  * point — so the payload degrades to no-ancestor mode (§5.4), which is loud and
  * changes nothing, rather than being merged against a guess.
  *
- * Why the whole chain and not just the applied payload's own base: being simply
- * BEHIND is the ordinary case, and a peer that pushed twice since our last sync
- * declares a base we never held (its own previous generation) — while the
- * EARLIER bundle in the same chain declares one we do hold. Walking the chain
- * is what keeps routine repeat pulls merging instead of skipping.
+ * Why more than just the applied payload's own base: being simply BEHIND is the
+ * ordinary case, and a peer that pushed twice since our last sync declares a
+ * base we never held (its own previous generation) — while its EARLIER bundle
+ * in the same chain declares one we do hold. Walking back over that machine's
+ * bases is what keeps routine repeat pulls merging instead of skipping.
  *
- * The chain is one machine's own pushes (a machine's index lists only bundles it
- * pushed — `hub/pull.ts` writes its index with `newBundles: []`), so the bases
- * within a chain are linear and every earlier one is an ancestor of the applied
- * payload. That linearity is what makes "newest match across the chain" safe;
- * if index writing ever starts merging other machines' bundle records into one
- * thread list, this reasoning breaks before the code does.
+ * BUT ONLY THAT MACHINE'S, which is why `chainWorkspaceBases` carries a machine
+ * id per entry. The reasoning above rests on the bases being LINEAR — every
+ * earlier one an ancestor of the applied payload — and that holds for one
+ * machine's own pushes and for nothing else. It used to hold for the whole
+ * chain as a matter of fact: a pull's `needed` was one machine's bundle list,
+ * sliced from its last full record, in its own push order.
+ *
+ * #35 ended that. `planThreadPull`/`assembleChain` now order `needed` by
+ * session-continuation links across every machine that pushed the thread —
+ * links say nothing about workspace generations, and two machines' generation
+ * histories are independent. So an EARLIER bundle in the assembled order can
+ * declare a base that is NEWER in OUR list than the base declared by the LATER
+ * bundle whose payload is actually being merged. Taking the minimum index over
+ * the whole chain then merges one machine's tree against a generation another
+ * machine held, our tree reads as unchanged against it, and every file the peer
+ * differs on is `taken` — the silent revert, measured, with no sidecar and no
+ * backup. Filtering to the payload's own machine restores the linearity the
+ * rule depends on, and is a no-op on a single-machine chain, which is every
+ * chain a pre-#35 hub produces.
  *
  * Known gap, three machines: C's chain declares C's generations. If this machine
  * shares a generation with C only through A, the intersection is empty and the
@@ -124,7 +137,10 @@ async function fetchAncestorWorkspace(backend, ref, tempRoot) {
  * just skipped, so every later pull skips too, until this machine pushes a
  * generation C then pulls, or the user reaches for a flag. Fixing it means
  * walking `basedOn` back through the hub's own bundle manifests rather than
- * stopping at the chain; deferred, not overlooked.
+ * stopping at what one machine declared; deferred, not overlooked. Note the
+ * direction it fails in — a skip, which writes nothing — and that reading
+ * another machine's bases off the assembled chain is NOT the fix: that is the
+ * defect above, trading a loud skip for a silent overwrite.
  *
  * Fallback direction: candidates after the first are `ours` continued from the
  * winner, i.e. strictly OLDER generations of our own. A base older than the
@@ -136,17 +152,25 @@ async function fetchAncestorWorkspace(backend, ref, tempRoot) {
  */
 async function chooseMergeAncestor(backend, 
 /**
- * Bundle ids the incoming chain declares it descends from, oldest first.
- * Only the id is consulted: the peer's `file` never becomes a path here (we
- * use OUR record of the same generation), so a forged one cannot reach the
- * filesystem at all.
+ * Generations the incoming chain declares it descends from, oldest first,
+ * each stamped with the machine that declared it. Only the id is consulted:
+ * the peer's `file` never becomes a path here (we use OUR record of the same
+ * generation), so a forged one cannot reach the filesystem at all.
  */
-chainBaseBundleIds, known, tempRoot) {
+chainBases, 
+/**
+ * The machine whose workspace payload is being applied. Bases declared by any
+ * OTHER machine are discarded unread — they are that machine's history, not
+ * this payload's, and using one is the silent revert described above.
+ */
+payloadMachineId, known, tempRoot) {
     let idx = -1;
-    for (const bundleId of chainBaseBundleIds) {
-        if (!bundleId)
+    for (const base of chainBases) {
+        if (base.machineId !== payloadMachineId)
+            continue; // another machine's history
+        if (!base.bundleId)
             continue; // the peer's first workspace push declares none
-        const j = known.findIndex((g) => g.bundleId === bundleId);
+        const j = known.findIndex((g) => g.bundleId === base.bundleId);
         if (j >= 0 && (idx === -1 || j < idx))
             idx = j;
     }
@@ -313,7 +337,7 @@ function describeWorkspaceMerge(r) {
  * linked project as having real content and skip the merge.
  */
 export async function runApplyWorkspaceStage(input) {
-    const { backend, extractDir, effectiveProjectPath, targetPathGiven, forceWorkspace, bundleDeclaresWorkspace, chainWorkspaceBases, hubId, record, tempRoot, } = input;
+    const { backend, extractDir, effectiveProjectPath, targetPathGiven, forceWorkspace, bundleDeclaresWorkspace, chainWorkspaceBases, machineId, hubId, record, tempRoot, } = input;
     const reasons = [];
     const incomingDir = join(extractDir, "workspace");
     // First, a payload the manifest declares and the bundle does not contain.
@@ -349,7 +373,7 @@ export async function runApplyWorkspaceStage(input) {
         // skips the ancestor hunt entirely rather than fetching a tree nothing
         // will read.
         if (hasRealContent && !forceWorkspace) {
-            const ancestor = await chooseMergeAncestor(backend, chainWorkspaceBases, known, tempRoot);
+            const ancestor = await chooseMergeAncestor(backend, chainWorkspaceBases, machineId, known, tempRoot);
             ancestorDir = ancestor.dir;
             reasons.push(...ancestor.warnings);
         }

@@ -2,6 +2,7 @@ import { type HubBackend } from "./backend.js";
 import { type HubBundleRecord } from "./layout.js";
 import { type WorkspaceMergeReport } from "./merge.js";
 import { type StageOutcome } from "./pull-stages.js";
+import type { ChainWorkspaceBase } from "./pull-apply-state.js";
 export interface ApplyWorkspaceStageInput {
     backend: HubBackend;
     extractDir: string;
@@ -9,7 +10,15 @@ export interface ApplyWorkspaceStageInput {
     targetPathGiven: boolean;
     forceWorkspace: boolean;
     bundleDeclaresWorkspace: boolean;
-    chainWorkspaceBases: ReadonlyArray<string | null>;
+    chainWorkspaceBases: ReadonlyArray<ChainWorkspaceBase>;
+    /**
+     * The machine whose index listed THIS bundle. When the stage does its work
+     * this is, by construction, the machine whose workspace payload is being
+     * applied (the caller gates on `i === state.workspaceBundleIndex`), and it is
+     * the only machine whose declared bases are legal candidates — see
+     * `chooseMergeAncestor`.
+     */
+    machineId: string;
     hubId: string;
     record: Pick<HubBundleRecord, "bundleId" | "file" | "pushedAt">;
     tempRoot: string;
