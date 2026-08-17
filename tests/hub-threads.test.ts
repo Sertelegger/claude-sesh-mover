@@ -78,6 +78,13 @@ describe("resolveThreads", () => {
     // `pullSourceFor` hands to a pull. Measured against the shipped dist/: the
     // forward listing resolved to one file's bundles and the reverse to the
     // other's.
+    //
+    // #28 closed the INPUT as well (readMachineIndex now skips a file whose
+    // declared machineId disagrees with its filename), so a real hub read can
+    // no longer produce this pair. The key and this case both stay: the
+    // contract is that `resolveThreads` — exported, and fed any HubIndexJson[]
+    // — orders by CONTENT rather than by its argument's order, and that must
+    // not quietly become the reader's promise instead of this function's.
     const shared = { localSessionId: "sX", headEntryUuid: "u", messageCount: 1,
       lastActiveAt: "2026-07-21T00:00:00Z" };
     const fileA = idx("X", { t1: entry({ ...shared, bundles: [bundle({ bundleId: "FROM-FILE-A" })] }) });
@@ -351,10 +358,24 @@ describe("findUnfetchableBundles", () => {
     ).toEqual(forward);
   });
 
-  it("merges two index files that declare the same internal machineId", () => {
-    // readMachineIndex never validates the machineId INSIDE an index file
-    // (only the one derived from its filename), so two copies can carry the
-    // same id. One row, not two.
+  it("keys by machineId, so two copies carrying one id are one row and not two", () => {
+    // PREMISE REVERSED, ASSERTION KEPT (#28, 2026-08-17).
+    //
+    // What this used to say: readMachineIndex never validates the machineId
+    // INSIDE an index file (only the one derived from its filename), so two
+    // index files could declare the same id and both land here as separate
+    // copies of one "machine". That is no longer reachable — the reader now
+    // reconciles the two and skips (with a warning) any file whose declared id
+    // disagrees with its filename, so through readAllIndexes every machine
+    // contributes exactly one copy per thread.
+    //
+    // What survives, and why the case is kept rather than deleted:
+    // findUnfetchableBundles is exported and takes a `copies` list directly, so
+    // "one row per machine id, and peers[...] read once per machine" is a
+    // property of THIS function, not of whichever reader built its input. Same
+    // call as the source-half NEVER guard a few cases up — annotate, don't
+    // bulldoze. Note that a duplicate id here is now the ONLY way to reach this
+    // branch, which is exactly why the assertion has to stay.
     const copies = [
       copy(A, { bundles: [bundle({ bundleId: "a1", sessionIdInBundle: "sA" })] }),
       copy(B, { bundles: [bundle({ bundleId: "b1", sessionIdInBundle: "sB" })] }),

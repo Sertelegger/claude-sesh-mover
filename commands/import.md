@@ -107,4 +107,6 @@ You are running the sesh-mover import command. Follow these steps:
        3. Remove the `MEMORY.md` pointer line whose target is `<parkedAs>` — the merged memory is reachable under its own name, and a `.pre-merge.md` backup is a backup, **not a memory**: never index it. Touch no other line of `MEMORY.md`.
     7. **On decline, change nothing.** Two files, two index entries, nothing lost.
 
+**Exit codes:** keep branching on the parsed JSON, not on `$?`. `import` exits `0` for a completed import **and for a `--dry-run`**, which changed nothing — so a zero exit is never on its own proof that sessions landed; read `importedSessions`/`skippedSessions`. `1` is a bad invocation or a failure while reading the bundle, and `2` is a refusal reported as a result. See "Exit Codes" in the skill doc for the full four-class table.
+
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations and any conditional/retry branches, e.g. `--no-register` for the version-mismatch fallback, `--allow-duplicates` for the duplicate-skip retry, `--include-plans` for the opt-in plans layer) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

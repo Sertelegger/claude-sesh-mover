@@ -43,17 +43,26 @@ export function newerThreadCopy(a, b) {
     if (a.machineId !== b.machineId)
         return a.machineId < b.machineId ? a : b;
     // ...and machineId alone was not enough, one layer down. Two copies of one
-    // thread can carry the SAME machineId: `resolveThreads` stamps them with the
+    // thread could carry the SAME machineId: `resolveThreads` stamps them with the
     // id an index file DECLARES (see below), while `readAllIndexes` dedupes on the
     // id derived from the file's NAME, so two differently-named index files that
-    // both declare `"X"` land here as two copies with every key equal — and the
+    // both declared `"X"` landed here as two copies with every key equal — and the
     // reduce fell through to `readdirSync` order again. Measured against shipped
     // `dist/`: a forward listing resolved to one file's bundle list and the
     // reversed listing to the other's, deciding what `pullSourceFor` returns and
-    // therefore what a pull fetches. Needs a damaged or hostile index (our own
+    // therefore what a pull fetches. Needed a damaged or hostile index (our own
     // writers always agree: `buildIndexFile` stamps `inputs.machineId` and
     // `writeMachineIndex` derives the path from `index.machineId`), which is why
     // this is the last key and not the first.
+    //
+    // #28 CLOSED THE INPUT, AND THIS KEY STAYS. `readMachineIndex` now skips (and
+    // warns about) any index file whose declared `machineId` disagrees with its
+    // filename, so a real hub read can no longer produce two copies sharing an id
+    // — the two keys below are unobservable through `readAllIndexes` today. Kept
+    // and annotated rather than deleted, the same call as the source-half NEVER
+    // guard in `findUnfetchableBundles`: `resolveThreads` is exported and takes
+    // any `HubIndexJson[]`, and "the answer is a total order over CONTENT" should
+    // be a property of THIS function rather than of whichever reader fed it.
     const ka = threadCopyContentKey(a);
     const kb = threadCopyContentKey(b);
     return ka <= kb ? a : b;
@@ -70,20 +79,27 @@ export function resolveThreads(indexes) {
             // every consumer here relies on; a per-entry override is not a fact at
             // all.
             //
-            // WHAT `index.machineId` IS NOT: filename-derived, and therefore not
-            // validated. This comment used to say the opposite ("derived from the
-            // index file's NAME, which is the only trustworthy source"), which was
-            // wrong in the dangerous direction — it told a reader `ThreadCopy.machineId`
-            // is path-safe. `readMachineIndex` uses its `machineId` ARGUMENT only to
+            // WHERE `index.machineId` COMES FROM, and it is the file's CONTENT, not
+            // its name. `readMachineIndex` uses its `machineId` ARGUMENT only to
             // build the path it reads and to label warnings; the `machineId` it
-            // returns is whatever the file's CONTENT declared, and it never passes
-            // `assertSafeHubId`. `whereis.ts` states this correctly and is why
-            // `createMachineNameLookup` wraps `machinePath(id)` in a try/catch;
-            // `findUnfetchableBundles` below keys by machineId for the same reason.
-            // Every `machinePath`/`bundleDir` caller that does NOT guard is passing
-            // this machine's own identity, so nothing is broken today — but anything
-            // that starts building a hub path out of a `ThreadCopy.machineId` has to
-            // validate it first, or reconcile content against filename at the read.
+            // returns is whatever the file declared.
+            //
+            // #28 MADE THE TWO AGREE, AT THE READ RATHER THAN HERE. `readMachineIndex`
+            // now skips (and warns about) any index whose declared `machineId`
+            // disagrees with the filename it was read from — the filename wins,
+            // because it is what every hub path is built from and the only one of the
+            // two that has passed `assertSafeHubId`. So for every index that arrived
+            // through `readAllIndexes` (the only production door), `ThreadCopy.machineId`
+            // IS the filename-derived, path-safe id.
+            //
+            // That is the READER's guarantee, not this function's, and the difference
+            // is why the downstream guards stay: `resolveThreads` is exported and
+            // takes any `HubIndexJson[]`, so a caller that hand-builds one can still
+            // hand it an unsafe or duplicated id. `whereis.ts` keeps its try/catch
+            // around `machinePath(id)` (it must anyway — `machines/<id>.json` is
+            // routinely absent), and `findUnfetchableBundles` below keeps keying by
+            // machineId. Anything NEW that builds a hub path out of a
+            // `ThreadCopy.machineId` should still validate it at that point.
             const copy = { ...entry, machineId: index.machineId };
             const list = byThread.get(threadId) ?? [];
             list.push(copy);
@@ -185,9 +201,16 @@ export function findUnfetchableBundles(args) {
         for (const b of c.bundles)
             offered.add(b.bundleId);
     }
-    // Keyed by machineId rather than per copy: readMachineIndex validates only
-    // the id derived from an index file's NAME, so two index files can declare
-    // the same internal machineId and both land here as separate copies.
+    // Keyed by machineId rather than per copy. THE ORIGINAL REASON IS GONE and
+    // the keying is not: it was built because `readMachineIndex` validated only
+    // the id derived from an index file's NAME, so two index files could declare
+    // the same internal machineId and both land here as separate copies. #28
+    // closed that at the read (the filename wins; a disagreeing file is skipped
+    // and warned about), so through `readAllIndexes` each machine now contributes
+    // exactly one copy per thread. What the keying still buys is that this
+    // function's OUTPUT SHAPE — one row per machine, and `state.peers[...]` read
+    // once per machine rather than once per copy — is a property of the function
+    // rather than of its caller's reader, for a `copies` list built any other way.
     const byMachine = new Map();
     for (const c of copies) {
         // The source half of this test is UNOBSERVABLE today and kept anyway,

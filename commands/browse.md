@@ -44,4 +44,6 @@ You are running the sesh-mover browse command. Follow these steps:
 
 6. After completing an action, if the user chose "View details", offer the import/delete options again for the same export.
 
+**Exit codes:** keep branching on the parsed JSON, not on `$?`. `browse` exits `0` whenever it produced a listing — including one whose entries are `metadataAvailable: false`, since an unreadable bundle is data about that bundle, not a failed command — and `1` only when the command itself failed, in which case stdout carries an `ErrorResult` (or, for an argument Commander rejected, nothing at all and a message on stderr). See "Exit Codes" in the skill doc for the full four-class table.
+
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocation above; do not search the plugin cache. The flag set documented in this file (in both the main invocation and any conditional branches) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

@@ -78,6 +78,17 @@ Move a session from machine A to machine B:
 
 **Migrate** is for same-machine moves (repo relocated, home dir renamed, config dir switched). Don't run it from inside the session being migrated — the CLI blocks this; exit, start a fresh session from an outer directory (e.g. `~/`), and run it there. `--scope current` requires `--session-id`.
 
+**Exit codes**, for scripting the CLI directly. Every command emits one JSON object on stdout and exits with a code naming the *class* of outcome, so `sesh-mover push || handle_failure` works without parsing anything:
+
+| code | meaning |
+|---|---|
+| `0` | success |
+| `1` | the command did not run — a bad invocation, or an unexpected failure. Argument validation prints on stderr and leaves stdout empty; everything else still emits its JSON |
+| `2` | refusal: understood and declined, nothing was done. "Already up to date", a project not linked to the hub, an unknown `--project-id`, and `pull`'s "which thread?" listing |
+| `3` | not ready: the invocation was fine and the machine is not — an unmounted share, a synced folder mid-copy, another sesh-mover operation holding this project's lock. **This is the class worth retrying unchanged** |
+
+Two edges worth knowing. `pull` with neither `--thread` nor `--latest` answers with the list of threads and exits `2` — it pulled nothing, so a `||` branch should catch it, even though its body says `success: true`. And a zero exit is not by itself proof that work happened: a `--dry-run`, an export that hit a name collision, and a push with nothing new all exit `0` and say so in the JSON. The two internal hook endpoints (`hub hook-session-end`, `hub hook-session-start`) are outside this scheme and always exit `0`; they are invoked by Claude Code, not by you.
+
 `export`, `import`, `migrate`, `push`, and `pull` all accept `--progress`, which emits NDJSON progress events on stderr (one JSON object per line) while leaving stdout's JSON result contract unchanged — useful when driving the CLI directly rather than through the slash commands. On `push` and `pull` the `hub-push`/`hub-pull` events carry a coarse `percent` and the per-session detail comes from the export/import phases underneath them. A `pull` emits either no events at all (it was refused before it took the project lock) or an opening `percent: 0` and a closing `percent: 100` — the closing one always arrives, including when the pull is refused or fails, so `100` means "finished", not "succeeded".
 
 ### Incremental sync between two machines

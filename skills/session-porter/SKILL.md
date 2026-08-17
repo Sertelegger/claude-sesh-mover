@@ -17,6 +17,24 @@ Do not run `find` over `~/.claude*/plugins/cache` to locate the plugin; the env 
 
 All commands output structured JSON to stdout. Parse it with JSON.parse(). (The two internal hook endpoints, `hub hook-session-end` and `hub hook-session-start`, are the deliberate exception — they speak Claude Code's hook protocol and are never invoked from this skill layer. See "Hub automation" below.)
 
+## Exit Codes
+
+**Keep branching on the parsed JSON, not on the exit code** — the body is what carries `reason`, `linkCandidates`, `warnings` and everything else a command flow needs. But the codes exist and mean something specific, so know them: a non-zero exit is *never* a reason to discard the JSON, and a zero exit is not by itself proof of success (a `--dry-run`, a `collision: true` export and an `upToDate: true` push all exit 0 and all need their body read).
+
+| code | class | what it means |
+|---|---|---|
+| `0` | success | it happened |
+| `1` | the command did not run | a bad invocation, or an unexpected failure. Commander's own argument validation is here, and it prints its message on **stderr with an empty stdout** — the one case where there is no JSON to parse |
+| `2` | refusal | understood and declined; nothing was done. `unlinked`, `no-such-project`, "already up to date", and `pull`'s pick-required listing |
+| `3` | environment-not-ready | the invocation was fine and the machine is not: `hub-unreachable`, `lock-busy`, `not-yet-synced`. **The retryable class** — the same invocation is expected to work once the share is mounted, the lock is released, or the sync finishes |
+
+Two shapes worth knowing because they contradict the obvious reading:
+
+- `pull`'s **pick-required listing is `success: true` and exits 2**. Nothing was pulled; the body carries `threads` for the user to choose from. Treat it as the pick-list branch the pull command file already describes, never as a failed pull.
+- A **`success: false` result on exit 2 is often routine**, not an error to escalate — a second identical `pull` answering "already up to date" is the everyday case. Report it as the state it is.
+
+The two hook endpoints are outside all of this and always exit 0 (see "Hub automation" below).
+
 ## Do Not Probe the CLI
 
 Each command file (`commands/*.md`) lists the exact CLI invocation it should produce, with every flag spelled out. **Do not run the CLI with `--help`, with no arguments, or with `-h` to discover its surface** — the command file is the authoritative reference. If a flag you need isn't listed there, the command file is wrong; fix it rather than working around it at runtime.

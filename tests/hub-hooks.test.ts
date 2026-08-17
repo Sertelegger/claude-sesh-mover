@@ -796,6 +796,52 @@ describe("hub hook-session-end (CLI)", () => {
     expect(r.stderr).toMatch(/sesh-mover auto-push/);
   });
 
+  /**
+   * THE EXIT-CODE CONTRACT DOES NOT REACH THE HOOKS (#76).
+   *
+   * `sesh-mover` grew distinct exit codes per outcome class — `1` the command
+   * did not run, `2` refusal, `3` environment-not-ready — and the two hook
+   * endpoints are exempt from all of it: Claude Code's hook protocol requires
+   * exit 0, so a broken hub must never surface as a hook error when a session
+   * ends. Structurally that holds because neither endpoint calls `output()` or
+   * `outputError()`, the only two places a code is ever set.
+   *
+   * A guard that only ran the hook would pass on a machine where the failure
+   * never happened, so this asserts BOTH SIDES of one condition: a `hub.path`
+   * pointing at a file rather than a directory, proved to make the ordinary
+   * verbs exit 3, and then proved not to move this endpoint off 0. The stderr
+   * diagnostic is asserted for the same reason — it is what shows the endpoint
+   * really reached the failure rather than declining at the gate.
+   *
+   * See the sibling guard in the hook-session-start describe below for that
+   * endpoint's half; it needs a different fault, because this one degrades to
+   * a silent, successful no-op there rather than to a failure.
+   */
+  it("keeps SessionEnd at exit 0 on a failure the ordinary verbs exit 3 for", () => {
+    const notADir = join(tempDir, "hub-path-is-a-file");
+    writeFileSync(notADir, "this is a file, not a hub directory\n");
+    writeSeshMoverConfig(home, { path: notADir });
+    linkProject(project);
+    const env = { ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir };
+
+    // The condition is real, and non-zero where the contract applies.
+    for (const argv of [
+      ["push", "--project-path", project, "--source-config-dir", configDir],
+      ["pull", "--latest", "--project-path", project, "--source-config-dir", configDir],
+    ]) {
+      const verb = runCli(argv, { env });
+      expect(JSON.parse(verb.stdout).reason, argv[0]).toBe("hub-unreachable");
+      expect(verb.status, argv[0]).toBe(3);
+    }
+
+    // Same machine, same config, same project — and the endpoint exits 0.
+    const end = runHook(JSON.stringify({ cwd: project, session_id: sessionId, reason: "clear" }));
+    expect(end.stdout).toBe("");
+    expect(end.status).toBe(0);
+    // It did notice; it just refuses to say so through the exit code.
+    expect(end.stderr).toMatch(/sesh-mover auto-push/);
+  });
+
   it("exits 0 without waiting forever when stdin is never closed", async () => {
     // Claude Code itself always does `stdin.write(payload); stdin.end()` (both
     // its sync and its async hook paths do), so in the real integration stdin
@@ -1252,6 +1298,44 @@ describe("hub hook-session-start (CLI)", () => {
     // half-written object on stdout that Claude Code would fail to parse.
     expect(r.stdout).toBe("");
     expect(r.status).toBe(0);
+  });
+
+  /**
+   * The SessionStart half of #76's hook exemption — see the SessionEnd guard in
+   * the describe above for the rule.
+   *
+   * IT NEEDS A DIFFERENT FAULT, and that is worth knowing before editing it. An
+   * unreachable hub does not fail this endpoint at all: `hubWhereis` reports the
+   * state inside a `success: true` result (deliberately — see
+   * `HubUnreachableResult`'s "which verbs return it is a judgement per verb"),
+   * so the endpoint takes an ordinary early return and never enters its catch.
+   * Measured: mutating the catch to set a non-zero code killed no test in this
+   * file, including the two "hub directory unreadable" / "index file corrupt"
+   * cases below, which degrade the same benign way.
+   *
+   * An unsafe `projectId` in the project's own link file DOES throw, out of
+   * `assertSafeHubId` inside `hubWhereis`, before the hub is touched. So this is
+   * the endpoint's real failure path, and the stderr diagnostic is what proves
+   * the catch ran rather than an early return standing in for it.
+   */
+  it("keeps SessionStart at exit 0 on a failure the ordinary verbs exit 1 for", () => {
+    writeSeshMoverConfig(home, { path: hubDir });
+    linkProject(project, "../../etc");
+    const env = { ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir };
+
+    // The fault is real: `whereis` asks the same question and takes class 1,
+    // because the failure arrives as a throw rather than as a typed refusal.
+    const verb = runCli(["whereis", "--project-path", project, "--source-config-dir", configDir], {
+      env,
+    });
+    expect(JSON.parse(verb.stdout).error).toMatch(/unsafe projectId/);
+    expect(verb.status).toBe(1);
+
+    const r = runHook(JSON.stringify({ cwd: project, source: "startup" }));
+    expect(r.stdout).toBe("");
+    expect(r.status).toBe(0);
+    // The catch ran — this is not an early return wearing the same exit code.
+    expect(r.stderr).toMatch(/sesh-mover startup notice failed/);
   });
 
   it("prints NOTHING and exits 0 when an index file on the hub is corrupt", () => {

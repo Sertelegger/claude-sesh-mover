@@ -870,8 +870,13 @@ export interface HubUnlinkedResult {
  * Scope: the guarantee is the LIBRARY's, not just the CLI's. The gate was
  * CLI-level when it was introduced (#29), which left a consumer calling
  * `hubPush`/`hubPull` through `src/index.ts` still getting the throw from
- * `readHubProjectAsLocal`; #75 moved it inward so the two agree. The CLI keeps
- * its own exit-code convention for it — see `outputRefusal` in `src/cli.ts`.
+ * `readHubProjectAsLocal`; #75 moved it inward so the two agree.
+ *
+ * Its exit class is 2, the refusal class — see `exitCodeForResult` below. It
+ * exited 1 until #76, argued there as "a bad invocation, the same class as
+ * `--on-divergence bogus`"; the owner's mapping moved it, and the more useful
+ * line for a shell caller is that the hub was reachable, nothing was written,
+ * and the body carries a pick list to correct the flag from.
  */
 export interface HubNoSuchProjectResult {
     success: false;
@@ -1363,6 +1368,92 @@ export interface HubUnlinkResult {
     warnings: string[];
 }
 export type CliResult = ExportResult | ImportResult | DryRunResult | MigrateResult | BrowseResult | ConfigureResult | HubInitResult | HubStatusResult | HubPushResult | HubPushFailedResult | WhereisResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnreachableResult | HubUnlinkResult | HubLockBusyResult | HubPullResult | HubPullListResult | NotYetSyncedResult | HubReindexResult | HubReindexFailedResult | ErrorResult;
+/**
+ * The CLI's process exit codes: **one per CLASS of outcome**, so a shell caller
+ * can branch on `$?` without parsing the JSON body (#76).
+ *
+ * Before this existed the split was an accident of which output helper a call
+ * site happened to reach — `output()` returned and every typed refusal exited
+ * 0, `outputError()` exited 1 — so `success: false` did not imply non-zero and
+ * `sesh-mover hub pull || handle_failure` was silently a no-op for the entire
+ * refusal class. The classes below are the stated rule; `exitCodeForResult` is
+ * the single place a result is mapped onto one.
+ *
+ * The class list is finite and deliberately small. It is a CONTRACT: adding a
+ * fifth class, or moving a result between two of them, is a breaking change for
+ * anyone scripting this CLI.
+ *
+ * **The two hook endpoints (`hub hook-session-end`, `hub hook-session-start`)
+ * are outside this scheme entirely and ALWAYS exit 0**, whatever happens. That
+ * is Claude Code's hook protocol, not a style choice — see the stdout-contract
+ * comments on both endpoints in `src/cli.ts` and the guards in
+ * `tests/hub-hooks.test.ts`. Neither endpoint calls the output helpers, which is
+ * what keeps the two schemes from meeting.
+ */
+export declare const EXIT_OK = 0;
+/**
+ * The command did not run: a bad invocation, or an unexpected failure.
+ *
+ * Commander's own argument validation already exits 1, and so does every
+ * exception that reaches a command's `catch` (`outputError` in `src/cli.ts`).
+ * Retrying the same invocation unchanged is not expected to help.
+ */
+export declare const EXIT_FAILED = 1;
+/**
+ * The command was understood and declined: nothing was done, and the JSON body
+ * says why. `unlinked`, `no-such-project`, "already up to date", and the
+ * pick-required listing are this class.
+ *
+ * A refusal is not an error — the caller is meant to read the shape and decide
+ * — but it is emphatically not a success either, which is the whole reason it
+ * no longer shares an exit code with one.
+ */
+export declare const EXIT_REFUSED = 2;
+/**
+ * The invocation was fine and the machine simply is not ready: an unmounted
+ * share, a synced folder mid-copy, another sesh-mover operation holding the
+ * project lock.
+ *
+ * This is exactly the set worth RETRYING, unchanged, in a moment — which is the
+ * property that makes it worth a code of its own rather than folding it into
+ * the refusals.
+ */
+export declare const EXIT_NOT_READY = 3;
+export type ExitCode = typeof EXIT_OK | typeof EXIT_FAILED | typeof EXIT_REFUSED | typeof EXIT_NOT_READY;
+/**
+ * The single mapping from a result SHAPE to an exit code.
+ *
+ * Shape-driven on purpose (#76): the code is a property of what the command
+ * produced, not of which helper printed it, so the two cannot drift apart again.
+ *
+ * Three rules, in order:
+ *
+ * 1. `success: true` exits 0 — **except** the pick-required listing, which is
+ *    the one place a `success: true` result exits non-zero. `sesh-mover pull`
+ *    with neither `--thread` nor `--latest` pulls nothing; it answers with the
+ *    list of threads and waits to be told which. A caller that treats that as
+ *    "the pull happened" is wrong, and `|| handle` catching it is the point of
+ *    the whole change. The skill layer reads `pickRequired` from the JSON and is
+ *    unaffected.
+ * 2. A typed `reason` takes its class from `REASON_EXIT_CODE` above.
+ * 3. Anything else that is `success: false` is a REFUSAL (2).
+ *
+ * Rule 3's default is 2 rather than 1 because of what reaches it: an
+ * `ErrorResult` that a command RETURNED as a value, having got far enough to
+ * describe the outcome — "already up to date with the source machine", "no
+ * thread <id> found", the self-migration block. An exception never reaches here
+ * at all; `outputError` handles those and always exits 1. So the line is "a
+ * result the code composed" versus "a throw it did not".
+ *
+ * The imprecision that line leaves, stated rather than hidden: a few untyped
+ * `ErrorResult`s are caught exceptions converted to results (`hubInit`'s mkdir
+ * failure, `importSession`'s unreadable bundle) and are really class 1. Giving
+ * them their right code needs a `reason` discriminator on the producing module,
+ * not a smarter classifier here — matching on `error` text is forbidden
+ * (`skills/session-porter/SKILL.md`) and would be exactly the fragility this
+ * function exists to remove. They exit 2 today: non-zero, one class off.
+ */
+export declare function exitCodeForResult(result: CliResult): ExitCode;
 export interface VersionAdapter {
     fromVersion: string;
     toVersion: string;

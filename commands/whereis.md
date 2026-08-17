@@ -48,4 +48,6 @@ You are running the sesh-mover whereis command. This is a read-only view — it 
 
 6. Report any `warnings` from the result (e.g. a machine whose index file couldn't be read).
 
+**Exit codes:** keep branching on the parsed JSON, not on `$?`. `whereis` is a diagnostic, so it exits `0` even when it reports `linked: false` or a hub whose index files it could only partly read — `$?` is not a link check and not a hub-health check; `linked`, `warnings` and `unfetchableBundles` are. `1` means the command itself failed and stdout carries an `ErrorResult`. See "Exit Codes" in the skill doc for the full four-class table.
+
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocation above; do not search the plugin cache. The flag set documented in this file (`--project-path`, `--source-config-dir`) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

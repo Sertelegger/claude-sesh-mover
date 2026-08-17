@@ -16,6 +16,10 @@ import { acquireProjectLock } from "./hub/lock.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import { createArchive, extractArchive, detectArchiveFormat, isZstdAvailable, ZstdNoContentChecksumError, readManifestFromArchive, } from "./archiver.js";
 import { discoverSessionById } from "./discovery.js";
+// Value import, deliberately separate from the type-only one below: the exit-code
+// classification is runtime behavior that lives beside the result union it
+// classifies, so a new result shape and its exit class are edited in one file.
+import { EXIT_FAILED, exitCodeForResult } from "./types.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
 import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
@@ -878,7 +882,7 @@ program
         const onProgress = opts.progress
             ? (ev) => process.stderr.write(JSON.stringify(ev) + "\n")
             : undefined;
-        outputHubResult(await hubPush({
+        output(await hubPush({
             configDir, projectPath, hubPath,
             sessionIds: opts.sessionId,
             noWorkspace: opts.workspace === false || config.hub.noWorkspace,
@@ -937,7 +941,7 @@ program
         const onProgress = opts.progress
             ? (ev) => process.stderr.write(JSON.stringify(ev) + "\n")
             : undefined;
-        outputHubResult(await hubPull({
+        output(await hubPull({
             configDir, projectPath, hubPath,
             threadId: opts.thread,
             latest: !!opts.latest,
@@ -1449,50 +1453,49 @@ async function readStdin(timeoutMs = HOOK_STDIN_TIMEOUT_MS) {
         stdin.on("error", finish);
     });
 }
+// --- Output chokepoints ---
+//
+// EXACTLY TWO of them, and the difference between them is the stated rule
+// rather than an accident of which one a call site reached (#76):
+//
+//   output(result)          — the command produced a RESULT. The result's own
+//                             shape picks the exit code, via the single
+//                             `exitCodeForResult` mapping in src/types.ts.
+//   outputError(cmd, error) — the command THREW. Always class 1.
+//
+// There is no third convention and there must not be one: the defect #76 fixes
+// is precisely that `output()` returned (exit 0) while `outputError()` exited 1,
+// so `success: false` did not imply a non-zero exit and a shell caller's
+// `sesh-mover hub pull || handle_failure` was a no-op for every refusal. The
+// former `outputRefusal`/`outputHubResult` pair — which hand-picked exit 1 for
+// `no-such-project` alone — is gone into `exitCodeForResult`, where a new result
+// type cannot silently default to the wrong class.
+//
+// Both set `process.exitCode` rather than calling `process.exit()`, and that is
+// not cosmetic. `process.exit()` terminates synchronously: it can truncate a
+// large JSON body still queued on a piped stdout (a `pull` result with many
+// warnings is not small), and it skips pending `finally` blocks — the `import`
+// command's `finally` removes its archive extract dir, which a failing import
+// therefore used to leak. Setting `exitCode` lets Node flush and unwind. Every
+// call site either returns immediately or is the last statement of its `catch`,
+// so nothing can overwrite the code afterwards.
+//
+// The hook endpoints call NEITHER helper. That is what keeps their "always exit
+// 0" protocol requirement structurally out of reach of this scheme.
 function output(result) {
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    process.exitCode = exitCodeForResult(result);
 }
 /**
- * Emit a TYPED refusal and exit non-zero.
+ * Emit an `ErrorResult` for something that THREW (or for an argument the
+ * command validated itself) and take the failure code.
  *
- * Two exit conventions already live side by side here and the difference is not
- * arbitrary: `output()` exits 0 even for a `success: false` body, which is right
- * for a refusal that is an ordinary state of the workflow (`unlinked`,
- * `lock-busy`, `not-yet-synced`, "already up to date" — the caller is meant to
- * read the shape and continue), while `outputError()` exits 1 for a bad
- * invocation. A `--project-id` naming no hub project is the second kind — the
- * same class as `--on-divergence bogus`, which has always exited 1 — so this
- * keeps that exit code while upgrading the BODY from a raw error string to a
- * shape with a `reason` and a pick list.
+ * Class 1 is set here explicitly rather than derived, because the shape cannot
+ * carry the distinction: an untyped `ErrorResult` RETURNED as a value is a
+ * refusal the code got far enough to describe ("already up to date with the
+ * source machine"), while the same shape built here stands for an exception it
+ * did not. See `exitCodeForResult` for the full rule.
  */
-function outputRefusal(result) {
-    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
-    process.exit(1);
-}
-/**
- * Emit a push/pull result under the two exit conventions above.
- *
- * The gate that produces `no-such-project` moved from this file into
- * `src/hub/preflight.ts` (#75) so that a library caller of `hubPush`/`hubPull`
- * gets the same refusal. Only the SHAPE moved: it is still a bad invocation —
- * the same class as `--on-divergence bogus` — so it still exits 1, and that is
- * what this function is for. Routing everything through `output()` instead
- * would have silently changed the exit code as a side effect of a refactor.
- *
- * `hub-unreachable` deliberately goes the OTHER way, and it is the one exit
- * code this change moves (it was 1, as an untyped `ErrorResult` out of a raw
- * ENOENT). The command was fine; the environment is not ready — an unmounted
- * share, a synced folder mid-copy — which is the `unlinked` / `lock-busy` /
- * `not-yet-synced` class: read the shape, remedy it, retry the same
- * invocation. Exiting 1 for it would say the user typed something wrong.
- */
-function outputHubResult(result) {
-    if (result.success === false && "reason" in result && result.reason === "no-such-project") {
-        outputRefusal(result);
-        return;
-    }
-    output(result);
-}
 function outputError(command, error) {
     const result = {
         success: false,
@@ -1500,7 +1503,7 @@ function outputError(command, error) {
         error: error.message,
     };
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
-    process.exit(1);
+    process.exitCode = EXIT_FAILED;
 }
 program.parse();
 //# sourceMappingURL=cli.js.map

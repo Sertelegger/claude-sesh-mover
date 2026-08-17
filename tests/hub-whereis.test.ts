@@ -418,17 +418,32 @@ describe("hub whereis", () => {
     }
   });
 
-  // SECURITY (Task 6 review, binding on this task): the machineId field
-  // INSIDE a parsed index file is never validated by readMachineIndex — only
-  // ids used in ITS OWN path building (derived from the filename) are. A
-  // hostile index file can therefore declare an internal machineId that is
-  // unsafe as a path component (e.g. "../evil"). resolveThreads copies that
-  // internal field verbatim into ThreadCopy.machineId, so whereis's
-  // machineName() helper — which calls machinePath(id) to read
-  // machines/<id>.json — must be the one to contain the resulting throw
-  // (machinePath asserts and throws on unsafe ids), not let it escape and
-  // wedge the whole command.
-  it("hostile internal machineId in an index file does not throw; that copy gets machineName null", async () => {
+  // REVERSED, DELIBERATELY (#28, 2026-08-17) — this test used to assert the
+  // opposite outcome and the reversal is the point of the change.
+  //
+  // WHAT IT USED TO PIN. The machineId field INSIDE a parsed index file was
+  // never validated by readMachineIndex — only ids used in ITS OWN path
+  // building (derived from the filename) were — so a hostile index file could
+  // declare an internal machineId that is unsafe as a path component
+  // ("../evil"), resolveThreads copied it verbatim into ThreadCopy.machineId,
+  // and the assertion was that the copy SURVIVES with machineName null:
+  // whereis's machineName() helper had to contain machinePath's throw rather
+  // than let it wedge the whole command.
+  //
+  // WHAT IT PINS NOW. readMachineIndex reconciles the declared machineId
+  // against the filename it was read from and the FILENAME WINS, so the file
+  // never reaches resolveThreads at all: it is skipped, named in `warnings`,
+  // and every other machine's index still answers. That is strictly stronger
+  // containment than "the copy survives but cannot be named", and it is why the
+  // "../evil" copy is now asserted ABSENT rather than present-and-nameless.
+  //
+  // THE SURVIVING HALF IS KEPT AND STILL ASSERTED BELOW. createMachineNameLookup's
+  // try/catch is NOT dead: machines/<id>.json is routinely absent (a machine
+  // that pushed before it wrote its record, a pruned hub), and a nameless copy
+  // must still come back as machineName null rather than throwing. The second
+  // index file here is that case — safe filename, agreeing content, no machine
+  // record — so the helper's live reason keeps its coverage.
+  it("an index declaring a machineId its filename disagrees with is skipped and named; a machine with no record is still machineName null", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-whereis-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-whereis-hub-"));
     const projectDir = mkdtempSync(join(tmpdir(), "sesh-whereis-proj-"));
@@ -441,6 +456,10 @@ describe("hub whereis", () => {
       makeHub(hub);
       const backend = createFsBackend(hub);
       await writeMachineFile(backend, me.id, "my-laptop");
+      await writeMachineIndex(backend, {
+        ...idx(me.id, { t1: entry({ localSessionId: "sLocal", lastActiveAt: "2026-07-22T00:00:00Z" }) }),
+        projectId: PROJECT_ID,
+      });
 
       // Safe filename ("hostile.json" -> derived id "hostile" passes
       // readAllIndexes's filename check) but the JSON content's own
@@ -451,12 +470,25 @@ describe("hub whereis", () => {
       };
       await backend.writeAtomic(indexPath(PROJECT_ID, "hostile"), JSON.stringify(hostileIndex, null, 2) + "\n");
 
+      // Agreeing identity, no machines/<id>.json — the case the name lookup's
+      // try/catch actually contains, now that a disagreeing one never arrives.
+      await writeMachineIndex(backend, {
+        ...idx("nameless-peer", { t1: entry({ localSessionId: "sPeer", lastActiveAt: "2026-07-21T00:00:00Z" }) }),
+        projectId: PROJECT_ID,
+      });
+
       const result = await hubWhereis({ configDir: home, projectPath: projectDir, hubPath: hub });
       expect(result.threads).toHaveLength(1);
       const t = result.threads[0];
-      expect(t.latest.machineId).toBe("../evil");
-      expect(t.latest.machineName).toBeNull();
-      expect(t.copies.find((c) => c.machineId === "../evil")!.machineName).toBeNull();
+      // Skipped: the hostile file contributed no copy under either id.
+      expect(t.copies.map((c) => c.machineId).sort()).toEqual([me.id, "nameless-peer"].sort());
+      // ...and it was reported rather than dropped silently, naming both the
+      // file it came from and the id it tried to claim.
+      expect(result.warnings.join(" ")).toContain("hostile");
+      expect(result.warnings.join(" ")).toContain("../evil");
+      // The surviving half.
+      expect(t.copies.find((c) => c.machineId === "nameless-peer")!.machineName).toBeNull();
+      expect(t.latest.machineName).toBe("my-laptop");
     } finally {
       restore.restore();
       for (const d of [home, hub, projectDir]) rmSync(d, { recursive: true, force: true });

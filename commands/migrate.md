@@ -85,4 +85,6 @@ You are running the sesh-mover migrate command. This is a same-machine operation
 - `--force` — overrides the self-migration block only. See step 10; never pass it on your own initiative.
 - `--progress` — emits NDJSON progress events on stderr. It is oriented at humans running the CLI directly; don't pass it from this command flow.
 
+**Exit codes:** keep branching on the parsed JSON, not on `$?`. `migrate` exits `0` for a completed migration **and for a `--dry-run`**, which moved nothing. `1` is a bad invocation or an unexpected failure. `2` is a refusal — **the self-migration block in step 10 is this class**, so a `2` there means nothing was moved and the exit-and-re-run recovery flow above is what to offer, not a retry. See "Exit Codes" in the skill doc for the full four-class table.
+
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is in the bash invocations above; do not search the plugin cache. The flag set documented in this file (in both the main invocations, the "Other flags" section, and any conditional/retry branches, e.g. `--force` for the self-migration override path described in step 10) is authoritative — do not run the CLI with `--help` or with no arguments to discover its surface.

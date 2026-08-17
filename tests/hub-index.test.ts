@@ -347,10 +347,110 @@ describe("readMachineIndex degrades on a poisoned bundle record", () => {
       expect(await readMachineIndex(backend, "p", "absent")).toBeNull();
       await backend.writeAtomic(indexPath("p", "torn"), "{not json");
       expect(await readMachineIndex(backend, "p", "torn")).toBeNull();
-      await backend.writeAtomic(indexPath("p", "v9"), JSON.stringify({ ...indexWith([]), schemaVersion: 9 }));
+      // Each of these carries the machineId its FILENAME implies, so the only
+      // thing wrong with it is the thing it is named for. Without that, #28's
+      // identity check (which runs before both) would answer for them and each
+      // case would stop proving the guard it exists for — a null for the wrong
+      // reason is still a green test.
+      await backend.writeAtomic(indexPath("p", "v9"), JSON.stringify({ ...indexWith([]), machineId: "v9", schemaVersion: 9 }));
       expect(await readMachineIndex(backend, "p", "v9")).toBeNull();
-      await backend.writeAtomic(indexPath("p", "nothreads"), JSON.stringify({ schemaVersion: 1 }));
+      await backend.writeAtomic(indexPath("p", "nothreads"), JSON.stringify({ schemaVersion: 1, machineId: "nothreads" }));
       expect(await readMachineIndex(backend, "p", "nothreads")).toBeNull();
+    } finally { rmSync(hub, { recursive: true, force: true }); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// IDENTITY: the FILENAME wins, and a disagreeing content field is a warning
+// (#28).
+//
+// Two things say which machine wrote an index — the path `index/<machineId>.json`
+// and the `machineId` inside it — and they could disagree. The filename is the
+// authoritative one: it is what `indexPath` builds, what `readAllIndexes`
+// dedupes on, and the only one of the two that has passed `assertSafeHubId` by
+// the time the file is read. Per-machine ownership is what makes that a rule
+// rather than a preference, so a disagreement is damage — a hand edit, a
+// truncated write, a sync client's conflict copy — never a legitimate state.
+//
+// SKIP-AND-WARN rather than fatal, and rather than repaired in memory: a
+// conflict copy must not turn a pull into a failure, and this machine does not
+// own that file, so rewriting its declared id would publish an id no writer
+// stands behind. (Fatal is the right answer once a second PERSON's machine can
+// write to a hub. Dropping the redundant field is the clean end state and is an
+// index schema change.)
+// ---------------------------------------------------------------------------
+describe("readMachineIndex reconciles the declared machineId against the filename", () => {
+  it("skips the whole file, and names both the file's id and the one it declared", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-hub-idx-"));
+    try {
+      const backend = createFsBackend(hub);
+      // Byte-identical to m1's own index, one filename over — what a sync
+      // client's conflict copy or a hand-copied hub directory produces.
+      await backend.writeAtomic(
+        indexPath("p", "m1-conflicted-copy"),
+        JSON.stringify(indexWith([OK_A]), null, 2) + "\n"
+      );
+
+      const warnings: string[] = [];
+      expect(await readMachineIndex(backend, "p", "m1-conflicted-copy", warnings)).toBeNull();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("m1-conflicted-copy");
+      expect(warnings[0]).toContain('"m1"');
+    } finally { rmSync(hub, { recursive: true, force: true }); }
+  });
+
+  it("skips a declared id that is path-unsafe, so it never reaches a consumer", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-hub-idx-"));
+    try {
+      const backend = createFsBackend(hub);
+      // The filename is safe ("hostile"), the declared id is not. This is the
+      // value `resolveThreads` used to copy verbatim into `ThreadCopy.machineId`
+      // — path-unsafe, and validated by nothing on the way.
+      await backend.writeAtomic(
+        indexPath("p", "hostile"),
+        JSON.stringify({ ...indexWith([OK_A]), machineId: "../evil" }, null, 2) + "\n"
+      );
+
+      const warnings: string[] = [];
+      expect(await readMachineIndex(backend, "p", "hostile", warnings)).toBeNull();
+      expect(warnings.join(" ")).toContain('"../evil"');
+    } finally { rmSync(hub, { recursive: true, force: true }); }
+  });
+
+  it("skips a file that declares no machineId at all", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-hub-idx-"));
+    try {
+      const backend = createFsBackend(hub);
+      const { machineId: _dropped, ...noId } = indexWith([OK_A]);
+      await backend.writeAtomic(indexPath("p", "m1"), JSON.stringify(noId, null, 2) + "\n");
+
+      const warnings: string[] = [];
+      expect(await readMachineIndex(backend, "p", "m1", warnings)).toBeNull();
+      expect(warnings).toHaveLength(1);
+    } finally { rmSync(hub, { recursive: true, force: true }); }
+  });
+
+  it("readAllIndexes drops only that file, keeps every other machine, and reports it exactly once", async () => {
+    const hub = mkdtempSync(join(tmpdir(), "sesh-hub-idx-"));
+    try {
+      const backend = createFsBackend(hub);
+      await writeMachineIndex(backend, indexWith([OK_A]));                    // m1, agreeing
+      await writeMachineIndex(backend, { ...indexWith([OK_B]), machineId: "m2" }); // m2, agreeing
+      await backend.writeAtomic(
+        indexPath("p", "m1-conflicted-copy"),
+        JSON.stringify(indexWith([OK_A]), null, 2) + "\n"
+      );
+
+      const all = await readAllIndexes(backend, "p");
+      // The blast radius is the file: m1 and m2 both still answer.
+      expect(all.indexes.map((i) => i.machineId).sort()).toEqual(["m1", "m2"]);
+      // EXACTLY ONE message for it. readMachineIndex explains this null itself,
+      // so readAllIndexes must not also append its generic "unreadable" line —
+      // one damaged file reported twice, the second time as something it is not
+      // (the file parses perfectly).
+      expect(all.warnings).toHaveLength(1);
+      expect(all.warnings[0]).toContain("m1-conflicted-copy");
+      expect(all.warnings[0]).not.toContain("unreadable");
     } finally { rmSync(hub, { recursive: true, force: true }); }
   });
 });

@@ -17,6 +17,7 @@ import { tmpdir, platform } from "node:os";
 import * as tar from "tar";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
 import { encodeProjectPath } from "../src/platform.js";
+import { exitCodeForResult, type CliResult } from "../src/types.js";
 import { overrideHome, homeEnv, prependPath, tmpEnv } from "./helpers/env.js";
 import { readTextLf } from "./helpers/eol.js";
 import { runCli as sharedRunCli, type RunCliResult } from "./helpers/run-cli.js";
@@ -139,7 +140,9 @@ describe("cli", () => {
         };
       }
       expect(caught).not.toBeNull();
-      expect(caught!.status).not.toBe(0);
+      // Class 1, bad invocation (#76). Was `not.toBe(0)`; tightened because the
+      // exit code is now a stated contract rather than a side effect.
+      expect(caught!.status).toBe(1);
       const result = JSON.parse(caught!.stdout);
       expect(result.success).toBe(false);
       expect(result.command).toBe("export");
@@ -162,7 +165,7 @@ describe("cli", () => {
         };
       }
       expect(caught).not.toBeNull();
-      expect(caught!.status).not.toBe(0);
+      expect(caught!.status).toBe(1); // bad invocation (#76)
       const result = JSON.parse(caught!.stdout);
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/scope/i);
@@ -299,7 +302,8 @@ describe("cli", () => {
         caught = { stdout: err.stdout ? err.stdout.toString() : "", status: err.status ?? 0 };
       }
       expect(caught).not.toBeNull();
-      expect(caught!.status).not.toBe(0);
+      // The reference case for class 1 in #76's decision: argument validation.
+      expect(caught!.status).toBe(1);
       const result = JSON.parse(caught!.stdout);
       expect(result.success).toBe(false);
       expect(result.command).toBe("pull");
@@ -378,7 +382,7 @@ describe("cli", () => {
     });
 
     /**
-     * "Already up to date" AT CLI LEVEL (#29).
+     * "Already up to date" AT CLI LEVEL (#29, exit code revised by #76).
      *
      * Module-level coverage of this refusal is good, but no in-process
      * `hubPull` test can observe what `commands/pull.md` actually tells the
@@ -388,13 +392,18 @@ describe("cli", () => {
      * Two things worth knowing before changing this test. First, the refusal is
      * `success: false`, NOT a `success: true` no-op — so a caller that branches
      * on `success` alone reports a routine second pull as a failure unless it
-     * reads `error`. Second, it exits **0**: `output()` writes the body and
-     * returns, and only `outputError()` exits 1. That split is real and this
-     * test pins it — every typed hub refusal (`unlinked`, `lock-busy`,
-     * `not-yet-synced`, this one) exits 0 while a bad invocation exits 1 — but
-     * it means an exit code cannot be used to detect a failed pull.
+     * reads `error`. Second, it exits **2**, the refusal class.
+     *
+     * THAT SECOND ASSERTION WAS `0` UNTIL #76, and the change is deliberate
+     * rather than a test bent to fit new behavior. It pinned the old accident:
+     * `output()` wrote the body and returned, `outputError()` exited 1, so which
+     * exit a result took was decided by which helper its call site happened to
+     * reach — and `success: false` therefore did not imply a non-zero exit. The
+     * comment here used to spell that out and end "an exit code cannot be used
+     * to detect a failed pull", which is exactly the property #76 removes.
+     * Everything else this test proved is unchanged and still asserted below.
      */
-    it("a second identical pull is a success:false 'already up to date' refusal on a zero exit", async () => {
+    it("a second identical pull is a success:false 'already up to date' refusal that exits 2", async () => {
       const homeA = mkdtempSync(join(tmpdir(), "sesh-cli-up-homeA-"));
       const homeB = mkdtempSync(join(tmpdir(), "sesh-cli-up-homeB-"));
       const hubDir = mkdtempSync(join(tmpdir(), "sesh-cli-up-hub-"));
@@ -445,7 +454,8 @@ describe("cli", () => {
         expect(secondResult.success).toBe(false);
         expect(secondResult.command).toBe("pull");
         expect(secondResult.suggestion).toBeTruthy();
-        expect(second.status).toBe(0);
+        // The refusal class (#76). `|| handle_failure` in a shell now sees it.
+        expect(second.status).toBe(2);
         // `--latest` selects across threads, so it stops at the PLURAL exit —
         // receipt-shaped, deliberately not a claim about heads.
         //
@@ -517,10 +527,18 @@ describe("cli", () => {
         expect(result.linkCandidates).toHaveLength(1);
         expect(result.linkCandidates[0].projectId).toBe(realId);
         expect(result.linkCandidates[0].name).toBe("a-real-project");
-        // A bad invocation, so it still exits non-zero — but the BODY is now a
-        // shape rather than an error string, and nothing echoes the hub's
-        // absolute path back out (the old ENOENT message did).
-        expect(missing.status).not.toBe(0);
+        // Non-zero, and the BODY is a shape rather than an error string, with
+        // nothing echoing the hub's absolute path back out (the old ENOENT
+        // message did).
+        //
+        // The CODE changed from 1 to 2 in #76 and the argument moved with it.
+        // This comment said "a bad invocation, so it still exits non-zero",
+        // which is one defensible reading of `--project-id <nonexistent>` — but
+        // the owner's mapping puts `no-such-project` in the refusal class, and
+        // that is the more useful line for a shell caller: nothing happened, the
+        // hub was reachable, and the body carries a pick list to choose from.
+        // Class 1 is reserved for what did not get that far.
+        expect(missing.status).toBe(2);
         expect(missing.stdout).not.toContain(hubDir);
         expect(result.error).toBeUndefined();
 
@@ -534,7 +552,7 @@ describe("cli", () => {
         const unsafeResult = JSON.parse(unsafe.stdout);
         expect(unsafeResult.reason).toBe("no-such-project");
         expect(unsafeResult.requestedProjectId).toBe("../../etc");
-        expect(unsafe.status).not.toBe(0);
+        expect(unsafe.status).toBe(2);
 
         // ...and nothing was linked by either attempt.
         expect(existsSync(join(project, ".sesh-mover-project.json"))).toBe(false);
@@ -598,12 +616,15 @@ describe("cli", () => {
           // Throws if stdout is not exactly one JSON document.
           const result = JSON.parse(stdout);
           expect(result.success).toBe(false);
-          // Exit 0, deliberately, and this is the one exit code #75 moves (it
-          // was 1, as an untyped ErrorResult). The invocation was fine; the
-          // environment is not ready — the `unlinked` / `lock-busy` /
-          // `not-yet-synced` class, all of which exit 0 so the caller reads the
-          // shape and retries. See outputRefusal's doc in src/cli.ts.
-          expect(status).toBe(0);
+          // Exit 3 — environment-not-ready. WAS `0` UNTIL #76, and the earlier
+          // comment here argued the right thing from the wrong premise: it
+          // reasoned that the invocation was fine and the machine simply is not
+          // ready ("the `unlinked` / `lock-busy` / `not-yet-synced` class"),
+          // then concluded that class exits 0, which is what made the whole
+          // refusal set invisible to `$?`. #76 keeps the reasoning and gives
+          // that class its own code. `hub-unreachable` / `lock-busy` /
+          // `not-yet-synced` are the retryable set, and 3 is what says so.
+          expect(status).toBe(3);
           expect(result.command).toBe(argv[0]);
           expect(result.reason).toBe("hub-unreachable");
           expect(result.hubState).toBe("no-directory");
@@ -1467,7 +1488,7 @@ describe("cli", () => {
         homeOverride.restore();
       }
       expect(caught).not.toBeNull();
-      expect(caught!.status).not.toBe(0);
+      expect(caught!.status).toBe(1); // bad invocation (#76)
       const result = JSON.parse(caught!.stdout);
       expect(result.success).toBe(false);
       expect(result.error).toContain("hub.carryMaxMb");
@@ -1482,7 +1503,7 @@ describe("cli", () => {
         caught = { stdout: err.stdout ? err.stdout.toString() : "", status: err.status ?? 0 };
       }
       expect(caught).not.toBeNull();
-      expect(caught!.status).not.toBe(0);
+      expect(caught!.status).toBe(1); // bad invocation (#76)
       const result = JSON.parse(caught!.stdout);
       expect(result.success).toBe(false);
       expect(result.command).toBe("configure");
@@ -1587,7 +1608,8 @@ describe("cli", () => {
         }
 
         expect(caught).not.toBeNull();
-        expect(caught!.status).not.toBe(0);
+        // Class 1: `createArchive` THREW and the command's catch reported it.
+        expect(caught!.status).toBe(1);
         const result = JSON.parse(caught!.stdout);
         expect(result.success).toBe(false);
 
@@ -1618,7 +1640,7 @@ describe("cli", () => {
         };
       }
       expect(caught).not.toBeNull();
-      expect(caught!.status).not.toBe(0);
+      expect(caught!.status).toBe(1); // bad invocation (#76)
       const result = JSON.parse(caught!.stdout);
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/--to|--since/);
@@ -2203,6 +2225,168 @@ describe("cli", () => {
       } finally {
         rmSync(home, { recursive: true, force: true });
         rmSync(hubDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  /**
+   * THE EXIT-CODE CONTRACT (#76).
+   *
+   * `0` success · `1` the command did not run (bad invocation, or a throw) ·
+   * `2` refusal · `3` environment-not-ready. Stated in CLAUDE.md, in every
+   * command doc that can produce a non-zero code, and in SKILL.md.
+   *
+   * What this replaced was not a different rule but the ABSENCE of one: the
+   * code a result took was decided by which output helper its call site
+   * happened to reach, so every typed refusal exited 0 alongside every success
+   * and `sesh-mover hub pull || handle_failure` was silently a no-op for the
+   * whole refusal class. The class assignments below are the contract; several
+   * assertions elsewhere in this file changed from `0`/`not.toBe(0)` to a
+   * specific code as part of the same decision, each annotated at its site.
+   */
+  describe("exit codes", () => {
+    /**
+     * The classifier itself, exhaustively — one case per class, including the
+     * two that no CLI-level test in this file reaches (`lock-busy` needs a
+     * concurrent holder, `failed-after-link` needs a push to break mid-flight).
+     *
+     * `exitCodeForResult` reads exactly `success`, `pickRequired` and `reason`,
+     * so the partial objects below are the whole input it sees; the cast is to
+     * avoid restating fifteen irrelevant fields per case.
+     */
+    it("classifies each result shape into its documented class", () => {
+      const cases: Array<[string, Record<string, unknown>, number]> = [
+        ["a plain success", { success: true, command: "push" }, 0],
+        // The one `success: true` shape that exits non-zero. `sesh-mover pull`
+        // with neither --thread nor --latest pulls nothing — it answers with
+        // the thread list and waits to be told which.
+        [
+          "the pick-required listing",
+          { success: true, command: "pull", pickRequired: true, threads: [] },
+          2,
+        ],
+        ["unlinked", { success: false, command: "push", reason: "unlinked" }, 2],
+        ["no-such-project", { success: false, command: "pull", reason: "no-such-project" }, 2],
+        ["hub-unreachable", { success: false, command: "pull", reason: "hub-unreachable" }, 3],
+        ["lock-busy", { success: false, command: "push", reason: "lock-busy" }, 3],
+        ["not-yet-synced", { success: false, command: "pull", reason: "not-yet-synced" }, 3],
+        // A push that THREW past the identity decision: it may have left a
+        // link, an orphan hub project or an unreferenced bundle behind. Not a
+        // refusal ("nothing happened") and not retryable the way class 3 is.
+        [
+          "a push that failed after linking",
+          { success: false, command: "push", reason: "failed-after-link" },
+          1,
+        ],
+        // The untyped bucket: an ErrorResult a command RETURNED as a value,
+        // having got far enough to describe the outcome. Class 2 by default —
+        // an exception never reaches this function, `outputError` handles those.
+        [
+          "an untyped refusal returned as a value",
+          {
+            success: false,
+            command: "pull",
+            error: "Already up to date with the source machine.",
+          },
+          2,
+        ],
+      ];
+      for (const [label, result, code] of cases) {
+        expect(exitCodeForResult(result as unknown as CliResult), label).toBe(code);
+      }
+    });
+
+    it("exits 1 for Commander's own argument validation, with nothing on stdout", () => {
+      // `--from` is a requiredOption, so Commander refuses before any action
+      // runs. The owner's mapping keeps this at 1 (it already was), and this
+      // pins that the new scheme did not disturb it — nor teach Commander to
+      // print a JSON body it has never printed.
+      const r = runCli(["import"]);
+      expect(r.status).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toMatch(/--from/);
+    });
+
+    it("exits 0 for an ordinary success", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-exit-ok-home-"));
+      try {
+        const r = runCli(["browse", "--storage", "user", "--json"], homeEnv(home));
+        expect(r.status).toBe(0);
+        expect(JSON.parse(r.stdout).success).toBe(true);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it("exits 2 for an unlinked project's push, alongside the pick list", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-exit-unlinked-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-exit-unlinked-hub-"));
+      const project = mkdtempSync(join(tmpdir(), "sesh-exit-unlinked-proj-"));
+      try {
+        expect(runCli(["hub", "init", "--path", hubDir], homeEnv(home)).status).toBe(0);
+        const r = runCli(
+          ["push", "--project-path", project, "--source-config-dir", configDir],
+          homeEnv(home)
+        );
+        const result = JSON.parse(r.stdout);
+        expect(result.success).toBe(false);
+        expect(result.reason).toBe("unlinked");
+        expect(result.suggestion).toBeTruthy();
+        // The refusal class. Nothing was pushed and nothing was linked, which
+        // is the state a shell caller's `|| handle` now actually observes.
+        expect(r.status).toBe(2);
+        expect(existsSync(join(project, ".sesh-mover-project.json"))).toBe(false);
+      } finally {
+        for (const d of [home, hubDir, project]) rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * `pick-required` is the one place a `success: true` body carries a
+     * non-zero exit, and it is the assignment most worth pinning: it is
+     * deliberate (the owner's mapping puts it in the refusal class) and it is
+     * exactly the shape a future "success means 0" simplification would undo.
+     *
+     * The pull really did nothing — that is what makes 2 right — so this
+     * asserts the no-op as well as the code.
+     */
+    it("exits 2 for a pull that requires a thread to be picked", () => {
+      const home = mkdtempSync(join(tmpdir(), "sesh-exit-pick-home-"));
+      const hubDir = mkdtempSync(join(tmpdir(), "sesh-exit-pick-hub-"));
+      const projectPath = join(tempDir, "pickproj");
+      mkdirSync(projectPath, { recursive: true });
+      writeFileSync(join(projectPath, "README.md"), "hello\n");
+      try {
+        cpSync(
+          join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+          join(configDir, "projects", encodeProjectPath(projectPath)),
+          { recursive: true }
+        );
+        expect(runCli(["hub", "init", "--path", hubDir], homeEnv(home)).status).toBe(0);
+        const push = JSON.parse(
+          runCli(
+            ["push", "--project-path", projectPath, "--create-project",
+              "--source-config-dir", configDir],
+            homeEnv(home)
+          ).stdout
+        );
+        expect(push.success).toBe(true);
+
+        // Neither --thread nor --latest: the pick list.
+        const r = runCli(
+          ["pull", "--project-path", projectPath, "--source-config-dir", configDir],
+          homeEnv(home)
+        );
+        const result = JSON.parse(r.stdout);
+        expect(result.success).toBe(true);
+        expect(result.pickRequired).toBe(true);
+        expect(result.threads.length).toBeGreaterThan(0);
+        expect(r.status).toBe(2);
+        // Nothing was applied: no session was imported into this machine's
+        // config dir beyond the one the push read.
+        expect(result.importedSessions).toBeUndefined();
+      } finally {
+        for (const d of [home, hubDir]) rmSync(d, { recursive: true, force: true });
       }
     });
   });
