@@ -327,6 +327,18 @@ const REGISTRY: FlagUse[] = [
   },
   {
     file: "src/hub/preflight.ts",
+    match: "so checking hub.path will not help",
+    klass: "descriptive",
+    why: "The THIRD arm of the same refusal (#71's `unresponsive`), and the only one that names hub.path in order to tell the user NOT to touch it: the mount is hung, so the path is almost certainly right and editing it is the wrong move. That makes it descriptive in the strongest sense the class has — the key is named as a thing explicitly ruled out as the remedy, not offered as one. Nothing is foreclosed either: the probe writes nothing, and the refusal happens before every hub write, so a retry once the mount is back runs from the top.",
+  },
+  {
+    file: "src/hub/io-timeout.ts",
+    match: "looks like a mount that has stopped responding",
+    klass: "descriptive",
+    why: "HubIoTimeoutError's own message, which reaches a user only on the paths that do NOT convert it into the typed `hub-unreachable` refusal — a mid-pull timeout, `hub init` on a hung share, reindex/status/whereis. Same judgement as preflight.ts's arms: hub.path is the SUBJECT of the sentence (this is what your configured hub is doing), not advice to change it. It also deliberately carries no path of its own, for the reason #75 stripped the ENOENT's: this string can land in an untyped ErrorResult, and the hub's absolute path is not something to volunteer there.",
+  },
+  {
+    file: "src/hub/preflight.ts",
     match: "otherwise hub.path is set to a directory that is not a sesh-mover hub",
     klass: "descriptive",
     why: "The other arm of the same refusal, and the same judgement: the key is named as the state that explains the outcome. Deliberately not phrased as 'point hub.path at ...' — that would make it advice and put it back in front of the foreclosure question.",
@@ -689,6 +701,12 @@ const SURFACES: Record<string, string[]> = {
   "src/migrator.ts": ["migrate"],
   "src/hub/carry.ts": ["push", "pull"],
   "src/hub/init.ts": ["init"],
+  // The widest surface in the map, and it is not hedging: `HubIoTimeoutError`
+  // is thrown from inside `HubBackend`, which every hub verb constructs, and
+  // only push converts it to a typed refusal. Everywhere else it escapes as the
+  // message of an ErrorResult. `unlink` is absent because it builds no backend
+  // at all — the disarm path must not depend on the thing being disarmed.
+  "src/hub/io-timeout.ts": ["push", "pull", "init", "reindex", "status", "whereis"],
   "src/hub/merge.ts": ["pull"],
   "src/hub/pull-apply-carry.ts": ["pull"],
   "src/hub/pull-apply-sessions.ts": ["pull"],

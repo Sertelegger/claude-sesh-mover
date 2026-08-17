@@ -1,7 +1,8 @@
-import { mkdirSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
+import { withHubIoTimeout } from "./io-timeout.js";
 import { HUB_JSON, machinePath, type HubJson, type HubMachineJson } from "./layout.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { detectPlatform } from "../platform.js";
@@ -35,7 +36,14 @@ export async function hubInit(opts: {
 }): Promise<HubInitResult | ErrorResult> {
   const hubPath = resolve(opts.hubPath);
   try {
-    mkdirSync(hubPath, { recursive: true });
+    // The ONE hub syscall in this codebase that does not go through
+    // `HubBackend` — it has to, because it is what creates the directory the
+    // backend is then pointed at. It gets the same bound for the same reason
+    // (#71): on a hung mount a synchronous `mkdirSync` here blocked forever
+    // before any backend existed to be non-blocking, which would have left a
+    // hole in the fix exactly where `hub init` is most likely to be run (a
+    // share the user is still setting up).
+    await withHubIoTimeout("mkdir", () => mkdir(hubPath, { recursive: true }));
   } catch (e) {
     return {
       success: false,

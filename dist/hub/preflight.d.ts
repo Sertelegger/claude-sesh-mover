@@ -60,11 +60,15 @@ export type HubReachability = {
 /**
  * Can this machine see a sesh-mover hub at the configured path at all?
  *
- * Two failing states, and they are told apart because their remedies differ: the
- * directory is not there (`no-directory` — an unmounted share, a synced folder
- * that has not appeared here, a path that was never right) versus the directory
+ * Three failing states, and they are told apart because their remedies differ:
+ * the directory is not there (`no-directory` — an unmounted share, a synced
+ * folder that has not appeared here, a path that was never right); the directory
  * is there but carries no usable `hub.json` (`not-a-hub` — a first sync still in
- * flight, or a path naming some other directory entirely).
+ * flight, or a path naming some other directory entirely); or a call against it
+ * did not come back at all (`unresponsive` — #71, a hard mount whose server is
+ * gone, a dead FUSE daemon). The third is not a shade of the other two: the path
+ * is right and the share IS mounted, so both of their remedies are wrong, and it
+ * is the only one that costs `HUB_IO_TIMEOUT_MS` of wall clock to reach.
  *
  * `hub.json` is validated only as far as the verbs actually use it: it must
  * parse and carry a non-empty `hubId`, which is the id push and pull key their
@@ -81,7 +85,11 @@ export type HubReachability = {
  * `hub status` had its own rule — `hub.json` merely EXISTS — and so called a
  * `hub.json` with no `hubId` reachable while push refused it as `not-a-hub`.
  *
- * Writes nothing, and both calls are bounded: one `statSync`, one small read.
+ * Writes nothing, and both calls are bounded in BOTH senses: one `stat` and one
+ * small read, each of them under `withHubIoTimeout` so that "bounded" means a
+ * wall-clock bound and not merely a small number of syscalls. Before #71 it was
+ * only the latter — `statSync` plus a `readFileSync` backend — which is exactly
+ * how a push came to sit inside its own project lock forever.
  */
 export declare function probeHubReachable(hubPath: string, backend: HubBackend): Promise<HubReachability>;
 /**

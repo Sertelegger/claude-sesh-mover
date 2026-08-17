@@ -45,6 +45,30 @@ function lockPath(projectPath: string): string {
 // Locks older than LOCK_STALE_MS are stolen — a crashed/killed process
 // (SIGKILL, power loss) never runs its release(), so without a steal path a
 // dead holder would wedge the project's hub operations forever.
+//
+// RESIDUAL, LEFT OPEN DELIBERATELY (#71): the steal decision is `ageMs >
+// LOCK_STALE_MS` AND NOTHING ELSE. The record's `pid` is read a few lines
+// below, but only to decorate `LockBusyError` — nothing consults it, or any
+// other liveness signal, before the `rmSync`. So a lock is still taken from a
+// holder that is demonstrably alive and still working.
+//
+// #71 removed that mechanism's TRIGGER, not the mechanism. The trigger was a
+// hub read that blocked in the kernel forever (`hub/backend.ts` was
+// `readFileSync`), which parked a push inside its own critical section for as
+// long as the mount stayed dead; every staleness window produced another
+// stolen-from, still-running push, and they wrote this machine's own hub index
+// concurrently once the share came back. The backend is now bounded
+// (`hub/io-timeout.ts`), so a push can no longer sit in the lock indefinitely
+// through THAT route.
+//
+// What remains is any push that legitimately outruns the window: a large bundle
+// crossing a slow-but-working share, which is deliberately not bounded because
+// bounding throughput would fail exactly the shares this plugin exists to
+// support. Such a push is still stolen from, still never told, and still runs
+// on concurrently with the thief — the per-machine-ownership invariant's only
+// same-machine enforcement, gone, with no bound on the overlap. Fixing it needs
+// a liveness check the steal actually consults (and a decision about what to do
+// with a live holder), which is its own change; it is not fixed here.
 export function acquireProjectLock(projectPath: string): LockHandle {
   const p = lockPath(projectPath);
   mkdirSync(join(userSeshMoverDir(), "locks"), { recursive: true });

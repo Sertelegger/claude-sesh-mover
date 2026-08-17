@@ -31,6 +31,7 @@ import {
   writeSyncState,
 } from "./sync-state.js";
 import { acquireProjectLock } from "./hub/lock.js";
+import { hubIoAbandoned } from "./hub/io-timeout.js";
 import { readLastEntryUuid } from "./jsonl.js";
 import {
   createArchive,
@@ -909,6 +910,13 @@ hub
       }
     } catch (e) {
       writeHookDiagnostic(`sesh-mover auto-push failed: ${(e as Error).message}\n`);
+    } finally {
+      // THE endpoint #71 is about. It is spawned detached with `async: true`
+      // and no `timeout`, so Claude Code cannot bound it and nothing else will
+      // ever end it; if a hub syscall was abandoned, this is the last chance
+      // the process gets to stop existing. Nothing is written to stdout here
+      // (the contract above), so there is nothing to flush first.
+      leaveEvenIfHubIoWedged();
     }
   });
 
@@ -985,6 +993,16 @@ hub
       );
     } catch (e) {
       writeHookDiagnostic(`sesh-mover startup notice failed: ${(e as Error).message}\n`);
+    } finally {
+      // Safe after the write above rather than in place of it:
+      // `leaveEvenIfHubIoWedged` orders its signal behind a flush barrier, so
+      // the hook JSON still reaches Claude Code whole.
+      //
+      // In practice this endpoint is bounded by Claude Code (`timeout: 10`)
+      // well before HUB_IO_TIMEOUT_MS could fire, so the escalation is a
+      // backstop here rather than the main event — but the endpoint must not be
+      // the one place a wedged process can still survive.
+      leaveEvenIfHubIoWedged();
     }
   });
 
@@ -1698,9 +1716,98 @@ async function readStdin(timeoutMs = HOOK_STDIN_TIMEOUT_MS): Promise<string> {
 // The hook endpoints call NEITHER helper. That is what keeps their "always exit
 // 0" protocol requirement structurally out of reach of this scheme.
 
+// The two are ordered, and the order is the contract: set the code first, then
+// escalate. On every ordinary run the escalation is a no-op and the code is what
+// the caller reads. On the wedged path the code becomes unreadable — a signal
+// death has none — which is not a regression, because the alternative there is a
+// process that never exits and therefore never has a code to read at all.
+
+/**
+ * LEAVE, FOR REAL — the other half of the #71 fix, and the one that decides
+ * whether it stops the orphan accrual or merely renames it.
+ *
+ * Making the hub backend non-blocking is what lets a wedged push release its
+ * project lock, clean up its staging directory and emit a typed refusal. It
+ * does NOT let the process exit. The abandoned syscall is still running on a
+ * libuv threadpool thread, that outstanding request keeps the loop ref'd, and
+ * the exit path itself then blocks. Measured on Linux / Node 22.23.1, 3/3 runs
+ * each, identical for the callback API (so it is the libuv request, not a
+ * pending JS promise):
+ *
+ *   - letting the script end naturally  -> hangs until the filesystem answers
+ *   - `process.exit(0)`                 -> hangs (the 'exit' event fires first)
+ *   - `process.reallyExit(0)`           -> hangs
+ *   - `process.kill(pid, SIGTERM/KILL)` -> exits immediately
+ *
+ * A signal is therefore the ONLY thing that ends such a process, and without
+ * this the fix would trade "one lock-holding orphan per 10-minute staleness
+ * window" for "one inert 50 MB orphan per session end" — which is not obviously
+ * a smaller number.
+ *
+ * **It is called only at the process's exit boundary, and that placement is the
+ * safety property.** A timer-based watchdog was rejected: a hub timeout can fire
+ * in a place where the pull legitimately keeps going (a degraded workspace
+ * merge), and a blind SIGKILL some seconds later could land in the middle of a
+ * transcript splice or a `git apply` into the user's tree. Here there is
+ * provably no work left — the result has already been written.
+ *
+ * **The exit code changes in this one case, from "none at all" to a signal
+ * death**, and that is an improvement rather than a contract break: the
+ * alternative on this path is a process that never exits and therefore never
+ * has an exit code to read. It fires only when `hubIoAbandoned()` is true, so
+ * every ordinary run — including every ordinary FAILURE — keeps its existing 0
+ * or 1 exactly. It deliberately does not try to be the "environment not ready"
+ * code: there is no code to give when the runtime will not let us return one.
+ *
+ * **Returns true when it has taken over the exit**, so a caller with its own
+ * `process.exit` can stand down — that call is itself one of the ones measured
+ * to hang.
+ *
+ * SIGKILL drops whatever is still buffered in the stdio pipes, and on this path
+ * stderr usually holds the only diagnostic explaining the wedge, so the signal
+ * is ordered behind a flush barrier: a trailing zero-length write's callback
+ * runs after every earlier write's, because Writable fires them in write order.
+ * The timer is a backstop for a pipe whose reader is already gone and which may
+ * therefore never call back — the alternative there is the indefinite hang this
+ * function exists to end.
+ *
+ * **Where that barrier's proof lives, stated because the test suite is NOT it.**
+ * Measured with stdout on a pipe, killing with and without the barrier: 600 B
+ * arrives whole either way, 200 KB arrives whole only with it (65,536 B without
+ * — exactly one pipe buffer), 2 MB likewise (81,920 B without). Redirected to a
+ * FILE it always arrives whole, because Node writes those synchronously. So the
+ * barrier bites only above the pipe buffer, and every result a wedged run can
+ * currently produce is a refusal of a few hundred bytes — which is why
+ * `tests/hub-lock-orphan.test.ts` still passes with the barrier removed and says
+ * so. It is kept because `output()` is shared with results that are not bounded
+ * that way (a pull's warnings and disclosures), and losing one to a truncation
+ * that only appears on big payloads is the kind of thing found in production.
+ */
+function leaveEvenIfHubIoWedged(): boolean {
+  if (!hubIoAbandoned()) return false;
+  const kill = (): void => {
+    process.kill(process.pid, "SIGKILL");
+  };
+  let pending = 2;
+  const drained = (): void => {
+    if (--pending === 0) kill();
+  };
+  try {
+    process.stdout.write("", drained);
+    process.stderr.write("", drained);
+  } catch {
+    kill();
+    return true;
+  }
+  setTimeout(kill, 250).unref();
+  return true;
+}
+
 function output(result: CliResult): void {
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   process.exitCode = exitCodeForResult(result);
+  // A no-op on every ordinary run, wedged or not — see the doc above.
+  leaveEvenIfHubIoWedged();
 }
 
 /**
@@ -1721,6 +1828,18 @@ function outputError(command: string, error: Error): void {
   };
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   process.exitCode = EXIT_FAILED;
+  // The two changes that met here are complementary, and one removed a hazard
+  // the other had to work around. #71's version wrote `if
+  // (leaveEvenIfHubIoWedged()) return; process.exit(1);` — the guard was
+  // load-bearing, because `process.exit()` is itself one of the calls MEASURED
+  // to hang while a hub syscall is outstanding, so on the wedged path it would
+  // have hung on precisely the line explaining why the hub is unusable. #76
+  // replaced `process.exit()` with `process.exitCode` for an unrelated reason
+  // (it truncates a large piped result and skips pending `finally` blocks —
+  // `import` was leaking its extract dir), and setting a field cannot hang. So
+  // the guard is no longer needed to protect the exit, and the escalation runs
+  // unconditionally as the last statement instead.
+  leaveEvenIfHubIoWedged();
 }
 
 program.parse();

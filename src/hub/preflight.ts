@@ -1,5 +1,6 @@
-import { statSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import type { HubBackend } from "./backend.js";
+import { HubIoTimeoutError, withHubIoTimeout } from "./io-timeout.js";
 import { listHubProjects, readHubProjectAsLocal } from "./identity.js";
 import { HUB_JSON, type HubJson } from "./layout.js";
 import type {
@@ -59,11 +60,15 @@ export type HubReachability =
 /**
  * Can this machine see a sesh-mover hub at the configured path at all?
  *
- * Two failing states, and they are told apart because their remedies differ: the
- * directory is not there (`no-directory` — an unmounted share, a synced folder
- * that has not appeared here, a path that was never right) versus the directory
+ * Three failing states, and they are told apart because their remedies differ:
+ * the directory is not there (`no-directory` — an unmounted share, a synced
+ * folder that has not appeared here, a path that was never right); the directory
  * is there but carries no usable `hub.json` (`not-a-hub` — a first sync still in
- * flight, or a path naming some other directory entirely).
+ * flight, or a path naming some other directory entirely); or a call against it
+ * did not come back at all (`unresponsive` — #71, a hard mount whose server is
+ * gone, a dead FUSE daemon). The third is not a shade of the other two: the path
+ * is right and the share IS mounted, so both of their remedies are wrong, and it
+ * is the only one that costs `HUB_IO_TIMEOUT_MS` of wall clock to reach.
  *
  * `hub.json` is validated only as far as the verbs actually use it: it must
  * parse and carry a non-empty `hubId`, which is the id push and pull key their
@@ -80,7 +85,11 @@ export type HubReachability =
  * `hub status` had its own rule — `hub.json` merely EXISTS — and so called a
  * `hub.json` with no `hubId` reachable while push refused it as `not-a-hub`.
  *
- * Writes nothing, and both calls are bounded: one `statSync`, one small read.
+ * Writes nothing, and both calls are bounded in BOTH senses: one `stat` and one
+ * small read, each of them under `withHubIoTimeout` so that "bounded" means a
+ * wall-clock bound and not merely a small number of syscalls. Before #71 it was
+ * only the latter — `statSync` plus a `readFileSync` backend — which is exactly
+ * how a push came to sit inside its own project lock forever.
  */
 export async function probeHubReachable(
   hubPath: string,
@@ -88,10 +97,19 @@ export async function probeHubReachable(
 ): Promise<HubReachability> {
   let rootIsDir = false;
   try {
-    rootIsDir = statSync(hubPath).isDirectory();
-  } catch {
-    // Any error reads as "cannot see it": a missing path, a dead mount point, a
-    // permission failure. All three want the same answer from the caller.
+    // `stat`, not `statSync` (#71). This is the FIRST hub syscall a push makes,
+    // and `hubPush` makes it inside the project lock — so as a blocking call it
+    // was the exact place a dead hard mount wedged the process forever while
+    // holding that lock. Bounded, and async so that the bound can fire at all.
+    rootIsDir = (await withHubIoTimeout("stat", () => stat(hubPath))).isDirectory();
+  } catch (err) {
+    // A TIMEOUT IS NOT AN ABSENCE, and must not be swallowed into the arm below
+    // (#71): a hung mount is present, is very likely a real hub, and telling its
+    // user to "check that it is mounted" is a confident wrong diagnosis of the
+    // one state whose remedy is neither mounting nor editing config.
+    if (err instanceof HubIoTimeoutError) return { state: "unresponsive", hub: null };
+    // Any other error reads as "cannot see it": a missing path, a dead mount
+    // point, a permission failure. All three want the same answer.
     rootIsDir = false;
   }
   if (!rootIsDir) return { state: "no-directory", hub: null };
@@ -99,7 +117,10 @@ export async function probeHubReachable(
   let hub: HubJson | null = null;
   try {
     hub = JSON.parse((await backend.read(HUB_JSON)).toString()) as HubJson;
-  } catch {
+  } catch (err) {
+    // Same rule, same reason: a `hub.json` that never came back is not a
+    // `hub.json` that says the wrong thing.
+    if (err instanceof HubIoTimeoutError) return { state: "unresponsive", hub: null };
     hub = null;
   }
   if (hub === null || typeof hub.hubId !== "string" || hub.hubId.length === 0) {
@@ -126,9 +147,13 @@ export async function probeHubReachable(
 export function describeHubUnreachable(
   state: Exclude<HubReachabilityState, "ok">
 ): string {
-  return state === "no-directory"
-    ? "hub.path names a directory this machine cannot see. If the hub is a network share, check that it is mounted; if it is a synced folder, it may not have reached this machine yet."
-    : "The configured hub directory is readable but carries no usable hub.json, so this machine cannot tell which hub it is. If the hub is a synced folder its first sync may still be in flight; otherwise hub.path is set to a directory that is not a sesh-mover hub.";
+  if (state === "no-directory") {
+    return "hub.path names a directory this machine cannot see. If the hub is a network share, check that it is mounted; if it is a synced folder, it may not have reached this machine yet.";
+  }
+  if (state === "unresponsive") {
+    return "The configured hub directory is mounted but is not answering — a single filesystem call against it timed out. This is a stuck mount rather than a wrong path, so checking hub.path will not help: a hard-mounted network share whose server has gone away, or a sync/FUSE daemon that has died, both look exactly like this. Reconnect or force-unmount the filesystem, then retry.";
+  }
+  return "The configured hub directory is readable but carries no usable hub.json, so this machine cannot tell which hub it is. If the hub is a synced folder its first sync may still be in flight; otherwise hub.path is set to a directory that is not a sesh-mover hub.";
 }
 
 /**
@@ -152,6 +177,11 @@ export function hubUnreachableRefusal(
     hubState: state,
     suggestion:
       describeHubUnreachable(state) +
+      // `unresponsive` shares the weaker clause with `not-a-hub` deliberately:
+      // a timed-out syscall is a read that was ATTEMPTED and never answered, so
+      // "nothing was read" would be a claim about a call whose outcome this
+      // process does not and cannot know. "Nothing was written" is true for all
+      // three — the probe writes nothing at all.
       (state === "no-directory"
         ? " Nothing was read from or written to the hub."
         : " Nothing was written."),
