@@ -56,6 +56,43 @@ import type {
 } from "./types.js";
 
 /**
+ * QUOTING — every bundle-supplied string echoed into a message in this file is
+ * wrapped in `JSON.stringify`, never in a hand-written `"${…}"`.
+ *
+ * The rule is `hub/index-file.ts`'s, applied here rather than re-invented:
+ * quoting is what escapes the control characters that let a name redraw the
+ * line it is printed on. The transport cannot be the defence — a `warnings`
+ * entry rides out as JSON, where a newline is `\n` and corrupts nothing, and
+ * then `commands/import.md` relays it into markdown for a human. That relay is
+ * the sink, and it is the same one #79 closed for `MEMORY.md` pointer lines;
+ * these messages were the sibling class that fix deliberately left alone.
+ *
+ * Two things make the swap cheap, and both are why the manual quotes were not
+ * already good enough:
+ *
+ *  - `JSON.stringify` SUPPLIES the surrounding quotes, so `"${file}"` becomes
+ *    `${JSON.stringify(file)}` and not a double-quoted string. For an ordinary
+ *    filename the rendered output is byte-identical — which is why converting
+ *    the whole class required changing NO existing assertion, and why leaving
+ *    the sites bare bought nothing in the first place.
+ *  - It is the only form that also escapes `"` itself, so a name carrying a
+ *    quote can no longer close the quotes the message opened.
+ *
+ * Two sites here are NOT byte-identical for ordinary input, deliberately: the
+ * park failure quotes the OS error text (which repeats the name), and the
+ * version-skew warning quotes a manifest version string that had no quotes at
+ * all. Both are argued at their own site.
+ *
+ * Applies to: a filename read out of the bundle's `memory/` or `plans/`, a name
+ * derived from one (`parkedAs`), `manifest.sessions[].slug`, and
+ * `manifest.sourceClaudeVersion`/`sourceMachineName`. It does NOT apply to a
+ * value this machine produced (a target path, a minted session id, a config-dir
+ * path) or to an id `assertSafeManifestIds`/`isSafeSessionId` has already
+ * cleared — quoting those would assert a distrust that is not there, and the
+ * next reader would have to re-derive why.
+ */
+
+/**
  * The three auxiliary layer directories a bundle carries for one session, in
  * the layout the exporter writes them. Single source of truth shared by the
  * digest verification in step 3 and the copies in step 4, so a layer can never
@@ -417,8 +454,10 @@ function reconcileSharedLayers(opts: {
         const src = join(memoryDir, file);
         if (!isRegularFile(src)) {
           memoryPlan.push({ filename: file, verdict: "skip", note: "not a regular file" });
+          // `JSON.stringify`, not a hand-written `"${file}"` — see QUOTING at
+          // the top of this file. Identical output for an ordinary name.
           warnings.push(
-            `Ignored "${file}" in the bundle's memory folder — it is not a regular file.`
+            `Ignored ${JSON.stringify(file)} in the bundle's memory folder — it is not a regular file.`
           );
           continue;
         }
@@ -442,7 +481,7 @@ function reconcileSharedLayers(opts: {
             note: "one of the two copies could not be read",
           });
           warnings.push(
-            `Memory file "${file}" could not be compared with the incoming copy — kept the existing version.`
+            `Memory file ${JSON.stringify(file)} could not be compared with the incoming copy — kept the existing version.`
           );
           continue;
         }
@@ -509,8 +548,17 @@ function reconcileSharedLayers(opts: {
             try {
               parkedAs = copyToUniqueName(src, nameFor, (name) => join(targetMemDir, name));
             } catch (e) {
+              // BOTH halves are quoted, and the second one is the reason this
+              // site is not just `JSON.stringify(file)`. `copyToUniqueName`
+              // throws with the destination PATH in its message, and that path
+              // is built from `file` — so quoting the name and leaving the OS
+              // text bare would escape one copy of a hostile name and print the
+              // other verbatim, which fixes nothing. It is the only interpolated
+              // OS error message in this file whose text demonstrably carries a
+              // bundle-chosen name; the rest name a local path (the config dir,
+              // the project dir, MEMORY.md) and stay unquoted for that reason.
               warnings.push(
-                `Could not park the incoming copy of "${file}" (${(e as Error).message}).`
+                `Could not park the incoming copy of ${JSON.stringify(file)} (${JSON.stringify((e as Error).message)}).`
               );
               parkedAs = null;
             }
@@ -525,7 +573,7 @@ function reconcileSharedLayers(opts: {
           });
           memoryConflicts.push({ filename: file, existingHash, incomingHash });
           warnings.push(
-            `Memory file "${file}" differs from the incoming copy — kept yours, and the incoming copy could NOT be saved beside it. It is only in the bundle.`
+            `Memory file ${JSON.stringify(file)} differs from the incoming copy — kept yours, and the incoming copy could NOT be saved beside it. It is only in the bundle.`
           );
           continue;
         }
@@ -534,8 +582,8 @@ function reconcileSharedLayers(opts: {
         memoryConflicts.push({ filename: file, existingHash, incomingHash, parkedAs });
         warnings.push(
           reusedParked
-            ? `Memory file "${file}" differs from the copy in this bundle — kept yours; theirs was already saved here as "${parkedAs}".`
-            : `Memory file "${file}" differs from the copy in this bundle — kept yours and saved theirs as "${parkedAs}" (listed in ${MEMORY_INDEX_NAME}). Nothing was overwritten.`
+            ? `Memory file ${JSON.stringify(file)} differs from the copy in this bundle — kept yours; theirs was already saved here as ${JSON.stringify(parkedAs)}.`
+            : `Memory file ${JSON.stringify(file)} differs from the copy in this bundle — kept yours and saved theirs as ${JSON.stringify(parkedAs)} (listed in ${MEMORY_INDEX_NAME}). Nothing was overwritten.`
         );
 
         // One pointer per parked file, ever: keyed off the index's own targets,
@@ -564,14 +612,16 @@ function reconcileSharedLayers(opts: {
             // never indexed. Better than the alternative the raw template gave:
             // a line whose key does not read back as `parkedAs`, so this very
             // check misses it and appends another copy on EVERY later import.
-            // `JSON.stringify`, not bare `"${…}"` like the warnings above it
-            // (#28's rule, stated at the dedup filter below): those two names
-            // are ordinary in every case but THIS one — the branch is reached
-            // precisely because the name carries something a link cannot hold,
-            // so it is the one message guaranteed to interpolate a hostile
-            // string. Quoting is what escapes the control characters that let a
-            // name redraw the line it is printed on. For an ordinary name the
-            // rendering is identical.
+            // `JSON.stringify`, per QUOTING at the top of this file — which now
+            // covers the warnings above it too. This site was the FIRST to
+            // adopt it (#79) because it is the one message guaranteed to
+            // interpolate a hostile string: the branch is reached precisely
+            // because the name carries something a markdown link cannot hold.
+            // The others were left bare on the argument that their names are
+            // ordinary in every ordinary case, which is an argument about the
+            // usual input rather than about the message — so they are quoted
+            // now as well, at no cost, since the rendering of an ordinary name
+            // is identical either way.
             warnings.push(
               `Saved the incoming copy of ${JSON.stringify(file)} beside yours as ${JSON.stringify(parkedAs)}, but could not list it in ${MEMORY_INDEX_NAME}: that name cannot be written as a markdown link target. The file is on disk (see memoryConflicts) and your index was not changed.`
             );
@@ -656,8 +706,18 @@ function reconcileSharedLayers(opts: {
         );
       }
       if (unindexed.length > 0) {
+        // Quoted PER ELEMENT, then joined — not `unindexed.join(", ")` with the
+        // whole thing quoted, and not left bare. The separator is the second
+        // defect here and it is independent of the control characters: `, ` is
+        // a legal filename substring, so an unquoted join renders one file
+        // named `a, b.md` and two files named `a` and `b.md` identically, and
+        // the reader has no way to tell which they are looking at. Quoting each
+        // element fixes the ambiguity and the escaping in one move. The count
+        // in front stays authoritative either way.
         warnings.push(
-          `${unindexed.length} memory file(s) in this bundle are listed in no index and landed unreferenced: ${unindexed.join(", ")}.`
+          `${unindexed.length} memory file(s) in this bundle are listed in no index and landed unreferenced: ${unindexed
+            .map((f) => JSON.stringify(f))
+            .join(", ")}.`
         );
       }
     } catch (e) {
@@ -745,7 +805,7 @@ function reconcileSharedLayers(opts: {
         // would have to be invented.
         if (existingContent === null || newContent === null) {
           warnings.push(
-            `Plan "${file}" could not be compared with the incoming copy — kept the existing version, and the incoming plan was not written (it is only in the bundle).`
+            `Plan ${JSON.stringify(file)} could not be compared with the incoming copy — kept the existing version, and the incoming plan was not written (it is only in the bundle).`
           );
           continue;
         }
@@ -756,7 +816,7 @@ function reconcileSharedLayers(opts: {
           incomingHash: computeIntegrityHash([newContent]),
         });
         warnings.push(
-          `Plan "${file}" already exists here with different content — kept yours. The incoming plan was not written and is only in the bundle (see planConflicts).`
+          `Plan ${JSON.stringify(file)} already exists here with different content — kept yours. The incoming plan was not written and is only in the bundle (see planConflicts).`
         );
       }
     } catch (e) {
@@ -949,8 +1009,11 @@ export async function importSession(
     (session) => !existsSync(join(exportPath, "sessions", `${session.sessionId}.jsonl`))
   );
   if (absentFromBundle.length > 0) {
+    // `slug` quoted (QUOTING at the top of this file), `sessionId` not:
+    // `readManifest` ran `assertSafeManifestIds` over every session id before
+    // this function saw the manifest, and nothing clears a slug.
     const named = absentFromBundle
-      .map((s) => `"${s.slug}" (${s.sessionId})`)
+      .map((s) => `${JSON.stringify(s.slug)} (${s.sessionId})`)
       .join(", ");
     return {
       success: false,
@@ -1034,8 +1097,24 @@ export async function importSession(
         return false;
       }
       if (priorFileExists && prior && !prior.registered && !noRegister) {
+        // TWO causes, and they are NOT distinguishable from what is recorded.
+        // `SyncStateImported` carries one boolean and no reason: `registered`
+        // is written as `!noRegister && !registrationFailed.has(id)` (see the
+        // registry write in step 7), so it is `false` both when the earlier run
+        // was given `--no-register` and when that run's `history.jsonl` append
+        // THREW — the case #78's round found, where the sentence then named a
+        // flag the user never passed. Nothing else separates them either: both
+        // leave the same on-disk state (a transcript with no history entry), so
+        // re-deriving the cause from the config dir would answer the same
+        // question the boolean already answers. So the message names both and
+        // asserts neither, which is also what `commands/import.md` already does
+        // at its own resumability branch.
+        //
+        // Widening the record (a `reason` field) would let it assert one — that
+        // is a sync-state schema change, and it is not this fix. Do not restore
+        // the single-cause wording without it.
         warnings.push(
-          `Session "${session.slug}" was previously imported with \`sesh-mover import --no-register\`; importing a registered copy (the older unregistered copy remains on disk as ${prior.localSessionId}).`
+          `Session ${JSON.stringify(session.slug)} is already here as an unregistered copy — it is absent from Claude Code's resume list, either because the earlier import could not write that list or because it was given \`sesh-mover import --no-register\`; importing a registered copy (the older unregistered copy remains on disk as ${prior.localSessionId}).`
         );
       }
       return true;
@@ -1104,8 +1183,12 @@ export async function importSession(
   const versionAdaptations: string[] = [];
 
   if (versionDiff === "source-newer") {
+    // The source version is a manifest field and nothing validates it — not
+    // `assertSafeManifestIds`, which covers ids only — so it is quoted like any
+    // other bundle string. The TARGET version is this machine's own and stays
+    // bare: quoting it would imply a distrust that is not there.
     warnings.push(
-      `Export from newer Claude Code (${manifest.sourceClaudeVersion}) than target (${targetClaudeVersion}). Unknown entry types will be preserved.`
+      `Export from newer Claude Code (${JSON.stringify(manifest.sourceClaudeVersion)}) than target (${targetClaudeVersion}). Unknown entry types will be preserved.`
     );
   }
 
@@ -1141,7 +1224,7 @@ export async function importSession(
     if (actualHash !== session.integrityHash) {
       integrityFailedSessions.add(session.sessionId);
       warnings.push(
-        `integrity check failed for session "${session.slug}" (${session.sessionId}): JSONL content doesn't match manifest hash. Data may be corrupted.`
+        `integrity check failed for session ${JSON.stringify(session.slug)} (${session.sessionId}): JSONL content doesn't match manifest hash. Data may be corrupted.`
       );
     }
 
@@ -1157,15 +1240,17 @@ export async function importSession(
       if (!declared) continue;
       const actual = await computeLayerDigest(dir);
       if (actual === null) {
+        // `layer` is not quoted and must not be: it is one of the three literal
+        // strings `layerDirsFor` returns, not a bundle field.
         warnings.push(
-          `bundle declares a "${layer}" layer for session "${session.slug}" (${session.sessionId}) but does not contain it — those files are missing from this import.`
+          `bundle declares a "${layer}" layer for session ${JSON.stringify(session.slug)} (${session.sessionId}) but does not contain it — those files are missing from this import.`
         );
         continue;
       }
       if (actual !== declared) {
         failedLayers.add(`${session.sessionId}\0${layer}`);
         warnings.push(
-          `integrity check failed for the "${layer}" files of session "${session.slug}" (${session.sessionId}): they don't match the manifest digest, so they were NOT copied. The transcript itself imported normally.`
+          `integrity check failed for the "${layer}" files of session ${JSON.stringify(session.slug)} (${session.sessionId}): they don't match the manifest digest, so they were NOT copied. The transcript itself imported normally.`
         );
       }
     }
@@ -1363,7 +1448,7 @@ export async function importSession(
           return {
             success: false as const,
             command: "import",
-            error: `Import validation failed: session "${session.slug}" contains ${streamReport.parseFailures} unparseable JSONL line(s) after rewrite`,
+            error: `Import validation failed: session ${JSON.stringify(session.slug)} contains ${streamReport.parseFailures} unparseable JSONL line(s) after rewrite`,
             details:
               "Partially written session files have been cleaned up. No indexes were modified.",
             // This used to advise `--no-register`, and that advice was
@@ -1564,7 +1649,7 @@ export async function importSession(
         // them on the next run. Both directions have to be right.
         registrationFailed.add(session.sessionId);
         warnings.push(
-          `Session "${session.slug}" imported but could not be added to ${historyPath} (${(e as Error).message}), so it will not appear in Claude Code's resume list. Its files are in place; nothing was lost.`
+          `Session ${JSON.stringify(session.slug)} imported but could not be added to ${historyPath} (${(e as Error).message}), so it will not appear in Claude Code's resume list. Its files are in place; nothing was lost.`
         );
       }
     }

@@ -679,6 +679,92 @@ describe("importer", () => {
       }
     );
 
+    /**
+     * The SIBLING CLASS the test above deliberately left alone.
+     *
+     * #79 quoted one message — the link-target refusal — on the argument that
+     * it is the only one guaranteed to interpolate a hostile name. The other
+     * ~10 in `importer.ts` interpolated a bundle filename as a hand-written
+     * `"${file}"`, which is an argument about the usual input rather than about
+     * the message. The transport is not the defence: a `warnings` entry rides
+     * out as JSON, where a newline is `\n` and corrupts nothing, and then
+     * `commands/import.md` relays it into markdown for a human — which is the
+     * same sink #79 closed for `MEMORY.md` pointer lines.
+     *
+     * Three names, each reaching a DIFFERENT message, plus one assertion over
+     * the whole array. The last one is the guard: it is about the class, so a
+     * new warning added to this step is covered the day it is written.
+     */
+    it.skipIf(isWindows)(
+      "quotes every bundle-chosen name it echoes, so no warning can carry a forged line",
+      async () => {
+        // POSIX filenames may contain anything but `/` and NUL. Windows cannot
+        // hold these at all, which is why this is platform-guarded — the same
+        // reason as the pair above.
+        const conflicting = "notes\nMEM-INJECTED-CONFLICT.md";
+        const orphan = "loose\nMEM-INJECTED-ORPHAN.md";
+        const notAFile = "dir\nMEM-INJECTED-NOTAFILE.md";
+
+        const from = await exportWithMemory(
+          { [conflicting]: "theirs\n", [orphan]: "theirs\n" },
+          "hostile-name-warning-export"
+        );
+        // A DIRECTORY inside the bundle's memory folder: the third message.
+        // Planted after the export because the exporter copies files only.
+        mkdirSync(join(from, "memory", notAFile), { recursive: true });
+        // A local copy that differs is what makes the park/differ branch run.
+        seedMemory(conflicting, "mine, not theirs\n");
+
+        const result = await runImport({ from });
+        expect(result.success).toBe(true);
+        if (!result.success || !("memoryIndex" in result)) return;
+
+        const find = (needle: string): string => {
+          const w = result.warnings.find((x) => x.includes(needle));
+          expect(w, `no warning contained ${JSON.stringify(needle)}`).toBeDefined();
+          return w!;
+        };
+
+        // Each of the three names arrives QUOTED — `JSON.stringify` supplies
+        // the quotes, so for an ordinary name the rendering is unchanged and
+        // for these it escapes the newline into a visible `\n`.
+        expect(find("differs from the copy in this bundle")).toContain(
+          JSON.stringify(conflicting)
+        );
+        expect(find("is not a regular file")).toContain(JSON.stringify(notAFile));
+        expect(find("listed in no index")).toContain(JSON.stringify(orphan));
+
+        // THE CLASS, not those three lines: nothing this import said can carry
+        // a line break, so nothing it said can forge a bullet, a heading or a
+        // pointer in the markdown the skill layer renders it into.
+        for (const w of result.warnings) {
+          expect(w, `warning carries a raw line break: ${JSON.stringify(w)}`).not.toMatch(
+            /[\r\n]/
+          );
+        }
+      }
+    );
+
+    it("quotes each unindexed memory separately, so a name containing the separator is unambiguous", async () => {
+      // The join at that site has a second defect, independent of control
+      // characters and not fixed by escaping them: `, ` is a legal filename
+      // substring, so `unindexed.join(", ")` renders ONE file named `a, b.md`
+      // and TWO files named `a` and `b.md` identically. Quoting per element —
+      // rather than quoting the joined string — is what tells them apart.
+      const from = await exportWithMemory({ "a, b.md": "one file, not two\n" }, "comma-name-export");
+
+      const result = await runImport({ from });
+      expect(result.success).toBe(true);
+      if (!result.success || !("memoryIndex" in result)) return;
+
+      expect(result.memoryIndex?.unindexed).toContain("a, b.md");
+      const warn = result.warnings.find((w) => w.includes("listed in no index"));
+      expect(warn).toBeDefined();
+      // The quoted TOKEN, not the bare substring: `toContain("a, b.md")` passes
+      // against the unquoted join too and would assert nothing.
+      expect(warn).toContain('"a, b.md"');
+    });
+
     // --- #64: a destination is claimed by an EXCLUSIVE write, never by a
     // check standing in front of one ---
     //
@@ -1966,6 +2052,48 @@ describe("importer", () => {
       // next import re-imports (correct: the session is not resumable yet)
       // rather than skipping it forever as a registered duplicate.
       expect(entries[0].registered).toBe(false);
+    });
+
+    it("does not blame --no-register for an unregistered copy the user never asked for", async () => {
+      // The misattribution found in #78's round. `registered` is written as
+      // `!noRegister && !registrationFailed.has(id)`, so it is `false` for TWO
+      // causes — the flag, and a `history.jsonl` append that THREW — and
+      // `SyncStateImported` carries that single boolean and no reason. This run
+      // takes the second cause and passes no flag at all, so a message naming
+      // `--no-register` as THE cause names a flag the user never typed.
+      const { readSyncState } = await import("../src/sync-state.js");
+      const historyDir = join(targetConfigDir, "history.jsonl");
+      mkdirSync(historyDir, { recursive: true });
+
+      const first = await importOnce();
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      // The premise, asserted rather than assumed: this import passed no flag
+      // and still recorded `registered: false`.
+      expect(Object.values(readSyncState(targetProjectPath).imported)[0].registered).toBe(false);
+
+      // Clear the blockage so the next import CAN register, which is the branch
+      // that emits the warning.
+      rmSync(historyDir, { recursive: true, force: true });
+
+      const second = await importOnce();
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      const warn = (second as ImportResult).warnings.find((w) => w.includes("unregistered"));
+      expect(warn).toBeDefined();
+
+      // The two causes are NOT distinguishable from what is recorded, so the
+      // message must offer both and assert neither. It may still NAME the flag
+      // — as one of two possibilities, which is true — and it must still name
+      // the other, which is the half that was missing.
+      expect(warn).toMatch(/either because/i);
+      expect(warn).toContain("could not write");
+      expect(warn).toContain("--no-register");
+
+      // …and the behaviour the sentence describes is unchanged: a registered
+      // copy really is imported.
+      expect((second as ImportResult).importedSessions).toHaveLength(1);
+      expect((second as ImportResult).resumable).toBe(true);
     });
 
     it("a sync-state that cannot be written is a warning, not a discarded import", async () => {
