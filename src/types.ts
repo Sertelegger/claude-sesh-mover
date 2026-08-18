@@ -1867,6 +1867,21 @@ export interface HubReindexResult {
    * nothing was dropped.
    */
   droppedBundles?: Array<{ sessionId: string; file: string }>;
+  /**
+   * Bundle ids the PREVIOUS index listed that the rebuild no longer references.
+   *
+   * Distinct from `droppedBundles`, and the difference is which side is
+   * missing: that one is a bundle **on disk** the rebuild could not attribute
+   * to a thread; this one is a record **in the old index** the rebuild could
+   * not reproduce at all — usually because its file is gone.
+   *
+   * Reported rather than repaired, on purpose. `reindex` writes exactly what
+   * the bundles plus this machine's sync-state derive, because that
+   * derivability is the invariant it exists to enforce; copying a record
+   * forward because the old file had it would recreate the unre-derivable index
+   * being repaired. Absent when nothing was lost, never `[]`.
+   */
+  droppedFromPriorIndex?: string[];
   warnings: string[];
 }
 

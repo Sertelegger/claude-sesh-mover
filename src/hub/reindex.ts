@@ -9,7 +9,7 @@ import { readLocalProjectId } from "./identity.js";
 import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
 import { registerMachine } from "./init.js";
 import {
-  buildIndexFile, writeMachineIndex, type PriorIndexView, type PriorThreadEntry,
+  buildIndexFile, readMachineIndex, writeMachineIndex, type PriorIndexView, type PriorThreadEntry,
 } from "./index-file.js";
 import { extractArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
@@ -147,6 +147,7 @@ export async function hubReindex(
     // prose.
     const unrecognizedBundleFiles: string[] = [];
     const droppedBundles: Array<{ sessionId: string; file: string }> = [];
+    let droppedFromPriorIndex: string[] | undefined;
     const machine = loadOrCreateMachineId();
     await registerMachine(opts.hubPath);
 
@@ -315,6 +316,39 @@ export async function hubReindex(
       newBundles: records,
       now: new Date().toISOString(),
     });
+    // WHAT THE REBUILD COULD NOT REPRODUCE (spec §6 Q9).
+    //
+    // `reindex` replaces this machine's index wholesale, and until now it did
+    // so silently: a bundle record present in the old index and absent from the
+    // rebuild simply stopped existing, and no other machine could ever see it
+    // again. That is the wrong kind of quiet for a REPAIR tool — the command a
+    // user reaches for when something already looks wrong is the last one that
+    // should discard history without saying so.
+    //
+    // It is a disclosure, not a merge: the rebuilt index is still exactly what
+    // the bundles on disk plus this machine's sync-state say, because that
+    // derivability is the invariant `reindex` exists to enforce. Copying a
+    // record forward because the old file had it would defeat the whole point —
+    // an index that cannot be re-derived is precisely the state being repaired.
+    //
+    // The usual cause is benign and worth naming in the message: a bundle file
+    // that has been removed from the hub. The alarming cause is not, which is
+    // why the count is reported rather than the reasoning.
+    const priorIndex = await readMachineIndex(backend, local.projectId, machine.id, warnings);
+    if (priorIndex !== null) {
+      const rebuilt = new Set(
+        Object.values(built.threads).flatMap((t) => t.bundles.map((b) => b.bundleId))
+      );
+      const lost = Object.values(priorIndex.threads)
+        .flatMap((t) => t.bundles.map((b) => b.bundleId))
+        .filter((id) => !rebuilt.has(id));
+      if (lost.length > 0) {
+        droppedFromPriorIndex = [...new Set(lost)];
+        warnings.push(
+          `The rebuilt index no longer references ${droppedFromPriorIndex.length} bundle(s) the previous index listed (${droppedFromPriorIndex.slice(0, 5).join(", ")}${droppedFromPriorIndex.length > 5 ? ", …" : ""}). A rebuild is derived from the bundles on this machine's hub directory plus its own sync-state, so a record disappears when its bundle file is gone or can no longer be read. Those bundles are now invisible to every other machine. If you did not remove them, stop and check the hub directory before pushing again — a push republishes this index.`
+        );
+      }
+    }
     await writeMachineIndex(backend, built);
 
     return {
@@ -329,6 +363,7 @@ export async function hubReindex(
       // older build that never set it.
       ...(unrecognizedBundleFiles.length > 0 ? { unrecognizedBundleFiles } : {}),
       ...(droppedBundles.length > 0 ? { droppedBundles } : {}),
+      ...(droppedFromPriorIndex ? { droppedFromPriorIndex } : {}),
       warnings,
     };
   } finally {
