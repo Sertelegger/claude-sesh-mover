@@ -287,6 +287,33 @@ export declare function readCarryRules(projectPath: string, diagnostics?: string
  */
 export declare const WORKSPACE_MAX_BYTES: number;
 /**
+ * Which transport is capturing this payload — the ONE thing the two builders
+ * need to know about their caller, and they need it only to name the right
+ * setting and the right flag in a warning.
+ *
+ * `"hub"` is `hub push` (budget keys `hub.*MaxMb`, decline flags
+ * `--no-workspace`/`--no-carry`, payload on by default). `"export"` is
+ * `sesh-mover export` (budget keys `export.*MaxMb`, opt-in flags
+ * `--include-workspace`/`--include-carry`, payload off by default).
+ *
+ * It decides NOTHING about what is captured. Every rule — the floor,
+ * `.sesh-mover-ignore`, `.sesh-mover-include`, the tracked/untracked asymmetry —
+ * is identical on both transports, which is the whole point of #47: a bundle is
+ * a bundle regardless of how it travelled.
+ */
+export type PayloadScope = "hub" | "export";
+/**
+ * The config key a budget decline should name, as a LITERAL rather than a
+ * template.
+ *
+ * `tests/hub-warning-flags.test.ts` sweeps source lines for declared config
+ * keys, and a `${scope}.workspaceMaxMb` template names none of them — the key
+ * would vanish from the audit while still reaching the user. Spelled out, each
+ * one is a bare string literal, which that sweep already classifies as an
+ * argument rather than as prose.
+ */
+export declare function budgetKey(scope: PayloadScope, which: "workspace" | "carry"): string;
+/**
  * Copy a project's working tree into `destDir`, minus the excluded paths and
  * plus whatever `.sesh-mover-include` names back in (design §5, §6.0). The rules
  * themselves live in `forEachCarriedFile`, which the apply side shares.
@@ -303,9 +330,18 @@ export declare const WORKSPACE_MAX_BYTES: number;
  * file as an upstream state rather than as a payload that was cut short.
  * Callers must not record a generation or set `hasWorkspace` for a skipped
  * snapshot.
+ *
+ * `measureOnly` runs the first pass and stops: same rules, same budget verdict,
+ * same warnings, and NOT ONE BYTE written. It exists so `commands/export.md`
+ * can disclose what a payload would carry BEFORE the bundle is built (#47) —
+ * the alternative was to capture into staging and offer to abort, which writes
+ * the secrets to local disk before the user has consented to anything. The
+ * measuring pass was already here; this only exposes it.
  */
 export declare function snapshotWorkspace(projectPath: string, destDir: string, opts?: {
     maxBytes?: number;
+    measureOnly?: boolean;
+    scope?: PayloadScope;
 }): Promise<{
     fileCount: number;
     byteSize: number;
@@ -337,9 +373,37 @@ export declare function formatBytes(bytes: number): string;
  * here is what keeps the two apply paths (merge and unpack) saying the same
  * thing, the same argument that moved `classifyDestination` into this module.
  */
-export declare function unpackWorkspace(srcDir: string, targetPath: string, opts: {
+export interface UnpackWorkspaceOptions {
     force: boolean;
-}): Promise<{
+    /**
+     * Compute every verdict and write NOTHING.
+     *
+     * The same trade `reconcileSharedLayers`'s `plan` mode makes in
+     * `src/importer.ts`, and for the same reason: the write set an import
+     * discloses at its consent gate (#36) has to be the set the run then lands,
+     * so the preview is this function with the writes suppressed rather than a
+     * second walk that predicts them. A second walk is a second implementation of
+     * "what will be written", which is exactly the drift the gate cannot afford.
+     *
+     * The one place the two genuinely differ, stated so nobody reads the
+     * preview as a promise: the run creates directories as it descends, so a
+     * later `classifyDestination` sees a directory this unpack made, while the
+     * preview sees nothing there. Both answer `ok` for that case — the predicate
+     * returns `{ ok: true }` for an absent path and for a directory where a
+     * directory is expected — so the two agree on every path a payload can name.
+     */
+    plan?: boolean;
+    /**
+     * Called once per file this unpack writes (or, in `plan` mode, would write),
+     * with the payload-relative path and whether something is already there.
+     *
+     * `existing: true` means the write OVERWRITES a file the user already had —
+     * only reachable with `force`, and the one fact a consent gate must not blur
+     * into "a new file arrived".
+     */
+    onFile?: (relPath: string, existing: boolean) => void;
+}
+export declare function unpackWorkspace(srcDir: string, targetPath: string, opts: UnpackWorkspaceOptions): Promise<{
     fileCount: number;
     symlinksSkipped: number;
     blocked: Array<{

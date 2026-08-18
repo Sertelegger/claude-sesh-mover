@@ -11,7 +11,7 @@ import { copyTreeSync } from "./helpers/copy-tree.js";
 import { readBytesLf, readTextLf } from "./helpers/eol.js";
 import {
   applyCarry, captureCarry, CARRY_MAX_BYTES, normalizeCarryMeta, orNotRecorded, type CarryMeta,
-} from "../src/hub/carry.js";
+} from "../src/payload/carry.js";
 
 /** A throwaway repo with one commit and a remote. NEVER run git against the checkout. */
 function gitRepo(name = "carry"): string {

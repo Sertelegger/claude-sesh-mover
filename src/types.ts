@@ -4,7 +4,7 @@
 // guarantee the copies drift apart. Type-only means nothing is imported at
 // runtime, so neither creates a module cycle.
 import type { WorkspaceMergeReport } from "./hub/merge.js";
-import type { ApplyResult, CarryMeta } from "./hub/carry.js";
+import type { ApplyResult, CarryMeta } from "./payload/carry.js";
 
 // --- Platform ---
 
@@ -296,6 +296,43 @@ export interface SeshMoverConfig {
     exclude: ExportLayer[];
     scope: SessionScope;
     noSummary: boolean;
+    /**
+     * Capture the whole-project workspace snapshot beside the sessions
+     * (`--include-workspace`), for a project with NO git remote.
+     *
+     * **DEFAULT FALSE, and the polarity is the security decision (#47), not a
+     * style choice.** `hub.noWorkspace: false` is the mirror image — the hub's
+     * payload is on by default because linking a project is the consent gate
+     * and the bundle lands in a directory the user configured. An export has no
+     * such gate: `--output` names any path, and the artifact gets scp'd,
+     * emailed, dropped in a shared folder or handed to someone. The destination
+     * is unknown at capture time, so the user chooses. Do NOT "harmonize" the
+     * two polarities.
+     *
+     * The snapshot does not read `.gitignore` at all, which is why it is only
+     * ever taken for a project git says has no remote.
+     */
+    includeWorkspace: boolean;
+    /**
+     * Capture the git-diff carry beside the sessions (`--include-carry`), for a
+     * project WITH a git remote. Default false, for the reason above.
+     *
+     * The asymmetry with `includeWorkspace` is why these are two keys and not
+     * one: the two payloads have different disclosure profiles (the snapshot
+     * ignores `.gitignore` entirely; the carry filters the untracked half and
+     * nothing in the patch), so consent to one is not consent to the other, and
+     * a single key could not express "snapshot never, carry sometimes".
+     */
+    includeCarry: boolean;
+    /**
+     * Byte budget for `--include-workspace`, in MB. Separate from
+     * `hub.workspaceMaxMb` rather than merely tidy: the hub's is conservative
+     * BECAUSE its payload rides a bundle pushed on every session end, and an
+     * export is a one-shot foreground act with no such multiplier.
+     */
+    workspaceMaxMb: number;
+    /** The same, for `--include-carry`. See `hub.carryMaxMb` for the semantics. */
+    carryMaxMb: number;
   };
   import: {
     dryRunFirst: boolean;
@@ -382,6 +419,87 @@ export interface ExportResult {
   actualFormat?: ExportFormat;
   collision: boolean;
   existingPath?: string;
+  /**
+   * The bundle carries a whole-project workspace snapshot (`--include-workspace`
+   * on a project with no git remote). Same field name and same meaning as
+   * `HubPushResult.hasWorkspace`, because a bundle is a bundle regardless of how
+   * it travelled (#47).
+   *
+   * `false` is the default and the common case: unlike push, this payload is
+   * opt-in — see `SeshMoverConfig.export.includeWorkspace` for why the two
+   * polarities differ on purpose.
+   */
+  hasWorkspace: boolean;
+  /**
+   * The uncommitted work this bundle carries (`--include-carry` on a project
+   * with a git remote), or absent when it carries none.
+   *
+   * Its two disclosures are LOUDER here than on push and the reason is the
+   * artifact, not the mechanism: a hub bundle lands in a directory the user
+   * configured, while this one gets scp'd, emailed or handed on.
+   * `trackedIgnored` is the one that matters — no rule filters the patch, so a
+   * `.env` that was committed once and gitignored later travels with its
+   * current value in plaintext.
+   */
+  carry?: CarryMeta;
+  /**
+   * Gitignored paths this export did NOT carry — the `.sesh-mover-include`
+   * discovery aid, capped at ten and spelled the way git spells them.
+   *
+   * Emitted on every payload-carrying export of a git project with no include
+   * list, where push emits it only on a MANUAL push: every export is manual by
+   * construction, and the artifact leaves the machine.
+   */
+  ignoredNotCarried?: string[];
+  /** Never set on a real export. See `ExportPayloadPlanResult`. */
+  payloadPlan?: false;
+}
+
+/**
+ * `sesh-mover export --payload-plan`: what the FILE payload would carry, with
+ * nothing written (#47).
+ *
+ * **Why this exists at all.** The disclosure a user needs before consenting to
+ * ship their project's files — which payload applies, how many files, how many
+ * bytes, which gitignored files are in it and why — is only knowable after the
+ * capture has measured the tree, and a capture that has measured it has also
+ * written it. The two ways out were to capture into staging and offer to abort,
+ * which writes the secrets to local disk before anyone consented and makes the
+ * staging directory the artifact for `--format dir`; or to expose the measuring
+ * pass, which both builders already run first. This is the second.
+ *
+ * It exports NO sessions and creates NO bundle. `commands/export.md` runs it,
+ * presents it, confirms, and only then runs the real export — the same
+ * preview → confirm → execute shape `commands/import.md` already has, which is
+ * the asymmetry #47 names: import needed new content in an existing gate, and
+ * export needed the gate itself.
+ */
+export interface ExportPayloadPlanResult {
+  success: true;
+  command: "export";
+  /** The discriminator. Always `true` here, never present on a real export. */
+  payloadPlan: true;
+  projectPath: string;
+  /**
+   * Which payload this project takes, decided by `scanGitRemotes` and nothing
+   * else:
+   * - `workspace` — no git remote, so the whole tree travels. It does NOT read
+   *   `.gitignore`; that is the whole reason this arm is limited to a project
+   *   git says has no remote.
+   * - `carry` — a git remote, so only `git diff HEAD` plus untracked files
+   *   travel. `.gitignore` filters the untracked half and NOTHING filters the
+   *   patch.
+   * - `none` — nothing to capture, or neither payload was requested.
+   * - `unknown` — git could not be asked, which takes NEITHER payload. See
+   *   `GitRemoteScan`.
+   */
+  decision: "workspace" | "carry" | "none" | "unknown";
+  /** Present iff `decision` is `workspace`. The measured pass's own numbers. */
+  workspace?: { fileCount: number; byteSize: number };
+  /** Present iff `decision` is `carry`. The same block the bundle would declare. */
+  carry?: CarryMeta;
+  ignoredNotCarried?: string[];
+  warnings: string[];
 }
 
 /**
@@ -446,8 +564,18 @@ export interface MemoryPlanEntry {
   note?: string;
 }
 
-/** A shared-namespace payload: one that lands outside the minted session id. */
-export type WriteSetLayer = "memory" | "plans";
+/**
+ * A payload that lands outside the minted session id.
+ *
+ * The first two are the SHARED-NAMESPACE layers — bytes out of the bundle into a
+ * directory the target already owns. The second two are the FILE payloads #47
+ * added, which land in the target PROJECT directory: `workspace` is a copy of a
+ * whole working tree, `carry` is a git patch plus untracked files. They are the
+ * reason the gate had to grow: a workspace payload is routinely hundreds of
+ * paths where a memory layer is a handful, and every one of them is
+ * bundle-chosen.
+ */
+export type WriteSetLayer = "memory" | "plans" | "workspace" | "carry";
 
 /**
  * ONE path an import will write — or wrote — **outside the session id it
@@ -480,9 +608,13 @@ export interface WriteSetEntry {
    *   incoming copy is saved BESIDE it under this name. The local file is not
    *   touched, which is why a park is disclosed as a write of a *new* name.
    * - `index-append` — `MEMORY.md` is already here and lines are appended to
-   *   it. The only entry kind that modifies a file the user already had.
+   *   it. The only shared-layer kind that modifies a file the user already had.
+   * - `overwrite` — a file of this name is already here and the workspace
+   *   payload REPLACES it. Only reachable with `--force-workspace`, and the one
+   *   fact a gate must not blur into "a new file arrived": unlike `park`, the
+   *   local copy does not survive anywhere.
    */
-  kind: "create" | "park" | "index-append";
+  kind: "create" | "park" | "index-append" | "overwrite";
 }
 
 /**
@@ -499,6 +631,27 @@ export interface WriteSetEntry {
 export interface WriteSetRoot {
   layer: WriteSetLayer;
   path: string;
+  /**
+   * Whether `WriteSet.entries` enumerates this root's paths.
+   *
+   * `true` for `memory`, `plans` and `workspace`. `false` for `carry` ALONE, and
+   * that is an argued scope line rather than an omission: a carry's destinations
+   * live inside a git patch, and since #38 the only thing permitted to say what
+   * a patch writes is git's own parse of it, read ONCE (`git apply --numstat -z
+   * --summary`) because two invocations differing only in mode cannot disagree.
+   * Predicting them before the apply would need either a second patch parser —
+   * this codebase had one, and removed it after it let a copy-out of a
+   * floor-protected file through — or a second git run against a tree that can
+   * change in between.
+   *
+   * What stands in for enumeration is the payload's own gates, which are
+   * strictly tighter than the workspace's: `applyCarry` refuses anything but a
+   * CLEAN tree at the EXACT commit the patch was captured against, so it cannot
+   * overwrite uncommitted work, and `git checkout -- .` undoes the patch half
+   * whole. A gate that shows a list must SAY that this root's paths are not in
+   * it — see `commands/import.md`.
+   */
+  enumerated: boolean;
   /**
    * - `project` — the target project's own directory; nothing else reads it.
    * - `machine` — shared by every project in this config dir. `plans/` is the
@@ -539,12 +692,23 @@ export interface WriteSetRoot {
  */
 export interface WriteSet {
   /**
-   * The authoritative count. A presenter that shows the first N must state
-   * `total - N` withheld and take the number from HERE, not from a guess about
-   * how long the list is: `entries` is uncapped today, so `total ===
-   * entries.length`, and if a future payload class (a workspace tree, #47) ever
-   * truncates the enumeration, `total` must remain the count of paths that will
-   * be written or the bound stops being honest.
+   * The authoritative count of paths this run WILL WRITE — and since #47 it is
+   * no longer `entries.length`.
+   *
+   * That was written as a forward contract ("if a future payload class — a
+   * workspace tree, #47 — ever truncates the enumeration, `total` must remain
+   * the count of paths that will be written or the bound stops being honest"),
+   * and #47 is that class: a workspace payload is routinely thousands of files,
+   * so its entries are capped while this count is not. `memory` and `plans`
+   * entries are never capped. A presenter that shows the first N states
+   * `total - N` withheld and takes the number from HERE, never from counting a
+   * list it has already cut down.
+   *
+   * It counts only WRITES: a layer a flag declined contributes zero, and says so
+   * through its root's `applied: false` plus its own skipped count. The one root
+   * whose paths are not in `entries` at all is `carry` — see
+   * `WriteSetRoot.enumerated`, and note that its paths are not in `total`
+   * either, which is the fact a gate has to relay rather than round off.
    */
   total: number;
   entries: WriteSetEntry[];
@@ -652,7 +816,56 @@ export interface SharedLayerFindings {
   writeSet?: WriteSet;
 }
 
-export interface ImportResult extends SharedLayerFindings {
+/**
+ * What a run did to the two **file payloads** a bundle can carry — the
+ * whole-project `workspace/` snapshot and the git-diff `carry/` (#47).
+ *
+ * Deliberately the SAME field names `HubPullResult` uses, because a bundle is a
+ * bundle regardless of which transport delivered it: a caller that already knows
+ * how to read a pulled payload reads an imported one with no new branch.
+ *
+ * One declaration, mixed into `ImportResult` and `DryRunResult`, for the reason
+ * `SharedLayerFindings` states — a hand-written second copy on one of them is
+ * how a field ends up readable on the real run and absent from the preview,
+ * which for a consent gate is the half that matters.
+ */
+export interface PayloadFindings {
+  /**
+   * The workspace payload was unpacked, and where. Absent when the bundle
+   * carried none, when `--apply-workspace` was not passed, or on a dry run —
+   * a preview reports `writeSet`, not an outcome.
+   */
+  workspaceUnpacked?: { path: string; fileCount: number };
+  /**
+   * Paths in the workspace payload the `NEVER_INCLUDABLE` floor refused. Nothing
+   * from them was written. Never an accusation: a bundle from an older
+   * sesh-mover on a case-insensitive filesystem legitimately carried a `.GIT`.
+   */
+  workspaceRefused?: string[];
+  /** The manifest declared a workspace payload the bundle does not contain. */
+  workspaceDeclaredMissing?: boolean;
+  /**
+   * Project files the bundle carries that were **not written**, because
+   * `--apply-workspace` was not passed. A count and not a boolean, for the
+   * reason `plansSkipped` is: "this bundle wanted to write 1,412 files into your
+   * project" is a different sentence from "it wanted to write 3".
+   */
+  workspaceSkipped?: number;
+  /**
+   * The uncommitted work the bundle DECLARES, whether or not it was applied.
+   * Present on a decline too — it is the sender's claim, read from the manifest.
+   */
+  carryAvailable?: CarryMeta;
+  /**
+   * What became of it. Present only when `--apply-carry` was passed AND the
+   * bundle contained the payload: absent the flag, an import writes nothing at
+   * all — not even the saved copy a `hub pull` parks, because unlike a pull the
+   * bundle is a file the user still has and can re-import.
+   */
+  carryApplied?: ApplyResult;
+}
+
+export interface ImportResult extends SharedLayerFindings, PayloadFindings {
   success: true;
   command: "import";
   dryRun?: false;
@@ -671,7 +884,7 @@ export interface ImportResult extends SharedLayerFindings {
   versionAdaptations?: string[];
 }
 
-export interface DryRunResult {
+export interface DryRunResult extends PayloadFindings {
   success: true;
   command: "import";
   dryRun: true;
@@ -1745,6 +1958,7 @@ export interface HubRetireFailedResult {
 
 export type CliResult =
   | ExportResult
+  | ExportPayloadPlanResult
   | ImportResult
   | DryRunResult
   | MigrateResult

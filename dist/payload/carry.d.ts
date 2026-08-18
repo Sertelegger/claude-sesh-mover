@@ -1,4 +1,4 @@
-import { type DestinationBlock } from "./workspace.js";
+import { type DestinationBlock, type PayloadScope } from "./workspace.js";
 /**
  * Byte budget for one carry payload: the diff plus every file copied beside it.
  *
@@ -203,6 +203,29 @@ export interface CaptureCarryOptions {
      * cheap.
      */
     maxBytes?: number;
+    /**
+     * Which command is capturing — decides only which config key a budget decline
+     * names. See `PayloadScope`.
+     */
+    scope?: PayloadScope;
+    /**
+     * Compute the whole `CarryMeta` and write NOTHING — no `changes.patch`, no
+     * `untracked/`, no `carry.json`, no `destDir`.
+     *
+     * Everything the disclosure needs is already computed before the first write:
+     * the base commit, the branch, the in-progress operation, the patch size, the
+     * filtered untracked list, `reIncluded` and `trackedIgnored`. Exposing that
+     * point is what lets `commands/export.md` tell a user what a payload would
+     * carry BEFORE the artifact exists (#47), rather than writing the secrets to
+     * disk and then offering to delete them.
+     *
+     * The meta it returns describes the payload that WOULD land, with one honest
+     * difference from a real run: `untrackedCount`/`untrackedBytes` count the
+     * files that passed the rules, where a real capture counts the ones that
+     * copied — a file that becomes unreadable between the two is in the measure
+     * and not in the capture, and the real run says so in `diagnostics`.
+     */
+    measureOnly?: boolean;
 }
 /**
  * Capture this project's uncommitted work into `destDir` (design §6.1).

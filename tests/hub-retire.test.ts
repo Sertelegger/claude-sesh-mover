@@ -550,7 +550,7 @@ describe("physical removal has exactly one home", () => {
     "src/hub/retire.ts": "hub retire / hub delete — the only caller, funnelled through deleteHubFile",
     "src/hub/pull-select.ts": "Set.prototype.delete on a local Set, not a backend",
     "src/hub/index-file.ts": "delete of a poisoned thread key from a parsed index object",
-    "src/hub/carry.ts": "delete of a scrubbed variable from a child process's env, not a file",
+    "src/payload/carry.ts": "delete of a scrubbed variable from a child process's env, not a file",
   };
 
   function srcFiles(dir: string, prefix = "src"): string[] {

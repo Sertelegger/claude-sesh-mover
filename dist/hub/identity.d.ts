@@ -29,52 +29,6 @@ export declare function removeLocalProjectIdIfMatches(projectPath: string, proje
     detail: string;
 };
 export declare function writeLocalProjectId(projectPath: string, id: LocalProjectId): void;
-export declare function normalizeGitRemote(url: string): string | null;
-/**
- * What `git remote -v` established about this project, keeping the three
- * answers that used to collapse into one empty array APART.
- *
- * The distinction is load-bearing, not cosmetic. `push` gates the WORKSPACE
- * SNAPSHOT — a copy of the whole project directory that deliberately does not
- * read `.gitignore` — on "this project has no remotes", and the SessionEnd hook
- * runs that push unattended. Reading "I could not ask git" as "there is no
- * remote" therefore uploads a git project's entire working tree, `.env` and
- * `secrets/` included, with nothing said. Only `kind: "none"` may take that
- * path.
- *
- * - `remotes` — git answered and this project HAS at least one remote.
- *   `normalized` holds the ones `normalizeGitRemote` could canonicalize, which
- *   may be FEWER than `rawCount` (a self-hosted `git@gitserver:team/repo.git`
- *   normalizes to null because the host carries no dot) or even empty. Only
- *   `normalized` is used for hub-project matching; `rawCount > 0` is what
- *   decides the payload.
- * - `none` — git answered with no remotes at all, or there is demonstrably no
- *   repository here (no `.git` at this path or any ancestor). Both are
- *   genuinely "no remote to reconstruct this project from".
- * - `unknown` — a repository exists but git could not be asked (missing
- *   binary, timeout, unreadable/dubious-ownership repo). Not an answer.
- */
-export type GitRemoteScan = {
-    kind: "remotes";
-    normalized: string[];
-    rawCount: number;
-} | {
-    kind: "none";
-} | {
-    kind: "unknown";
-    reason: "git-missing" | "git-failed";
-    detail: string;
-};
-export declare function scanGitRemotes(projectPath: string): GitRemoteScan;
-/**
- * The project's remotes in matcher form, for hub-project identity only.
- *
- * Deliberately still collapses "no remotes", "remotes I could not normalize"
- * and "could not ask git" into `[]`: an empty matcher list means "do not link
- * by remote", which is the right answer in all three. Anything deciding what
- * LEAVES the machine must use `scanGitRemotes` instead — see its doc.
- */
-export declare function localGitRemotes(projectPath: string): string[];
 export declare function listHubProjects(backend: HubBackend): Promise<HubProjectJson[]>;
 export type IdentityResolution = {
     kind: "linked";

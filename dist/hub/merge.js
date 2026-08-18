@@ -3,8 +3,8 @@ import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readIgnorePatterns, readIncludePatterns, } from "./workspace.js";
-import { gitChildEnv } from "./carry.js";
+import { classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readIgnorePatterns, readIncludePatterns, } from "../payload/workspace.js";
+import { gitChildEnv } from "../payload/carry.js";
 import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "../sidecar.js";
 /**
  * Thrown when `mergeWorkspaceTrees` is called without an ancestor tree.

@@ -53,20 +53,30 @@ export interface BudgetResolution {
  * is what it is.
  */
 export declare function resolveBudgetMb(raw: unknown, key: string, defaultMb: number): BudgetResolution;
-/** Both hub payload budgets, resolved once, with everything they had to say. */
+/** Both payload budgets, resolved once, with everything they had to say. */
 export interface HubBudgets {
     carryMaxBytes: number;
     workspaceMaxBytes: number;
     warnings: string[];
 }
 /**
- * Resolve both budgets from an effective config.
+ * Which command's settings a payload capture reads — see `resolvePayloadBudgets`
+ * and `PayloadScope` in `src/payload/capture.ts`, which is the same distinction
+ * one layer up.
+ */
+export type BudgetScope = "hub" | "export";
+/**
+ * Resolve both budgets from an effective config, for one command's key block.
  *
  * One function rather than two `resolveBudgetMb` calls at each call site: the
  * SessionEnd auto-push and the manual `hub push` both need them, they take no
  * flags in the automatic case, and a second copy of the wiring is how one of
- * the two ends up reading a key the other does not.
+ * the two ends up reading a key the other does not. #47 gave it a second key
+ * block (`export.*MaxMb`) and PARAMETERIZED it rather than adding that second
+ * copy, for exactly the reason above.
  */
+export declare function resolvePayloadBudgets(config: SeshMoverConfig, scope: BudgetScope): HubBudgets;
+/** The hub's half of `resolvePayloadBudgets`, kept as its own name for its callers. */
 export declare function resolveHubBudgets(config: SeshMoverConfig): HubBudgets;
 export declare function readConfig(configDir: string): SeshMoverConfig;
 /**

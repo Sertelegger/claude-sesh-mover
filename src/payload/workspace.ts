@@ -689,6 +689,56 @@ function listDirSafely(dir: string): string[] {
 export const WORKSPACE_MAX_BYTES = DEFAULT_WORKSPACE_MAX_MB * 1024 * 1024;
 
 /**
+ * Which transport is capturing this payload — the ONE thing the two builders
+ * need to know about their caller, and they need it only to name the right
+ * setting and the right flag in a warning.
+ *
+ * `"hub"` is `hub push` (budget keys `hub.*MaxMb`, decline flags
+ * `--no-workspace`/`--no-carry`, payload on by default). `"export"` is
+ * `sesh-mover export` (budget keys `export.*MaxMb`, opt-in flags
+ * `--include-workspace`/`--include-carry`, payload off by default).
+ *
+ * It decides NOTHING about what is captured. Every rule — the floor,
+ * `.sesh-mover-ignore`, `.sesh-mover-include`, the tracked/untracked asymmetry —
+ * is identical on both transports, which is the whole point of #47: a bundle is
+ * a bundle regardless of how it travelled.
+ */
+export type PayloadScope = "hub" | "export";
+
+/** The remedy sentence for "this capture carried nothing", per transport. */
+function noPayloadRemedy(scope: PayloadScope): string {
+  return scope === "export"
+    ? "or drop --include-workspace from the next `sesh-mover export` if that is what you meant"
+    : "or pass --no-workspace on a later `sesh-mover push` if that is what you meant";
+}
+
+/**
+ * The config key a budget decline should name, as a LITERAL rather than a
+ * template.
+ *
+ * `tests/hub-warning-flags.test.ts` sweeps source lines for declared config
+ * keys, and a `${scope}.workspaceMaxMb` template names none of them — the key
+ * would vanish from the audit while still reaching the user. Spelled out, each
+ * one is a bare string literal, which that sweep already classifies as an
+ * argument rather than as prose.
+ */
+export function budgetKey(scope: PayloadScope, which: "workspace" | "carry"): string {
+  if (scope === "export") {
+    return which === "workspace" ? "export.workspaceMaxMb" : "export.carryMaxMb";
+  }
+  return which === "workspace" ? "hub.workspaceMaxMb" : "hub.carryMaxMb";
+}
+
+/**
+ * "Every file was dropped by a rule" — one sentence, TWO callers (the measure
+ * pass and the copy pass), because a disclosure the preview omits is a
+ * disclosure the user meets only after the bundle exists.
+ */
+function emptySnapshotWarning(scope: PayloadScope): string {
+  return `The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by ${IGNORE_FILE_NAME}, so no project files were captured. Check it for an over-broad pattern (\`*\` and \`*/\` match everything at a level), ${noPayloadRemedy(scope)}.`;
+}
+
+/**
  * What one carried FILE costs against a budget on top of its bytes (one tar
  * header). Fixed, not a fraction of the budget — see `CARRY_PER_FILE_BYTES` in
  * carry.ts, which is the same charge for the same reason.
@@ -712,11 +762,18 @@ const PER_FILE_BYTES = 512;
  * file as an upstream state rather than as a payload that was cut short.
  * Callers must not record a generation or set `hasWorkspace` for a skipped
  * snapshot.
+ *
+ * `measureOnly` runs the first pass and stops: same rules, same budget verdict,
+ * same warnings, and NOT ONE BYTE written. It exists so `commands/export.md`
+ * can disclose what a payload would carry BEFORE the bundle is built (#47) —
+ * the alternative was to capture into staging and offer to abort, which writes
+ * the secrets to local disk before the user has consented to anything. The
+ * measuring pass was already here; this only exposes it.
  */
 export async function snapshotWorkspace(
   projectPath: string,
   destDir: string,
-  opts?: { maxBytes?: number }
+  opts?: { maxBytes?: number; measureOnly?: boolean; scope?: PayloadScope }
 ): Promise<{
   fileCount: number;
   byteSize: number;
@@ -725,6 +782,7 @@ export async function snapshotWorkspace(
   warnings: string[];
 }> {
   const warnings: string[] = [];
+  const scope: PayloadScope = opts?.scope ?? "hub";
   const maxBytes = Math.max(0, opts?.maxBytes ?? WORKSPACE_MAX_BYTES);
   if (maxBytes === 0) {
     // A budget of 0 is an explicit "snapshot nothing" (see `resolveBudgetMb`),
@@ -739,7 +797,7 @@ export async function snapshotWorkspace(
       symlinksSkipped: 0,
       skipped: true,
       warnings: [
-        "The workspace snapshot budget is set to 0, so this push carries no project files (hub.workspaceMaxMb). Raise that setting, or pass --no-workspace on later pushes, if that is not what you meant.",
+        `The workspace snapshot budget is set to 0, so no project files were captured (${budgetKey(scope, "workspace")}). Raise that setting, ${noPayloadRemedy(scope)}.`,
       ],
     };
   }
@@ -775,9 +833,22 @@ export async function snapshotWorkspace(
   });
   if (cost > maxBytes) {
     warnings.push(
-      `The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so this push carries no project files (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with ${IGNORE_FILE_NAME} — and check ${INCLUDE_FILE_NAME} for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`
+      `The workspace snapshot was skipped: ${formatBytes(cost)} of project files across ${counted} file(s) exceeds the ${formatBytes(maxBytes)} snapshot budget, so no project files were captured (largest: ${largest.map((f) => `${f.path} ${formatBytes(f.size)}`).join(", ")}). Exclude what you don't need with ${IGNORE_FILE_NAME} — and check ${INCLUDE_FILE_NAME} for a pattern like \`*\` that re-admits node_modules and the other built-in excludes.`
     );
     return { fileCount: 0, byteSize: measured, symlinksSkipped: 0, skipped: true, warnings };
+  }
+
+  // MEASURE ONLY — everything above is the verdict, everything below writes.
+  // `fileCount`/`byteSize` are the measured pass's own numbers here, which is
+  // what makes the pre-write disclosure describe the payload that would land
+  // rather than a guess about it. The one honest difference from a real run:
+  // symlinks are counted during the COPY pass, so a measure reports zero, and
+  // an unreadable file that the copy would report shows up only then.
+  if (opts?.measureOnly) {
+    if (counted === 0 && listDirSafely(projectPath).some((n) => !isPluginStateName(n))) {
+      warnings.push(emptySnapshotWarning(scope));
+    }
+    return { fileCount: counted, byteSize: measured, symlinksSkipped: 0, skipped: false, warnings };
   }
 
   // Created up front, not lazily per file: a payload this function returns
@@ -807,9 +878,7 @@ export async function snapshotWorkspace(
   // top-level directory, so the snapshot silently carried nothing. Say so
   // whenever there WAS something to carry.
   if (fileCount === 0 && listDirSafely(projectPath).some((n) => !isPluginStateName(n))) {
-    warnings.push(
-      `The workspace snapshot is empty: every file in this project was dropped by the built-in workspace excludes or by ${IGNORE_FILE_NAME}, so this push carries no project files. Check it for an over-broad pattern (\`*\` and \`*/\` match everything at a level), or pass --no-workspace on future pushes if that is what you meant.`
-    );
+    warnings.push(emptySnapshotWarning(scope));
   }
   return { fileCount, byteSize, symlinksSkipped, skipped: false, warnings };
 }
@@ -843,10 +912,41 @@ export function formatBytes(bytes: number): string {
  * here is what keeps the two apply paths (merge and unpack) saying the same
  * thing, the same argument that moved `classifyDestination` into this module.
  */
+export interface UnpackWorkspaceOptions {
+  force: boolean;
+  /**
+   * Compute every verdict and write NOTHING.
+   *
+   * The same trade `reconcileSharedLayers`'s `plan` mode makes in
+   * `src/importer.ts`, and for the same reason: the write set an import
+   * discloses at its consent gate (#36) has to be the set the run then lands,
+   * so the preview is this function with the writes suppressed rather than a
+   * second walk that predicts them. A second walk is a second implementation of
+   * "what will be written", which is exactly the drift the gate cannot afford.
+   *
+   * The one place the two genuinely differ, stated so nobody reads the
+   * preview as a promise: the run creates directories as it descends, so a
+   * later `classifyDestination` sees a directory this unpack made, while the
+   * preview sees nothing there. Both answer `ok` for that case — the predicate
+   * returns `{ ok: true }` for an absent path and for a directory where a
+   * directory is expected — so the two agree on every path a payload can name.
+   */
+  plan?: boolean;
+  /**
+   * Called once per file this unpack writes (or, in `plan` mode, would write),
+   * with the payload-relative path and whether something is already there.
+   *
+   * `existing: true` means the write OVERWRITES a file the user already had —
+   * only reachable with `force`, and the one fact a consent gate must not blur
+   * into "a new file arrived".
+   */
+  onFile?: (relPath: string, existing: boolean) => void;
+}
+
 export async function unpackWorkspace(
   srcDir: string,
   targetPath: string,
-  opts: { force: boolean }
+  opts: UnpackWorkspaceOptions
 ): Promise<{
   fileCount: number;
   symlinksSkipped: number;
@@ -856,12 +956,13 @@ export async function unpackWorkspace(
   if (existsSync(targetPath) && readdirSync(targetPath).length > 0 && !opts.force) {
     throw new WorkspaceTargetNotEmptyError(targetPath);
   }
+  const plan = opts.plan === true;
   let fileCount = 0;
   let symlinksSkipped = 0;
   const blocked: Array<{ path: string; reason: DestinationBlock }> = [];
   const refused: string[] = [];
   const walk = (from: string, to: string, rel: string): void => {
-    mkdirSync(to, { recursive: true });
+    if (!plan) mkdirSync(to, { recursive: true });
     for (const entry of readdirSync(from, { withFileTypes: true })) {
       const src = join(from, entry.name);
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
@@ -888,7 +989,12 @@ export async function unpackWorkspace(
       }
       if (entry.isDirectory()) walk(src, join(to, entry.name), childRel);
       else {
-        copyFileSync(src, join(to, entry.name));
+        const outPath = join(to, entry.name);
+        // `lstatSync`, not `existsSync`: a dangling symlink at the destination
+        // is not "absent", and `classifyDestination` has already refused every
+        // link — so anything this sees is a real file being overwritten.
+        opts.onFile?.(childRel, lstatSync(outPath, { throwIfNoEntry: false }) !== undefined);
+        if (!plan) copyFileSync(src, outPath);
         fileCount++;
       }
     }

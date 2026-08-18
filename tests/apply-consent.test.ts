@@ -107,6 +107,13 @@ describe("the apply boundary: every payload outside a minted session id is opt-i
     // hub's own automation flags (`hub.pullAppend`, `hub.carryDiff`) are about
     // what a PUSH captures and how a continuation splices; none of them decides
     // whether a received payload is written into the working tree.
+    //
+    // #47 added `export.includeWorkspace` / `export.includeCarry`, and they are
+    // NOT a counter-example: they are CAPTURE settings, about what this
+    // machine's own outgoing bundles contain, which is a decision the user makes
+    // about their own files. The apply side has no key and must not gain one —
+    // that asymmetry is the whole distinction this test encodes, and the regex
+    // below is what keeps a well-meaning `import.applyWorkspace` out.
     const offenders = configKeys().filter((k) => /apply(?!Append)/i.test(k));
     expect(
       offenders,
@@ -116,27 +123,55 @@ describe("the apply boundary: every payload outside a minted session id is opt-i
     ).toEqual([]);
   });
 
-  it("has no --apply-workspace yet, and says what #47 must preserve when it lands", () => {
-    // TRIPWIRE, not an assertion about the feature being unwanted. #47 adds
-    // `sesh-mover import --apply-workspace`, and when it does this test WILL
-    // fail. Replace it with the same three checks the --apply-carry test makes
-    // — declared as a plain flag, no `--no-apply-workspace`, absence coerced to
-    // false at every wiring site — rather than deleting it.
-    //
-    // Two further things #47 must preserve, recorded here because this is the
-    // file the implementer will be looking at:
-    //   - PER PAYLOAD. No `--apply-files` that implies both workspace and
-    //     carry: an umbrella flag is one consent decision covering two payloads
-    //     with different blast radii, which is what the ruling forbids.
-    //   - Never "the bundle carried one, so it was applied". A payload's
-    //     presence is not a request to write it.
+  it("keeps --apply-workspace an opt-in whose ABSENCE means do not apply", () => {
+    // THE TRIPWIRE, DISCHARGED. This test used to assert that
+    // `--apply-workspace` did not exist yet, and named the three checks its
+    // successor had to make when #47 landed. #47 has landed; these are they,
+    // and they are the same three the --apply-carry test above makes.
     const cli = codeOf("src/cli.ts");
-    expect(
-      /\.option\(\s*"--apply-workspace"/.test(cli),
-      "#47 has landed --apply-workspace. This tripwire has done its job — now replace it with " +
-        "the opt-in shape checks in the --apply-carry test above (plain flag, no negated form, " +
-        "absence coerced to false at every wiring site). Do not delete it."
-    ).toBe(false);
+    const importer = codeOf("src/importer.ts");
+
+    // Declared as a plain boolean flag. A `--no-apply-workspace` would mean
+    // Commander defaults it to true — the exact inversion of the property.
+    expect(cli).toMatch(/\.option\(\s*\n?\s*"--apply-workspace"/);
+    expect(cli).not.toMatch(/"--no-apply-workspace"/);
+    expect(cli).not.toMatch(/"--no-force-workspace"/);
+
+    // Two wiring sites, and BOTH coerce absence to "no": `!!` at the CLI and
+    // `=== true` in the orchestrator. `!== false` at either one turns a bundle
+    // someone handed the user into an arbitrary project-file write.
+    expect(cli).toMatch(/applyWorkspace:\s*!!opts\.applyWorkspace/);
+    expect(cli).toMatch(/forceWorkspace:\s*!!opts\.forceWorkspace/);
+    expect(importer).toMatch(/applyWorkspace\s*=\s*options\.filePayload\?\.applyWorkspace === true/);
+    expect(importer).toMatch(/forceWorkspace\s*=\s*options\.filePayload\?\.forceWorkspace === true/);
+    expect(importer).not.toMatch(/applyWorkspace\s*!==\s*false/);
+    expect(importer).not.toMatch(/forceWorkspace\s*!==\s*false/);
+
+    // The carry's import-side wiring is the same shape, at a site the
+    // --apply-carry test above does not reach (it reads `pull.ts`).
+    expect(cli).toMatch(/applyCarry:\s*!!opts\.applyCarry/);
+    expect(importer).toMatch(/applyCarryRequested\s*=\s*options\.filePayload\?\.applyCarry === true/);
+    expect(importer).not.toMatch(/applyCarry\s*!==\s*false/);
+
+    // The reason has to survive at the site, or the next reader reads a default
+    // and sees a taste call. Raw source — these two ARE comments.
+    expect(read("src/cli.ts")).toMatch(/SECURITY PROPERTY RATHER THAN A UX PREFERENCE/i);
+    expect(read("src/importer.ts")).toMatch(/security property rather/i);
+
+    // PER PAYLOAD, and this is the check that would catch a later "simplify
+    // these two into one flag": an umbrella flag is a single consent decision
+    // covering two payloads with different blast radii, which is what the
+    // ruling forbids.
+    expect(cli).not.toMatch(/"--apply-files"/);
+    expect(cli).not.toMatch(/"--apply-payload"/);
+
+    // Never "the bundle carried one, so it was applied". The behavioural half
+    // — a real bundle with a real workspace payload, imported with no flag,
+    // landing not one file — is in `tests/payload-parity.test.ts`; asserted here
+    // so that deleting it is loud rather than silent.
+    expect(read("tests/payload-parity.test.ts")).toContain(
+      'it("writes no project file when the bundle carries a workspace payload and no flag asked for it"'
+    );
   });
 
   it("keeps the two shared-namespace layers on opposite defaults, each stated explicitly", () => {

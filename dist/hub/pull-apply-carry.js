@@ -1,4 +1,4 @@
-import { applyCarry, normalizeCarryMeta, orNotRecorded, } from "./carry.js";
+import { applyCarry, normalizeCarryMeta, orNotRecorded, } from "../payload/carry.js";
 import { isCarrySuppressed } from "./pull-apply-state.js";
 import { isReadableDir } from "./fs-probe.js";
 import { stageOk, stageSkip } from "./pull-stages.js";

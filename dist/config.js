@@ -8,6 +8,14 @@ export function getDefaultConfig() {
             exclude: [],
             scope: "current",
             noSummary: false,
+            // OFF, where the hub's two payload settings are on. See the field docs in
+            // types.ts: an export bundle's destination is unknown at capture time, so
+            // the file payload is opt-in on this side of the fence and opt-out on the
+            // hub's. Flipping either of these is a security change.
+            includeWorkspace: false,
+            includeCarry: false,
+            workspaceMaxMb: DEFAULT_WORKSPACE_MAX_MB,
+            carryMaxMb: DEFAULT_CARRY_MAX_MB,
         },
         import: {
             dryRunFirst: true,
@@ -93,21 +101,28 @@ export function resolveBudgetMb(raw, key, defaultMb) {
     return { bytes: Math.floor(raw * 1024 * 1024), warning: null };
 }
 /**
- * Resolve both budgets from an effective config.
+ * Resolve both budgets from an effective config, for one command's key block.
  *
  * One function rather than two `resolveBudgetMb` calls at each call site: the
  * SessionEnd auto-push and the manual `hub push` both need them, they take no
  * flags in the automatic case, and a second copy of the wiring is how one of
- * the two ends up reading a key the other does not.
+ * the two ends up reading a key the other does not. #47 gave it a second key
+ * block (`export.*MaxMb`) and PARAMETERIZED it rather than adding that second
+ * copy, for exactly the reason above.
  */
-export function resolveHubBudgets(config) {
-    const carry = resolveBudgetMb(config.hub.carryMaxMb, "hub.carryMaxMb", DEFAULT_CARRY_MAX_MB);
-    const workspace = resolveBudgetMb(config.hub.workspaceMaxMb, "hub.workspaceMaxMb", DEFAULT_WORKSPACE_MAX_MB);
+export function resolvePayloadBudgets(config, scope) {
+    const block = scope === "export" ? config.export : config.hub;
+    const carry = resolveBudgetMb(block.carryMaxMb, `${scope}.carryMaxMb`, DEFAULT_CARRY_MAX_MB);
+    const workspace = resolveBudgetMb(block.workspaceMaxMb, `${scope}.workspaceMaxMb`, DEFAULT_WORKSPACE_MAX_MB);
     return {
         carryMaxBytes: carry.bytes,
         workspaceMaxBytes: workspace.bytes,
         warnings: [carry.warning, workspace.warning].filter((w) => w !== null),
     };
+}
+/** The hub's half of `resolvePayloadBudgets`, kept as its own name for its callers. */
+export function resolveHubBudgets(config) {
+    return resolvePayloadBudgets(config, "hub");
 }
 export function readConfig(configDir) {
     const configPath = join(configDir, "config.json");

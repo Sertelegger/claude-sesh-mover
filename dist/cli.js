@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolveConfigDir } from "./platform.js";
-import { readConfig, readConfigOverrides, writeConfigOverrides, setConfigOverride, computeEffectiveConfig, resolveHubBudgets, configValueKind, } from "./config.js";
-import { exportSession, exportAllSessions } from "./exporter.js";
+import { readConfig, readConfigOverrides, writeConfigOverrides, setConfigOverride, computeEffectiveConfig, resolveHubBudgets, resolvePayloadBudgets, configValueKind, } from "./config.js";
+import { exportSession, exportAllSessions, planExportPayload } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { migrateSession } from "./migrator.js";
 import { readManifest, assertSafeManifestIds, isBundleManifestShape, } from "./manifest.js";
@@ -49,6 +49,26 @@ program
     .option("--incremental", "Produce an incremental export (requires --to or --since)")
     .option("--to <peer>", "Target peer machine id or name (incremental)")
     .option("--since <path>", "Diff against a previous export at <path> (incremental)")
+    // ---------------------------------------------------------------------
+    // THE FILE PAYLOAD (#47). Two positive flags, both OFF by default, and both
+    // facts are load-bearing rather than stylistic.
+    //
+    // OFF: this is a SECURITY PROPERTY RATHER THAN A UX PREFERENCE. `hub push`
+    // builds its payload unless told not to, because linking a project is the
+    // hub's consent gate and the bundle lands in a directory the user configured.
+    // An export bundle has no gate and no known destination — `--output` names any
+    // path, and the artifact gets scp'd, emailed or handed to someone. So the
+    // opt-in IS the consent, and Commander's `--no-*` spelling is forbidden here:
+    // it would default them to true, which is the exact inversion.
+    //
+    // TWO, not one `--include-files`: the payloads have different disclosure
+    // profiles — the snapshot ignores `.gitignore` entirely, the carry filters the
+    // untracked half and nothing in the patch — so consent to one is not consent
+    // to the other. Same rule the import side's `--apply-workspace` /
+    // `--apply-carry` follow, and the same rule #36 states.
+    .option("--include-workspace", "Also capture a copy of the project's working tree (only for a project with NO git remote; does not read .gitignore)")
+    .option("--include-carry", "Also capture uncommitted work as a git patch plus untracked files (only for a project WITH a git remote)")
+    .option("--payload-plan", "Measure what --include-workspace / --include-carry would carry and report it, writing nothing. Exports no sessions.")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     try {
@@ -57,6 +77,25 @@ program
             : undefined;
         const configDir = resolveConfigDir(opts.sourceConfigDir);
         const config = loadEffectiveConfig(configDir, process.cwd());
+        // `!!`, never `!== false`: absence has to coerce to "do not capture" at
+        // EVERY wiring site (#36's ruling, applied to #47's payloads). A config
+        // key may raise the default because that is a capture decision the user
+        // makes about their own machine's outgoing bundles — the apply side is
+        // where a config key would be wrong, and there is none there.
+        const includeWorkspace = !!opts.includeWorkspace || config.export.includeWorkspace === true;
+        const includeCarry = !!opts.includeCarry || config.export.includeCarry === true;
+        const payloadBudgets = resolvePayloadBudgets(config, "export");
+        if (opts.payloadPlan) {
+            const plan = await planExportPayload({
+                projectPath: opts.projectPath ?? process.cwd(),
+                includeWorkspace,
+                includeCarry,
+                payloadBudgets,
+            });
+            plan.warnings.unshift(...payloadBudgets.warnings);
+            output(plan);
+            return;
+        }
         const scope = parseScope(opts.scope ?? config.export.scope, "export");
         const storage = parseStorage(opts.storage ?? config.export.storage);
         const format = parseFormat(opts.format ?? config.export.format);
@@ -102,6 +141,7 @@ program
                     sessions: [],
                     warnings: [],
                     archivePath: null,
+                    hasWorkspace: false,
                     collision: true,
                     existingPath: join(outputDir, name),
                 });
@@ -113,7 +153,25 @@ program
             finalName = `${name}-${suffix}`;
         }
         const noSummary = opts.summary === false || config.export.noSummary;
-        const result = await doExport(configDir, scope, opts.sessionId, outputDir, finalName, excludeLayers, claudeVersion, opts.projectPath, noSummary, incremental, onProgress);
+        const result = await doExport({
+            configDir,
+            projectPath: opts.projectPath ?? process.cwd(),
+            scope,
+            sessionId: opts.sessionId,
+            outputDir,
+            name: finalName,
+            excludeLayers,
+            claudeVersion,
+            noSummary,
+            incremental,
+            includeWorkspace,
+            includeCarry,
+            payloadBudgets,
+            onProgress,
+        });
+        if (result.success && (includeWorkspace || includeCarry)) {
+            result.warnings.unshift(...payloadBudgets.warnings);
+        }
         if (result.success) {
             await finalizeExport({
                 result: result,
@@ -150,6 +208,31 @@ program
     // flow. Both are DISCLOSED either way, in `memorySkipped`/`plansSkipped` and
     // in the dry run's `writeSet`.
     .option("--no-memory", "Do not write the bundle's memory/ into this project's memory folder (written by default — it lands in the target project's own directory)")
+    // ---------------------------------------------------------------------
+    // THE FILE PAYLOAD, RECEIVE SIDE (#47). Both plain positive flags, both OFF,
+    // and neither has a `--no-*` form — that spelling would make Commander default
+    // them to true, which is the exact inversion of the property below.
+    //
+    // A SECURITY PROPERTY RATHER THAN A UX PREFERENCE, and more so here than
+    // anywhere else in this CLI. Every payload a machine applied before #47 was
+    // produced by that user's own other machine and travelled through a directory
+    // that user configured. An export bundle can come from anyone, so this is the
+    // first place sesh-mover can write arbitrary project files on the say-so of a
+    // stranger — and #36's ruling is that the flag IS the consent and is the whole
+    // of it: no path filter stands behind it and none ever will, because "names
+    // that subvert sesh-mover" is a finite set this plugin defines while "names
+    // that lead to code execution" is a property of this machine's toolchain.
+    //
+    // PER PAYLOAD, never an umbrella `--apply-files`: one consent decision cannot
+    // cover two payloads with different blast radii. The workspace unpack writes a
+    // whole tree and, with --force-workspace, overwrites files of the same name;
+    // the carry only ever applies to a clean tree at the exact recorded commit.
+    //
+    // And never "the bundle carried one, so it was applied" — a payload's presence
+    // is not a request to write it.
+    .option("--apply-workspace", "Unpack the bundle's workspace/ into the target project directory (refused if it is not empty, unless --force-workspace)")
+    .option("--apply-carry", "Apply the bundle's carried uncommitted changes (requires the same base commit and a clean tree)")
+    .option("--force-workspace", "Unpack the workspace payload over a target that already has content, OVERWRITING any file of the same name (it does not combine the two)")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     let tempExtractDir;
@@ -183,6 +266,18 @@ program
             // Commander's `--no-memory` sets `opts.memory` to false; absent, it is
             // `true`. Same shape as `--no-register` two lines up.
             noMemory: opts.memory === false,
+            // Present at all only because THIS is `sesh-mover import` — `hub pull`
+            // and `migrate` call `importSession` without it and get no file-payload
+            // handling whatsoever (see `ImportOptions.filePayload`).
+            //
+            // `!!`, never `!== false`. See the flag declarations above: absence has
+            // to coerce to "do not apply" at every wiring site, and `importSession`
+            // coerces again with `=== true` for the same reason.
+            filePayload: {
+                applyWorkspace: !!opts.applyWorkspace,
+                applyCarry: !!opts.applyCarry,
+                forceWorkspace: !!opts.forceWorkspace,
+            },
             onProgress,
         });
         // Container-level observations belong in the same warnings array as the
@@ -1116,34 +1211,9 @@ function exportArtifactExists(outputDir, name) {
         existsSync(join(outputDir, `${name}.tar.gz`)) ||
         existsSync(join(outputDir, `${name}.tar.zst`)));
 }
-async function doExport(configDir, scope, sessionId, outputDir, name, excludeLayers, claudeVersion, projectPathOverride, noSummary, incremental, onProgress) {
-    // Detect project path from cwd or override
-    const projectPath = projectPathOverride ?? process.cwd();
-    if (scope === "all") {
-        return exportAllSessions({
-            configDir,
-            projectPath,
-            outputDir,
-            name,
-            excludeLayers,
-            claudeVersion,
-            noSummary,
-            incremental,
-            onProgress,
-        });
-    }
-    return exportSession({
-        configDir,
-        projectPath,
-        sessionId,
-        outputDir,
-        name,
-        excludeLayers,
-        claudeVersion,
-        noSummary,
-        incremental,
-        onProgress,
-    });
+async function doExport(options) {
+    const { scope, ...rest } = options;
+    return scope === "all" ? exportAllSessions(rest) : exportSession(rest);
 }
 async function finalizeExport(params) {
     const { result, format, incremental, projectPath, onProgress } = params;

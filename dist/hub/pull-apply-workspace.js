@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, createWriteStream, readdirSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { join } from "node:path";
-import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
+import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "../payload/workspace.js";
 import { mergeWorkspaceTrees } from "./merge.js";
 import { isReadableDir } from "./fs-probe.js";
 import { stageAbort, stageOk, stageSkip } from "./pull-stages.js";

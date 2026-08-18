@@ -9,6 +9,10 @@ import { foreignKeyedRecord, readSyncState, writeSyncState } from "./sync-state.
 import { readLastEntryUuid } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
 import { readLocalProjectId, writeLocalProjectId } from "./hub/identity.js";
+import { unpackWorkspace } from "./payload/workspace.js";
+import { applyCarry, normalizeCarryMeta, orNotRecorded, } from "./payload/carry.js";
+import { isReadableDir } from "./hub/fs-probe.js";
+import { IGNORE_FILE_NAME, INCLUDE_FILE_NAME, isPluginStateName } from "./paths.js";
 import { MEMORY_INDEX_NAME, appendIndexLines, formatMemoryPointer, memoryIndexTargets, unionMemoryIndex, } from "./memory-index.js";
 import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "./sidecar.js";
 /**
@@ -310,6 +314,9 @@ function reconcileSharedLayers(opts) {
             path: join(targetProjectDir, "memory"),
             scope: "project",
             applied: false,
+            // Enumerated in full: this layer is a handful of files, and one of its
+            // kinds edits a file the user already had.
+            enumerated: true,
         });
         try {
             // Names only: the root is not a symlink (checked above), no file in it is
@@ -332,6 +339,9 @@ function reconcileSharedLayers(opts) {
                 path: targetMemDir,
                 scope: "project",
                 applied: true,
+                // Enumerated in full: a handful of files, and one kind edits a file
+                // the user already had.
+                enumerated: true,
             });
             const indexPath = join(targetMemDir, MEMORY_INDEX_NAME);
             if (!plan)
@@ -748,6 +758,9 @@ function reconcileSharedLayers(opts) {
             path: join(targetConfigDir, "plans"),
             scope: "machine",
             applied: false,
+            // Enumerated in full: this layer is a handful of files, and one of its
+            // kinds edits a file the user already had.
+            enumerated: true,
         });
         try {
             // Safe to enumerate: the root is not a symlink (checked above), and this
@@ -771,6 +784,9 @@ function reconcileSharedLayers(opts) {
                 path: targetPlansDir,
                 scope: "machine",
                 applied: true,
+                // Enumerated in full: a handful of files, and one kind edits a file
+                // the user already had.
+                enumerated: true,
             });
             if (!plan)
                 mkdirSync(targetPlansDir, { recursive: true });
@@ -841,6 +857,331 @@ function reconcileSharedLayers(opts) {
         writeSet: { total: writeEntries.length, entries: writeEntries, roots: writeRoots },
     };
 }
+// ---------------------------------------------------------------------------
+// THE FILE PAYLOAD, APPLY SIDE (#47)
+// ---------------------------------------------------------------------------
+/**
+ * Cap on how many WORKSPACE paths a write set enumerates.
+ *
+ * A workspace payload is a whole project tree and is routinely thousands of
+ * files, where `memory/` and `plans/` are a handful each. Emitting one entry
+ * per file would put megabytes of JSON on stdout for the skill layer to parse,
+ * so the enumeration is bounded — and `WriteSet.total` stays the TRUE count of
+ * paths that will be written, which is the field `commands/import.md` takes its
+ * "and N more" from. That contract was written down before this feature existed
+ * (see `WriteSet.total`) precisely so the bound would land somewhere honest.
+ *
+ * The memory and plans entries are NEVER truncated: they are few, and one of
+ * their kinds (`index-append`) modifies a file the user already had, which the
+ * gate is required to show in full.
+ */
+const MAX_WORKSPACE_WRITE_ENTRIES = 200;
+/**
+ * What a caller that does not handle file payloads contributes: nothing, in
+ * every field. Distinct from "handled and found nothing" only in that it is
+ * never reached — which is the point, since `hub pull` and `migrate` both go
+ * through `importSession` and neither may emit a word about these payloads.
+ */
+function emptyPayloadReport() {
+    return {
+        warnings: [], writeEntries: [], writeRoots: [],
+        workspacePathCount: 0, workspaceWriteCount: 0,
+    };
+}
+/**
+ * Apply — or preview, or decline — the two FILE payloads a bundle can carry.
+ *
+ * ## Bootstrap, not sync, and the difference is enforced rather than intended
+ *
+ * `hub pull` needs a 3-way merge, ancestor selection (`chooseMergeAncestor`) and
+ * a divergence policy because two machines drift apart over repeated syncs.
+ * export -> import is the BOOTSTRAP case: a bundle is handed over once. So none
+ * of that is here, and none of it is deferred either —
+ *
+ *  - no `mergeWorkspaceTrees`: a non-empty target REFUSES (see the precondition
+ *    in `importSession`) rather than being merged into. If a user wants merge
+ *    semantics they want the hub.
+ *  - no `chooseMergeAncestor`, and nothing is recorded into
+ *    `SyncState.hub.workspaceGenerations` / `lastWorkspace`. A generation is
+ *    identified by a HUB BUNDLE ID and is the one input `chooseMergeAncestor`
+ *    treats as proof that a tree really held it; recording an id no hub bundle
+ *    has would put a lie in that set. The visible consequence — a later hub pull
+ *    into this project merges in no-ancestor mode — is correct, and no-ancestor
+ *    mode fails toward "keep local + visible conflicts".
+ *  - no `--on-divergence`: it was never a workspace concern (it is a SESSIONS
+ *    policy), and a bootstrap import mints a fresh session id per session and
+ *    never splices.
+ *
+ * ## Where this deliberately differs from the pull stage
+ *
+ * **A carry the user did not ask to apply is NOT saved into their project.**
+ * `pull-apply-carry.ts` runs `applyCarry` with `saveOnly: true` when
+ * `--apply-carry` is absent, and it is right to: by the time that stage runs the
+ * pull has recorded its bundles as received, the extraction directory is about
+ * to be deleted, and a re-run answers "already up to date" — there is no second
+ * chance, so parking the payload beside the project is the only way not to
+ * destroy another machine's work.
+ *
+ * None of that holds here. The bundle is a FILE THE USER HAS: a directory
+ * export, or an archive that `--from` re-extracts on demand. Re-running
+ * `sesh-mover import --from <same bundle> --apply-carry` reaches this payload
+ * even when every session is now a duplicate, because the fully-duplicate branch
+ * of `importSession` calls this function too — the same shape #53 established
+ * for the memory layer. So the pull's argument for writing an unrequested
+ * payload into the user's project inverts into #36's: writing files a user
+ * declined, into a directory they own, is exactly what the opt-in exists to
+ * prevent. Nothing is written; `carryAvailable` says what the bundle holds.
+ *
+ * ## `plan` mode
+ *
+ * Same function, writes suppressed — the rule `reconcileSharedLayers` follows,
+ * for the same reason: the write set the consent gate shows and the bytes the
+ * run lands have to come off ONE set of decisions. `unpackWorkspace`'s own
+ * `plan` option is what makes that true for the workspace half rather than a
+ * second walk predicting it.
+ */
+async function reconcilePayloadLayers(opts) {
+    const { exportPath, targetProjectPath, applyWorkspace, forceWorkspace, plan, } = opts;
+    const warnings = [];
+    const writeEntries = [];
+    const writeRoots = [];
+    const report = {
+        warnings, writeEntries, writeRoots, workspacePathCount: 0, workspaceWriteCount: 0,
+    };
+    const incomingDir = join(exportPath, "workspace");
+    // `isReadableDir`, not `existsSync`: a bundle whose `workspace` entry is a
+    // FILE reaches the same `readdirSync` and throws ENOTDIR — the identical
+    // terminal shape the pull stage's own guard exists to close, and here it would
+    // land AFTER the sessions were written.
+    const hasWorkspacePayload = isReadableDir(incomingDir);
+    if (opts.declaresWorkspace && !hasWorkspacePayload) {
+        report.workspaceDeclaredMissing = true;
+        warnings.push("The bundle's manifest declares a workspace payload but the bundle does not contain one, so there was nothing to apply and this project's files were left untouched. It was written by an older sesh-mover whose snapshot carried no files, damaged in transit, or not produced by sesh-mover at all.");
+    }
+    if (hasWorkspacePayload) {
+        const entries = existsSync(targetProjectPath) ? readdirSync(targetProjectPath) : [];
+        // Plugin state is not content — an import plants `.sesh-mover-project.json`
+        // into the project root when the bundle carries an id, and that metadata
+        // alone must not make the next import read the directory as occupied.
+        // `isPluginStateName` rather than one literal, for the reason its own doc
+        // gives.
+        const hasRealContent = entries.some((n) => !isPluginStateName(n));
+        writeRoots.push({
+            layer: "workspace",
+            path: targetProjectPath,
+            scope: "project",
+            applied: applyWorkspace,
+            enumerated: true,
+        });
+        try {
+            const ws = await unpackWorkspace(incomingDir, targetProjectPath, {
+                // In `plan` mode nothing is written, so `force` decides nothing — it is
+                // passed as `true` only to keep the emptiness THROW out of a preview.
+                // The real run's emptiness decision is the precondition in
+                // `importSession`, taken before a single byte is written, so this call
+                // can never reach the throw either.
+                force: plan || forceWorkspace || !hasRealContent,
+                // The declined case still WALKS the payload, to count it. That count is
+                // the disclosure — "this bundle wanted to write 1,412 files into your
+                // project" is a different sentence from "it wanted to write 3" — and it
+                // is the same reason `plansSkipped`/`memorySkipped` are counts.
+                plan: plan || !applyWorkspace,
+                onFile: (relPath, existing) => {
+                    report.workspacePathCount++;
+                    // A DECLINED layer contributes nothing to the write set — not an
+                    // entry, not a count. The set is what this run writes, and a declined
+                    // layer writes nothing; what it contributes instead is
+                    // `workspaceSkipped`, the same split `plansSkipped` makes.
+                    if (!applyWorkspace)
+                        return;
+                    report.workspaceWriteCount++;
+                    if (writeEntries.length >= MAX_WORKSPACE_WRITE_ENTRIES)
+                        return;
+                    const abs = join(targetProjectPath, ...relPath.split("/"));
+                    writeEntries.push({
+                        layer: "workspace",
+                        path: abs,
+                        // Computed HERE, never by the consumer. Every segment after the
+                        // target path came out of the bundle. Same rule, same sink, same
+                        // reason as the memory entries above.
+                        display: JSON.stringify(abs),
+                        // `overwrite` is only reachable with --force-workspace, and it is
+                        // the one fact the gate must not blur into "a new file arrived".
+                        kind: existing ? "overwrite" : "create",
+                    });
+                },
+            });
+            if (applyWorkspace && !plan) {
+                report.workspaceUnpacked = { path: targetProjectPath, fileCount: ws.fileCount };
+                // A CONSEQUENCE OF THE FLOOR, disclosed rather than fixed by weakening
+                // it. `.sesh-mover-include` and `.sesh-mover-ignore` are on
+                // `NEVER_INCLUDABLE`, so no payload can carry them — the floor exists
+                // precisely to stop a payload rewriting the list that decides what the
+                // next push ships, and that argument does not weaken because the target
+                // happened to be empty: a planted include list is the same exfiltration
+                // primitive one push later.
+                //
+                // The cost is real and lands exactly here, where the whole point of the
+                // operation is "this project now lives here": the destination has
+                // neither file, so its next push or export carries a different set than
+                // the source did. For a git project the clone already has both, since
+                // they are meant to be committed.
+                const missingRules = [INCLUDE_FILE_NAME, IGNORE_FILE_NAME].filter((name) => !existsSync(join(targetProjectPath, name)));
+                if (missingRules.length > 0) {
+                    warnings.push(`The workspace payload could not carry ${missingRules.join(" or ")} — those names are on the floor that stops a bundle rewriting what this machine's next push uploads, so no payload may contain them. This project therefore has ${missingRules.length > 1 ? "neither file" : "no such file"} and will carry a different set of files than the source did. Copy ${missingRules.length > 1 ? "them" : "it"} across by hand if the source had ${missingRules.length > 1 ? "them" : "it"}; for a git project they are meant to be committed, so a clone already has ${missingRules.length > 1 ? "them" : "it"}.`);
+                }
+            }
+            if (ws.symlinksSkipped > 0) {
+                warnings.push(`${ws.symlinksSkipped} symlink(s) skipped while unpacking the workspace.`);
+            }
+            if (ws.refused.length > 0) {
+                report.workspaceRefused = ws.refused;
+                // Deliberately does NOT accuse the sender: a bundle written by an older
+                // sesh-mover, on a case-insensitive filesystem, legitimately carried a
+                // `.GIT` store — the very leak the guard closed.
+                warnings.push(`${ws.refused.length} path(s) in the workspace payload were refused because they name plugin or VCS internals that never travel (${ws.refused.slice(0, 5).join(", ")}). Nothing from them was written here. Current sesh-mover versions never put those in a bundle, so this one came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`);
+            }
+            if (ws.blocked.length > 0) {
+                warnings.push(`${ws.blocked.length} workspace file(s) were not unpacked because of what already occupies their path here (${[...new Set(ws.blocked.map((b) => b.reason))].join(", ")}): ${ws.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them; the incoming copies are still in the bundle.`);
+            }
+            if (!applyWorkspace) {
+                report.workspaceSkipped = report.workspacePathCount;
+                if (report.workspacePathCount > 0) {
+                    warnings.push(`This bundle carries ${report.workspacePathCount} project file(s), and they were NOT written, because \`sesh-mover import --apply-workspace\` was not passed. Every one of them is still in the bundle, so nothing was consumed by declining: re-run the same import with that flag to land them.`);
+                }
+            }
+            else if (!plan && hasRealContent) {
+                warnings.push("This import unpacked the workspace payload over the existing directory, overwriting any file of the same name, because --force-workspace was passed. It is a bootstrap copy, not a merge — anything of yours the payload does not contain is still here, and anything it does contain was replaced.");
+            }
+        }
+        catch (e) {
+            // Defence in depth. The emptiness precondition in `importSession` makes
+            // `WorkspaceTargetNotEmptyError` unreachable from here, and every other
+            // failure is a filesystem fault against the user's own project. Either way
+            // it must NOT become an ErrorResult: the sessions are already on disk by
+            // the time this runs, and the failure contract is that no failure of the
+            // optional half costs the user a transcript.
+            warnings.push(`The workspace payload could not be applied (${e.message}) — the sessions imported normally and nothing else in this import depends on it.`);
+        }
+    }
+    // --- carry ---
+    const carryDir = join(exportPath, "carry");
+    if (opts.declaredCarry) {
+        const { meta, unreadable } = normalizeCarryMeta(opts.declaredCarry);
+        report.carryAvailable = meta;
+        if (unreadable.length > 0) {
+            warnings.push(`This bundle's manifest describes the uncommitted changes it carries in a way this version could not read (${unreadable.join(", ")}), so ${unreadable.length > 1 ? "those fields are" : "that field is"} reported as "(not recorded)". A current sesh-mover always records ${unreadable.length > 1 ? "them" : "it"}, so this bundle came from an older version, was damaged in transit, or was not produced by sesh-mover at all.`);
+        }
+        if (!isReadableDir(carryDir)) {
+            warnings.push("The bundle's manifest declares carried uncommitted changes but the bundle does not contain them, so there was nothing to apply. The bundle is damaged or was not produced by sesh-mover.");
+        }
+        else {
+            writeRoots.push({
+                layer: "carry",
+                path: targetProjectPath,
+                scope: "project",
+                applied: opts.applyCarry,
+                // The ONE root whose paths are not in `entries`, and the reason is #38's
+                // ruling rather than an omission. A patch's destinations are decided by
+                // git's own parse and ONLY git's — `git apply --numstat -z --summary`,
+                // read once, because two invocations differing only in mode cannot
+                // disagree. Enumerating them before the apply means either a second
+                // parser (this module HAD one; it was removed for cause, after a
+                // measured copy-out of a floor-protected file) or a second git
+                // invocation against a tree that can change in between. What bounds the
+                // blast radius instead is the payload's own gates: `applyCarry` refuses
+                // anything but a CLEAN tree at the EXACT recorded commit, so unlike the
+                // workspace it cannot overwrite uncommitted work, and `git checkout --
+                // .` undoes the patch half whole. `commands/import.md` says exactly this
+                // at the gate.
+                enumerated: false,
+            });
+            if (opts.applyCarry && !plan) {
+                report.carryApplied = await applyCarry({
+                    carryDir,
+                    targetPath: targetProjectPath,
+                    meta,
+                    // Never `saveOnly` on this path — see the module doc above. Reaching
+                    // `applyCarry` at all is what `--apply-carry` buys.
+                    saveOnly: false,
+                });
+                warnings.push(...describeCarryOutcome(report.carryApplied, meta));
+            }
+            else {
+                warnings.push(`This bundle carries uncommitted work (${meta.untrackedCount} untracked file(s) and a ${meta.patchBytes}-byte patch against commit ${orNotRecorded(meta.baseCommit.slice(0, 8))} on branch ${orNotRecorded(meta.branch)}), and ${plan ? "it would not be applied" : "NONE of it was applied"}, because \`sesh-mover import --apply-carry\` was not passed. Nothing was written and nothing was consumed by declining — it is still in the bundle, and a re-run with that flag reaches it even when every session is a duplicate by then.`);
+            }
+        }
+    }
+    return report;
+}
+/** What `applyCarry` did, in sentences a user can act on. */
+function describeCarryOutcome(result, meta) {
+    const out = [];
+    const origin = `branch ${orNotRecorded(meta.branch)} at commit ${orNotRecorded(meta.baseCommit.slice(0, 8))}`;
+    if (!result.applied) {
+        out.push(`The uncommitted changes this bundle carries (${origin}) were not applied: ${result.detail}. ` +
+            (result.savedTo === null
+                ? "They could not be saved beside the project either, so the only remaining copy is the bundle itself."
+                : `The whole payload — patch, untracked files and a README ${result.savedCommands
+                    ? "with the exact commands"
+                    : "explaining what was found and what was withheld"} — is saved at ${result.savedTo}. Nothing was written to your working tree.`));
+        if (result.refused.length > 0) {
+            out.push(`${result.refused.length} path(s) in that payload were left out of the saved copy because they name plugin or VCS internals that never travel (${result.refused.slice(0, 5).join(", ")}). They are not in the saved directory, so the commands in its README cannot write them here.`);
+        }
+        if (result.reason === "unsafe-payload") {
+            out.push("That payload tried to write paths that never travel (plugin or VCS internals such as .sesh-mover-include, which decides what this machine's NEXT push uploads), or to create a symbolic link, or it described its own changes in a way git's output could not be read back unambiguously. It was refused whole rather than partly applied. Read the saved copy before doing anything with it.");
+        }
+        return out;
+    }
+    out.push(`Applied the uncommitted changes this bundle carries (${origin}): ${result.filesChanged} file(s) from the patch, ${result.untrackedCopied} untracked file(s) copied. They are uncommitted here too — \`git status\` shows them, and \`git checkout -- .\` undoes the patch half.`);
+    if (meta.inProgress) {
+        out.push(`Those changes were captured during an in-progress ${meta.inProgress} on the source machine, so the patch contained conflict markers as ordinary file content and the ${meta.inProgress} itself did not travel — search for <<<<<<< before working on them.`);
+    }
+    if (result.collisions.length > 0) {
+        out.push(`${result.collisions.length} carried file(s) already existed here with different content, so yours were left alone and the incoming copies were written beside them as *.incoming-*: ${result.collisions.slice(0, 5).join(", ")}. Reconcile and delete the sidecars.`);
+    }
+    if (result.refused.length > 0) {
+        out.push(`${result.refused.length} carried file(s) were refused because they name plugin or VCS internals that never travel (${result.refused.slice(0, 5).join(", ")}). Nothing from them was written.`);
+    }
+    if (result.blocked.length > 0) {
+        out.push(`${result.blocked.length} carried file(s) were not written because of what already occupies their path here (${[...new Set(result.blocked.map((b) => b.reason))].join(", ")}): ${result.blocked.slice(0, 5).map((b) => b.path).join(", ")}. Nothing was written near them.`);
+    }
+    return out;
+}
+/**
+ * The one write set an import discloses — the shared-namespace layers plus the
+ * file payload, concatenated in ONE place so `total` cannot be computed two
+ * ways.
+ *
+ * `total` is the count of paths that WILL BE WRITTEN, which is not
+ * `entries.length` any more: the workspace enumeration is bounded (see
+ * `MAX_WORKSPACE_WRITE_ENTRIES`) while the count is not, and
+ * `commands/import.md`'s "and N more" takes N from here. That is the contract
+ * `WriteSet.total` was written with.
+ */
+/**
+ * The public `PayloadFindings` projection of a payload report. ONE place, for
+ * the reason `sharedFindings` is one place: the preview and the real run build
+ * different result objects, and a hand-written second copy is how a field ends
+ * up on one of them and not the other.
+ */
+function payloadFindings(p) {
+    return {
+        workspaceUnpacked: p.workspaceUnpacked,
+        workspaceRefused: p.workspaceRefused,
+        workspaceDeclaredMissing: p.workspaceDeclaredMissing,
+        workspaceSkipped: p.workspaceSkipped,
+        carryAvailable: p.carryAvailable,
+        carryApplied: p.carryApplied,
+    };
+}
+function mergeWriteSets(shared, payload) {
+    return {
+        total: shared.writeSet.total + payload.workspaceWriteCount,
+        entries: [...shared.writeSet.entries, ...payload.writeEntries],
+        roots: [...shared.writeSet.roots, ...payload.writeRoots],
+    };
+}
 /**
  * Reconcile a bundle's `memory/` and `plans/` **without importing a session**.
  *
@@ -892,6 +1233,16 @@ export function applySharedLayers(opts) {
 }
 export async function importSession(options) {
     const { exportPath, targetConfigDir, targetProjectPath, targetClaudeVersion, dryRun, sessionIds, noRegister, allowDuplicates, includePlans, noMemory, onProgress, } = options;
+    // `=== true`, never `!== false`: absence coerces to "do not apply" at EVERY
+    // wiring site. These are the receive-side consent gate for a payload that
+    // lands in the user's own project directory (#36's ruling, #47's payloads),
+    // and one `!== false` here turns a bundle someone handed you into an arbitrary
+    // project-file write. `handlesPayload` is the separate question of whether
+    // this CALLER deals with file payloads at all — see `ImportOptions.filePayload`.
+    const handlesPayload = options.filePayload !== undefined;
+    const applyWorkspace = options.filePayload?.applyWorkspace === true;
+    const applyCarryRequested = options.filePayload?.applyCarry === true;
+    const forceWorkspace = options.filePayload?.forceWorkspace === true;
     const warnings = [];
     // Step 1: Read manifest
     let manifest;
@@ -920,6 +1271,24 @@ export async function importSession(options) {
             suggestion: "Re-export or re-transfer the bundle. This check detects damage, not tampering: it cannot tell a corrupted bundle from one a sender rewrote deliberately.",
         };
     }
+    // The FILE payload runs at all FOUR of the shared-layer sites, for the reason
+    // #53 established for `memory/`: a fully-duplicate import is "no new
+    // sessions", not "nothing happened", and a user who declined the payload on
+    // the first run and re-runs with the flag must reach it even though every
+    // session is a duplicate by then. That reachability is what lets the import
+    // side decline WITHOUT saving an unrequested payload into the project.
+    const payloadFor = (plan) => handlesPayload
+        ? reconcilePayloadLayers({
+            exportPath,
+            targetProjectPath,
+            applyWorkspace,
+            applyCarry: applyCarryRequested,
+            forceWorkspace,
+            declaredCarry: manifest.carry,
+            declaresWorkspace: manifest.workspace !== undefined,
+            plan,
+        })
+        : Promise.resolve(emptyPayloadReport());
     // Filter sessions if specific IDs requested
     let targetSessions = sessionIds
         ? manifest.sessions.filter((s) => sessionIds.includes(s.sessionId))
@@ -971,6 +1340,40 @@ export async function importSession(options) {
             // follow. See tests/hub-warning-flags.test.ts's cross-command check.
             suggestion: "Re-transfer or re-extract the bundle and import again. To import only the sessions that ARE present, pass --session-id with their ids to `sesh-mover import`.",
         };
+    }
+    // Step 1c: a workspace payload asked to land in a directory that already has
+    // content is REFUSED, and refused HERE — before any write.
+    //
+    // `unpackWorkspace` has this check of its own and throws
+    // `WorkspaceTargetNotEmptyError`, but at APPLY time, which for an import is
+    // after the sessions have landed: a partial result, where every other gate in
+    // this function advertises "a refused bundle leaves the target config dir
+    // byte-identical". So the test is lifted to a precondition and the throw
+    // becomes unreachable.
+    //
+    // TWO differences from `unpackWorkspace`'s raw `readdirSync().length > 0`,
+    // both deliberate:
+    //  - `isPluginStateName` decides what counts as content. This import plants
+    //    `.sesh-mover-project.json` into the project root when the bundle carries
+    //    an id, so a directory holding nothing but plugin state must still read as
+    //    empty on the NEXT import of the same bundle.
+    //  - it fires only when the payload would actually be applied. A bundle whose
+    //    workspace nobody asked for writes nothing, so there is nothing to refuse.
+    //
+    // The word "merge" appears nowhere in the refusal, on purpose: `force` means
+    // unpack OVER what is there. Calling it a merge is how a user consents to an
+    // overwrite believing their local files will be combined.
+    if (applyWorkspace && !forceWorkspace && isReadableDir(join(exportPath, "workspace"))) {
+        const occupants = existsSync(targetProjectPath) ? readdirSync(targetProjectPath) : [];
+        if (occupants.some((n) => !isPluginStateName(n))) {
+            return {
+                success: false,
+                command: "import",
+                error: `workspace target ${targetProjectPath} exists and is not empty — nothing was written`,
+                details: "No sessions were imported and no project files were written. An export bundle's workspace payload is a bootstrap copy, not a merge: applying it here would overwrite files of the same name.",
+                suggestion: "Re-run this import against an empty directory with --target-project-path <dir>, or pass --force-workspace to unpack over what is there, OVERWRITING any file of the same name — it does not combine the two. To take the sessions only, drop --apply-workspace.",
+            };
+        }
     }
     // Compute the target project dir up front — the dedup filters below need
     // it to verify a prior "imported" record still has a file on disk before
@@ -1066,6 +1469,8 @@ export async function importSession(options) {
             plan: dryRun,
         });
         warnings.push(...shared.warnings);
+        const payload = await payloadFor(dryRun);
+        warnings.push(...payload.warnings);
         if (dryRun) {
             return {
                 success: true,
@@ -1080,7 +1485,8 @@ export async function importSession(options) {
                 planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
                 plansSkipped: shared.plansSkipped,
                 memorySkipped: shared.memorySkipped,
-                writeSet: shared.writeSet,
+                writeSet: mergeWriteSets(shared, payload),
+                ...payloadFindings(payload),
             };
         }
         return {
@@ -1091,6 +1497,8 @@ export async function importSession(options) {
             warnings,
             resumable: true,
             ...sharedFindings(shared),
+            writeSet: mergeWriteSets(shared, payload),
+            ...payloadFindings(payload),
         };
     }
     // Step 1.5: Version reconciliation
@@ -1235,13 +1643,14 @@ export async function importSession(options) {
             noMemory,
             plan: true,
         });
+        const payload = await payloadFor(true);
         return {
             success: true,
             command: "import",
             dryRun: true,
             importedSessions,
             skippedSessions,
-            warnings: [...warnings, ...shared.warnings],
+            warnings: [...warnings, ...shared.warnings, ...payload.warnings],
             resumable: true,
             rewriteReport,
             versionAdaptations: adapters.map((a) => a.description),
@@ -1250,7 +1659,8 @@ export async function importSession(options) {
             planConflicts: shared.planConflicts.length > 0 ? shared.planConflicts : undefined,
             plansSkipped: shared.plansSkipped,
             memorySkipped: shared.memorySkipped,
-            writeSet: shared.writeSet,
+            writeSet: mergeWriteSets(shared, payload),
+            ...payloadFindings(payload),
         };
     }
     // Step 4: Write session files
@@ -1457,6 +1867,22 @@ export async function importSession(options) {
         plan: false,
     });
     warnings.push(...shared.warnings);
+    // Step 6: the FILE payload — LAST, and after the write loop's try/catch, so
+    // `rollbackImportedFiles` is out of reach by the time it runs.
+    //
+    // That ordering is the failure contract (#47 §4.4): the sessions are the
+    // primary artifact and no failure of the optional half may cost the user a
+    // transcript. A workspace or carry failure here is reported as `success: true`
+    // with warnings, never as an `ErrorResult`, and `rollbackImportedFiles` must
+    // never grow a notion of the project tree — there is no rollback for an
+    // unpack, and there should not be one: "undoing" it means deleting files in
+    // the user's project directory on the strength of our own bookkeeping.
+    //
+    // The one refusal that IS allowed is the non-empty-target check, and it is a
+    // precondition (step 1c) precisely so that it happens before anything is
+    // written rather than here.
+    const payload = await payloadFor(false);
+    warnings.push(...payload.warnings);
     // Step 7: Register in indexes (only after successful validation)
     /** Sessions whose `history.jsonl` append failed, so they are NOT resumable. */
     const registrationFailed = new Set();
@@ -1599,6 +2025,8 @@ export async function importSession(options) {
         resumable: !noRegister && registrationFailed.size === 0,
         versionAdaptations: versionAdaptations.length > 0 ? versionAdaptations : undefined,
         ...sharedFindings(shared),
+        writeSet: mergeWriteSets(shared, payload),
+        ...payloadFindings(payload),
     };
 }
 //# sourceMappingURL=importer.js.map

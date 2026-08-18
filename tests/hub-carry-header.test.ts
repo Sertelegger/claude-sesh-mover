@@ -8,8 +8,8 @@ import { join } from "node:path";
 import {
   __parseApplyPathsForTests as parseApplyPaths,
   __scanPatchBytesForTests as scanPatchBytes,
-} from "../src/hub/carry.js";
-import { isNeverIncludable } from "../src/hub/workspace.js";
+} from "../src/payload/carry.js";
+import { isNeverIncludable } from "../src/payload/workspace.js";
 import { readTextLf } from "./helpers/eol.js";
 import { copyTreeSync } from "./helpers/copy-tree.js";
 

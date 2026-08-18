@@ -1,6 +1,6 @@
 import type { HubBundleRecord } from "./layout.js";
 import type { WorkspaceMergeReport } from "./merge.js";
-import type { CarryMeta } from "./carry.js";
+import type { CarryMeta } from "../payload/carry.js";
 import type {
   AuxiliaryConflict,
   ExportManifest,
