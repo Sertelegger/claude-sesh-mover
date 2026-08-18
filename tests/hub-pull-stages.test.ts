@@ -1054,7 +1054,23 @@ describe("fetch stage", () => {
    * Both ends are made to fail here so the late error is guaranteed to exist
    * rather than merely likely. This is still a RACE and the assertion is on the
    * process, not on a return value: `unhandledRejection`/`uncaughtException`
-   * during the awaited settle. Mutation-checked against the unfixed source.
+   * during the awaited settle.
+   *
+   * **WHICH HALF OF THE FIX THIS PROVES DEPENDS ON THE PLATFORM, and neither
+   * runner proves both.** `pipeline` settles on whichever end fails first and
+   * then detaches, so the OTHER end is the one with an error in flight:
+   *
+   * - On Linux the source loses (a missing hub file fails fast), so the late
+   *   error is the destination's. Mutating away the destination's absorption
+   *   fails this test here.
+   * - On macOS the destination's ENOTDIR won instead — measured, as a CI
+   *   failure on a green-on-Linux commit — so the late error was the source's.
+   *   Mutating away the SOURCE's absorption **survives on Linux**: this test
+   *   stays green with that half deleted, and macOS CI is its only proof.
+   *
+   * Do not read a local green as covering both. That asymmetry is why the fix
+   * absorbs both ends unconditionally rather than the one that happened to be
+   * late in the case first observed.
    */
   it("leaves no unhandled error behind when the download aborts", async () => {
     const record = await writeHealthyBundle({ basedOn: "gen-1", carry: true });
