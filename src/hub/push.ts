@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { bundleDir, bundleFileName, type HubBundleRecord, type HubJson } from "./layout.js";
-import { acquireProjectLock, LockBusyError } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import {
   resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId,
   readLocalProjectId, removeLocalProjectIdIfMatches, type LocalProjectId,
@@ -382,7 +382,7 @@ export async function hubPush(opts: HubPushOptions): Promise<HubPushOutcome> {
       warnings.push(...(opts.budgets?.warnings ?? []));
       if (lock.stoleStale) {
         warnings.push(
-          "Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress."
+          describeLockSteal(lock.steal, "push")
         );
       }
       const machine = loadOrCreateMachineId();

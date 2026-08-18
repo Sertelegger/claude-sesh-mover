@@ -603,6 +603,127 @@ describe("export/import payload parity (#47)", () => {
       rmSync(twin, { recursive: true, force: true });
     });
 
+    it("refuses a patch that is not the one the bundle's own digest declares", async () => {
+      // The gap the patch digest closes. Before it, `changes.patch` was the one
+      // thing a bundle carried that nothing hashed: damage was discovered when
+      // `git apply` refused the patch — or, for damage git is happy to apply,
+      // never. The mutation below is deliberately of the second kind.
+      const source = linkSessions(gitProject("digest"));
+      writeFileSync(join(source, "tracked.txt"), "v2\n");
+      const { exportSession } = await import("../src/exporter.js");
+      const exported = await exportSession({
+        configDir, projectPath: source, sessionId,
+        outputDir: join(tempDir, "exports"), name: "digest-carry",
+        excludeLayers: [], claudeVersion: "2.1.81", includeCarry: true,
+      });
+      if (!exported.success) throw new Error("export failed");
+      expect(exported.carry?.patchDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+      const patchPath = join(exported.exportPath, "carry", "changes.patch");
+      const original = readFileSync(patchPath);
+      const mutated = Buffer.from(
+        original.toString("latin1").replace("+v2", "+v3"),
+        "latin1"
+      );
+      expect(mutated.equals(original)).toBe(false);
+      // SAME LENGTH, and that is the point of choosing this mutation: the only
+      // field a manifest carried about the patch before the digest was its
+      // SIZE, and `patchBytes` is unchanged here. So is every other guard's
+      // verdict — it parses, it names one ordinary tracked file, and git
+      // applies it (the second half of this test proves that rather than
+      // asserting it).
+      expect(mutated.length).toBe(original.length);
+      writeFileSync(patchPath, mutated);
+
+      const twin = cleanTwin(source, "digest-twin");
+      const refused = await importInto(exported.exportPath, twin, { applyCarry: true });
+      expect(refused.success).toBe(true);
+      if (!refused.success) return;
+      expect(refused.carryApplied?.applied).toBe(false);
+      expect(refused.carryApplied && !refused.carryApplied.applied
+        ? refused.carryApplied.reason : null).toBe("patch-damaged");
+      // The working tree is untouched — a decline is whole-payload.
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\n");
+      if (refused.carryApplied && !refused.carryApplied.applied) {
+        // The payload is still there to inspect, and the README declines to
+        // teach the user to apply the bytes it has just rejected.
+        expect(refused.carryApplied.savedCommands).toBe(false);
+        const readme = readFileSync(
+          join(refused.carryApplied.savedTo!, "README.md"),
+          "utf-8"
+        );
+        expect(readme).not.toContain("apply --whitespace=nowarn");
+        expect(readme).toContain("not the one the bundle says it is");
+        // Not an accusation, and not a diagnosis of the receiver's git.
+        expect(readme).not.toContain("could not read this patch");
+      }
+
+      // --- THE CONTROL, and without it this whole test is worthless.
+      //
+      // Strip the digest — the shape of every bundle written before the field
+      // existed — and import the IDENTICAL mutated patch again. It applies, and
+      // `tracked.txt` ends up holding the mutation. That proves two things at
+      // once: the refusal above came from the digest and from nothing else (git
+      // was perfectly willing to apply these bytes, so no pre-existing guard
+      // would have caught them), and a pre-digest bundle still behaves exactly
+      // as it always did.
+      //
+      // Edited as raw JSON on purpose: `writeManifest` would restamp
+      // `sessionsDigest`, and this asserts in passing that it does not have to
+      // — that digest covers the session list, and `carry` sits outside it.
+      const manifestPath = join(exported.exportPath, "manifest.json");
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      delete m.carry.patchDigest;
+      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+
+      const older = cleanTwin(source, "digest-older");
+      const applied = await importInto(exported.exportPath, older, { applyCarry: true });
+      expect(applied.success).toBe(true);
+      if (!applied.success) return;
+      expect(applied.carryApplied?.applied).toBe(true);
+      expect(readTextLf(join(older, "tracked.txt"))).toBe("v3\n");
+
+      rmSync(source, { recursive: true, force: true });
+      rmSync(twin, { recursive: true, force: true });
+      rmSync(older, { recursive: true, force: true });
+    });
+
+    it("fails closed on a carry block whose digest is not a string", async () => {
+      // `normalizeCarryMeta` is total, not a predicate — a malformed field
+      // degrades to its type's empty value so the payload is still SAVED rather
+      // than refused before it can be. For `patchDigest` that empty value is
+      // `""`, which no patch can hash to, so a garbled digest declines the
+      // apply instead of being read as "no digest declared" and skipped. The
+      // wrong repair here is a silent `undefined`.
+      const source = linkSessions(gitProject("garbled"));
+      writeFileSync(join(source, "tracked.txt"), "v2\n");
+      const { exportSession } = await import("../src/exporter.js");
+      const exported = await exportSession({
+        configDir, projectPath: source, sessionId,
+        outputDir: join(tempDir, "exports"), name: "garbled-digest",
+        excludeLayers: [], claudeVersion: "2.1.81", includeCarry: true,
+      });
+      if (!exported.success) throw new Error("export failed");
+
+      const manifestPath = join(exported.exportPath, "manifest.json");
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      m.carry.patchDigest = 42;
+      writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+
+      const twin = cleanTwin(source, "garbled-twin");
+      const result = await importInto(exported.exportPath, twin, { applyCarry: true });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.carryApplied && !result.carryApplied.applied
+        ? result.carryApplied.reason : null).toBe("patch-damaged");
+      // The patch itself was never touched, so this is the digest declining and
+      // nothing else — and the tree is untouched.
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\n");
+
+      rmSync(source, { recursive: true, force: true });
+      rmSync(twin, { recursive: true, force: true });
+    });
+
     it("writes nothing at all — not even a saved copy — when --apply-carry is absent", async () => {
       // The deliberate divergence from `hub pull`. A pull's decline SAVES the
       // payload beside the project, because by then the bundle is recorded as

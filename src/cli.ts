@@ -435,17 +435,30 @@ program
 
 // --- Browse ---
 
+/** One browse entry. The payload fields live on the declared result shape in
+ * `types.ts` alongside the metadata ones, because `null` means the same thing
+ * for all of them — not read — and splitting them invites a reader who honours
+ * that rule for four fields and not the other two. */
+type BrowseEntry = BrowseResult["exports"][number];
+
 /**
  * The one shape a READABLE bundle turns into — archive or directory, one
  * builder, so the two paths cannot drift into reporting different field sets
  * for the same fact.
+ *
+ * The payload answers come out of the manifest this function was already
+ * handed, and that bound is deliberate: `browse` is IO-bound in total archive
+ * size when `.tar.zst` bundles are present (reading one decompresses the whole
+ * bundle), and a field that needed a second look inside the archive would
+ * multiply exactly the cost #32 was about. Everything reported here is a field
+ * of a manifest already in memory.
  */
 function readableBrowseEntry(
   name: string,
   path: string,
   storage: StorageScope,
   manifest: ExportManifest
-): BrowseResult["exports"][number] {
+): BrowseEntry {
   return {
     name,
     path,
@@ -456,6 +469,14 @@ function readableBrowseEntry(
     sessions: manifest.sessions,
     storage,
     metadataAvailable: true,
+    // The SAME two tests the importer runs against the same manifest —
+    // `declaresWorkspace: manifest.workspace !== undefined` and
+    // `if (opts.declaredCarry)` in `importer.ts` — including the fact that they
+    // are spelled differently there. What this row promises is "here is what an
+    // import of this bundle will find", so a tidier second opinion would be a
+    // listing that disagrees with the command it is advising about.
+    hasWorkspace: manifest.workspace !== undefined,
+    hasCarry: !!manifest.carry,
   };
 }
 
@@ -471,7 +492,7 @@ function degradedBrowseEntry(
   path: string,
   storage: StorageScope,
   detail: string
-): BrowseResult["exports"][number] {
+): BrowseEntry {
   return {
     name,
     path,
@@ -483,6 +504,12 @@ function degradedBrowseEntry(
     storage,
     metadataAvailable: false,
     metadataError: detail,
+    // NOT `false`. The manifest is what says whether a bundle carries files,
+    // and it is the manifest that could not be read — so `false` here would be
+    // this listing's most dangerous invention: "importing this cannot write to
+    // your project", asserted about a bundle nobody checked.
+    hasWorkspace: null,
+    hasCarry: null,
   };
 }
 
@@ -494,7 +521,7 @@ async function archiveBrowseEntry(
   archivePath: string,
   name: string,
   storage: StorageScope
-): Promise<BrowseResult["exports"][number]> {
+): Promise<BrowseEntry> {
   const r = await readManifestFromArchive(archivePath);
   return r.ok
     ? readableBrowseEntry(name, archivePath, storage, r.manifest)
@@ -567,7 +594,7 @@ function storeDirectoryBrowseEntry(
   dirPath: string,
   name: string,
   storage: StorageScope
-): BrowseResult["exports"][number] {
+): BrowseEntry {
   const r = readDirectoryManifest(dirPath);
   return r.ok
     ? readableBrowseEntry(name, dirPath, storage, r.manifest)
@@ -592,7 +619,7 @@ function storeDirectoryBrowseEntry(
 function cwdDirectoryBrowseEntry(
   dirPath: string,
   name: string
-): BrowseResult["exports"][number] | null {
+): BrowseEntry | null {
   const r = readDirectoryManifest(dirPath);
   return r.ok ? readableBrowseEntry(name, dirPath, "project", r.manifest) : null;
 }
@@ -636,7 +663,7 @@ program
   .option("--prune", "Delete old exports interactively")
   .action(async (opts) => {
     try {
-      const exports: BrowseResult["exports"] = [];
+      const exports: BrowseEntry[] = [];
 
       const searchDirs: Array<{ dir: string; storage: StorageScope }> = [];
 
@@ -675,7 +702,7 @@ program
       // thunks and run in bounded batches: concurrent enough that a directory
       // of bundles doesn't serialize, bounded so it can't exhaust file
       // descriptors and fail the listing outright.
-      const archiveReads: Array<() => Promise<BrowseResult["exports"][number]>> = [];
+      const archiveReads: Array<() => Promise<BrowseEntry>> = [];
       for (const { dir, storage } of searchDirs) {
         const entries = readdirSync(dir);
         for (const entry of entries) {

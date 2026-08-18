@@ -109,6 +109,53 @@ export declare function assertSafeManifestIds(manifest: ExportManifest): void;
 export declare function computeIntegrityHash(contents: string[]): string;
 export declare function computeIntegrityHashFromFile(path: string): Promise<string>;
 export declare function verifyIntegrity(contents: string[], expectedHash: string): boolean;
+/**
+ * The carry payload's `changes.patch`, hashed as BYTES — the fourth hash a
+ * bundle carries, and the same kind of thing as the three above it: damage
+ * detection, never attestation (#37). Anyone who can rewrite the patch can
+ * rewrite the digest sitting beside it in the same manifest; what this catches
+ * is a patch that arrived different from the one that left.
+ *
+ * ## Bytes, and a bare sha256
+ *
+ * No domain-separation prefix, unlike `computeSessionsDigest`, and that is
+ * deliberate twice over. It has to agree with `computeIntegrityHashFromFile`,
+ * which is what the apply side re-hashes the extracted file with — the two are
+ * the same function over the same bytes, one from a buffer and one from a
+ * stream. And it makes the field independently checkable: `sha256sum
+ * changes.patch` prints exactly what the manifest declares, minus the `sha256:`
+ * label, so a user debugging a refused carry can settle "is my copy the
+ * damaged one" without this plugin.
+ *
+ * A `Buffer` rather than a string because the patch is bytes end to end: a
+ * `git diff` of a text file that is not valid UTF-8 does not survive a string
+ * round trip (see `payload/carry.ts`), and a digest taken over the lossy
+ * spelling would fail on exactly the payloads that need it most.
+ *
+ * ## Why the CAPTURE side hashes the buffer and not the file it just wrote
+ *
+ * The opposite of `memoryDigest`, on purpose. That one is taken over the
+ * bundle's own copy because it decides a re-send skip: a copy truncated in
+ * flight must fail toward re-sending, so it has to describe what travelled.
+ * This one decides an APPLY, so it has to describe what was *captured* — hash
+ * the file back and a truncated write yields a self-consistent pair that
+ * verifies happily and is then applied as if intact. Hashing the buffer puts
+ * the write itself inside the covered range.
+ */
+export declare function computePatchDigest(patch: Buffer): string;
+/**
+ * `null` when the bundle declares no patch digest (any bundle written before
+ * the field existed) or the patch on disk is the one it declares; otherwise a
+ * caller-facing description of the mismatch. Same contract as
+ * `verifySessionsDigest`, including the "absent means unverifiable, not
+ * broken" arm — a pre-digest bundle is applied exactly as it always was.
+ *
+ * An unreadable or absent `changes.patch` is a MISMATCH rather than a skip
+ * once a digest is declared: a bundle that declares one comes from a version
+ * that always writes the file, so its absence is damage. Callers that legally
+ * have no patch at all pass `undefined` for `declared` and never reach this.
+ */
+export declare function verifyPatchDigest(patchPath: string, declared: string | undefined): Promise<string | null>;
 /** The auxiliary layers a bundle can carry per session, each as its own directory. */
 export declare const HASHED_LAYERS: readonly ["subagents", "tool-results", "file-history"];
 export type HashedLayer = (typeof HASHED_LAYERS)[number];

@@ -4,7 +4,7 @@ import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync,
   existsSync, readdirSync, realpathSync, openSync, writeSync, closeSync, constants, cpSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { overrideHome, homeEnv, tmpEnv } from "./helpers/env.js";
@@ -48,15 +48,29 @@ import { LOCK_STALE_MS } from "../src/hub/lock.js";
  *   | one live orphan per staleness window        | zero survivors after N session ends    |
  *   | no timer fires while the read is blocked    | the timer fires ON TIME, mid-read      |
  *
- * ## The one thing that did NOT invert, and is asserted as a residual
+ * ## The one thing that did not invert here — and has since inverted too (#84)
  *
- * `acquireProjectLock` still steals from a holder it can see is alive — the
- * decision is `ageMs > LOCK_STALE_MS` and the recorded pid is read only to
- * decorate `LockBusyError`. #71 removed that mechanism's TRIGGER, not the
- * mechanism, and the last test here keeps that fact under test so the issue is
- * not read as fully closed by this work. See the comment on
- * `acquireProjectLock` for what still gets stolen from (a push that legitimately
- * outruns the window on a slow-but-working share).
+ * This file used to carry a fifth test asserting a RESIDUAL: that
+ * `acquireProjectLock` still stole from a holder it could see was alive,
+ * because the decision was `ageMs > LOCK_STALE_MS` and the recorded pid was
+ * read only to decorate `LockBusyError`. #71 removed that mechanism's TRIGGER,
+ * not the mechanism, and the residual was kept under test so the issue would
+ * not be read as fully closed.
+ *
+ * #84 closed it, so that test is now the opposite of what it was — a second
+ * round of reversals in a file already built out of them, and documented as
+ * one rather than deleted:
+ *
+ *   | was pinned as the residual                  | is pinned now                          |
+ *   | ------------------------------------------- | -------------------------------------- |
+ *   | a live holder's lock is taken at 10 minutes | it is refused, and the refusal says so |
+ *   | the recorded pid is never consulted         | a provably gone holder loses it at once |
+ *   | the steal is silent on both sides           | thief and victim both leave a record    |
+ *
+ * The trade #84 had to make is why the last test asserts BOTH directions: a
+ * liveness probe alone would turn one stuck holder into a silent permanent
+ * outage for the project, so a live holder is protected only up to
+ * `LOCK_LIVE_HOLDER_CEILING_MS` and is then stolen from deliberately.
  *
  * ## Two properties of the wedge that shape every test below
  *
@@ -136,6 +150,27 @@ function isAlive(pid: number): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Run `fn` with this process's stderr captured.
+ *
+ * A steal writes a disclosure line there (#84) — half of what the last test in
+ * this file asserts — and without this it would also scribble across the
+ * runner's own output.
+ */
+function captureStderr<T>(fn: () => T): { value: T; err: string } {
+  const original = process.stderr.write.bind(process.stderr);
+  let err = "";
+  (process.stderr as unknown as { write: unknown }).write = ((chunk: unknown): boolean => {
+    err += String(chunk);
+    return true;
+  }) as unknown;
+  try {
+    return { value: fn(), err };
+  } finally {
+    (process.stderr as unknown as { write: unknown }).write = original;
+  }
 }
 
 async function waitFor(
@@ -558,52 +593,116 @@ describe.skipIf(!canMkfifo)("issue #71: a hub that blocks no longer wedges the a
     expect(rec.stdout).toContain("READ_RETURNED");
   }, 30_000);
 
-  it("still steals the project lock from a holder it can see is alive (RESIDUAL, not fixed here)", async () => {
-    // NOT an inversion — this is the half of the issue #71 did not close, kept
-    // under test so the issue is not read as fully closed.
+  it("consults liveness before stealing the project lock, and discloses the steal (#84)", async () => {
+    // THE THIRD INVERSION. This test used to assert the residual verbatim:
+    // that a lock was taken at `LOCK_STALE_MS` from a holder whose pid sat in
+    // the file being deleted and was trivially checkable. #84 made the steal
+    // consult that pid, so every assertion below is the reverse of the one it
+    // replaces — with the ceiling as the deliberate exception, because a probe
+    // with no ceiling converts a stuck holder into a project that can never
+    // push again.
     //
-    // The steal decision is `ageMs > LOCK_STALE_MS` and nothing else. The
-    // record's `pid` is read, but only to decorate `LockBusyError`; nothing
-    // consults it, or any other liveness signal, before the `rmSync`. The
-    // blocking hub read was merely the easiest way to PRODUCE a long-lived
-    // holder, and it is gone — but any push that legitimately outruns the
-    // window (a large bundle over a slow-but-working share, which is
-    // deliberately not bounded) is still stolen from, still never told, and
-    // still runs on concurrently with the thief.
-    //
-    // No FIFO needed: the holder here is this very process, whose liveness is
-    // not in question, which is the whole point.
+    // No FIFO needed. Two of the three holders here are this very process,
+    // whose liveness is not in question, and the third is a real child this
+    // test kills — which is the actual shape of the case the steal path exists
+    // for (a crashed or SIGKILLed process never runs its release()).
     const restore = overrideHome(home);
     try {
-      const { acquireProjectLock } = await import("../src/hub/lock.js");
+      const { acquireProjectLock, LOCK_LIVE_HOLDER_CEILING_MS, readLockStealRecord } =
+        await import("../src/hub/lock.js");
       const holder = acquireProjectLock(project);
       expect(holder.stoleStale).toBe(false);
-      const held = JSON.parse(readFileSync(lockFile, "utf-8")) as { pid?: number };
+      const held = JSON.parse(readFileSync(lockFile, "utf-8")) as { pid?: number; token?: string };
       expect(held.pid).toBe(process.pid);
       expect(isAlive(held.pid as number)).toBe(true);
 
-      // Ten minutes pass (compressed by rewriting the timestamp — no source
-      // seam needed, and the holder is untouched).
+      const backdate = (ageMs: number): void => {
+        writeFileSync(
+          lockFile,
+          JSON.stringify({ ...held, acquiredAt: new Date(Date.now() - ageMs).toISOString() })
+        );
+      };
+
+      // 1. Ten minutes pass (compressed by rewriting the timestamp — no source
+      //    seam needed, and the holder is untouched). WAS: stolen. IS: refused,
+      //    and the refusal names the reason, which is what `hub unlink` / `hub
+      //    reindex` / `hub retire` copy into their lock-busy `error`.
+      backdate(LOCK_STALE_MS + 1_000);
+      let busy: Error | null = null;
+      try {
+        acquireProjectLock(project);
+      } catch (e) {
+        busy = e as Error;
+      }
+      expect(busy, "a live holder was stolen from at LOCK_STALE_MS").toBeInstanceOf(Error);
+      expect(busy?.message).toContain(`pid ${process.pid}`);
+      expect(busy?.message).toContain("still running");
+      expect(existsSync(lockFile), "the refused acquire removed the holder's lock").toBe(true);
+
+      // 2. An hour passes. The ceiling fires and the live holder loses the lock
+      //    anyway — the availability half of the trade, asserted so a future
+      //    "never steal from a live holder" cannot land unnoticed.
+      backdate(LOCK_LIVE_HOLDER_CEILING_MS + 1_000);
+      const thief = captureStderr(() => acquireProjectLock(project));
+      try {
+        expect(thief.value.stoleStale).toBe(true);
+        expect(thief.value.steal?.kind).toBe("live-holder-past-ceiling");
+        expect(thief.value.steal?.holderPid).toBe(process.pid);
+        expect(isAlive(held.pid as number), "the pid the steal now consults").toBe(true);
+        // THE DISCLOSURE, thief side: durable, beside the lock, and written
+        // without needing the lock — the one channel a victim can also use.
+        const record = readLockStealRecord(project);
+        expect(record?.holderToken).toBe(held.token);
+        expect(record?.noticedByHolderAt).toBeUndefined();
+
+        // WAS: "the victim is not told — its own release() is a no-op, so it
+        // cannot even discover the loss by releasing." IS: the release is
+        // still a no-op on the thief's lock (that part must never change), but
+        // it now stamps the record and says so.
+        const victim = captureStderr(() => holder.release());
+        expect(existsSync(lockFile), "the victim's release freed the thief's lock").toBe(true);
+        expect(victim.err).toContain("lost the project lock");
+        expect(readLockStealRecord(project)?.noticedByHolderAt).toBeTruthy();
+      } finally {
+        thief.value.release();
+      }
+
+      // 3. A holder that is genuinely gone still loses its lock at
+      //    LOCK_STALE_MS, immediately — the property the ceiling must not cost.
+      //    A real child, killed, rather than a pid literal: pid_max is in the
+      //    millions, so a made-up number is not reliably absent.
+      const doomed = spawn("node", ["-e", "setInterval(() => {}, 1000)"], {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      const doomedRec: Spawned = {
+        proc: doomed, pid: doomed.pid as number, stdout: "", stderr: "",
+        exited: false, code: null, signal: null,
+        exit: new Promise<number | null>((resolve) => {
+          doomed.on("close", (code, signal) => {
+            doomedRec.exited = true; doomedRec.code = code; doomedRec.signal = signal; resolve(code);
+          });
+        }),
+      };
+      spawned.push(doomedRec);
+      doomed.kill("SIGKILL");
+      await doomedRec.exit;
+      expect(isAlive(doomedRec.pid)).toBe(false);
+
       writeFileSync(
         lockFile,
-        JSON.stringify({ ...held, acquiredAt: new Date(Date.now() - LOCK_STALE_MS - 1_000).toISOString() })
+        JSON.stringify({
+          pid: doomedRec.pid,
+          host: hostname(),
+          token: "crashed",
+          acquiredAt: new Date(Date.now() - LOCK_STALE_MS - 1_000).toISOString(),
+        })
       );
-
-      const thief = acquireProjectLock(project);
-      try {
-        // THE RESIDUAL: stolen, from a holder whose pid is recorded in the file
-        // being deleted and is trivially checkable.
-        expect(thief.stoleStale).toBe(true);
-        expect(isAlive(held.pid as number), "the pid the steal ignored").toBe(true);
-        // And the victim is not told: its own release() is a no-op (token
-        // mismatch), so it cannot even discover the loss by releasing.
-        holder.release();
-        expect(existsSync(lockFile), "the victim's release freed the thief's lock").toBe(true);
-      } finally {
-        thief.release();
-      }
+      const reaper = captureStderr(() => acquireProjectLock(project));
+      expect(reaper.value.stoleStale).toBe(true);
+      expect(reaper.value.steal?.kind).toBe("dead-holder");
+      reaper.value.release();
     } finally {
       restore.restore();
     }
-  }, 15_000);
+  }, 30_000);
 });

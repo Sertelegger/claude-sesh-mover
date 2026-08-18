@@ -117,6 +117,39 @@ export interface CarryMeta {
      * at the repository root.
      */
     repoPrefix: string;
+    /**
+     * `computePatchDigest` over `changes.patch` — sha256 of the exact bytes
+     * `git diff` produced, taken before the file was written.
+     *
+     * **Damage detection, and only that.** It sits in the same manifest as the
+     * patch it describes, so anyone who can rewrite one can rewrite the other; it
+     * makes no statement about who produced the payload and none about whether
+     * applying it is safe. The floor is still git's own parse and only git's
+     * (#38), and `applyCarry` still runs every one of its guards ahead of this
+     * one. What the digest adds is the case none of them can see: a patch that
+     * parses cleanly, names only ordinary paths, and is not the patch that was
+     * captured — which before this field was found by `git apply` refusing it, or
+     * not at all.
+     *
+     * It lives on the carry block rather than beside `memoryDigest` at the
+     * manifest root because this is where a carry's self-description already
+     * lives — so it reaches the apply side through `hub/push.ts`'s in-place patch
+     * and `exporter.ts`'s manifest literal alike, neither of which needed to
+     * learn about it, and it is covered by `normalizeCarryMeta`, the trust
+     * boundary this block already has.
+     *
+     * Optional: every bundle written before this field existed carries none, and
+     * those apply exactly as they always did (`verifyPatchDigest` returns `null`
+     * for an absent digest). A block whose digest is present but not a string
+     * arrives as `""` — see `normalizeCarryMeta` — which no patch can hash to, so
+     * it fails closed.
+     *
+     * It covers the PATCH only. `untracked/` travels as ordinary file copies and
+     * is hashed nowhere; the apply side never overwrites with those (a collision
+     * is parked as a sidecar beside the local file), which is why the half that
+     * rewrites files in place is the half that got a digest first.
+     */
+    patchDigest?: string;
 }
 /**
  * How an unreadable `CarryMeta` string field reads inside a sentence.
@@ -358,7 +391,16 @@ export type CarryApplyDeclineReason =
  * unsafe was found in it; a parse refusal means a damaged or truncated
  * bundle, and the saved README says so rather than giving a command.
  */
- | "apply-failed";
+ | "apply-failed"
+/**
+ * `changes.patch` is not the patch the bundle's own `patchDigest` declares —
+ * damage between capture and here. Distinct from `apply-failed` because a
+ * damaged patch that git can still parse is the whole reason the digest
+ * exists: `apply-failed` says "this machine's git could not use it", this
+ * says "these are not the bytes that were captured", and the second is true
+ * of patches git would have applied perfectly happily.
+ */
+ | "patch-damaged";
 /** What an applied carry did to the working tree. */
 export interface CarryApplied {
     applied: true;

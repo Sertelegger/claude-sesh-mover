@@ -880,6 +880,23 @@ export interface BrowseResult {
         storage: StorageScope;
         metadataAvailable: boolean;
         metadataError?: string;
+        /**
+         * Whether the bundle carries a file payload an import could write into the
+         * project — `workspace/` and `carry/` respectively (#47).
+         *
+         * **`null` follows the same rule as the four fields above: it means NOT
+         * READ, never "no payload".** `false` on a bundle whose manifest could not
+         * be parsed would be the dangerous direction of lie — it says "importing
+         * this cannot write to your project" about a bundle nobody checked. A
+         * caller deciding whether to warn must treat `null` as unknown.
+         *
+         * Both are read from the manifest `browse` already parsed for the fields
+         * above; neither costs a second look inside the archive, which matters
+         * because reading a `.tar.zst` manifest decompresses the whole bundle
+         * (#32).
+         */
+        hasWorkspace: boolean | null;
+        hasCarry: boolean | null;
     }>;
 }
 export interface ConfigureResult {
@@ -997,6 +1014,23 @@ export interface HubStatusResult {
         notes: string[];
         noteCount: number;
     };
+    /**
+     * The last time another process took this project's lock away from a holder
+     * (#84), or absent if that has never happened here.
+     *
+     * It is reported by `status` and nowhere else for a specific reason: the two
+     * parties to a steal are both badly placed to tell anyone. The thief's own
+     * warning rides on whatever verb it was running — a SessionEnd auto-push has
+     * closed stdout and an invisible stderr — and the victim, by definition, no
+     * longer holds the lock `recordAutoPushOutcome` re-takes to write its
+     * breadcrumb, so its note is dropped in exactly the case worth recording.
+     * `status` holds no lock and is the verb a user runs when something looks
+     * wrong, which makes it the one place this can be read.
+     *
+     * `noticedByHolderAt` absent means the victim has not unwound yet — or never
+     * will, which is itself the interesting answer.
+     */
+    lastLockSteal?: LockStealRecord;
     warnings: string[];
 }
 export interface HubPushResult {
@@ -1316,6 +1350,57 @@ export interface HubUnreachableResult {
      */
     hubState: Exclude<HubReachabilityState, "ok">;
     suggestion: string;
+}
+/**
+ * What a liveness probe learned about the process recorded in a lock file.
+ *
+ * Three states, not a boolean, and the third is the load-bearing one: a torn
+ * lock (the "wx" create and the JSON write are two syscalls, so a reader can
+ * catch a live holder at zero bytes), a lock written before this field
+ * existed, and a lock whose recorded hostname is not this machine all answer
+ * `unknown` — and `lock.ts` treats `unknown` exactly as it treats `alive`,
+ * because an unidentified holder is not evidence of an absent one.
+ */
+export type LockHolderLiveness = "alive" | "dead" | "unknown";
+/**
+ * A project lock taken from a previous holder, written to
+ * `~/.sesh-mover/locks/<encoded-project>.lock.steal.json`.
+ *
+ * **Why a file rather than a result field.** A steal has two sides and only
+ * one of them can report through the normal channels. The thief surfaces it as
+ * a warning (`LockHandle.stoleStale`), which for a session-end push reaches
+ * `hub status` through `lastAutoPush`. The victim has nothing: it does not
+ * learn it was robbed until its own `release()`, and `recordAutoPushOutcome`
+ * (cli.ts) — the only reader an unattended push has — writes its breadcrumb by
+ * re-taking the very lock the thief is holding and gives up silently when it
+ * is busy. So the one durable trace of a steal must not require the lock, and
+ * this is it: written by the thief at steal time, stamped by the victim when
+ * it finds out, readable by anyone via `readLockStealRecord`.
+ */
+export interface LockStealRecord {
+    /** When the steal happened, on the thief's clock. Local by construction — the lock file is per-machine, never on the hub. */
+    at: string;
+    /**
+     * Which arm of the steal rule fired. `dead-holder` is the benign one (a
+     * crashed or killed process never runs its release). The other two are the
+     * hard ceiling firing: a holder that was still running, or one that could
+     * not be identified at all, kept its lock as long as the rule allows and
+     * then lost it anyway, because refusing forever would be a silent permanent
+     * outage for the project.
+     */
+    kind: "dead-holder" | "live-holder-past-ceiling" | "unidentified-holder-past-ceiling";
+    /** The pid recorded in the stolen lock, or null when it carried none (torn write, foreign file). */
+    holderPid: number | null;
+    /** The hostname recorded in the stolen lock, or null. A value that is not this machine's is why `holderLiveness` can be `unknown`. */
+    holderHost: string | null;
+    /** The stolen lock's per-acquisition token — how the victim recognizes ITS loss rather than an older one. */
+    holderToken: string | null;
+    holderLiveness: LockHolderLiveness;
+    /** Age of the stolen lock at steal time. Seconds, because minutes-scale is all this is ever read at. */
+    holderAgeSeconds: number;
+    stolenByPid: number;
+    /** Stamped by the victim when its `release()` discovers the loss. Absent means it has not unwound yet — or never will. */
+    noticedByHolderAt?: string;
 }
 export interface HubLockBusyResult {
     success: false;

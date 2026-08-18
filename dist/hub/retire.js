@@ -1,5 +1,5 @@
 import { createFsBackend } from "./backend.js";
-import { acquireProjectLock, LockBusyError } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { readLocalProjectId, removeLocalProjectIdIfMatches, } from "./identity.js";
 import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
 import { projectDir, projectJsonPath, tombstoneDirPath, tombstonePath, } from "./layout.js";
@@ -95,7 +95,7 @@ async function preamble(command, opts) {
     }
     const warnings = [];
     if (lock.stoleStale) {
-        warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no push or pull is genuinely in progress for this project.");
+        warnings.push(describeLockSteal(lock.steal, "operation"));
     }
     // THE LOCK IS RELEASED ON EVERY PATH OUT OF HERE EXCEPT `kind: "ok"`, which
     // hands it to the caller's `finally`. Splitting ownership across that boundary

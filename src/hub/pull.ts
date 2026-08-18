@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend, type HubBackend } from "./backend.js";
 import { type HubBundleRecord } from "./layout.js";
-import { acquireProjectLock, LockBusyError } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { runApplyCarryStage } from "./pull-apply-carry.js";
 import { runApplySessionsStage } from "./pull-apply-sessions.js";
 import { runApplyWorkspaceStage } from "./pull-apply-workspace.js";
@@ -341,7 +341,7 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
     const warnings: string[] = [];
     if (lock.stoleStale) {
       warnings.push(
-        "Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress."
+        describeLockSteal(lock.steal, "pull")
       );
     }
     const machine = loadOrCreateMachineId();
