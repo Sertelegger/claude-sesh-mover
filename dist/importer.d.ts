@@ -97,6 +97,60 @@ export interface ImportOptions {
      * discloses it in `memorySkipped`, and leaves every file in the bundle.
      */
     noMemory?: boolean;
+    /**
+     * Handle the bundle's two FILE payloads — `workspace/` and `carry/` (#47).
+     *
+     * **ABSENT means this caller does not handle them AT ALL**: not applied, not
+     * counted, not disclosed. That is not a default, it is a statement about which
+     * of `importSession`'s THREE callers this is:
+     *
+     *  - `sesh-mover import` (cli.ts) passes it. This is the bootstrap transport
+     *    #47 exists for.
+     *  - `hub pull` does NOT, because it has its own stages for both payloads
+     *    (`pull-apply-workspace.ts`, `pull-apply-carry.ts`) with a 3-way merge, an
+     *    ancestor rule and a saved-payload contract that all differ from
+     *    bootstrap's on purpose. Two handlers running over one bundle would report
+     *    it twice and, worse, disagree: the pull's carry decline SAVES the payload
+     *    and may not name a re-run, while this one writes nothing and may.
+     *  - `migrate` does NOT, deliberately and permanently. It is export + import +
+     *    delete-source on ONE machine, so a workspace snapshot of files already on
+     *    that machine is pure copying and `--rename-dir` already moves the
+     *    directory. Writing that down matters more than the exclusion: the next
+     *    reader will otherwise add it for symmetry, and a payload apply inside a
+     *    flow that also DELETES SOURCE SESSIONS is the worst place in this
+     *    codebase to discover an interaction.
+     *
+     * Every field inside is `false` by default at every wiring site — see the flag
+     * declarations in `cli.ts` for why that is a security property rather than a
+     * UX preference, and `reconcilePayloadLayers` for what each one does.
+     */
+    filePayload?: {
+        /**
+         * Unpack `workspace/` into `targetProjectPath`. Never implied by the bundle
+         * carrying one — a payload's presence is not a request to write it.
+         *
+         * OPTIONAL, and that is deliberate rather than lax: absent has to MEAN "do
+         * not apply", so the `=== true` coercion below is load-bearing rather than
+         * redundant belt-and-braces. Declaring these three required would make
+         * `=== true` and `!== false` indistinguishable to every caller a type
+         * checker can see — which is exactly how a security default stops being
+         * testable. (Found by mutation: a test helper that pre-coerced them made the
+         * behavioural half of this guard unable to fail.)
+         */
+        applyWorkspace?: boolean;
+        /**
+         * `git apply` the carried patch and copy its untracked files. Absent,
+         * NOTHING is written — not even the saved copy a `hub pull` parks. See
+         * `reconcilePayloadLayers` for why that divergence is right.
+         */
+        applyCarry?: boolean;
+        /**
+         * Unpack the workspace payload OVER a target that already has content,
+         * OVERWRITING any file of the same name. Without it a non-empty target is
+         * refused before anything is written. It is an overwrite, never a merge.
+         */
+        forceWorkspace?: boolean;
+    };
     onProgress?: (ev: ProgressEvent) => void;
 }
 export declare function importSession(options: ImportOptions): Promise<ImportResult | DryRunResult | ErrorResult>;

@@ -6,8 +6,9 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-  classifyDestination, formatBytes, isCarriedPath, isNeverIncludable, isReIncluded,
+  budgetKey, classifyDestination, formatBytes, isCarriedPath, isNeverIncludable, isReIncluded,
   NEVER_INCLUDABLE, readCarryRules, type CarryRules, type DestinationBlock,
+  type PayloadScope,
 } from "./workspace.js";
 import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 import { DEFAULT_CARRY_MAX_MB } from "../config.js";
@@ -488,6 +489,29 @@ export interface CaptureCarryOptions {
    * cheap.
    */
   maxBytes?: number;
+  /**
+   * Which command is capturing — decides only which config key a budget decline
+   * names. See `PayloadScope`.
+   */
+  scope?: PayloadScope;
+  /**
+   * Compute the whole `CarryMeta` and write NOTHING — no `changes.patch`, no
+   * `untracked/`, no `carry.json`, no `destDir`.
+   *
+   * Everything the disclosure needs is already computed before the first write:
+   * the base commit, the branch, the in-progress operation, the patch size, the
+   * filtered untracked list, `reIncluded` and `trackedIgnored`. Exposing that
+   * point is what lets `commands/export.md` tell a user what a payload would
+   * carry BEFORE the artifact exists (#47), rather than writing the secrets to
+   * disk and then offering to delete them.
+   *
+   * The meta it returns describes the payload that WOULD land, with one honest
+   * difference from a real run: `untrackedCount`/`untrackedBytes` count the
+   * files that passed the rules, where a real capture counts the ones that
+   * copied — a file that becomes unreadable between the two is in the measure
+   * and not in the capture, and the real run says so in `diagnostics`.
+   */
+  measureOnly?: boolean;
 }
 
 type GitResult =
@@ -743,6 +767,7 @@ export async function captureCarry(
   opts?: CaptureCarryOptions
 ): Promise<CaptureResult> {
   const diagnostics = opts?.diagnostics ?? [];
+  const scope: PayloadScope = opts?.scope ?? "hub";
   // `Math.max(0, …)`, not `Math.max(1, …)`: a configured budget of 0 means
   // "carry nothing" and has to stay exactly 0, or the early return below never
   // fires and a 1-byte budget declines with a message about sizes instead.
@@ -754,7 +779,7 @@ export async function captureCarry(
     return {
       captured: false,
       reason: "budget-disabled",
-      detail: "the carry budget is set to 0, so no uncommitted work is carried (hub.carryMaxMb)",
+      detail: `the carry budget is set to 0, so no uncommitted work is carried (${budgetKey(scope, "carry")})`,
     };
   }
 
@@ -881,6 +906,47 @@ export async function captureCarry(
   // files at all. See `findTrackedIgnored` for why this is not `reIncluded`.
   const trackedIgnored = patch.length > 0 ? findTrackedIgnored(projectPath, diagnostics) : [];
 
+  /**
+   * Everything above this line is measurement; everything below it writes.
+   *
+   * The `CarryMeta` fields that differ between the two are exactly the two the
+   * copy loop counts (`untrackedCount`/`untrackedBytes`) and `reIncluded`,
+   * which the copy loop fills from the files it managed to read. A measure
+   * takes them from the filtered list instead, so it describes the payload as
+   * the rules decided it rather than as the filesystem allowed it — see
+   * `measureOnly`.
+   */
+  const metaOf = (
+    untrackedCountValue: number,
+    untrackedBytesValue: number,
+    reIncludedPaths: string[]
+  ): CarryMeta => ({
+    baseCommit,
+    branch,
+    detached: !symref.ok,
+    inProgress: gitDir ? detectInProgress(gitDir) : null,
+    capturedAt: new Date().toISOString(),
+    untrackedCount: untrackedCountValue,
+    untrackedBytes: untrackedBytesValue,
+    patchBytes: patch.length,
+    reIncludedCount: reIncludedPaths.length,
+    reIncluded: reIncludedPaths.slice(0, MAX_REPORTED_REINCLUDED),
+    trackedIgnoredCount: trackedIgnored.length,
+    trackedIgnored: trackedIgnored.slice(0, MAX_REPORTED_REINCLUDED),
+    repoPrefix,
+  });
+
+  if (opts?.measureOnly) {
+    return {
+      captured: true,
+      meta: metaOf(
+        files.length,
+        untrackedBytes,
+        files.filter((f) => f.reIncluded).map((f) => f.rel)
+      ),
+    };
+  }
+
   const preexisting = existsSync(destDir);
   const cleanupPartial = (): void => {
     // Each removal stands alone: whatever made the write fail may well make one
@@ -923,21 +989,7 @@ export async function captureCarry(
       writtenBytes += file.size;
       if (file.reIncluded) reIncluded.push(file.rel);
     }
-    const meta: CarryMeta = {
-      baseCommit,
-      branch,
-      detached: !symref.ok,
-      inProgress: gitDir ? detectInProgress(gitDir) : null,
-      capturedAt: new Date().toISOString(),
-      untrackedCount: written,
-      untrackedBytes: writtenBytes,
-      patchBytes: patch.length,
-      reIncludedCount: reIncluded.length,
-      reIncluded: reIncluded.slice(0, MAX_REPORTED_REINCLUDED),
-      trackedIgnoredCount: trackedIgnored.length,
-      trackedIgnored: trackedIgnored.slice(0, MAX_REPORTED_REINCLUDED),
-      repoPrefix,
-    };
+    const meta: CarryMeta = metaOf(written, writtenBytes, reIncluded);
     writeFileSync(join(destDir, "carry.json"), JSON.stringify(meta, null, 2) + "\n", "utf-8");
     return { captured: true, meta };
   } catch (e) {

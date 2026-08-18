@@ -10,8 +10,8 @@ import { basename, dirname, join } from "node:path";
 import {
   classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readIgnorePatterns,
   readIncludePatterns, type CarryDropReason, type CarryRules,
-} from "./workspace.js";
-import { gitChildEnv } from "./carry.js";
+} from "../payload/workspace.js";
+import { gitChildEnv } from "../payload/carry.js";
 import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "../sidecar.js";
 
 /** A file was left alone and the incoming copy parked beside it. */

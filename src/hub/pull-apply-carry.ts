@@ -1,6 +1,6 @@
 import {
   applyCarry, normalizeCarryMeta, orNotRecorded, type ApplyResult, type CarryMeta,
-} from "./carry.js";
+} from "../payload/carry.js";
 import { isCarrySuppressed, type PulledCarry } from "./pull-apply-state.js";
 import { isReadableDir } from "./fs-probe.js";
 import { stageOk, stageSkip, type StageOutcome } from "./pull-stages.js";

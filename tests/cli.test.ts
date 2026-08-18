@@ -2185,7 +2185,7 @@ describe("cli", () => {
         // snapshotted `<tempDir>/.claude`, i.e. this test's own bundle carried
         // the fixture's transcripts inside the WORKSPACE payload. That is
         // currently harmless only because `.claude` sits on
-        // DEFAULT_WORKSPACE_EXCLUDES, which `src/hub/workspace.ts` documents as
+        // DEFAULT_WORKSPACE_EXCLUDES, which `src/payload/workspace.ts` documents as
         // a re-includable convenience default rather than the NEVER_INCLUDABLE
         // floor — so a user-overridable policy, not directory isolation, was
         // holding this test's hygiene up. Own directory instead.
@@ -2244,6 +2244,137 @@ describe("cli", () => {
    * assertions elsewhere in this file changed from `0`/`not.toBe(0)` to a
    * specific code as part of the same decision, each annotated at its site.
    */
+  /**
+   * THE FILE PAYLOAD, THROUGH THE REAL BINARY (#47).
+   *
+   * `tests/payload-parity.test.ts` proves the behaviour at the library level and
+   * `tests/apply-consent.test.ts` reads the wiring's SHAPE. Neither goes through
+   * `dist/cli.js`, so a flag that is declared, documented and never threaded —
+   * or threaded with the wrong polarity — passes both. These four go end to end
+   * for exactly that gap.
+   */
+  describe("export/import file payload flags", () => {
+    /** A real project directory the fixture config dir has sessions for. */
+    function realProject(name: string, files: Record<string, string>): string {
+      const proj = join(tempDir, name);
+      mkdirSync(proj, { recursive: true });
+      for (const [rel, content] of Object.entries(files)) {
+        const abs = join(proj, ...rel.split("/"));
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, content);
+      }
+      cpSync(
+        join(configDir, "projects", "-Users-testuser-Projects-testproject"),
+        join(configDir, "projects", encodeProjectPath(proj)),
+        { recursive: true }
+      );
+      return proj;
+    }
+
+    it("carries no project files without --include-workspace", () => {
+      const proj = realProject("no-flag-proj", { "src/app.ts": "x\n" });
+      const out = join(tempDir, "cli-out-1");
+      mkdirSync(out, { recursive: true });
+      const result = JSON.parse(
+        runCli(
+          `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path "${proj}" --format dir --name p1 --output "${out}"`
+        )
+      );
+      expect(result.hasWorkspace).toBe(false);
+      expect(existsSync(join(out, "p1", "workspace"))).toBe(false);
+    });
+
+    it("carries them with it, and reports a plan without writing one", () => {
+      const proj = realProject("flag-proj", { "src/app.ts": "x\n" });
+
+      // The plan first: it must write NOTHING — no bundle, no staging dir.
+      const out = join(tempDir, "cli-out-2");
+      mkdirSync(out, { recursive: true });
+      const plan = JSON.parse(
+        runCli(
+          `export --payload-plan --include-workspace --source-config-dir "${configDir}" --project-path "${proj}"`
+        )
+      );
+      expect(plan.payloadPlan).toBe(true);
+      expect(plan.decision).toBe("workspace");
+      expect(plan.workspace.fileCount).toBeGreaterThan(0);
+      expect(readdirSync(out)).toEqual([]);
+
+      const result = JSON.parse(
+        runCli(
+          `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path "${proj}" --format dir --name p2 --output "${out}" --include-workspace`
+        )
+      );
+      expect(result.hasWorkspace).toBe(true);
+      expect(existsSync(join(out, "p2", "workspace", "src", "app.ts"))).toBe(true);
+      // The plan predicted what the bundle then carried.
+      expect(plan.workspace.fileCount).toBe(
+        JSON.parse(readFileSync(join(out, "p2", "manifest.json"), "utf-8")).workspace.fileCount
+      );
+    });
+
+    it("writes no project file on import without --apply-workspace, and does with it", () => {
+      const proj = realProject("src-proj", { "src/app.ts": "carried\n" });
+      const out = join(tempDir, "cli-out-3");
+      mkdirSync(out, { recursive: true });
+      runCli(
+        `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path "${proj}" --format dir --name p3 --output "${out}" --include-workspace`
+      );
+      const bundle = join(out, "p3");
+
+      const target = join(tempDir, "cli-target");
+      mkdirSync(target, { recursive: true });
+      const targetConfig = join(tempDir, "cli-target-config");
+      mkdirSync(join(targetConfig, "projects"), { recursive: true });
+
+      const declined = JSON.parse(
+        runCli(
+          `import --from "${bundle}" --target-project-path "${target}" --target-config-dir "${targetConfig}"`
+        )
+      );
+      expect(declined.success).toBe(true);
+      expect(existsSync(join(target, "src", "app.ts"))).toBe(false);
+      expect(declined.workspaceSkipped).toBeGreaterThan(0);
+
+      const applied = JSON.parse(
+        runCli(
+          `import --from "${bundle}" --target-project-path "${target}" --target-config-dir "${targetConfig}" --apply-workspace`
+        )
+      );
+      expect(applied.success).toBe(true);
+      expect(readFileSync(join(target, "src", "app.ts"), "utf-8")).toBe("carried\n");
+    });
+
+    it("exits 2 and writes nothing when the workspace target is not empty", () => {
+      const proj = realProject("refuse-proj", { "src/app.ts": "theirs\n" });
+      const out = join(tempDir, "cli-out-4");
+      mkdirSync(out, { recursive: true });
+      runCli(
+        `export --scope current --session-id ${sessionId} --source-config-dir "${configDir}" --project-path "${proj}" --format dir --name p4 --output "${out}" --include-workspace`
+      );
+
+      const target = join(tempDir, "cli-refuse-target");
+      mkdirSync(join(target, "src"), { recursive: true });
+      writeFileSync(join(target, "src", "app.ts"), "mine\n");
+      const targetConfig = join(tempDir, "cli-refuse-config");
+      mkdirSync(join(targetConfig, "projects"), { recursive: true });
+
+      const r = runCli([
+        "import", "--from", join(out, "p4"),
+        "--target-project-path", target,
+        "--target-config-dir", targetConfig,
+        "--apply-workspace",
+      ]);
+      // A refusal reported as a result: exit class 2, nothing written.
+      expect(r.status).toBe(2);
+      const result = JSON.parse(r.stdout);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/exists and is not empty/);
+      expect(readFileSync(join(target, "src", "app.ts"), "utf-8")).toBe("mine\n");
+      expect(readdirSync(join(targetConfig, "projects"))).toEqual([]);
+    });
+  });
+
   describe("exit codes", () => {
     /**
      * The classifier itself, exhaustively — one case per class, including the

@@ -1,6 +1,6 @@
 import type { HubBundleRecord } from "./layout.js";
 import type { WorkspaceMergeReport } from "./merge.js";
-import type { CarryMeta } from "./carry.js";
+import type { CarryMeta } from "../payload/carry.js";
 import type { AuxiliaryConflict, ExportManifest, HubPullDivergence, HubPullResult, MemoryConflict, SharedLayerFindings } from "../types.js";
 /**
  * The `memory/` and `plans/` outcomes of a whole pull, accumulated across the

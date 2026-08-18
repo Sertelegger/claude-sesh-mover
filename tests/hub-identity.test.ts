@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createFsBackend } from "../src/hub/backend.js";
 import {
-  normalizeGitRemote, localGitRemotes, scanGitRemotes, resolveProjectIdentity,
+  resolveProjectIdentity,
   createHubProject, linkToHubProject, readLocalProjectId, listHubProjects,
 } from "../src/hub/identity.js";
+import {
+  normalizeGitRemote, localGitRemotes, scanGitRemotes,
+} from "../src/payload/git-scan.js";
 import { projectJsonPath } from "../src/hub/layout.js";
 import { overridePath } from "./helpers/env.js";
 

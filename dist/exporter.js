@@ -12,6 +12,8 @@ import { computeIncrementalPlan } from "./diff.js";
 import { readEntryUuids } from "./jsonl.js";
 import { percentThrottle } from "./progress.js";
 import { readLocalProjectId } from "./hub/identity.js";
+import { capturePayload } from "./payload/capture.js";
+import { scanGitRemotes } from "./payload/git-scan.js";
 /**
  * Digest every auxiliary layer directory this session actually landed in the
  * bundle. Hashes the BUNDLE's copies, never the source tree: the manifest
@@ -90,8 +92,50 @@ async function copyFileWithHash(src, dest, onBytes) {
     }
     return `sha256:${hash.digest("hex")}`;
 }
+/**
+ * Measure the file payload and report it, writing NOTHING (#47).
+ *
+ * The pre-write half of `commands/export.md`'s new confirm gate. It runs the
+ * SAME `capturePayload` the real export runs, in `measureOnly` mode, so the
+ * numbers a user consents to and the payload that then lands come off one
+ * decision — the rule `reconcileSharedLayers`'s plan mode already establishes on
+ * the import side, applied here for the same reason.
+ *
+ * It exports no session and creates no bundle, so there is nothing to clean up
+ * if the user declines.
+ */
+export async function planExportPayload(options) {
+    const captured = await capturePayload({
+        projectPath: options.projectPath,
+        // Never read in `measureOnly` mode — no directory under it is created and
+        // no file is written. Named for what it WOULD be so the two modes read the
+        // same, rather than passing a path that suggests a real destination.
+        destDir: options.projectPath,
+        wantWorkspace: options.includeWorkspace === true,
+        wantCarry: options.includeCarry === true,
+        scan: scanGitRemotes(options.projectPath),
+        scope: "export",
+        workspaceMaxBytes: options.payloadBudgets?.workspaceMaxBytes,
+        carryMaxBytes: options.payloadBudgets?.carryMaxBytes,
+        measureOnly: true,
+        discoverIgnored: true,
+    });
+    return {
+        success: true,
+        command: "export",
+        payloadPlan: true,
+        projectPath: options.projectPath,
+        decision: captured.decision,
+        ...(captured.workspace
+            ? { workspace: { fileCount: captured.workspace.fileCount, byteSize: captured.workspace.byteSize } }
+            : {}),
+        ...(captured.carry ? { carry: captured.carry } : {}),
+        ...(captured.ignoredNotCarried ? { ignoredNotCarried: captured.ignoredNotCarried } : {}),
+        warnings: captured.warnings,
+    };
+}
 export async function exportSession(options) {
-    const { configDir, projectPath, sessionId, outputDir, name, excludeLayers, claudeVersion, collisionCheck, summaryOverrides, incremental, noSummary, onProgress, } = options;
+    const { configDir, projectPath, sessionId, outputDir, name, collisionCheck } = options;
     const exportPath = join(outputDir, name);
     // Collision check
     if (collisionCheck && existsSync(exportPath)) {
@@ -102,6 +146,7 @@ export async function exportSession(options) {
             sessions: [],
             warnings: [],
             archivePath: null,
+            hasWorkspace: false,
             collision: true,
             existingPath: exportPath,
         };
@@ -120,10 +165,10 @@ export async function exportSession(options) {
                 : "No sessions found for this project",
         };
     }
-    return exportSessions([target], configDir, projectPath, exportPath, excludeLayers, claudeVersion, "current", summaryOverrides, noSummary, incremental, onProgress);
+    return exportSessions([target], exportPath, "current", options);
 }
 export async function exportAllSessions(options) {
-    const { configDir, projectPath, sessionIds, outputDir, name, excludeLayers, claudeVersion, summaryOverrides, incremental, noSummary, onProgress, } = options;
+    const { configDir, projectPath, sessionIds, outputDir, name } = options;
     let sessions = discoverSessions(configDir, projectPath);
     if (sessions.length === 0) {
         return {
@@ -145,10 +190,10 @@ export async function exportAllSessions(options) {
         const wanted = new Set(sessionIds);
         sessions = sessions.filter((s) => wanted.has(s.sessionId));
     }
-    const exportPath = join(outputDir, name);
-    return exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, "all", summaryOverrides, noSummary, incremental, onProgress);
+    return exportSessions(sessions, join(outputDir, name), "all", options);
 }
-async function exportSessions(sessions, configDir, projectPath, exportPath, excludeLayers, claudeVersion, scope, summaryOverrides, noSummary, incremental, onProgress) {
+async function exportSessions(sessions, exportPath, scope, options) {
+    const { configDir, projectPath, excludeLayers, claudeVersion, summaryOverrides, noSummary, incremental, onProgress, } = options;
     // POLICY: the layers this export is permitted to carry. It gates each copy
     // below and is never stamped into the manifest — see `landedLayers`.
     const requestedLayers = getAllLayers().filter((l) => !excludeLayers.includes(l));
@@ -384,6 +429,48 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
             }
         }
     }
+    // ## The FILE payload (#47) — OPT-IN, where push's is opt-out
+    //
+    // `export`/`import` and `push`/`pull` are the same operation with different
+    // transports, so the capture is literally the same code: `capturePayload`
+    // makes the three-way git-remote decision once, for both. What differs is the
+    // DEFAULT, and it is a security decision rather than a taste one — a hub
+    // bundle lands in a directory the user configured, an export bundle gets
+    // scp'd, emailed or handed to someone, so its destination is unknown here and
+    // the user has to choose. See `ExportOptions.includeWorkspace`.
+    //
+    // Placed here, immediately before the manifest literal, so the two payload
+    // fields are set IN the literal rather than patched afterwards. `push` patches
+    // its staged `manifest.json` in place because that manifest was written before
+    // the hub link existed; export has no such ordering problem, so it needs no
+    // patch, no second write and no `sessionsDigest` restamp. Doing what push does
+    // here would import a workaround for a constraint this side does not have.
+    let workspaceMeta;
+    let carryMeta;
+    let ignoredNotCarried;
+    if (options.includeWorkspace || options.includeCarry) {
+        const captured = await capturePayload({
+            projectPath,
+            destDir: exportPath,
+            wantWorkspace: options.includeWorkspace === true,
+            wantCarry: options.includeCarry === true,
+            scan: scanGitRemotes(projectPath),
+            scope: "export",
+            workspaceMaxBytes: options.payloadBudgets?.workspaceMaxBytes,
+            carryMaxBytes: options.payloadBudgets?.carryMaxBytes,
+            // Unconditional, where push runs it on a MANUAL push only: every export
+            // is manual by construction, and the artifact leaves the machine.
+            discoverIgnored: true,
+        });
+        warnings.push(...captured.warnings);
+        // NO `basedOn`, ever. A workspace generation is identified by a hub bundle
+        // id and proves a generation was common to two trees; an export mints none,
+        // so absent is the honest answer and it degrades a future merge to
+        // no-ancestor mode, which is safe by design. See the field's doc.
+        workspaceMeta = captured.workspace;
+        carryMeta = captured.carry;
+        ignoredNotCarried = captured.ignoredNotCarried;
+    }
     for (const l of bundleLayers)
         landedLayers.add(l);
     const includedLayers = layerList(landedLayers);
@@ -398,6 +485,11 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         sessionScope: scope,
         includedLayers,
         sessions: sessionManifests,
+        // Set in the literal, never patched in afterwards (see the payload block
+        // above). Both sit OUTSIDE `sessionsDigest`, which covers the session list
+        // and nothing else, so adding them invalidates no bundle that predates them.
+        workspace: workspaceMeta,
+        carry: carryMeta,
         // sessionsDigest is deliberately absent here: writeManifest stamps it over
         // the finished list, so there is exactly one place that computes it and no
         // way for a manifest to be written with a stale one. It is a hash of the
@@ -440,6 +532,9 @@ async function exportSessions(sessions, configDir, projectPath, exportPath, excl
         })),
         warnings,
         archivePath: null,
+        hasWorkspace: workspaceMeta !== undefined,
+        ...(carryMeta ? { carry: carryMeta } : {}),
+        ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
         collision: false,
     };
 }

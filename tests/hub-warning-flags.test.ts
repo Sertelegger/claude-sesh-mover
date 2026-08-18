@@ -244,11 +244,23 @@ const REGISTRY: FlagUse[] = [
       reruns: "hubPush",
     },
   },
+  // ---- src/payload/capture.ts ----------------------------------------------
+  // The capture decision and its disclosures, shared by `hub push` and
+  // `sesh-mover export` since #47. Both commands surface every line here
+  // verbatim, so the two trackedIgnored sentences are worded per transport and
+  // each names its own command — which is also what keeps them out of the
+  // cross-command check.
   {
-    file: "src/hub/push.ts",
+    file: "src/payload/capture.ts",
+    match: "untrack them (git rm --cached), or export without --include-carry, to keep the next one from carrying them",
+    klass: "future-only",
+    why: "The files are already in the bundle this export just wrote; both remedies — untracking and dropping the flag — are about what the NEXT export carries. Names `export` explicitly because `push` surfaces this file too and does not declare --include-carry.",
+  },
+  {
+    file: "src/payload/capture.ts",
     match: "untrack them (git rm --cached) or push with --no-carry",
     klass: "future-only",
-    why: "The files are already on the hub; both remedies are about what the NEXT push carries.",
+    why: "The files are already on the hub; both remedies are about what the NEXT push carries. Names `push` explicitly because `export` surfaces this file too and does not declare --no-carry.",
   },
   {
     file: "src/hub/push.ts",
@@ -419,17 +431,18 @@ const REGISTRY: FlagUse[] = [
     why: "A boundary assertion aimed at callers of the library, not a user-facing remedy.",
   },
   {
-    file: "src/hub/carry.ts",
+    file: "src/payload/carry.ts",
     match: "the pull did not ask for carried changes to be applied (--apply-carry)",
     klass: "descriptive",
     why: "Names the flag as the CAUSE of this decline. pull.ts turns it into advice, and that line is classified above.",
   },
-  {
-    file: "src/hub/carry.ts",
-    match: "the carry budget is set to 0, so no uncommitted work is carried (hub.carryMaxMb)",
-    klass: "descriptive",
-    why: "A config-key remedy, not a flag one — this is the reason the sweep reads src/config.ts's defaults too. It names the key as the CAUSE of the decline; push.ts is where it becomes advice, and workspace.ts's sibling line carries that wording.",
-  },
+  // `captureCarry`'s budget-disabled detail used to appear here. It now
+  // interpolates `budgetKey(scope, "carry")`, because #47 gave the module a
+  // SECOND key block (`export.carryMaxMb` beside `hub.carryMaxMb`) and a message
+  // naming one of them was wrong for the other transport. Both spellings are
+  // still literals, in `workspace.ts`'s `budgetKey`, which is what keeps them
+  // greppable — and the sweep classifies a bare string literal as an argument
+  // rather than as prose, which is exactly what they are there.
   // `src/hub/status.ts` used to carry an entry here for
   //   "hub.path is set (${hubPath}) but hub.json is missing — run hub init."
   // It is gone because the line is: `hub status` now pushes
@@ -442,17 +455,22 @@ const REGISTRY: FlagUse[] = [
   // point. status.ts names no flag or key of its own any more, so it has no
   // entry; its SURFACES row below stays, because the map is about which
   // commands COULD surface that file's messages.
+  // ONE remedy sentence, two transports (`noPayloadRemedy`). #47 made this
+  // module shared, so the sentence has to name a flag its reader's command
+  // actually declares — and naming the command in it is also what satisfies the
+  // cross-command check, since `--no-workspace` is push's and
+  // `--include-workspace` is export's.
   {
-    file: "src/hub/workspace.ts",
-    match: "or pass --no-workspace on future pushes",
+    file: "src/payload/workspace.ts",
+    match: "or drop --include-workspace from the next `sesh-mover export` if that is what you meant",
     klass: "future-only",
-    why: "The snapshot was empty, not skipped; --no-workspace is about how the user pushes from now on.",
+    why: "Both callers of this sentence (an empty snapshot, and a budget of 0) describe a capture that already happened and carried nothing. The remedy is about the NEXT export, and the wording says so.",
   },
   {
-    file: "src/hub/workspace.ts",
-    match: "or pass --no-workspace on later pushes",
+    file: "src/payload/workspace.ts",
+    match: "or pass --no-workspace on a later `sesh-mover push` if that is what you meant",
     klass: "future-only",
-    why: "hub.workspaceMaxMb is 0, so this push already carried no files and recorded its bundle. Both remedies — raising the setting and the flag — apply to a LATER push. Worded distinctly from the empty-snapshot line above so each keeps its own registry entry.",
+    why: "Same sentence, push's spelling. The bundle is already written and recorded by the time either caller emits it, so the flag applies to a later push.",
   },
   // ---- src/importer.ts -----------------------------------------------------
   // The sharpest gap the widened sweep closed. `importSession` is called by
@@ -523,6 +541,54 @@ const REGISTRY: FlagUse[] = [
   // object, because that branch never consults `noRegister`. The suggestion now
   // names no flag, so there is deliberately no entry for it — the sweep will
   // ask for one again the moment a flag comes back.
+  // ---- src/importer.ts, the file payload (#47) -----------------------------
+  // The ONLY messages in importer.ts that `migrate` and `pull` never surface:
+  // both call `importSession` without `filePayload`, so the whole block that
+  // emits them is unreachable for them. They name `sesh-mover import` anyway,
+  // because the SURFACES map is per FILE and the cross-command check reads it
+  // that way — and because being explicit survives a future caller.
+  {
+    file: "src/importer.ts",
+    match: "sesh-mover import --apply-workspace\\` was not passed",
+    klass: "retry-works",
+    why: "Nothing was written and nothing was consumed by declining: the payload is still in the bundle, which is a file the user has. The re-run genuinely reaches it even when every session is a duplicate by then, because the fully-duplicate branch of importSession reconciles the file payload too — the same reachability #53 established for the memory layer.",
+    provenBy: {
+      test: "importer.test.ts",
+      name: "lands a declined workspace payload on a re-run, when every session is already a duplicate",
+      // The local `runImport` wrapper, which is `importSession` plus this
+      // suite's fixed target — counting the wrapper is what makes the proof
+      // legible in a test that would otherwise repeat six arguments twice.
+      reruns: "runImport",
+    },
+  },
+  {
+    file: "src/importer.ts",
+    match: "sesh-mover import --apply-carry\\` was not passed",
+    klass: "retry-works",
+    why: "Same argument as the workspace line above, and it is why this path deliberately does NOT save the payload the way a pull's decline does: a pull records its bundles as received and deletes its extraction directory, so its re-run is foreclosed and parking is the only remedy left. An import's bundle is a file the user still has.",
+    provenBy: {
+      test: "importer.test.ts",
+      name: "applies a declined carry payload on a re-run, when every session is already a duplicate",
+      reruns: "importSession",
+    },
+  },
+  {
+    file: "src/importer.ts",
+    match: "This import unpacked the workspace payload over the existing directory",
+    klass: "descriptive",
+    why: "Names the flag as the CAUSE of what just happened, not as advice. It is the disclosure that a bootstrap unpack over an occupied directory replaced files, which is the one thing --force-workspace buys.",
+  },
+  {
+    file: "src/importer.ts",
+    match: "Re-run this import against an empty directory with --target-project-path <dir>",
+    klass: "retry-works",
+    why: "The emptiness check is a PRECONDITION: it runs before the session write loop and before any shared-layer write, so the target config dir and the project directory are both byte-identical afterwards. All three remedies it names — a different destination, --force-workspace, or dropping --apply-workspace — are reached by re-running the same invocation.",
+    provenBy: {
+      test: "importer.test.ts",
+      name: "refuses a non-empty workspace target before writing anything, and --force-workspace then unpacks over it",
+      reruns: "runImport",
+    },
+  },
   // ---- src/migrator.ts -----------------------------------------------------
   {
     file: "src/migrator.ts",
@@ -758,7 +824,11 @@ function messageLines(): MessageLine[] {
 const SURFACES: Record<string, string[]> = {
   "src/importer.ts": ["import", "migrate", "pull"],
   "src/migrator.ts": ["migrate"],
-  "src/hub/carry.ts": ["push", "pull"],
+  // Both halves of this module now have two commands each: `captureCarry` is
+  // reached by `hub push` and by `sesh-mover export` (#47), `applyCarry` by
+  // `hub pull` and by `sesh-mover import`.
+  "src/payload/carry.ts": ["push", "pull", "export", "import"],
+  "src/payload/capture.ts": ["push", "export"],
   "src/hub/init.ts": ["init"],
   // The widest surface in the map, and it is not hedging: `HubIoTimeoutError`
   // is thrown from inside `HubBackend`, which every hub verb constructs, and
@@ -789,7 +859,9 @@ const SURFACES: Record<string, string[]> = {
   "src/hub/tombstone.ts": ["pull"],
   "src/hub/status.ts": ["status"],
   "src/hub/unlink.ts": ["unlink"],
-  "src/hub/workspace.ts": ["push"],
+  // `snapshotWorkspace` is reached by push and export; `unpackWorkspace` by pull
+  // and import. One module, four surfaces.
+  "src/payload/workspace.ts": ["push", "export", "pull", "import"],
 };
 
 /**

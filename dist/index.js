@@ -26,9 +26,14 @@ export * from "./hub/layout.js";
 export * from "./hub/identity.js";
 export * from "./hub/threads.js";
 export * from "./hub/index-file.js";
-export * from "./hub/workspace.js";
+// The transport-independent payload layer (#47). `hub/` is a CONSUMER of these,
+// alongside `exporter`/`importer` — they name a project directory and a
+// destination directory and know nothing about a hub.
+export * from "./payload/workspace.js";
+export * from "./payload/carry.js";
+export * from "./payload/git-scan.js";
+export * from "./payload/capture.js";
 export * from "./hub/merge.js";
-export * from "./hub/carry.js";
 export * from "./hub/lock.js";
 export * from "./hub/append.js";
 export * from "./hub/init.js";

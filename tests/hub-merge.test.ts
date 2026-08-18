@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import {
   isBinaryFile, isGitMergeFileAvailable, mergeWorkspaceTrees, MergeAncestorRequiredError,
 } from "../src/hub/merge.js";
-import { snapshotWorkspace, unpackWorkspace } from "../src/hub/workspace.js";
+import { snapshotWorkspace, unpackWorkspace } from "../src/payload/workspace.js";
 import { overridePath } from "./helpers/env.js";
 
 const isWindows = platform() === "win32";

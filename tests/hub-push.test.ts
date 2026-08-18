@@ -16,7 +16,7 @@ import { loadOrCreateMachineId } from "../src/machine.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { extractArchive } from "../src/archiver.js";
 import { readSyncState } from "../src/sync-state.js";
-import { WORKSPACE_MAX_BYTES } from "../src/hub/workspace.js";
+import { WORKSPACE_MAX_BYTES } from "../src/payload/workspace.js";
 import { acquireProjectLock } from "../src/hub/lock.js";
 import { projectJsonFilePath } from "../src/paths.js";
 import type { HubPushFailedResult, ProgressEvent } from "../src/types.js";

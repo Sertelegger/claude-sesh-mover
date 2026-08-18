@@ -8,7 +8,7 @@ import {
   includeFilePath, ignoreFilePath, projectJsonFilePath, projectSeshMoverDir,
   PLUGIN_STATE_NAMES, INCLUDE_FILE_NAME, IGNORE_FILE_NAME,
 } from "../src/paths.js";
-import { readIncludePatterns, readIgnorePatterns } from "../src/hub/workspace.js";
+import { readIncludePatterns, readIgnorePatterns } from "../src/payload/workspace.js";
 
 /**
  * The on-disk names, and 0.8.0's clean break.

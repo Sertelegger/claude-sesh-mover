@@ -7,7 +7,7 @@ import {
   readIncludePatterns, isReIncluded, mayContainReIncluded, isNeverIncludable,
   WorkspaceTargetNotEmptyError, DEFAULT_WORKSPACE_EXCLUDES, NEVER_INCLUDABLE,
   WORKSPACE_MAX_BYTES, isCarriedPath, readCarryRules, forEachCarriedFile,
-} from "../src/hub/workspace.js";
+} from "../src/payload/workspace.js";
 
 function tmp(p: string): string { return mkdtempSync(join(tmpdir(), p)); }
 const isWindows = platform() === "win32";
@@ -613,7 +613,7 @@ describe("the include list", () => {
   });
 
   it("WORKSPACE_MAX_BYTES is the 50 MB default, and the carry's now matches it", async () => {
-    const { CARRY_MAX_BYTES } = await import("../src/hub/carry.js");
+    const { CARRY_MAX_BYTES } = await import("../src/payload/carry.js");
     expect(WORKSPACE_MAX_BYTES).toBe(50 * 1024 * 1024);
     // They disagreed (50 MB vs 5 MB) on the reasoning that a carry is a diff
     // and therefore small. Measured, that was false — this repo's own untracked

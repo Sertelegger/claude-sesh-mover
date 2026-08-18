@@ -24,7 +24,7 @@ import {
   HUB_JSON, bundleDir, bundleFileName, indexPath, machinePath, projectJsonPath,
   type HubBundleRecord, type HubIndexJson,
 } from "../src/hub/layout.js";
-import type { CarryMeta } from "../src/hub/carry.js";
+import type { CarryMeta } from "../src/payload/carry.js";
 import { runFetchStage } from "../src/hub/pull-fetch.js";
 import { runRecordStage, type RecordApplyView } from "../src/hub/pull-record.js";
 import { runResolveStage } from "../src/hub/pull-resolve.js";

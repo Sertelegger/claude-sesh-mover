@@ -1,4 +1,4 @@
-import { type ApplyResult, type CarryMeta } from "./carry.js";
+import { type ApplyResult, type CarryMeta } from "../payload/carry.js";
 import { type PulledCarry } from "./pull-apply-state.js";
 import { type StageOutcome } from "./pull-stages.js";
 /**

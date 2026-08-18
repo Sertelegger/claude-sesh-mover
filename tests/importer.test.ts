@@ -9,6 +9,7 @@ import {
   mkdirSync,
   symlinkSync,
   writeFileSync,
+  cpSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { platform, tmpdir } from "node:os";
@@ -647,6 +648,17 @@ describe("importer", () => {
     // changed with what the result promised. Content hashes rather than a
     // name list, because `index-append` MODIFIES a file that was already there
     // and a created-files diff cannot see it.
+    //
+    // #47 WIDENED WHAT "COMPLETE" HAS TO COVER, and this block was extended
+    // rather than weakened: a workspace payload lands in the target PROJECT
+    // directory, which is outside the config dir this snapshot walks — so a set
+    // that omitted it would have gone on passing here while the gate under-
+    // reported by a whole tree. `TARGET_PROJECT` is a path that does not exist
+    // on disk for these bundles (they carry no payload), which is exactly why
+    // the project-side half of the proof lives in `tests/payload-parity.test.ts`
+    // where the trees are real. What is pinned HERE is the boundary: an import
+    // of a payload-less bundle must report the same set it always did, and
+    // `total` must still equal `entries.length` when nothing truncates.
     /** Every file under `dir`, absolute, with its bytes. Directories excluded. */
     const snapshotTree = (dir: string): Map<string, string> => {
       const out = new Map<string, string>();
@@ -2434,6 +2446,200 @@ describe("importer", () => {
       // The receipt has to survive the round trip to disk, which is where the
       // prototype write lost it: JSON.stringify reads own enumerable keys only.
       expect(JSON.stringify(peer.received)).toContain("__proto__");
+    });
+  });
+
+  /**
+   * THE FILE PAYLOAD, RECEIVE SIDE (#47).
+   *
+   * The end-to-end behaviour lives in `tests/payload-parity.test.ts`, which owns
+   * real project trees and real git. These four are here because
+   * `tests/hub-warning-flags.test.ts` requires them here: each is the `provenBy`
+   * proof for a `retry-works` classification, which means it has to CALL
+   * `importSession` at least twice and show the second call reaching what the
+   * first declined. A message that promises a re-run and a test that never
+   * re-runs is exactly the defect that registry exists to catch.
+   */
+  describe("the file payload's declines are genuinely re-runnable (#47)", () => {
+    const TARGET = () => join(tempDir, "payload-target");
+
+    /** A bundle carrying a workspace payload, exported from a real tree. */
+    const bundleWithWorkspace = async (): Promise<string> => {
+      const source = join(tempDir, "payload-source");
+      mkdirSync(join(source, "src"), { recursive: true });
+      writeFileSync(join(source, "src", "app.ts"), "export const a = 1;\n");
+      const { encodeProjectPath } = await import("../src/platform.js");
+      cpSync(
+        join(sourceConfigDir, "projects", "-Users-testuser-Projects-testproject"),
+        join(sourceConfigDir, "projects", encodeProjectPath(source)),
+        { recursive: true }
+      );
+      const { exportSession } = await import("../src/exporter.js");
+      const result = await exportSession({
+        configDir: sourceConfigDir,
+        projectPath: source,
+        sessionId,
+        outputDir: join(tempDir, "payload-exports"),
+        name: "with-workspace",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        includeWorkspace: true,
+      });
+      if (!result.success) throw new Error("export failed in test setup");
+      return (result as ExportResult).exportPath;
+    };
+
+    const runImport = async (
+      from: string,
+      // Partial and passed through UNCOERCED — see the note on the sibling
+      // helper in `tests/payload-parity.test.ts`. A helper that normalizes an
+      // absent flag to `false` cannot tell an opt-in from an opt-out.
+      filePayload: Partial<{
+        applyWorkspace: boolean; applyCarry: boolean; forceWorkspace: boolean;
+      }>
+    ): Promise<ImportResult | ErrorResult> => {
+      const { importSession } = await import("../src/importer.js");
+      return (await importSession({
+        exportPath: from,
+        targetConfigDir,
+        targetProjectPath: TARGET(),
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+        filePayload,
+      })) as ImportResult | ErrorResult;
+    };
+
+    it("lands a declined workspace payload on a re-run, when every session is already a duplicate", async () => {
+      const from = await bundleWithWorkspace();
+      mkdirSync(TARGET(), { recursive: true });
+
+      // NOTHING passed: the absence IS the test. An explicit `false` would
+      // pass against a `!== false` orchestrator too.
+      const first = await runImport(from, {});
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      expect(existsSync(join(TARGET(), "src", "app.ts"))).toBe(false);
+      expect(first.warnings.join(" ")).toMatch(/--apply-workspace` was not passed/);
+
+      // The re-run the warning promises. Every session is a duplicate by now, so
+      // this exercises the fully-duplicate branch — the one that returns before
+      // the session write loop, and where a payload half wired into only the main
+      // branch would silently do nothing.
+      const second = await runImport(from, { applyWorkspace: true });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect(second.importedSessions).toEqual([]);
+      expect(readFileSync(join(TARGET(), "src", "app.ts"), "utf-8")).toBe("export const a = 1;\n");
+      expect(second.workspaceUnpacked?.path).toBe(TARGET());
+    });
+
+    it("applies a declined carry payload on a re-run, when every session is already a duplicate", async () => {
+      const { gitProject, cleanTwin, git } = await import("./helpers/project-tree.js");
+      const { encodeProjectPath } = await import("../src/platform.js");
+      const source = gitProject("importer-carry");
+      cpSync(
+        join(sourceConfigDir, "projects", "-Users-testuser-Projects-testproject"),
+        join(sourceConfigDir, "projects", encodeProjectPath(source)),
+        { recursive: true }
+      );
+      writeFileSync(join(source, "tracked.txt"), "v2\n");
+      const { exportSession } = await import("../src/exporter.js");
+      const exported = await exportSession({
+        configDir: sourceConfigDir,
+        projectPath: source,
+        sessionId,
+        outputDir: join(tempDir, "payload-exports"),
+        name: "with-carry",
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+        includeCarry: true,
+      });
+      if (!exported.success) throw new Error("export failed in test setup");
+      const from = (exported as ExportResult).exportPath;
+
+      const twin = cleanTwin(source, "importer-carry-twin");
+      const { importSession } = await import("../src/importer.js");
+      const args = {
+        exportPath: from,
+        targetConfigDir,
+        targetProjectPath: twin,
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      };
+
+      const first = (await importSession({
+        ...args,
+        // Empty, not absent: this caller HANDLES payloads and applies none.
+        filePayload: {},
+      })) as ImportResult;
+      expect(first.success).toBe(true);
+      expect(first.carryApplied).toBeUndefined();
+      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\n");
+      // Nothing was parked either — the divergence from `hub pull` that makes
+      // the re-run below the remedy rather than a saved directory.
+      expect(existsSync(join(twin, ".sesh-mover"))).toBe(false);
+
+      const second = (await importSession({
+        ...args,
+        filePayload: { applyCarry: true },
+      })) as ImportResult;
+      expect(second.success).toBe(true);
+      expect(second.importedSessions).toEqual([]);
+      expect(second.carryApplied?.applied).toBe(true);
+      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v2\n");
+      // A real repository was used, so the guard the apply passed is real.
+      expect(git(twin, ["status", "--porcelain"])).toContain("tracked.txt");
+
+      rmSync(source, { recursive: true, force: true });
+      rmSync(twin, { recursive: true, force: true });
+    });
+
+    it("refuses a non-empty workspace target before writing anything, and --force-workspace then unpacks over it", async () => {
+      const from = await bundleWithWorkspace();
+      mkdirSync(join(TARGET(), "src"), { recursive: true });
+      writeFileSync(join(TARGET(), "src", "app.ts"), "mine\n");
+
+      const refused = await runImport(from, { applyWorkspace: true });
+      expect(refused.success).toBe(false);
+      if (refused.success) return;
+      expect(refused.error).toMatch(/exists and is not empty/);
+      // "Nothing was written" is the half that matters, and it is checked on the
+      // TARGET CONFIG DIR as well as the project: the refusal is a precondition,
+      // so no session file may exist either.
+      expect(readFileSync(join(TARGET(), "src", "app.ts"), "utf-8")).toBe("mine\n");
+      const projectsDir = join(targetConfigDir, "projects");
+      const landed = existsSync(projectsDir) ? readdirSync(projectsDir) : [];
+      expect(landed.flatMap((d) => readdirSync(join(projectsDir, d)))).toEqual([]);
+
+      const forced = await runImport(from, { applyWorkspace: true, forceWorkspace: true });
+      expect(forced.success).toBe(true);
+      if (!forced.success) return;
+      expect(readFileSync(join(TARGET(), "src", "app.ts"), "utf-8")).toBe("export const a = 1;\n");
+      expect(forced.importedSessions).toHaveLength(1);
+    });
+
+    it("stays completely inert for a caller that does not handle file payloads", async () => {
+      // `hub pull` and `migrate` both call `importSession`, and both must get
+      // NOTHING from this half — no apply, no count, no warning. The pull has its
+      // own stages for both payloads, and a second handler would report the
+      // bundle twice and, worse, disagree with them about what a decline means.
+      const from = await bundleWithWorkspace();
+      mkdirSync(TARGET(), { recursive: true });
+      const { importSession } = await import("../src/importer.js");
+      const result = (await importSession({
+        exportPath: from,
+        targetConfigDir,
+        targetProjectPath: TARGET(),
+        targetClaudeVersion: "2.1.81",
+        dryRun: false,
+      })) as ImportResult;
+
+      expect(result.success).toBe(true);
+      expect(existsSync(join(TARGET(), "src", "app.ts"))).toBe(false);
+      expect(result.workspaceSkipped).toBeUndefined();
+      expect(result.workspaceUnpacked).toBeUndefined();
+      expect(result.warnings.join(" ")).not.toMatch(/--apply-workspace/);
+      expect(result.writeSet!.roots.some((r) => r.layer === "workspace")).toBe(false);
     });
   });
 });

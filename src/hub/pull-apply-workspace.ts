@@ -3,7 +3,7 @@ import { pipeline } from "node:stream/promises";
 import { join } from "node:path";
 import { type HubBackend } from "./backend.js";
 import { type HubBundleRecord } from "./layout.js";
-import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "./workspace.js";
+import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "../payload/workspace.js";
 import { mergeWorkspaceTrees, type WorkspaceMergeReport } from "./merge.js";
 import { isReadableDir } from "./fs-probe.js";
 import { stageAbort, stageOk, stageSkip, type StageOutcome } from "./pull-stages.js";
