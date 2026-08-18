@@ -2587,7 +2587,9 @@ describe("importer", () => {
       expect(second.success).toBe(true);
       expect(second.importedSessions).toEqual([]);
       expect(second.carryApplied?.applied).toBe(true);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v2\n");
+      // git materialised this one (see tests/helpers/eol.ts); any untracked
+      // file in this payload stays byte-exact on purpose.
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v2\n");
       // A real repository was used, so the guard the apply passed is real.
       expect(git(twin, ["status", "--porcelain"])).toContain("tracked.txt");
 

@@ -587,7 +587,14 @@ describe("export/import payload parity (#47)", () => {
       expect(ok.success).toBe(true);
       if (!ok.success) return;
       expect(ok.carryApplied?.applied).toBe(true);
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v2\n");
+      // THE TWO LINES BELOW DELIBERATELY DIFFER, and folding them together
+      // would delete a real guard. `tracked.txt` is materialised by `git apply`,
+      // so under Windows' `core.autocrlf` it legitimately comes back CRLF and is
+      // read through `readTextLf`. `new.txt` is UNTRACKED: it travels through
+      // the carry code's own byte copy, never through git's filters, so it must
+      // stay byte-exact — that assertion is what would catch a text-mode
+      // transform sneaking into the copy path. See `tests/helpers/eol.ts`.
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v2\n");
       expect(readFileSync(join(twin, "new.txt"), "utf-8")).toBe("brought along\n");
 
       rmSync(source, { recursive: true, force: true });
