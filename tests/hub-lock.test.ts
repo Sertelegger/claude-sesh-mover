@@ -254,10 +254,25 @@ describe("project lock", () => {
       expect(probeHolderLiveness(process.pid, "not-this-host")).toBe("unknown");
       expect(probeHolderLiveness(reapedPid(), hostname())).toBe("dead");
       // EPERM — the process exists, it is simply not ours to signal — must
-      // read ALIVE, never as absent. pid 1 is the portable example of it.
-      // (Under a root test runner the probe succeeds outright, and this
-      // degrades to a characterization of the same answer.)
-      expect(probeHolderLiveness(1, hostname())).toBe("alive");
+      // read ALIVE, never as absent. This is the direction that matters: a
+      // permission error is evidence the holder EXISTS, and mapping it to
+      // "dead" would steal a live holder's lock.
+      //
+      // POSIX only, and the reason is not squeamishness about platforms. pid 1
+      // is init and is guaranteed present-but-unsignalable to a non-root user;
+      // **Windows has no pid 1 at all**, so `process.kill(1, 0)` throws ESRCH
+      // there and the call correctly answers "dead" — asserting "alive" was
+      // asserting a POSIX fact on a platform where it is false.
+      //
+      // Windows has no portable stand-in worth pinning (the System process's
+      // pid is an implementation detail), so the EPERM→alive mapping is
+      // genuinely unexercised there. It is a one-line branch shared by every
+      // platform, and every OTHER arm above runs on all three.
+      if (process.platform !== "win32") {
+        // Under a root runner the probe succeeds outright and this degrades to
+        // a characterization of the same answer.
+        expect(probeHolderLiveness(1, hostname())).toBe("alive");
+      }
     });
   });
 
