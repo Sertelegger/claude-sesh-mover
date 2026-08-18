@@ -238,6 +238,75 @@ describe("hub reindex", () => {
   });
 
   /**
+   * The repair tool must not discard history quietly (spec 3.5 §6 Q9).
+   *
+   * `reindex` replaces this machine's index wholesale from what it can derive.
+   * When a bundle file is gone, the record for it cannot be re-derived and
+   * simply stops existing — and until now nothing said so, on the one command a
+   * user runs *because* something already looks wrong.
+   *
+   * It is a DISCLOSURE and not a merge, which this test pins from both sides:
+   * the lost id is named, and the rebuilt index still does not contain it.
+   * Copying the record forward would recreate the un-re-derivable index that
+   * `reindex` exists to repair.
+   */
+  it("says which records the rebuild could not reproduce, and still does not resurrect them", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-reindex-lost-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-reindex-lost-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-lost-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+      if (!first.success) return;
+      const jsonlPath = join(
+        configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+      );
+      continueSession(jsonlPath, sessionId, projectPath);
+      const second = await hubPush({ configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81" });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const original = await readMachineIndex(backend, first.projectId, machine.id);
+      if (!original) return;
+      const bundles = Object.values(original.threads)[0].bundles;
+      expect(bundles.length).toBe(2);
+      const doomed = bundles[0];
+
+      // The ordinary cause: the bundle file is gone from the hub. The index
+      // still lists it, so the rebuild is the moment the loss becomes real.
+      await backend.delete(doomed.file);
+
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      expect(result.droppedFromPriorIndex).toEqual([doomed.bundleId]);
+      expect(result.warnings.join(" ")).toContain(doomed.bundleId);
+      // Named as a loss the user may not have caused, not as routine tidying.
+      expect(result.warnings.join(" ")).toMatch(/invisible to every other machine/i);
+
+      // ...and NOT resurrected: the rebuilt index is still only what the hub
+      // and this machine's sync-state derive.
+      const rebuilt = await readMachineIndex(backend, first.projectId, machine.id);
+      if (!rebuilt) return;
+      const ids = Object.values(rebuilt.threads).flatMap((t) => t.bundles.map((b) => b.bundleId));
+      expect(ids).not.toContain(doomed.bundleId);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
    * The other half, and the one that decides whether the field could be a
    * redefinition of `fromEntryUuid` rather than an addition: reindex CANNOT
    * recover an anchor the manifest never carried. A bundle pushed before chain
