@@ -353,11 +353,17 @@ program
         outputError("migrate", e);
     }
 });
-// --- Browse ---
 /**
  * The one shape a READABLE bundle turns into — archive or directory, one
  * builder, so the two paths cannot drift into reporting different field sets
  * for the same fact.
+ *
+ * The payload answers come out of the manifest this function was already
+ * handed, and that bound is deliberate: `browse` is IO-bound in total archive
+ * size when `.tar.zst` bundles are present (reading one decompresses the whole
+ * bundle), and a field that needed a second look inside the archive would
+ * multiply exactly the cost #32 was about. Everything reported here is a field
+ * of a manifest already in memory.
  */
 function readableBrowseEntry(name, path, storage, manifest) {
     return {
@@ -370,6 +376,14 @@ function readableBrowseEntry(name, path, storage, manifest) {
         sessions: manifest.sessions,
         storage,
         metadataAvailable: true,
+        // The SAME two tests the importer runs against the same manifest —
+        // `declaresWorkspace: manifest.workspace !== undefined` and
+        // `if (opts.declaredCarry)` in `importer.ts` — including the fact that they
+        // are spelled differently there. What this row promises is "here is what an
+        // import of this bundle will find", so a tidier second opinion would be a
+        // listing that disagrees with the command it is advising about.
+        hasWorkspace: manifest.workspace !== undefined,
+        hasCarry: !!manifest.carry,
     };
 }
 /**
@@ -391,6 +405,12 @@ function degradedBrowseEntry(name, path, storage, detail) {
         storage,
         metadataAvailable: false,
         metadataError: detail,
+        // NOT `false`. The manifest is what says whether a bundle carries files,
+        // and it is the manifest that could not be read — so `false` here would be
+        // this listing's most dangerous invention: "importing this cannot write to
+        // your project", asserted about a bundle nobody checked.
+        hasWorkspace: null,
+        hasCarry: null,
     };
 }
 /**

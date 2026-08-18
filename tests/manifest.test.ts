@@ -480,6 +480,67 @@ describe("manifest", () => {
   });
 
   /**
+   * The carry payload's patch digest — the fourth hash a bundle carries, and
+   * the same kind of thing as the other three: damage detection, not
+   * attestation. These pin the two properties the apply side depends on (an
+   * absent digest is unverifiable rather than broken, and a bare sha256 that a
+   * user can reproduce with `sha256sum`), and the agreement between the
+   * buffer-side and file-side halves, which are two different functions.
+   */
+  describe("computePatchDigest / verifyPatchDigest", () => {
+    it("is a bare sha256 over the bytes, so the capture and apply halves agree", async () => {
+      const { computePatchDigest, computeIntegrityHashFromFile } = await import(
+        "../src/manifest.js"
+      );
+      // Deliberately NOT valid UTF-8: a `git diff` of a latin-1 file is not,
+      // and a digest taken over a lossy string spelling would fail on exactly
+      // the payloads that need it most.
+      const patch = Buffer.from([0x64, 0x69, 0x66, 0x66, 0x0a, 0xff, 0xfe, 0x0a]);
+      const path = join(tempDir, "changes.patch");
+      writeFileSync(path, patch);
+
+      const fromBuffer = computePatchDigest(patch);
+      expect(fromBuffer).toMatch(/^sha256:[0-9a-f]{64}$/);
+      // The capture side hashes the buffer it is about to write; the apply side
+      // streams the file back. Two functions, one value — a divergence here
+      // would fail every carry in the field and none of the unit tests.
+      expect(await computeIntegrityHashFromFile(path)).toBe(fromBuffer);
+      // Reproducible without this plugin, which is what makes the README's
+      // "`sha256sum changes.patch`" advice true.
+      const { createHash } = await import("node:crypto");
+      expect(fromBuffer).toBe(`sha256:${createHash("sha256").update(patch).digest("hex")}`);
+    });
+
+    it("passes an undeclared digest, and names the mismatch on a flipped byte", async () => {
+      const { computePatchDigest, verifyPatchDigest } = await import("../src/manifest.js");
+      const patch = Buffer.from("diff --git a/x b/x\n+one\n", "utf-8");
+      const path = join(tempDir, "declared.patch");
+      writeFileSync(path, patch);
+      const declared = computePatchDigest(patch);
+
+      // A bundle from before the field existed: unverifiable is not broken.
+      expect(await verifyPatchDigest(path, undefined)).toBeNull();
+      expect(await verifyPatchDigest(path, declared)).toBeNull();
+
+      // One byte, inside a content line — the shape `git apply` would happily
+      // accept, and the reason this digest exists at all.
+      const flipped = Buffer.from(patch);
+      flipped[flipped.length - 2] ^= 0x01;
+      writeFileSync(path, flipped);
+      expect(await verifyPatchDigest(path, declared)).toMatch(/hashes to sha256:/);
+    });
+
+    it("treats an absent or unreadable patch as a mismatch once a digest is declared", async () => {
+      const { verifyPatchDigest } = await import("../src/manifest.js");
+      // A bundle that declares a digest comes from a version that always writes
+      // `changes.patch`, so its absence is damage — not "no patch to check".
+      const problem = await verifyPatchDigest(join(tempDir, "nope.patch"), "sha256:abc");
+      expect(problem).not.toBeNull();
+      expect(problem).toMatch(/could not be read/);
+    });
+  });
+
+  /**
    * #53 changed what `includedLayers` MEANS (policy → content) and added a
    * bundle-level `memoryDigest`. Both are outside `computeSessionsDigest`,
    * which covers `manifest.sessions` and nothing else — so no bundle written

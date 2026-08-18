@@ -2,6 +2,7 @@ import { createFsBackend } from "./backend.js";
 import { machinePath } from "./layout.js";
 import { describeHubUnreachable, probeHubReachable } from "./preflight.js";
 import { resolveHubPath } from "./init.js";
+import { readLockStealRecord } from "./lock.js";
 import { readMachineId } from "../machine.js";
 import { computeEffectiveConfig } from "../config.js";
 import { readLocalProjectId } from "./identity.js";
@@ -113,6 +114,19 @@ export async function hubStatus(opts) {
     // not readSyncState: `hub status` is documented read-only, and readSyncState
     // renames a corrupt file aside — a write.
     const lastAutoPush = peekSyncState(opts.cwd).hub?.lastAutoPush;
+    // The lock-steal record (#84). Read here because both parties to a steal are
+    // badly placed to report it themselves: the thief's warning rides on whatever
+    // verb it ran (a session-end push has closed stdout), and the victim no longer
+    // holds the lock `recordAutoPushOutcome` re-takes, so its note is dropped in
+    // exactly the case worth recording. Reading is a plain file read and holds no
+    // lock, which keeps `status` read-only as documented.
+    const lastLockSteal = readLockStealRecord(opts.cwd);
+    if (lastLockSteal && lastLockSteal.kind !== "dead-holder") {
+        warnings.push(`Another sesh-mover process took this project's lock at ${lastLockSteal.at} from a holder that was ${lastLockSteal.kind === "live-holder-past-ceiling" ? "still running" : "not identifiable"} (pid ${lastLockSteal.holderPid ?? "unknown"}), after it held the lock past the safety ceiling.` +
+            (lastLockSteal.noticedByHolderAt
+                ? ` That holder has since finished and noticed at ${lastLockSteal.noticedByHolderAt}.`
+                : ` That holder has NOT been seen to finish, so it may still be writing this project's hub state.`));
+    }
     if (lastAutoPush && !lastAutoPush.ok) {
         warnings.push(`The last automatic push for this project (${lastAutoPush.at}) failed: ${lastAutoPush.notes[0] ?? "no detail recorded"}. Session-end pushes run detached and their output is not shown, so this is the only place it is reported.`);
     }
@@ -134,6 +148,7 @@ export async function hubStatus(opts) {
         machinesKnown,
         project: { linked: local !== null, projectId: local?.projectId ?? null },
         ...(lastAutoPush ? { lastAutoPush } : {}),
+        ...(lastLockSteal ? { lastLockSteal } : {}),
         warnings,
     };
 }

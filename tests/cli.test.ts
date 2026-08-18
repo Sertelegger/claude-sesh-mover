@@ -1333,6 +1333,155 @@ describe("cli", () => {
     });
   });
 
+  // #47 gave `export` a FILE payload — a whole-project workspace snapshot or a
+  // git-diff carry — so a bundle can now write into the project directory on
+  // import. `browse` is where a user chooses which bundle to import, and until
+  // this it said nothing about that: the import confirm gate was the first
+  // disclosure, i.e. after the choice had already been made.
+  describe("browse file-payload disclosure (#47)", () => {
+    const BASE_MANIFEST = {
+      version: 1,
+      plugin: "sesh-mover",
+      exportedAt: "2026-08-14T09:00:00.000Z",
+      sourcePlatform: "wsl2",
+      sourceProjectPath: "/mnt/e/GitHub/someone/faraway",
+      sourceConfigDir: "/home/someone/.claude",
+      sourceClaudeVersion: "2.1.81",
+      sessionScope: "current",
+      includedLayers: ["jsonl"],
+      sessions: [
+        {
+          sessionId: "550e8400-e29b-41d4-a716-446655440000",
+          slug: "faraway",
+          summary: "work done elsewhere",
+          lastActiveAt: "2026-08-14T08:00:00Z",
+          messageCount: 7,
+          gitBranch: "main",
+          entrypoint: "cli",
+          integrityHash: "sha256:abc",
+        },
+      ],
+    };
+    const WORKSPACE_BLOCK = {
+      fileCount: 12,
+      byteSize: 4096,
+      snapshotAt: "2026-08-14T08:59:00.000Z",
+    };
+    const CARRY_BLOCK = {
+      baseCommit: "0123456789abcdef0123456789abcdef01234567",
+      branch: "main",
+      detached: false,
+      inProgress: null,
+      capturedAt: "2026-08-14T08:59:00.000Z",
+      untrackedCount: 1,
+      untrackedBytes: 10,
+      patchBytes: 200,
+      reIncludedCount: 0,
+      reIncluded: [],
+      trackedIgnoredCount: 0,
+      trackedIgnored: [],
+      repoPrefix: "",
+    };
+
+    function writeBundleDir(parent: string, name: string, manifest: unknown): void {
+      const dir = join(parent, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
+    }
+
+    it("says per entry whether a bundle carries project files — directories and archives alike", async () => {
+      const homeDir = mkdtempSync(join(tmpdir(), "sesh-browse-payload-"));
+      try {
+        const store = join(homeDir, ".sesh-mover");
+        mkdirSync(store, { recursive: true });
+        writeBundleDir(store, "2026-08-14-plain", BASE_MANIFEST);
+        writeBundleDir(store, "2026-08-14-snapshot", {
+          ...BASE_MANIFEST,
+          workspace: WORKSPACE_BLOCK,
+        });
+        writeBundleDir(store, "2026-08-14-uncommitted", {
+          ...BASE_MANIFEST,
+          carry: CARRY_BLOCK,
+        });
+        // The archive half of the same claim. It costs nothing extra — the
+        // manifest is already parsed out of the tar for the four metadata
+        // fields — and browse must not grow a second read to answer this.
+        const staging = join(homeDir, "stage", "2026-08-14-archived");
+        mkdirSync(staging, { recursive: true });
+        writeFileSync(
+          join(staging, "manifest.json"),
+          JSON.stringify({ ...BASE_MANIFEST, workspace: WORKSPACE_BLOCK, carry: CARRY_BLOCK })
+        );
+        await tar.create(
+          { gzip: true, file: join(store, "2026-08-14-archived.tar.gz"), cwd: dirname(staging) },
+          [basename(staging)]
+        );
+
+        const result = JSON.parse(runCli(`browse --storage user --json`, homeEnv(homeDir)));
+        expect(result.success).toBe(true);
+        const byName: Record<string, { hasWorkspace: unknown; hasCarry: unknown }> = {};
+        for (const e of result.exports) byName[e.name] = e;
+
+        expect(byName["2026-08-14-plain"].hasWorkspace).toBe(false);
+        expect(byName["2026-08-14-plain"].hasCarry).toBe(false);
+        expect(byName["2026-08-14-snapshot"].hasWorkspace).toBe(true);
+        expect(byName["2026-08-14-snapshot"].hasCarry).toBe(false);
+        expect(byName["2026-08-14-uncommitted"].hasWorkspace).toBe(false);
+        expect(byName["2026-08-14-uncommitted"].hasCarry).toBe(true);
+        expect(byName["2026-08-14-archived.tar.gz"].hasWorkspace).toBe(true);
+        expect(byName["2026-08-14-archived.tar.gz"].hasCarry).toBe(true);
+      } finally {
+        rmSync(homeDir, { recursive: true, force: true });
+      }
+    });
+
+    it("reports NOT READ, never `false`, when the manifest could not be read", () => {
+      // The dangerous direction of the lie, and the reason these fields are
+      // nullable rather than defaulted: `false` here reads as "importing this
+      // cannot write to your project", asserted about a bundle nobody checked.
+      // Both degraded kinds — an unreadable archive and a store directory whose
+      // manifest.json is broken — must answer the same way.
+      const homeDir = mkdtempSync(join(tmpdir(), "sesh-browse-payload-degraded-"));
+      try {
+        const store = join(homeDir, ".sesh-mover");
+        mkdirSync(store, { recursive: true });
+        writeFileSync(join(store, "2026-08-14-broken.tar.gz"), "definitely not a tar archive");
+        mkdirSync(join(store, "2026-08-14-truncated"), { recursive: true });
+        writeFileSync(
+          join(store, "2026-08-14-truncated", "manifest.json"),
+          '{"version":1,"plugin":"sesh-mo'
+        );
+        // Positive control in the same listing: without it, "everything is
+        // null" could mean the fields were never populated at all.
+        writeBundleDir(store, "2026-08-14-healthy", { ...BASE_MANIFEST, carry: CARRY_BLOCK });
+
+        const result = JSON.parse(runCli(`browse --storage user --json`, homeEnv(homeDir)));
+        expect(result.success).toBe(true);
+        const byName: Record<
+          string,
+          { metadataAvailable: boolean; hasWorkspace: unknown; hasCarry: unknown }
+        > = {};
+        for (const e of result.exports) byName[e.name] = e;
+
+        for (const name of ["2026-08-14-broken.tar.gz", "2026-08-14-truncated"]) {
+          expect(byName[name].metadataAvailable).toBe(false);
+          expect(byName[name].hasWorkspace).toBeNull();
+          expect(byName[name].hasCarry).toBeNull();
+          // Spelled out because `toBeNull` passing is not the same claim: the
+          // convention these fields join is "null means not read", and `false`
+          // is the specific value that would silently mean "no payload".
+          expect(byName[name].hasWorkspace).not.toBe(false);
+          expect(byName[name].hasCarry).not.toBe(false);
+        }
+        expect(byName["2026-08-14-healthy"].metadataAvailable).toBe(true);
+        expect(byName["2026-08-14-healthy"].hasCarry).toBe(true);
+        expect(byName["2026-08-14-healthy"].hasWorkspace).toBe(false);
+      } finally {
+        rmSync(homeDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("configure command", () => {
     it("shows current config", () => {
       // Isolated HOME on purpose: `--show` reports the EFFECTIVE config, so

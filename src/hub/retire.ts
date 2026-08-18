@@ -1,5 +1,5 @@
 import { createFsBackend, type HubBackend } from "./backend.js";
-import { acquireProjectLock, LockBusyError, type LockHandle } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError, type LockHandle } from "./lock.js";
 import {
   readLocalProjectId, removeLocalProjectIdIfMatches,
 } from "./identity.js";
@@ -224,7 +224,7 @@ async function preamble(
   const warnings: string[] = [];
   if (lock.stoleStale) {
     warnings.push(
-      "Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no push or pull is genuinely in progress for this project."
+      describeLockSteal(lock.steal, "operation")
     );
   }
 

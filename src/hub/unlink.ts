@@ -1,5 +1,5 @@
 import { lstatSync, readFileSync, rmSync } from "node:fs";
-import { acquireProjectLock, LockBusyError, type LockHandle } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError, type LockHandle } from "./lock.js";
 import { projectJsonFilePath } from "../paths.js";
 import type { ErrorResult, HubLockBusyResult, HubUnlinkResult } from "../types.js";
 
@@ -98,7 +98,7 @@ export function hubUnlink(
     }
     if (lock.stoleStale) {
       warnings.push(
-        "Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — the unlink proceeded, but verify no push or pull is genuinely in progress."
+        describeLockSteal(lock.steal, "unlink")
       );
     }
   }

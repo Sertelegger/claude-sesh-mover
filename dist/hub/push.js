@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { bundleDir, bundleFileName } from "./layout.js";
-import { acquireProjectLock, LockBusyError } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, readLocalProjectId, removeLocalProjectIdIfMatches, } from "./identity.js";
 import { scanGitRemotes } from "../payload/git-scan.js";
 import { capturePayload } from "../payload/capture.js";
@@ -243,7 +243,7 @@ export async function hubPush(opts) {
             // on an unattended session-end push this is the only trace of the typo.
             warnings.push(...(opts.budgets?.warnings ?? []));
             if (lock.stoleStale) {
-                warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress.");
+                warnings.push(describeLockSteal(lock.steal, "push"));
             }
             const machine = loadOrCreateMachineId();
             let pendingIdentity;

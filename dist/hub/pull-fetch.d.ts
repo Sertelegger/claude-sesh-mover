@@ -56,38 +56,5 @@ export interface FetchStageResult {
     extractDir: string;
     manifest: ExportManifest;
 }
-/**
- * Retrieve one bundle of the chain, unpack it, and read its manifest.
- *
- * **This stage mutates `state`; it deliberately does not return the two values
- * it writes.**
- *
- * - `state.chainWorkspaceBases` is read by `chooseMergeAncestor` in the SAME
- *   loop iteration, so what is load-bearing is *timing*: this bundle's
- *   generation must be present before the workspace gate runs. A
- *   return-and-assign design invites a caller that pushes after the gate,
- *   silently dropping the newest and most-likely-shared generation.
- * - `state.lastCarry` is *newest-wins-**only if present***. Returning an
- *   optional carry invites `st.lastCarry = value.carry ?? null` at the call
- *   site, which CLEARS an earlier bundle's carry when a later bundle has none —
- *   silently discarding another machine's uncommitted work. The
- *   `if (manifest.carry)` guard stays welded to the assignment in here so that
- *   shape is not available to write.
- *
- * FIVE `aborted` outcomes — one per untrusted-input call, in the order they
- * run: the download, the unpack, the manifest parse, the manifest's own digest,
- * and the transcript that manifest declares. The count is worth stating because
- * it only moves in one direction: every call in this stage is handed bytes off
- * the hub, so a new one without a `try` is a new way for the stage to leave
- * `hubPull` as a throw — which is exactly what the download and the unpack were
- * until now.
- *
- * The caller's only correct handling of any of them is
- * `return fetched.terminal!` immediately. `break` falls through to the carry
- * gate, the thread mapping and the index write and then reports `success: true`
- * — a refusal turned into a successful pull. `continue` violates the chain
- * invariant (bundle N+1 is anchored on N's head) and fragment-imports *and
- * records* the next bundle, foreclosing the remedy.
- */
 export declare function runFetchStage(input: FetchStageInput): Promise<StageOutcome<FetchStageResult>>;
 //# sourceMappingURL=pull-fetch.d.ts.map

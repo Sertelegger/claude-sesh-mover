@@ -37,6 +37,18 @@ import { readManifest, verifySessionsDigest } from "../manifest.js";
  * invariant (bundle N+1 is anchored on N's head) and fragment-imports *and
  * records* the next bundle, foreclosing the remedy.
  */
+/**
+ * Tear a stream down and swallow whatever it reports on the way.
+ *
+ * Used only on a failure path where the real diagnosis is already in hand. A
+ * stream that has lost its `pipeline` has no error listener left, so an error
+ * still in flight becomes an unhandled one — a run-failing event under vitest,
+ * and in production a crash on the path whose whole job is to fail politely.
+ */
+async function absorbLateError(s) {
+    s.destroy?.();
+    await finished(s).catch(() => { });
+}
 export async function runFetchStage(input) {
     const { backend, record, machineId, bundleIndex: i, chainLength, tempRoot, state: st } = input;
     // Bundles COMPLETED over bundles total, emitted as this one starts: bundle 0
@@ -50,6 +62,9 @@ export async function runFetchStage(input) {
     });
     const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
     const out = createWriteStream(tarPath);
+    // Declared out here so the catch can reach it: whichever end fails first,
+    // the OTHER one still has an error in flight that nobody is listening for.
+    let src;
     /**
      * The download is a GUARD, for the same reason the manifest parse below is:
      * this is hub-fetched input and the failure is the user's to act on, not an
@@ -80,7 +95,8 @@ export async function runFetchStage(input) {
         // assertHubRelPath (hub/layout.ts, enforced inside every HubBackend
         // method, see hub/backend.ts) is the containment that rejects
         // traversal/absolute paths before anything touches the filesystem.
-        await pipeline(await backend.readStream(record.file), out);
+        src = await backend.readStream(record.file);
+        await pipeline(src, out);
     }
     catch (e) {
         // ABSORB THE DESTINATION'S LATE ERROR before returning, or it lands on a
@@ -100,8 +116,21 @@ export async function runFetchStage(input) {
         // close, swallowing whatever it reports. The error being discarded here is
         // never the one worth reporting — `e` already describes why the download
         // failed, and this one only says the scratch copy could not be finished.
-        out.destroy();
-        await finished(out).catch(() => { });
+        // BOTH ENDS, not just the destination — macOS proved the asymmetry was a
+        // bug. `pipeline` settles on whichever stream fails FIRST and then detaches
+        // its listeners; the other one's error arrives afterwards with nobody
+        // listening. Absorbing only `out` covered the case where the source lost
+        // the race (the common one on Linux, where a missing hub file fails fast)
+        // and left the mirror image uncovered, which is exactly what macOS hit when
+        // the destination's ENOTDIR won instead.
+        //
+        // Destroy-then-await, the shape `FsBackend.abort()` already uses. The
+        // errors discarded here are never the ones worth reporting: `e` already
+        // says why the download failed, and these two only say that a stream being
+        // torn down was torn down.
+        await absorbLateError(out);
+        if (src !== undefined)
+            await absorbLateError(src);
         return stageAbort({
             success: false,
             command: "pull",

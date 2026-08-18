@@ -1,5 +1,5 @@
 import { lstatSync, readFileSync, rmSync } from "node:fs";
-import { acquireProjectLock, LockBusyError } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { projectJsonFilePath } from "../paths.js";
 /**
  * Remove this directory's hub link — the disarm path for the hub's automation.
@@ -77,7 +77,7 @@ export function hubUnlink(opts) {
             throw e;
         }
         if (lock.stoleStale) {
-            warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — the unlink proceeded, but verify no push or pull is genuinely in progress.");
+            warnings.push(describeLockSteal(lock.steal, "unlink"));
         }
     }
     try {

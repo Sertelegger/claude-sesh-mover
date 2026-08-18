@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend } from "./backend.js";
-import { acquireProjectLock, LockBusyError } from "./lock.js";
+import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { runApplyCarryStage } from "./pull-apply-carry.js";
 import { runApplySessionsStage } from "./pull-apply-sessions.js";
 import { runApplyWorkspaceStage } from "./pull-apply-workspace.js";
@@ -251,7 +251,7 @@ export async function hubPull(opts) {
         const backend = createFsBackend(opts.hubPath);
         const warnings = [];
         if (lock.stoleStale) {
-            warnings.push("Stole a stale project lock left by a previous sesh-mover hub operation (likely crashed or was killed) — proceeding, but verify no other push/pull is genuinely in progress.");
+            warnings.push(describeLockSteal(lock.steal, "pull"));
         }
         const machine = loadOrCreateMachineId();
         // Identity is resolved/linked against opts.projectPath — deliberately

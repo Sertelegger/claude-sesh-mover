@@ -12,6 +12,12 @@ import {
 } from "./workspace.js";
 import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 import { DEFAULT_CARRY_MAX_MB } from "../config.js";
+// `manifest.ts` owns every hash a bundle carries, and the patch digest is one
+// of them — a private sha256 here would be the second copy this codebase keeps
+// paying for. The dependency runs the same way the module's other three do
+// (`payload/` → the root modules, never `src/hub/`), and manifest.ts imports
+// nothing from here but a type.
+import { computePatchDigest, verifyPatchDigest } from "../manifest.js";
 
 /**
  * Byte budget for one carry payload: the diff plus every file copied beside it.
@@ -329,6 +335,39 @@ export interface CarryMeta {
    * at the repository root.
    */
   repoPrefix: string;
+  /**
+   * `computePatchDigest` over `changes.patch` — sha256 of the exact bytes
+   * `git diff` produced, taken before the file was written.
+   *
+   * **Damage detection, and only that.** It sits in the same manifest as the
+   * patch it describes, so anyone who can rewrite one can rewrite the other; it
+   * makes no statement about who produced the payload and none about whether
+   * applying it is safe. The floor is still git's own parse and only git's
+   * (#38), and `applyCarry` still runs every one of its guards ahead of this
+   * one. What the digest adds is the case none of them can see: a patch that
+   * parses cleanly, names only ordinary paths, and is not the patch that was
+   * captured — which before this field was found by `git apply` refusing it, or
+   * not at all.
+   *
+   * It lives on the carry block rather than beside `memoryDigest` at the
+   * manifest root because this is where a carry's self-description already
+   * lives — so it reaches the apply side through `hub/push.ts`'s in-place patch
+   * and `exporter.ts`'s manifest literal alike, neither of which needed to
+   * learn about it, and it is covered by `normalizeCarryMeta`, the trust
+   * boundary this block already has.
+   *
+   * Optional: every bundle written before this field existed carries none, and
+   * those apply exactly as they always did (`verifyPatchDigest` returns `null`
+   * for an absent digest). A block whose digest is present but not a string
+   * arrives as `""` — see `normalizeCarryMeta` — which no patch can hash to, so
+   * it fails closed.
+   *
+   * It covers the PATCH only. `untracked/` travels as ordinary file copies and
+   * is hashed nowhere; the apply side never overwrites with those (a collision
+   * is parked as a sidecar beside the local file), which is why the half that
+   * rewrites files in place is the half that got a digest first.
+   */
+  patchDigest?: string;
 }
 
 /**
@@ -434,6 +473,29 @@ export function normalizeCarryMeta(raw: unknown): NormalizedCarryMeta {
     unreadable.push(name);
     return false;
   };
+  /**
+   * The OPTIONAL-field reader, and the distinction it draws is the whole reason
+   * it is not `str`.
+   *
+   * `undefined` means the block never declared this field — which for
+   * `patchDigest` is every bundle written before it existed. That is not a
+   * damaged block: it stays `undefined`, nothing is listed as unreadable, and
+   * the identity guarantee below still holds for those bundles (they come back
+   * as `raw`, not as a copy). Reading an absent optional field as damage would
+   * have made every pre-existing carry announce a repaired field it never had.
+   *
+   * A field that IS declared and is not a string is damage, listed and replaced
+   * with `""` — the same fail-closed empty value `str` uses, and for
+   * `patchDigest` an especially convenient one: no patch can hash to it, so a
+   * garbled digest declines the apply instead of being skipped as absent.
+   */
+  const optStr = (name: string): string | undefined => {
+    const v = src[name];
+    if (v === undefined) return undefined;
+    if (typeof v === "string") return v;
+    unreadable.push(name);
+    return "";
+  };
   const inProgress = ((): GitOperationInProgress | null => {
     const v = src.inProgress;
     if (v === null) return null;
@@ -458,6 +520,7 @@ export function normalizeCarryMeta(raw: unknown): NormalizedCarryMeta {
     trackedIgnoredCount: num("trackedIgnoredCount"),
     trackedIgnored: list("trackedIgnored"),
     repoPrefix: str("repoPrefix"),
+    patchDigest: optStr("patchDigest"),
   };
   // `inProgress` is evaluated above the object literal, so its name would sort
   // ahead of `baseCommit` without this.
@@ -934,6 +997,12 @@ export async function captureCarry(
     trackedIgnoredCount: trackedIgnored.length,
     trackedIgnored: trackedIgnored.slice(0, MAX_REPORTED_REINCLUDED),
     repoPrefix,
+    // Over the BUFFER, above the line where writing starts — so the write is
+    // inside the range the digest covers rather than outside it. A `measureOnly`
+    // pass declares the same value for the same reason it declares
+    // `patchBytes`: it describes the patch that would be captured, and the
+    // capture that follows produces those bytes or fails.
+    patchDigest: computePatchDigest(patch),
   });
 
   if (opts?.measureOnly) {
@@ -1307,7 +1376,16 @@ export type CarryApplyDeclineReason =
    * unsafe was found in it; a parse refusal means a damaged or truncated
    * bundle, and the saved README says so rather than giving a command.
    */
-  | "apply-failed";
+  | "apply-failed"
+  /**
+   * `changes.patch` is not the patch the bundle's own `patchDigest` declares —
+   * damage between capture and here. Distinct from `apply-failed` because a
+   * damaged patch that git can still parse is the whole reason the digest
+   * exists: `apply-failed` says "this machine's git could not use it", this
+   * says "these are not the bytes that were captured", and the second is true
+   * of patches git would have applied perfectly happily.
+   */
+  | "patch-damaged";
 
 /** What an applied carry did to the working tree. */
 export interface CarryApplied {
@@ -2061,11 +2139,11 @@ function saveCarryPayload(opts: {
 /**
  * What the saved README may tell the user to do with this payload.
  *
- * Three states rather than a boolean because two very different things withhold
- * the apply command, and saying the wrong one is a real cost either way: the
- * security paragraph on a merely damaged bundle accuses a peer of an attack,
- * and the damaged-bundle paragraph on a hostile one invites the user to fix it
- * up and apply it.
+ * Four states rather than a boolean because three very different things
+ * withhold the apply command, and saying the wrong one is a real cost every
+ * time: the security paragraph on a merely damaged bundle accuses a peer of an
+ * attack, and either damaged-bundle paragraph on a hostile one invites the user
+ * to fix it up and apply it.
  */
 type SavedAdvice =
   /** Guards declined, but the payload itself is sound: give the command. */
@@ -2073,7 +2151,13 @@ type SavedAdvice =
   /** The floor or the symlink check fired. No command, and say why. */
   | "unsafe"
   /** `git apply` here could not parse it. No command, and DON'T call it hostile. */
-  | "unparseable";
+  | "unparseable"
+  /**
+   * The patch is not the one its own digest declares. No command, and don't
+   * call it hostile either — but don't say git could not read it, which is the
+   * one thing `unparseable` asserts and this case routinely disproves.
+   */
+  | "damaged";
 
 /**
  * A POSIX-shell single-quoted literal.
@@ -2210,6 +2294,20 @@ function renderSavedReadme(opts: {
       "**`git apply` on this machine could not read this patch**, so sesh-mover could not finish checking it and gives no apply command here. Nothing about it was found to be unsafe — the bundle looks damaged or truncated rather than hostile. The patch is beside this file if you want to inspect it; the surer fix is to have the other machine push again.",
       ""
     );
+  } else if (opts.advice === "damaged") {
+    // A THIRD thing, and the one the other two cannot say. git may well read
+    // this patch perfectly — it simply is not the patch that was captured, so
+    // "could not read it" would be false and "it named something forbidden"
+    // would be an accusation. No command, because the command would apply bytes
+    // this file has just said are not the ones the sender sent.
+    //
+    // Same non-early-return as `unparseable`, for the same reason: the digest
+    // covers the patch, and the untracked files beside it are ordinary copies
+    // it says nothing about.
+    lines.push(
+      "**This patch is not the one the bundle says it is.** Its bytes do not match the `patchDigest` recorded in the same manifest, so it was damaged somewhere between the machine that captured it and here — a truncated transfer, a partially-synced share, an edited file. No apply command is given, because applying it would apply exactly the bytes this check rejected; `sha256sum changes.patch` reproduces the value it was compared against if you want to look. The fix is to have the other machine push or export again. Note what this check is not: it detects damage, not tampering — the digest travels in the same manifest as the patch, so anyone able to rewrite one could rewrite the other.",
+      ""
+    );
   } else {
     lines.push(
       "To apply it by hand, from the project directory:",
@@ -2235,7 +2333,7 @@ function renderSavedReadme(opts: {
   }
   if (opts.untrackedSaved > 0) {
     lines.push(
-      (opts.advice === "unparseable"
+      (opts.advice === "unparseable" || opts.advice === "damaged"
         ? "The untracked files travelled as ordinary copies, not in the patch, so nothing above affects them. They are under `untracked/`."
         : "The untracked files are under `untracked/`.") +
         " Copying them OVERWRITES same-named files — sesh-mover's own apply never does that — so check first:",
@@ -2520,6 +2618,62 @@ export async function applyCarry(opts: ApplyCarryOptions): Promise<ApplyResult> 
   // on disk — and where git DID answer, the byte scan no longer over-refuses a
   // spelling git discards at `-p1`.
   if (scanBlocking || (!gitFloorAnswered && scanUnsafe)) return declineScan();
+
+  /**
+   * Is `changes.patch` the patch the bundle's own manifest says it is?
+   *
+   * ## Why HERE and not first
+   *
+   * Every safety verdict above outranks this one, deliberately, and the
+   * ordering is the argument rather than an accident of where it was easiest to
+   * add. The floor and the symlink scan answer *what would these bytes do*,
+   * which is true of the bytes in front of us whether or not they are the bytes
+   * that were captured — and a payload naming `.sesh-mover-include` must be
+   * refused as `unsafe-payload`, with the security paragraph that reason
+   * carries, not as "damaged, ask for a re-push". Put this first and the
+   * loudest disclosure in the module is replaced by the mildest on exactly the
+   * payload that was hostile (`tests/hub-pull.test.ts`'s end-to-end hostile
+   * carry rewrites the patch, so its digest fails too). `apply-failed` from
+   * git's parse outranks it for the same practical reason: git has then already
+   * refused the patch, and its own words are the more specific answer.
+   *
+   * What is left for this check is the case none of them can see, and it is the
+   * one worth having: a patch that parses cleanly, names only ordinary paths
+   * and would apply — but is not what was captured. Before the digest, that was
+   * discovered by `git apply` refusing it, or not at all.
+   *
+   * ## Why it declines the CARRY and not the bundle
+   *
+   * The neighbouring digests draw the line at what the check gates, not at how
+   * bad the damage is. A `layerDigests` mismatch skips that one layer and the
+   * transcript still imports; a per-session `integrityHash` mismatch only warns
+   * in `importer.ts` (the session lands in a file the import just minted) but
+   * REFUSES in `pull-apply-sessions.ts` (a splice mutates a transcript the user
+   * already owns). The carry is the second kind — it writes into a working tree
+   * the user owns — so it refuses. And it refuses only itself: the sessions are
+   * the primary artifact of the operation and a damaged patch says nothing
+   * about them, exactly as a damaged `file-history` says nothing about the
+   * transcript beside it. `sessionsDigest`'s whole-bundle refusal is not the
+   * model here; that digest covers the sessions themselves.
+   *
+   * The decline is whole-payload, never partial (the untracked half is not
+   * copied either), and on a pull it saves the payload the way every other
+   * decline does — so a bundle that is damaged on the hub still leaves the user
+   * a copy to inspect and a README that declines to teach them to apply it.
+   */
+  const patchProblem = await verifyPatchDigest(patchPath, meta.patchDigest);
+  if (patchProblem !== null) {
+    return decline(
+      "patch-damaged",
+      patchProblem,
+      // Exactly what `decline`'s own default does with `scanUnsafe`, spelled
+      // out because the third state has to be chosen explicitly: a byte scan
+      // that saw something the floor forbids keeps the louder README even
+      // though the reason names the damage, and every decline below this point
+      // already behaves that way.
+      scanUnsafe ? "unsafe" : "damaged"
+    );
+  }
 
   if (opts.saveOnly) {
     return decline(

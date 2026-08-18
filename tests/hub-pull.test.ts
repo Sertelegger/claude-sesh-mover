@@ -3,7 +3,7 @@ import {
   mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, cpSync, readFileSync, readdirSync,
   appendFileSync, utimesSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { overrideHome, overridePath } from "./helpers/env.js";
@@ -4767,11 +4767,23 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
 
       // A lock left behind by a crashed operation, old enough to steal. The
       // steal is disclosed as a warning before the first bundle is fetched.
+      //
+      // `host` is OURS and the pid is one nothing is using, so this is the
+      // `dead-holder` arm — the ordinary crashed-process case. Omitting `host`
+      // would be a different test: since #84 a lock that cannot be attributed
+      // to this machine is treated as unidentifiable rather than dead, keeps
+      // its lock to the ceiling, and is disclosed in different words. That is
+      // correct for a pre-#84 lock file, and it is not what this test is for.
       const locks = join(userSeshMoverDir(), "locks");
       mkdirSync(locks, { recursive: true });
       writeFileSync(
         join(locks, `${encodeProjectPath(f.projectB)}.lock`),
-        JSON.stringify({ pid: 999999, acquiredAt: "2020-01-01T00:00:00.000Z", token: "stale" })
+        JSON.stringify({
+          pid: 999999,
+          host: hostname(),
+          acquiredAt: "2020-01-01T00:00:00.000Z",
+          token: "stale",
+        })
       );
 
       const result = await f.pull();
