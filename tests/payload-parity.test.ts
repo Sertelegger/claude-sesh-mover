@@ -1,6 +1,7 @@
+import { readTextLf } from "./helpers/eol.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
-  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -495,8 +496,29 @@ describe("export/import payload parity (#47)", () => {
       if (!result.success) return;
 
       expect(listFiles(target)).toEqual(["README.md", "keep.txt"]);
+      // `.GIT` is asserted only when the filesystem could actually HOLD it as a
+      // second entry. On a case-insensitive one — macOS and Windows by default —
+      // `.git/config` and `.GIT/hooks/pre-commit` are the same directory, so the
+      // bundle physically cannot carry both spellings and the refusal list is
+      // one shorter. That is the payload being unable to express the attack, not
+      // the floor failing to catch it, and asserting a fixed list turned a
+      // filesystem property into a red build on two platforms.
+      //
+      // The case-folding rule itself still has teeth here: the surviving
+      // spelling is refused whichever one it is, and `tests/hub-workspace.test.ts`
+      // covers the folded predicates directly, where no real directory is created.
+      // READDIR, not existsSync: on a case-insensitive filesystem
+      // `existsSync(".GIT/...")` RESOLVES to the `.git` directory and returns
+      // true, so an existence probe cannot detect the very condition it is for.
+      // Two distinct directory entries is the only honest question.
+      const spellings = readdirSync(ws);
+      const bothSpellings = spellings.includes(".git") && spellings.includes(".GIT");
       expect(result.workspaceRefused).toEqual(
-        expect.arrayContaining([".git", ".GIT", ".sesh-mover-include", "nested/.sesh-mover-ignore"])
+        expect.arrayContaining([
+          ...(bothSpellings ? [".git", ".GIT"] : [spellings.includes(".git") ? ".git" : ".GIT"]),
+          ".sesh-mover-include",
+          "nested/.sesh-mover-ignore",
+        ])
       );
       // The refused paths are not in the write set either — a gate that listed a
       // path the run then refused would be describing a different run.
@@ -543,8 +565,8 @@ describe("export/import payload parity (#47)", () => {
       expect(dirtyResult.carryApplied && !dirtyResult.carryApplied.applied
         ? dirtyResult.carryApplied.reason : null).toBe("dirty-tree");
       // Nothing of theirs arrived, and nothing of the user's own work moved.
-      expect(readFileSync(join(dirty, "other.txt"), "utf-8")).toBe("unrelated local work\n");
-      expect(readFileSync(join(dirty, "tracked.txt"), "utf-8")).toBe("v1\n");
+      expect(readTextLf(join(dirty, "other.txt"))).toBe("unrelated local work\n");
+      expect(readTextLf(join(dirty, "tracked.txt"))).toBe("v1\n");
       expect(existsSync(join(dirty, "new.txt"))).toBe(false);
 
       // --- wrong base: refused too

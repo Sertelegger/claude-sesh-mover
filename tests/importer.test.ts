@@ -1,3 +1,4 @@
+import { readTextLf } from "./helpers/eol.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   mkdtempSync,
@@ -2574,7 +2575,7 @@ describe("importer", () => {
       })) as ImportResult;
       expect(first.success).toBe(true);
       expect(first.carryApplied).toBeUndefined();
-      expect(readFileSync(join(twin, "tracked.txt"), "utf-8")).toBe("v1\n");
+      expect(readTextLf(join(twin, "tracked.txt"))).toBe("v1\n");
       // Nothing was parked either — the divergence from `hub pull` that makes
       // the re-run below the remedy rather than a saved directory.
       expect(existsSync(join(twin, ".sesh-mover"))).toBe(false);
