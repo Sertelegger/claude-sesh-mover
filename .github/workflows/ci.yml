@@ -12,6 +12,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # The default is SIX HOURS, and a hung step will use all of it — measured,
+    # when an apt install waited on the dpkg lock until the job was cancelled.
+    # The suite runs in well under a minute on every platform.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -36,7 +40,26 @@ jobs:
       # for platform behaviour, and this test is about the wire format.
       - name: Install the age oracle (differential test for src/crypto)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y age
+        # NOT apt. The first version of this step was
+        # `sudo apt-get update && sudo apt-get install -y age` and it HUNG FOR
+        # SIX HOURS before the job timed out — GitHub's runners run
+        # unattended-upgrades, which holds the dpkg lock, and apt waits on it
+        # indefinitely with no output. A pinned release tarball needs no lock,
+        # takes about a second, and pins the oracle's VERSION, which matters
+        # more here than convenience: a differential test whose oracle floats
+        # is a test whose meaning floats.
+        #
+        # Checksum verified rather than trusted: this binary is executed, and
+        # the whole point of the step is that we do not self-certify.
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 3 --max-time 60 \
+            https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz \
+            -o /tmp/age.tgz
+          echo "7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50  /tmp/age.tgz" | sha256sum -c -
+          tar xzf /tmp/age.tgz -C /tmp
+          echo "/tmp/age" >> "$GITHUB_PATH"
       - run: npm run lint
       - run: npm run build
       - name: dist freshness (committed dist/ must match src/)
