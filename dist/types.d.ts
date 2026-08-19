@@ -1073,6 +1073,27 @@ export interface HubPushResult {
      * or `--no-carry`).
      */
     carry?: CarryMeta;
+    /**
+     * Present **iff** this push ran with `--full` and got as far as the ledger —
+     * the recovery escape hatch for a hub that can no longer serve what it is
+     * recorded as holding (bundles deleted; later, bundles encrypted to a lost
+     * key). Absent on every ordinary push, so its presence alone is the signal
+     * that this run re-sent whole sessions rather than deltas.
+     *
+     * It reports what was FORGOTTEN, not what was sent: `pushedSessions` already
+     * says what travelled, and the two differ in the case worth seeing — a
+     * session the hub was never credited with is pushed whole either way and is
+     * not counted here. So `forgottenSessions` is exactly the number of deltas
+     * this run turned into full bundles.
+     *
+     * `forgottenMemoryDigest` is the same question for the `memory/` layer, which
+     * has no delta form: its ledger is one digest per peer, so a `--full` push
+     * scoped to specific `--session-id`s leaves it alone and reports `false`.
+     */
+    fullResend?: {
+        forgottenSessions: number;
+        forgottenMemoryDigest: boolean;
+    };
 }
 /**
  * A push that threw AFTER the point where it could have linked this project.

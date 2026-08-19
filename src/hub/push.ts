@@ -27,7 +27,7 @@ import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import {
   readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace,
-  setPeerMemoryDigest,
+  setPeerMemoryDigest, forgetSentToPeer,
 } from "../sync-state.js";
 import type {
   ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPushFailedResult, HubPushResult,
@@ -39,6 +39,37 @@ export interface HubPushOptions {
   projectPath: string;
   hubPath: string;
   sessionIds?: string[];
+  /**
+   * Send every session in scope WHOLE, by forgetting what this machine believes
+   * the hub already holds (`peers["hub:<hubId>"]`) before planning the export.
+   *
+   * The escape hatch for a hub that can no longer serve what its ledger claims
+   * — bundles deleted, or (once encryption lands) encrypted to a key that is
+   * gone. Without it the next push ships a delta anchored on a base nobody can
+   * read, which is an unreconstructable thread for every other machine. See
+   * `forgetSentToPeer` for the exact set of ledgers this covers and the ones it
+   * pointedly does not.
+   *
+   * Three things it is not:
+   *
+   * - **Not a config key, and never reachable from the SessionEnd auto-push.**
+   *   A config key would arm the unattended push to re-upload every session in
+   *   the project at every session end, with no channel to disclose it. This is
+   *   flag-only, and the flag is on the verb that does the re-uploading, so the
+   *   forget and the repair are one operation under one project lock rather
+   *   than a cleared ledger waiting for whatever push happens next.
+   * - **Not persisted.** The forget is applied to this push's in-memory state
+   *   and never written; the ledger on disk is restamped from the bundle that
+   *   actually lands (`recordSentFromBundle`). So a `--full` push that dies
+   *   before its bundle commits leaves the ledger exactly as it found it.
+   * - **Not destructive.** A push copies — nothing local is deleted and nothing
+   *   on the hub is overwritten — so the whole cost is bytes and time, which is
+   *   why there is no confirmation here. Disclosure is `commands/push.md`'s job.
+   *
+   * Narrowed by `sessionIds` when both are given: forgetting is scoped to the
+   * sessions this push is actually sending.
+   */
+  full?: boolean;
   noWorkspace?: boolean;
   /**
    * Skip the git-diff carry (design §6.1). Off by default: for a project with
@@ -506,6 +537,33 @@ export async function hubPush(opts: HubPushOptions): Promise<HubPushOutcome> {
       }
       writeSyncState(state);
 
+      /**
+       * `--full`: forget what the hub is believed to already hold, so the export
+       * below plans a whole bundle for every session in scope instead of a
+       * delta against a base the hub may no longer be able to serve.
+       *
+       * Applied AFTER the `writeSyncState` above on purpose — that write is the
+       * thread minting's, and letting it carry the forget to disk is precisely
+       * the persistence `HubPushOptions.full` says this must not have. The
+       * mutation lands on the in-memory `state` that the export options below
+       * read, so `peerSent` and `peerMemoryDigest` need no `--full` branch of
+       * their own: the forget is expressed once, at the ledger, and every
+       * reader of it sees the same answer.
+       */
+      const forgotten = opts.full
+        ? forgetSentToPeer(
+            state,
+            { id: hubPeerId },
+            sessionIds ? { localSessionIds: sessionIds } : undefined
+          )
+        : null;
+      const fullResend = forgotten
+        ? {
+            forgottenSessions: forgotten.forgotten.length,
+            forgottenMemoryDigest: forgotten.memoryDigest,
+          }
+        : undefined;
+
       // Incremental export against the hub pseudo-peer. One export path:
       // exportAllSessions honors sessionIds (undefined = all) and errors on
       // any requested id that doesn't exist.
@@ -579,6 +637,12 @@ export async function hubPush(opts: HubPushOptions): Promise<HubPushOutcome> {
         return {
           success: true, command: "push", projectId: local.projectId,
           bundleId: null, pushedSessions: [], upToDate: true, hasWorkspace: false, warnings,
+          // Unreachable under `--full` in practice — a forgotten ledger makes
+          // every discovered session a full one, and a project with no sessions
+          // at all fails in the exporter above. Reported anyway so the field's
+          // contract ("present iff this push reached the ledger with `--full`")
+          // holds on every success return rather than on the ones we predicted.
+          ...(fullResend ? { fullResend } : {}),
         };
       }
 
@@ -764,6 +828,7 @@ export async function hubPush(opts: HubPushOptions): Promise<HubPushOutcome> {
         bundleId, pushedSessions, upToDate: false, hasWorkspace, warnings,
         ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
         ...(carryMeta ? { carry: carryMeta } : {}),
+        ...(fullResend ? { fullResend } : {}),
       };
     } catch (e) {
       bodyThrew = true;
