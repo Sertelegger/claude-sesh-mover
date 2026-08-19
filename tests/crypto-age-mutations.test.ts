@@ -142,9 +142,14 @@ const RUNNER = `
 import { readFileSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { pathToFileURL } from "node:url";
 
 const [mode, modPath, key, inFile, outFile] = process.argv.slice(2);
-const m = await import(modPath);
+// pathToFileURL, NOT the bare path. A dynamic ESM import of an absolute
+// Windows path fails with ERR_UNSUPPORTED_ESM_URL_SCHEME because \`C:\` reads
+// as a protocol; a POSIX \`/path\` happens to work, so the bug is invisible on
+// Linux and macOS and fails every Windows run.
+const m = await import(pathToFileURL(modPath).href);
 
 async function through(data, t) {
   const out = [];
