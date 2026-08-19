@@ -19,7 +19,7 @@ import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
-import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, setPeerMemoryDigest, } from "../sync-state.js";
+import { readSyncState, writeSyncState, recordSentFromBundle, getThreadId, setThreadId, setLastWorkspace, setPeerMemoryDigest, forgetSentToPeer, } from "../sync-state.js";
 /**
  * Undo the LOCAL half of a link this push made.
  *
@@ -343,6 +343,28 @@ export async function hubPush(opts) {
                     setThreadId(state, hub.hubId, s.sessionId, randomUUID());
             }
             writeSyncState(state);
+            /**
+             * `--full`: forget what the hub is believed to already hold, so the export
+             * below plans a whole bundle for every session in scope instead of a
+             * delta against a base the hub may no longer be able to serve.
+             *
+             * Applied AFTER the `writeSyncState` above on purpose — that write is the
+             * thread minting's, and letting it carry the forget to disk is precisely
+             * the persistence `HubPushOptions.full` says this must not have. The
+             * mutation lands on the in-memory `state` that the export options below
+             * read, so `peerSent` and `peerMemoryDigest` need no `--full` branch of
+             * their own: the forget is expressed once, at the ledger, and every
+             * reader of it sees the same answer.
+             */
+            const forgotten = opts.full
+                ? forgetSentToPeer(state, { id: hubPeerId }, sessionIds ? { localSessionIds: sessionIds } : undefined)
+                : null;
+            const fullResend = forgotten
+                ? {
+                    forgottenSessions: forgotten.forgotten.length,
+                    forgottenMemoryDigest: forgotten.memoryDigest,
+                }
+                : undefined;
             // Incremental export against the hub pseudo-peer. One export path:
             // exportAllSessions honors sessionIds (undefined = all) and errors on
             // any requested id that doesn't exist.
@@ -416,6 +438,12 @@ export async function hubPush(opts) {
                 return {
                     success: true, command: "push", projectId: local.projectId,
                     bundleId: null, pushedSessions: [], upToDate: true, hasWorkspace: false, warnings,
+                    // Unreachable under `--full` in practice — a forgotten ledger makes
+                    // every discovered session a full one, and a project with no sessions
+                    // at all fails in the exporter above. Reported anyway so the field's
+                    // contract ("present iff this push reached the ledger with `--full`")
+                    // holds on every success return rather than on the ones we predicted.
+                    ...(fullResend ? { fullResend } : {}),
                 };
             }
             // Memoized: `git remote -v` is read by the payload capture below AND by
@@ -594,6 +622,7 @@ export async function hubPush(opts) {
                 bundleId, pushedSessions, upToDate: false, hasWorkspace, warnings,
                 ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
                 ...(carryMeta ? { carry: carryMeta } : {}),
+                ...(fullResend ? { fullResend } : {}),
             };
         }
         catch (e) {

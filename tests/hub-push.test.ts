@@ -187,6 +187,184 @@ describe("hub push", () => {
   });
 
   /**
+   * `--full` — the recovery escape hatch (Slice 3.5 §2.3/§3.7).
+   *
+   * **The point is the OUTCOME, not the ledger.** A hub that has lost the
+   * ability to serve what it holds (bundles deleted by compaction; later,
+   * bundles encrypted to a key that is gone) still has this machine recording
+   * "the hub has you up to entry X", so the next push ships a delta anchored on
+   * a base nobody can read — an unreconstructable thread for every other
+   * machine. So the assertion that matters is that the same transcript, in the
+   * same state, ships as a CONTINUATION carrying only the new entries without
+   * the flag and as a FULL bundle carrying the whole history with it. Asserting
+   * on `peers[hub].sent` alone would only pin the mechanism.
+   *
+   * Both directions are run here rather than split across two tests, because
+   * "it shipped full" means nothing without the control that says it would
+   * otherwise not have.
+   */
+  it("--full ships a whole bundle where the same state would otherwise ship a continuation", async () => {
+    /** Push, extend the transcript, push again — with or without `--full`. */
+    async function scenario(full: boolean): Promise<{
+      secondType: string;
+      shippedUuids: string[];
+      fullResend: { forgottenSessions: number; forgottenMemoryDigest: boolean } | undefined;
+      ledgerAfter: string | undefined;
+    }> {
+      const home = mkdtempSync(join(tmpdir(), "sesh-push-full-home-"));
+      const hub = mkdtempSync(join(tmpdir(), "sesh-push-full-hub-"));
+      const base = mkdtempSync(join(tmpdir(), "sesh-push-full-fix-"));
+      const restore = overrideHome(home);
+      try {
+        const { configDir, sessionId } = createFixtureTree(base);
+        const projectPath = createRealProject(base, configDir);
+        await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+        const first = await hubPush({
+          configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+        });
+        if (!first.success) throw new Error(`first push failed: ${JSON.stringify(first)}`);
+
+        const jsonlPath = join(
+          configDir, "projects", encodeProjectPath(projectPath), `${sessionId}.jsonl`
+        );
+        const lines = readFileSync(jsonlPath, "utf-8").split("\n").filter((l) => l !== "");
+        const anchorUuid = (JSON.parse(lines[lines.length - 1]) as { uuid: string }).uuid;
+        writeFileSync(
+          jsonlPath,
+          readFileSync(jsonlPath, "utf-8") +
+            [
+              {
+                uuid: "x-entry-4", parentUuid: anchorUuid, timestamp: "2026-04-11T09:00:00Z",
+                sessionId, cwd: projectPath, version: "2.1.81", type: "user",
+                message: { role: "user", content: "one more thing" },
+              },
+              {
+                uuid: "x-entry-5", parentUuid: "x-entry-4", timestamp: "2026-04-11T09:00:05Z",
+                sessionId, cwd: projectPath, version: "2.1.81", type: "assistant",
+                message: {
+                  model: "claude-opus-4-6", id: "msg_x",
+                  content: [{ type: "text", text: "Done." }],
+                },
+              },
+            ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+          "utf-8"
+        );
+
+        const second = await hubPush({
+          configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81", full,
+        });
+        if (!second.success) throw new Error(`second push failed: ${JSON.stringify(second)}`);
+
+        // Read the bundle as it landed on the hub — what another machine sees.
+        const backend = createFsBackend(hub);
+        const { indexes } = await readAllIndexes(backend, first.projectId);
+        const bundles = Object.values(indexes[0].threads)[0].bundles;
+        expect(bundles).toHaveLength(2);
+        const archiveTmp = join(base, "second.tar.gz");
+        writeFileSync(archiveTmp, await backend.read(bundles[1].file));
+        const extractDir = join(base, "second-extracted");
+        mkdirSync(extractDir, { recursive: true });
+        await extractArchive(archiveTmp, extractDir);
+        const shipped = readFileSync(
+          join(extractDir, "sessions", `${bundles[1].sessionIdInBundle}.jsonl`), "utf-8"
+        );
+        const shippedUuids = shipped
+          .split("\n").filter((l) => l !== "")
+          .map((l) => (JSON.parse(l) as { uuid?: string }).uuid)
+          .filter((u): u is string => typeof u === "string");
+
+        return {
+          secondType: bundles[1].type,
+          shippedUuids,
+          fullResend: second.fullResend,
+          ledgerAfter: readSyncState(projectPath).peers[
+            `hub:${JSON.parse(readFileSync(join(hub, "hub.json"), "utf-8")).hubId}`
+          ]?.sent[sessionId]?.headEntryUuid,
+        };
+      } finally {
+        restore.restore();
+        for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+      }
+    }
+
+    // Control: the ordinary push. A delta, carrying ONLY what came after the
+    // hub's recorded head — the original three entries are not in it.
+    const ordinary = await scenario(false);
+    expect(ordinary.secondType).toBe("continuation");
+    expect(ordinary.shippedUuids).toContain("x-entry-4");
+    expect(ordinary.shippedUuids).toContain("x-entry-5");
+    expect(ordinary.shippedUuids).not.toContain("entry-1");
+    expect(ordinary.shippedUuids).not.toContain("entry-3");
+    expect(ordinary.fullResend).toBeUndefined();
+
+    // `--full`: the same state, the whole transcript, as a bundle that stands
+    // on its own — which is the property key-loss recovery needs, since there
+    // is no readable base for a delta to anchor on.
+    const recovered = await scenario(true);
+    expect(recovered.secondType).toBe("full");
+    for (const u of ["entry-1", "entry-2", "entry-3", "x-entry-4", "x-entry-5"]) {
+      expect(recovered.shippedUuids).toContain(u);
+    }
+    expect(recovered.fullResend?.forgottenSessions).toBe(1);
+
+    // And the forget does not leave the ledger cleared: it is restamped from
+    // the bundle that actually landed, so the NEXT push is incremental again.
+    expect(recovered.ledgerAfter).toBe("x-entry-5");
+    expect(ordinary.ledgerAfter).toBe("x-entry-5");
+  });
+
+  /**
+   * The forget is applied to the push's IN-MEMORY state and never written, so a
+   * `--full` push that dies before its bundle reaches the hub leaves the ledger
+   * exactly as it found it. That is the conservative direction: the retry is
+   * still a deliberate `--full` push, rather than a cleared ledger sitting
+   * there waiting for whatever push happens next — which, with the default-on
+   * SessionEnd auto-push, is an unattended full re-upload nobody asked for.
+   *
+   * Failed here by throwing from the progress callback during the export, which
+   * is after the forget and before any hub write.
+   */
+  it("a --full push that fails before its bundle lands leaves the ledger on disk intact", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-push-fullfail-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-push-fullfail-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-push-fullfail-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir, sessionId } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      const first = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(first.success).toBe(true);
+
+      const hubId = (JSON.parse(readFileSync(join(hub, "hub.json"), "utf-8")) as { hubId: string }).hubId;
+      const before = readSyncState(projectPath).peers[`hub:${hubId}`].sent[sessionId];
+      expect(before.headEntryUuid).toBe("entry-3");
+
+      let threw = false;
+      try {
+        await hubPush({
+          configDir, projectPath, hubPath: hub, claudeVersion: "2.1.81", full: true,
+          onProgress: (ev: ProgressEvent) => {
+            if (ev.phase === "export-copy") throw new Error("boom");
+          },
+        });
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(true);
+
+      const after = readSyncState(projectPath).peers[`hub:${hubId}`].sent[sessionId];
+      expect(after).toEqual(before);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
    * Linking IS the consent gate for the default-on automation: once
    * `.sesh-mover-project.json` exists, `evaluateHookGate` lets the
    * SessionEnd auto-push run, and for a git-less project that push uploads the

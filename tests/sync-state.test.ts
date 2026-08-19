@@ -614,3 +614,225 @@ describe("sync-state v2 (hub)", () => {
     expect(after.peers["m1"].received["__proto__"].localSessionId).toBe("s9");
   });
 });
+
+/**
+ * `forgetSentToPeer` — the recovery escape hatch (Slice 3.5 §2.3/§3.7).
+ *
+ * The *outcome* it exists for (a push that ships a full bundle where it would
+ * otherwise have shipped a continuation) is pinned in `hub-push.test.ts`; these
+ * pin the primitive's contract, and above all the set of ledgers it deliberately
+ * does NOT touch — every one of which, if it were cleared, would cost something
+ * that has nothing to do with the hub having lost a bundle.
+ */
+describe("forgetSentToPeer", () => {
+  let tempHome: string;
+  let homeOverride: HomeOverrideHandle;
+
+  beforeEach(() => {
+    tempHome = mkdtempSync(join(tmpdir(), "sesh-mover-forget-test-"));
+    homeOverride = overrideHome(tempHome);
+  });
+
+  afterEach(() => {
+    homeOverride.restore();
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  const sentEntry = (uuid: string) => ({
+    headEntryUuid: uuid, messageCount: 3, sentAsType: "full" as const, sentAsSessionId: uuid,
+  });
+
+  async function seed(projectPath: string) {
+    const { readSyncState, writeSyncState } = await import("../src/sync-state.js");
+    const state = readSyncState(projectPath);
+    state.peers["hub:H"] = {
+      name: "hub",
+      lastSentAt: "2026-08-01T00:00:00Z",
+      lastReceivedAt: "2026-08-02T00:00:00Z",
+      sent: { "s-1": sentEntry("u1"), "s-2": sentEntry("u2") },
+      received: { "r-1": { localSessionId: "l-1", type: "full", importedAt: "2026-08-02T00:00:00Z" } },
+      memoryDigest: "digest-abc",
+    };
+    state.peers["machine-b"] = {
+      name: "b", lastSentAt: null, lastReceivedAt: null,
+      sent: { "s-1": sentEntry("u1") }, received: {}, memoryDigest: "digest-b",
+    };
+    state.imported["hash-1"] = {
+      localSessionId: "l-1", importedAt: "2026-08-02T00:00:00Z", registered: true,
+    };
+    state.lineage["l-1"] = {
+      sourceMachineId: "machine-b", sourceSessionId: "s-9",
+      importedAt: "2026-08-02T00:00:00Z", type: "full",
+    };
+    state.schemaVersion = 2;
+    state.hub = {
+      hubId: "H",
+      threadByLocalSession: { "s-1": "thread-1", "s-2": "thread-2" },
+      lastWorkspace: { bundleId: "b1", file: "f1", pushedAt: "2026-08-01T00:00:00Z", syncedAt: "2026-08-01T00:00:00Z" },
+      workspaceGenerations: [
+        { bundleId: "b1", file: "f1", pushedAt: "2026-08-01T00:00:00Z", syncedAt: "2026-08-01T00:00:00Z" },
+      ],
+    };
+    writeSyncState(state);
+    return readSyncState(projectPath);
+  }
+
+  it("drops the whole sent ledger and the memory digest, and reports both", async () => {
+    const { forgetSentToPeer } = await import("../src/sync-state.js");
+    const state = await seed("/p-forget-all");
+
+    const result = forgetSentToPeer(state, { id: "hub:H" });
+
+    expect(result.forgotten.sort()).toEqual(["s-1", "s-2"]);
+    expect(result.memoryDigest).toBe(true);
+    expect(state.peers["hub:H"].sent).toEqual({});
+    expect(state.peers["hub:H"].memoryDigest).toBeUndefined();
+  });
+
+  /**
+   * The list of things a forget must NOT reach. Each assertion is a different
+   * ledger answering a different question, and clearing any of them costs
+   * something a lost hub bundle gives no reason to pay:
+   * `received`/`lineage`/`imported` describe THIS machine's disk (re-pull,
+   * re-import, duplicates), `threadByLocalSession` is the cross-machine
+   * identity a recovery push has to keep, and the workspace generations are our
+   * half of the merge-ancestor test for INCOMING payloads.
+   */
+  it("leaves every other ledger — including the OTHER peer's — untouched", async () => {
+    const { forgetSentToPeer } = await import("../src/sync-state.js");
+    const state = await seed("/p-forget-scope");
+
+    forgetSentToPeer(state, { id: "hub:H" });
+
+    expect(state.peers["hub:H"].received["r-1"].localSessionId).toBe("l-1");
+    expect(state.peers["hub:H"].name).toBe("hub");
+    expect(state.peers["hub:H"].lastSentAt).toBe("2026-08-01T00:00:00Z");
+    expect(state.peers["hub:H"].lastReceivedAt).toBe("2026-08-02T00:00:00Z");
+    // A forget is peer-scoped: the same session's watermark for a real machine
+    // peer is a claim about that machine, which the hub losing a bundle does
+    // not falsify.
+    expect(state.peers["machine-b"].sent["s-1"].headEntryUuid).toBe("u1");
+    expect(state.peers["machine-b"].memoryDigest).toBe("digest-b");
+    expect(state.imported["hash-1"].localSessionId).toBe("l-1");
+    expect(state.lineage["l-1"].sourceSessionId).toBe("s-9");
+    // The one that would actively hurt: a new thread id would split the thread
+    // in two in every other machine's index.
+    expect(state.hub?.threadByLocalSession).toEqual({ "s-1": "thread-1", "s-2": "thread-2" });
+    expect(state.hub?.lastWorkspace?.bundleId).toBe("b1");
+    expect(state.hub?.workspaceGenerations?.map((g) => g.bundleId)).toEqual(["b1"]);
+  });
+
+  it("scoped to session ids, forgets only those and leaves the memory digest alone", async () => {
+    const { forgetSentToPeer } = await import("../src/sync-state.js");
+    const state = await seed("/p-forget-one");
+
+    const result = forgetSentToPeer(state, { id: "hub:H" }, { localSessionIds: ["s-2"] });
+
+    expect(result.forgotten).toEqual(["s-2"]);
+    // `memory/` has no per-session form, so a targeted forget has nothing to
+    // say about it — and must not silently re-send the whole directory.
+    expect(result.memoryDigest).toBe(false);
+    expect(state.peers["hub:H"].memoryDigest).toBe("digest-abc");
+    expect(Object.keys(state.peers["hub:H"].sent)).toEqual(["s-1"]);
+  });
+
+  it("reports only ids the ledger actually held, and never invents an entry", async () => {
+    const { forgetSentToPeer } = await import("../src/sync-state.js");
+    const state = await seed("/p-forget-unknown");
+
+    const result = forgetSentToPeer(state, { id: "hub:H" }, { localSessionIds: ["s-2", "never-sent"] });
+
+    expect(result.forgotten).toEqual(["s-2"]);
+    expect(Object.keys(state.peers["hub:H"].sent)).toEqual(["s-1"]);
+  });
+
+  it("a peer that was never credited is a no-op, not a new empty ledger", async () => {
+    const { forgetSentToPeer, readSyncState } = await import("../src/sync-state.js");
+    const state = readSyncState("/p-forget-absent");
+
+    const result = forgetSentToPeer(state, { id: "hub:nobody" });
+
+    expect(result).toEqual({ forgotten: [], memoryDigest: false });
+    expect(Object.hasOwn(state.peers, "hub:nobody")).toBe(false);
+  });
+
+  /**
+   * `sent` is keyed by strings that came from outside this machine, so the
+   * record may have a null prototype (`foreignKeyedRecord`) — on which
+   * `sent.hasOwnProperty` does not exist — or, hand-built, a real one on which
+   * `"__proto__" in sent` is true for a key nobody wrote. Both directions have
+   * to answer "was this really in the ledger" correctly.
+   */
+  it("answers own-key questions correctly for Object.prototype names", async () => {
+    const { forgetSentToPeer, readSyncState, writeSyncState } = await import("../src/sync-state.js");
+    const projectPath = "/p-forget-proto";
+    const seeded = readSyncState(projectPath);
+    seeded.peers["hub:H"] = {
+      name: "hub", lastSentAt: null, lastReceivedAt: null, sent: {}, received: {},
+    };
+    writeSyncState(seeded);
+    const state = readSyncState(projectPath);
+    state.peers["hub:H"].sent["__proto__"] = sentEntry("u-proto");
+    writeSyncState(state);
+
+    const reread = readSyncState(projectPath);
+    // Not in the ledger: must not be reported as forgotten.
+    const missing = forgetSentToPeer(reread, { id: "hub:H" }, { localSessionIds: ["constructor"] });
+    expect(missing.forgotten).toEqual([]);
+    // In the ledger: must be.
+    const hit = forgetSentToPeer(reread, { id: "hub:H" }, { localSessionIds: ["__proto__"] });
+    expect(hit.forgotten).toEqual(["__proto__"]);
+    expect(Object.hasOwn(reread.peers["hub:H"].sent, "__proto__")).toBe(false);
+
+    // The other direction, which the null-prototype case cannot show: a state
+    // object built in memory rather than parsed off disk has an ORDINARY
+    // prototype on its `sent` map, and `"constructor" in sent` is then true for
+    // a key nobody ever wrote. Reporting it as forgotten would tell a caller
+    // (and, through `fullResend.forgottenSessions`, a user) that a session was
+    // re-sent that never existed.
+    const handBuilt = readSyncState("/p-forget-proto-plain");
+    handBuilt.peers["hub:H"] = {
+      name: "hub", lastSentAt: null, lastReceivedAt: null,
+      sent: { "s-1": sentEntry("u1") }, received: {},
+    };
+    const plain = forgetSentToPeer(handBuilt, { id: "hub:H" }, {
+      localSessionIds: ["constructor", "toString", "s-1"],
+    });
+    expect(plain.forgotten).toEqual(["s-1"]);
+  });
+
+  it("writes nothing — the caller decides whether the forget is persisted", async () => {
+    const { forgetSentToPeer, readSyncState } = await import("../src/sync-state.js");
+    const projectPath = "/p-forget-nowrite";
+    await seed(projectPath);
+    const state = readSyncState(projectPath);
+
+    forgetSentToPeer(state, { id: "hub:H" });
+
+    // `hub/push.ts` depends on this: a `--full` push that dies before its
+    // bundle lands must leave the on-disk ledger exactly as it found it.
+    const onDisk = readSyncState(projectPath);
+    expect(Object.keys(onDisk.peers["hub:H"].sent).sort()).toEqual(["s-1", "s-2"]);
+    expect(onDisk.peers["hub:H"].memoryDigest).toBe("digest-abc");
+  });
+
+  it("does not touch schemaVersion", async () => {
+    const { forgetSentToPeer, readSyncState, writeSyncState } = await import("../src/sync-state.js");
+    const projectPath = "/p-forget-v1";
+    const state = readSyncState(projectPath);
+    state.peers["peer-x"] = {
+      name: "x", lastSentAt: null, lastReceivedAt: null,
+      sent: { "s-1": sentEntry("u1") }, received: {},
+    };
+    writeSyncState(state);
+    const reread = readSyncState(projectPath);
+    expect(reread.schemaVersion).toBe(1);
+
+    forgetSentToPeer(reread, { id: "peer-x" });
+    writeSyncState(reread);
+
+    // A pre-hub plugin meeting a bumped file renames it aside and loses the
+    // imported registry with it, so a forget must never be what promotes one.
+    expect(readSyncState(projectPath).schemaVersion).toBe(1);
+  });
+});

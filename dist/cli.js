@@ -1078,6 +1078,7 @@ program
     .option("--create-project", "Mint a new hub project for this directory")
     .option("--no-workspace", "Skip the workspace snapshot (taken for projects with no git remote, including a git repo that has none)")
     .option("--no-carry", "Do not carry uncommitted changes (taken for projects that have a git remote)")
+    .option("--full", "Re-send every session in scope WHOLE — forget what the hub is recorded as already holding (recovery for a hub that can no longer serve it)")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     try {
@@ -1099,6 +1100,12 @@ program
             sessionIds: opts.sessionId,
             noWorkspace: opts.workspace === false || config.hub.noWorkspace,
             noCarry: opts.carry === false || !config.hub.carryDiff,
+            // Flag-only, with NO config key beside it — deliberately unlike the two
+            // above. A config key would arm the default-on, unattended SessionEnd
+            // auto-push to re-upload every session in the project at every session
+            // end, with no channel to disclose that it did. `--full` is a recovery
+            // action a human takes once, watching it.
+            full: !!opts.full,
             // Deliberately NO `--carry-max-mb` flag to override this. The decline
             // is not retryable on demand — the carry rides a bundle, so an
             // immediate re-push answers `upToDate` and a flag on the retry would be

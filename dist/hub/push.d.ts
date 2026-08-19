@@ -4,6 +4,37 @@ export interface HubPushOptions {
     projectPath: string;
     hubPath: string;
     sessionIds?: string[];
+    /**
+     * Send every session in scope WHOLE, by forgetting what this machine believes
+     * the hub already holds (`peers["hub:<hubId>"]`) before planning the export.
+     *
+     * The escape hatch for a hub that can no longer serve what its ledger claims
+     * — bundles deleted, or (once encryption lands) encrypted to a key that is
+     * gone. Without it the next push ships a delta anchored on a base nobody can
+     * read, which is an unreconstructable thread for every other machine. See
+     * `forgetSentToPeer` for the exact set of ledgers this covers and the ones it
+     * pointedly does not.
+     *
+     * Three things it is not:
+     *
+     * - **Not a config key, and never reachable from the SessionEnd auto-push.**
+     *   A config key would arm the unattended push to re-upload every session in
+     *   the project at every session end, with no channel to disclose it. This is
+     *   flag-only, and the flag is on the verb that does the re-uploading, so the
+     *   forget and the repair are one operation under one project lock rather
+     *   than a cleared ledger waiting for whatever push happens next.
+     * - **Not persisted.** The forget is applied to this push's in-memory state
+     *   and never written; the ledger on disk is restamped from the bundle that
+     *   actually lands (`recordSentFromBundle`). So a `--full` push that dies
+     *   before its bundle commits leaves the ledger exactly as it found it.
+     * - **Not destructive.** A push copies — nothing local is deleted and nothing
+     *   on the hub is overwritten — so the whole cost is bytes and time, which is
+     *   why there is no confirmation here. Disclosure is `commands/push.md`'s job.
+     *
+     * Narrowed by `sessionIds` when both are given: forgetting is scoped to the
+     * sessions this push is actually sending.
+     */
+    full?: boolean;
     noWorkspace?: boolean;
     /**
      * Skip the git-diff carry (design §6.1). Off by default: for a project with

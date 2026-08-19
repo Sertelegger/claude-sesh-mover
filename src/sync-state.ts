@@ -281,6 +281,119 @@ export function setPeerMemoryDigest(
   state.peers[peer.id].memoryDigest = digest;
 }
 
+/** What a forget actually dropped — see `forgetSentToPeer`. */
+export interface ForgetSentResult {
+  /**
+   * Local session ids whose watermark was dropped, i.e. exactly the sessions
+   * the next push to this peer sends WHOLE that it would otherwise have sent as
+   * a delta. Empty when the peer held no ledger, which is a successful forget
+   * and not an error.
+   */
+  forgotten: string[];
+  /** True when the memory layer's "peer already has it" digest went too. */
+  memoryDigest: boolean;
+}
+
+/**
+ * Forget what this machine believes a peer already holds.
+ *
+ * **This is the ONE definition of what "forgetting" means**, so the callers that
+ * need it cannot come to disagree about which ledgers it covers. Today that is
+ * `hub push --full`; the design also names key-loss recovery and compaction
+ * repair, which clear the same watermark for the same reason and must clear
+ * exactly the same set.
+ *
+ * **Why it has to exist at all.** `sent` is not a fact about this machine — it
+ * is a claim about what the PEER can still serve, and a hub can stop being able
+ * to serve what it holds (bundles deleted by compaction; bundles encrypted to a
+ * key that is gone). The ledger then makes the next push ship a delta anchored
+ * on a base nobody can read, which is `recordSentToPeer`'s unreconstructable
+ * thread arriving from the other end. Nothing else in this file can undo that:
+ * every other writer here only ever credits.
+ *
+ * Note what this is NOT. `recordSentToPeer`'s invariant forbids CREDITING the
+ * hub ledger from a transfer path that did not go through the hub, because a
+ * false credit costs a thread. Forgetting fails in the opposite direction: the
+ * worst a wrong forget does is re-send bytes the peer already had. So this adds
+ * no new way to credit the ledger, and there is deliberately no
+ * `--full`-shaped flag anywhere that writes one.
+ *
+ * **What it deliberately leaves alone, and why each is a different ledger:**
+ *
+ * - `received` — what this machine has TAKEN from the peer. A hub losing the
+ *   ability to serve a bundle does not un-import a session already on local
+ *   disk, so nothing here is falsified; clearing it would make the next pull
+ *   re-fetch and re-apply bundles this machine already applied.
+ * - `imported` — the content-hash dedup registry. Per PROJECT rather than per
+ *   peer, and a claim about this machine's own disk, which no peer can
+ *   invalidate. Clearing it turns import's idempotence off and duplicates
+ *   sessions the user already has.
+ * - `lineage` — provenance of what arrived. Same class as `received`.
+ * - `hub.threadByLocalSession` — the one that would actively hurt. A thread id
+ *   is the cross-machine identity of a conversation, so forgetting it mints a
+ *   NEW one on the next push and splits the thread in two in every other
+ *   machine's index. A recovery push has to land under the same thread as the
+ *   history it is replacing, which is the whole point of it.
+ * - `hub.workspaceGenerations` / `hub.lastWorkspace` — a workspace `basedOn`
+ *   naming a bundle nobody can read is already handled, and one level down:
+ *   `pull-apply-workspace.ts`'s `fetchAncestorWorkspace` degrades to no ancestor
+ *   with a warning, and the merge falls to keep-local. Meanwhile that list is
+ *   also OUR half of the "common to both trees" test for INCOMING payloads, so
+ *   clearing it would break merges of other machines' work for a push-side
+ *   problem it has nothing to do with.
+ *
+ * The peer entry itself is never created and never removed: forgetting a peer
+ * that was never credited is a no-op, not the minting of an empty ledger, and a
+ * forget must not take the peer's `name`/`received` with it.
+ *
+ * Mutates `state` in place and writes nothing, like `setThreadId` /
+ * `setLastWorkspace` / `setPeerMemoryDigest` — the caller decides whether this
+ * forget is persisted. `hub/push.ts` deliberately does not persist it: a
+ * `--full` push that dies before its bundle lands leaves the old ledger intact,
+ * so the retry is still a `--full` push rather than a silent full re-upload on
+ * whatever unattended push happens next. Touches no `schemaVersion`, since
+ * every field it reaches is v1.
+ *
+ * @param opts.localSessionIds Forget only these sessions (compaction repair
+ * knows exactly whose bundles it deleted). Omitted means the whole ledger — and
+ * only the whole-ledger form drops `memoryDigest`, which is not per-session and
+ * so has no targeted meaning.
+ */
+export function forgetSentToPeer(
+  state: SyncState,
+  peer: { id: string },
+  opts?: { localSessionIds?: string[] }
+): ForgetSentResult {
+  const entry = state.peers[peer.id];
+  if (!entry) return { forgotten: [], memoryDigest: false };
+  // `parseSyncState` backfills this, but a state object built in memory (a
+  // test, a future caller) has only the type's word for it.
+  const sent = entry.sent ?? foreignKeyedRecord();
+  entry.sent = sent;
+
+  const scope = opts?.localSessionIds;
+  if (scope) {
+    const forgotten: string[] = [];
+    for (const id of scope) {
+      // `Object.prototype.hasOwnProperty.call`, not `id in sent` and not
+      // `sent.hasOwnProperty`: these keys come from outside this machine
+      // (`foreignKeyedRecord`), so the record may have a null prototype — which
+      // has no `hasOwnProperty` — or, if it was built by hand, a real one on
+      // which `"__proto__" in sent` is true for a key nobody wrote.
+      if (!Object.prototype.hasOwnProperty.call(sent, id)) continue;
+      delete sent[id];
+      forgotten.push(id);
+    }
+    return { forgotten, memoryDigest: false };
+  }
+
+  const forgotten = Object.keys(sent);
+  entry.sent = foreignKeyedRecord();
+  const memoryDigest = entry.memoryDigest !== undefined;
+  delete entry.memoryDigest;
+  return { forgotten, memoryDigest };
+}
+
 export function getThreadId(state: SyncState, localSessionId: string): string | null {
   // `?.` after threadByLocalSession too: `parseSyncState` validates neither
   // the `hub` block's shape nor its sub-objects, and `hub` now carries four of

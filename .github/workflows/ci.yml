@@ -19,6 +19,24 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # The age binary is the DIFFERENTIAL ORACLE for src/crypto/age.ts, and
+      # without it the most important test in that module skips.
+      #
+      # This is not belt-and-braces. Four of the injected defects — a frozen
+      # nonce counter, a little-endian counter, an empty trailing chunk, and a
+      # one-character HKDF info typo — round-trip through our own code
+      # PERFECTLY, so a self-round-trip test is green while the file reuses one
+      # nonce across every chunk. Only a second implementation catches them, and
+      # nonce reuse is catastrophic and silent.
+      #
+      # SESH_MOVER_REQUIRE_AGE turns the skip into a hard failure, so a runner
+      # that loses the binary fails loudly instead of quietly dropping the
+      # coverage. Linux only: apt is the cheap install, and one oracle running
+      # everywhere the code is identical is the point — the platform matrix is
+      # for platform behaviour, and this test is about the wire format.
+      - name: Install the age oracle (differential test for src/crypto)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y age
       - run: npm run lint
       - run: npm run build
       - name: dist freshness (committed dist/ must match src/)
@@ -29,6 +47,9 @@ jobs:
             exit 1
           fi
       - run: npm test
+        env:
+          # Only where the oracle was installed; elsewhere the skip is correct.
+          SESH_MOVER_REQUIRE_AGE: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
 
   windows-smoke:
     runs-on: windows-latest
