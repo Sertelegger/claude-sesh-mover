@@ -14,6 +14,12 @@
  * by side forever, and the decision has to be per file. `isEncryptedBundleFile`
  * (hub/layout.ts) is the whole of it.
  *
+ * `rewrapBundleFile` is the one exception that proves the rule rather than
+ * breaking it: it rewrites a bundle in place, and the only bundles it is ever
+ * handed are the calling machine's OWN, which is what keeps per-machine
+ * ownership intact. It also never changes a name, so no index anywhere has to
+ * learn that it ran.
+ *
  * Reaching for `resolveHubEncryption` here instead is the mistake this comment
  * exists to prevent, and it fails in BOTH directions: on a hub whose switch has
  * just been flipped it strands every bundle pushed before the flip, and on a
@@ -36,7 +42,7 @@
  */
 import { createWriteStream } from "node:fs";
 import { finished, pipeline } from "node:stream/promises";
-import { AgeDecryptStream, AgeEncryptStream, AgeError, parseIdentity, parseRecipient } from "../crypto/age.js";
+import { AgeDecryptStream, AgeEncryptStream, AgeError, AgeRewrapStream, parseIdentity, parseRecipient, } from "../crypto/age.js";
 import { readIdentityFile } from "../crypto/identity-file.js";
 import { isEncryptedBundleFile } from "./layout.js";
 /**
@@ -65,7 +71,14 @@ async function absorbLateError(s) {
     s.destroy?.();
     await finished(s).catch(() => { });
 }
-function classify(e) {
+/**
+ * One exception, one of the four kinds. **Shared by both directions**, which is
+ * the point: a re-wrap and a fetch fail for the same four reasons and must not
+ * describe them two ways — "this machine is not a recipient" in particular is
+ * the same fact whether it was found while reading a bundle or while trying to
+ * re-address one.
+ */
+export function classifyBundleFailure(e) {
     const message = e.message;
     if (!(e instanceof AgeError))
         return { kind: "transfer", message };
@@ -85,6 +98,40 @@ function classify(e) {
             return { kind: "no-identity", message };
         default:
             return { kind: "ciphertext-rejected", message };
+    }
+}
+/**
+ * This machine's identity as raw key bytes, or the failure that explains why
+ * not — the one step both directions take before they can touch ciphertext.
+ *
+ * Shared rather than written twice because the DISTINCTION it draws is the
+ * valuable part and is easy to lose: "no usable key here" (`no-identity`) is a
+ * different fact from "this key is not one of the file's recipients"
+ * (`no-matching-identity`), and only the first has a local remedy. A second
+ * copy is how one of the two callers ends up reporting a permission problem as
+ * "this bundle was never addressed to you".
+ */
+function identityBytes(key) {
+    if (key.state !== "present") {
+        return {
+            ok: false,
+            failure: {
+                kind: "no-identity",
+                message: key.state === "absent"
+                    ? "this machine has no ~/.sesh-mover/identity.age"
+                    : // The detail carries the identity file's own absolute path on an
+                        // `io` cause. Kept, unlike the hub path the preflight refusals
+                        // withhold: this one is a fixed, documented, local path the user
+                        // already knows, and EACCES-vs-EISDIR is the entire diagnosis.
+                        `~/.sesh-mover/identity.age is unreadable (${key.cause}): ${key.detail}`,
+            },
+        };
+    }
+    try {
+        return { ok: true, raw: parseIdentity(key.identity) };
+    }
+    catch (e) {
+        return { ok: false, failure: classifyBundleFailure(e) };
     }
 }
 /**
@@ -113,29 +160,10 @@ export async function fetchBundleArchive(input) {
     const encrypted = isEncryptedBundleFile(input.file);
     let identityRaw = null;
     if (encrypted) {
-        const key = input.identity ?? readIdentityFile();
-        if (key.state !== "present") {
-            return {
-                ok: false,
-                encrypted,
-                failure: {
-                    kind: "no-identity",
-                    message: key.state === "absent"
-                        ? "this machine has no ~/.sesh-mover/identity.age"
-                        : // The detail carries the identity file's own absolute path on an
-                            // `io` cause. Kept, unlike the hub path the preflight refusals
-                            // withhold: this one is a fixed, documented, local path the user
-                            // already knows, and EACCES-vs-EISDIR is the entire diagnosis.
-                            `~/.sesh-mover/identity.age is unreadable (${key.cause}): ${key.detail}`,
-                },
-            };
-        }
-        try {
-            identityRaw = parseIdentity(key.identity);
-        }
-        catch (e) {
-            return { ok: false, encrypted, failure: classify(e) };
-        }
+        const key = identityBytes(input.identity ?? readIdentityFile());
+        if (!key.ok)
+            return { ok: false, encrypted, failure: key.failure };
+        identityRaw = key.raw;
     }
     const out = createWriteStream(input.destPath);
     // ATTACHED AT CREATION, and that timing is the whole point. `absorbLateError`
@@ -205,7 +233,7 @@ export async function fetchBundleArchive(input) {
             await absorbLateError(dec);
         if (src !== undefined)
             await absorbLateError(src);
-        return { ok: false, encrypted, failure: classify(e) };
+        return { ok: false, encrypted, failure: classifyBundleFailure(e) };
     }
     return { ok: true, encrypted };
 }
@@ -223,5 +251,96 @@ export async function fetchBundleArchive(input) {
  */
 export function bundleEncryptStream(recipients) {
     return new AgeEncryptStream(recipients.map((r) => parseRecipient(r)));
+}
+/**
+ * Re-address one of THIS machine's own encrypted bundles to a new recipient
+ * set, in place, without decrypting the payload.
+ *
+ * The primitive under `hub rekey`, and the seam compaction (#92) reaches for
+ * when it needs the same thing. Everything about which files, in what order,
+ * and what to do when one fails belongs to the caller; this function moves one
+ * file's bytes and classifies one failure.
+ *
+ * ### In place, under the SAME NAME, and that is the whole reason it is cheap
+ *
+ * The name is what every index on the hub records, and a rekey changes no name:
+ * the file was `….tar.gz.age` before and is `….tar.gz.age` after, so this
+ * machine's index needs no rewrite, no other machine's index goes stale, and
+ * nothing has to be deleted. That is also why it cannot turn a PLAINTEXT bundle
+ * into an encrypted one — that changes the suffix, which the reader branches on
+ * — and why the caller filters by `isEncryptedBundleFile` before calling.
+ *
+ * ### The failure contract, which is what makes a partial run safe
+ *
+ * `writeStreamAtomic` writes a temp file and renames, so this either replaces
+ * the bundle whole or leaves it exactly as it was; there is no state in which
+ * the file is half a header. Combined with the caller's self-check — the new
+ * recipient set must contain the machine running this — every bundle is
+ * readable by this machine before the call and after it, whichever way the call
+ * goes. A run that dies at file K therefore leaves K-1 files re-addressed and
+ * the rest untouched, and no file unreadable by anyone.
+ *
+ * **Returns a result and never throws**, on the same reasoning
+ * `fetchBundleArchive` states: the caller is a loop over files, and one file's
+ * exception must not cost the diagnosis for the rest.
+ *
+ * @param identity read ONCE by the caller and passed down, so the key that
+ *   satisfied the self-check is provably the key every unwrap uses — re-reading
+ *   here would leave a window in which the file changes mid-run.
+ */
+export async function rewrapBundleFile(input) {
+    const key = identityBytes(input.identity);
+    if (!key.ok)
+        return { ok: false, failure: key.failure };
+    let rewrap;
+    try {
+        // Both throws land here on purpose: a recipient string the census admitted
+        // and `parseRecipient` rejects, and an empty list. Neither is reachable
+        // from `hub rekey` (the census re-parses, and the self-check guarantees at
+        // least this machine), so this is the belt — and it is a `no-identity`
+        // classification for a `bad-key`, which is the right remedy for both.
+        rewrap = new AgeRewrapStream(key.raw, input.recipients.map((r) => parseRecipient(r)));
+    }
+    catch (e) {
+        return { ok: false, failure: classifyBundleFailure(e) };
+    }
+    swallowErrors(rewrap);
+    let w;
+    try {
+        // Opened BEFORE the read, and it only creates the temp file — the target is
+        // untouched until `commit()` renames over it.
+        w = await input.backend.writeStreamAtomic(input.file);
+    }
+    catch (e) {
+        return { ok: false, failure: classifyBundleFailure(e) };
+    }
+    swallowErrors(w.stream);
+    let src;
+    try {
+        src = await input.backend.readStream(input.file);
+        swallowErrors(src);
+        await pipeline(src, rewrap, w.stream);
+        // WAIT FOR THE SOURCE FD TO CLOSE BEFORE COMMITTING. `commit()` renames the
+        // temp over the file this pipeline was just reading, and on Windows a
+        // rename over a path with an open handle fails outright. `pipeline`
+        // destroys the source when it settles, but the close is asynchronous, so
+        // awaiting it is what makes the ordering real rather than likely. The
+        // rejection this can produce (`ERR_STREAM_PREMATURE_CLOSE` on a destroyed
+        // stream) is the expected path, not a failure.
+        await finished(src).catch(() => { });
+        await w.commit();
+    }
+    catch (e) {
+        // `abort()` removes the temp and never throws, so the bundle on the hub is
+        // exactly what it was. The transform and the source still have errors in
+        // flight that `pipeline` stopped listening for — same reasoning, and the
+        // same measured failure, as `fetchBundleArchive`'s catch.
+        await w.abort();
+        await absorbLateError(rewrap);
+        if (src !== undefined)
+            await absorbLateError(src);
+        return { ok: false, failure: classifyBundleFailure(e) };
+    }
+    return { ok: true, previousRecipientStanzas: rewrap.previousRecipientStanzas };
 }
 //# sourceMappingURL=bundle-io.js.map

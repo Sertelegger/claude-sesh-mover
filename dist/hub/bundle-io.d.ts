@@ -14,6 +14,12 @@
  * by side forever, and the decision has to be per file. `isEncryptedBundleFile`
  * (hub/layout.ts) is the whole of it.
  *
+ * `rewrapBundleFile` is the one exception that proves the rule rather than
+ * breaking it: it rewrites a bundle in place, and the only bundles it is ever
+ * handed are the calling machine's OWN, which is what keeps per-machine
+ * ownership intact. It also never changes a name, so no index anywhere has to
+ * learn that it ran.
+ *
  * Reaching for `resolveHubEncryption` here instead is the mistake this comment
  * exists to prevent, and it fails in BOTH directions: on a hub whose switch has
  * just been flipped it strands every bundle pushed before the flip, and on a
@@ -49,10 +55,12 @@ import type { HubBackend } from "./backend.js";
  *   `~/.sesh-mover/identity.age`. The key may be perfectly intact behind a
  *   permission problem, so this is NOT "you are not a recipient".
  * - `no-matching-identity` — this machine holds a key and it is not one of the
- *   bundle's recipients. Permanent for this bundle, by construction: a bundle
- *   is written once and never re-wrapped by anyone but the machine that owns
- *   it. Distinguishing it from `no-identity` is the difference between "fix
- *   your key file" and "this bundle was never addressed to you".
+ *   bundle's recipients. Permanent FROM HERE, by construction: only the machine
+ *   that owns a bundle may re-wrap it (`rewrapBundleFile`, reached by `hub
+ *   rekey`), so nothing this machine does reaches it and nothing ever will if
+ *   that machine is gone. Distinguishing it from `no-identity` is the
+ *   difference between "fix your key file" and "this bundle was never addressed
+ *   to you".
  * - `ciphertext-rejected` — the header MAC or a chunk's AEAD tag refused the
  *   bytes, or the file is not an age v1 file we can read. Damage or tampering;
  *   the AEAD does not say which, and neither does this.
@@ -76,6 +84,14 @@ export type BundleFetchOutcome = {
     encrypted: boolean;
     failure: BundleFetchFailure;
 };
+/**
+ * One exception, one of the four kinds. **Shared by both directions**, which is
+ * the point: a re-wrap and a fetch fail for the same four reasons and must not
+ * describe them two ways — "this machine is not a recipient" in particular is
+ * the same fact whether it was found while reading a bundle or while trying to
+ * re-address one.
+ */
+export declare function classifyBundleFailure(e: unknown): BundleFetchFailure;
 /**
  * Download one bundle from the hub into a local PLAINTEXT `.tar.gz`,
  * decrypting on the way when the hub-side name says it is encrypted.
@@ -117,4 +133,63 @@ export declare function fetchBundleArchive(input: {
  * throw is the belt.
  */
 export declare function bundleEncryptStream(recipients: readonly string[]): AgeEncryptStream;
+/** The two outcomes of `rewrapBundleFile`. */
+export type BundleRewrapOutcome = {
+    ok: true;
+    /**
+     * How many recipient stanzas the file carried BEFORE this call, or `null`
+     * if the stream never reported (it always does on success). Compare it
+     * with the size of the new set to notice that a rekey NARROWED the
+     * readership; which machines were dropped is not recoverable, because a
+     * stanza carries an ephemeral share and never a public key.
+     */
+    previousRecipientStanzas: number | null;
+} | {
+    ok: false;
+    failure: BundleFetchFailure;
+};
+/**
+ * Re-address one of THIS machine's own encrypted bundles to a new recipient
+ * set, in place, without decrypting the payload.
+ *
+ * The primitive under `hub rekey`, and the seam compaction (#92) reaches for
+ * when it needs the same thing. Everything about which files, in what order,
+ * and what to do when one fails belongs to the caller; this function moves one
+ * file's bytes and classifies one failure.
+ *
+ * ### In place, under the SAME NAME, and that is the whole reason it is cheap
+ *
+ * The name is what every index on the hub records, and a rekey changes no name:
+ * the file was `….tar.gz.age` before and is `….tar.gz.age` after, so this
+ * machine's index needs no rewrite, no other machine's index goes stale, and
+ * nothing has to be deleted. That is also why it cannot turn a PLAINTEXT bundle
+ * into an encrypted one — that changes the suffix, which the reader branches on
+ * — and why the caller filters by `isEncryptedBundleFile` before calling.
+ *
+ * ### The failure contract, which is what makes a partial run safe
+ *
+ * `writeStreamAtomic` writes a temp file and renames, so this either replaces
+ * the bundle whole or leaves it exactly as it was; there is no state in which
+ * the file is half a header. Combined with the caller's self-check — the new
+ * recipient set must contain the machine running this — every bundle is
+ * readable by this machine before the call and after it, whichever way the call
+ * goes. A run that dies at file K therefore leaves K-1 files re-addressed and
+ * the rest untouched, and no file unreadable by anyone.
+ *
+ * **Returns a result and never throws**, on the same reasoning
+ * `fetchBundleArchive` states: the caller is a loop over files, and one file's
+ * exception must not cost the diagnosis for the rest.
+ *
+ * @param identity read ONCE by the caller and passed down, so the key that
+ *   satisfied the self-check is provably the key every unwrap uses — re-reading
+ *   here would leave a window in which the file changes mid-run.
+ */
+export declare function rewrapBundleFile(input: {
+    backend: HubBackend;
+    /** Hub-relative path to one of THIS machine's own bundle/workspace files. */
+    file: string;
+    /** The new set, in full — `age1…` strings, as the census reports them. */
+    recipients: readonly string[];
+    identity: IdentityFileState;
+}): Promise<BundleRewrapOutcome>;
 //# sourceMappingURL=bundle-io.d.ts.map

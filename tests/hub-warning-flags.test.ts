@@ -431,6 +431,17 @@ const REGISTRY: FlagUse[] = [
     },
   },
   {
+    file: "src/hub/rekey.ts",
+    match: "Run push (with --create-project or --project-id) to link and publish this project",
+    klass: "retry-works",
+    why: "rekey found no link and did nothing — the refusal is the first thing it decides, before the hub is probed, before the lock and before registerMachine. The named push is a different command that has not been foreclosed. Names `push` explicitly, which is also what keeps it out of the cross-command check below: rekey declares neither flag. Same shape and same reasoning as reindex's entry above.",
+    provenBy: {
+      test: "hub-rekey.test.ts",
+      name: "refuses an unlinked project, and rekeys once a push with --create-project has linked it",
+      reruns: "hubRekey",
+    },
+  },
+  {
     file: "src/hub/merge.ts",
     match: "no-ancestor mode (unpack into an empty target, else skip unless --force-workspace)",
     klass: "descriptive",
@@ -892,15 +903,19 @@ const SURFACES: Record<string, string[]> = {
   "src/hub/preflight.ts": ["push", "pull"],
   // `planBundleEncryption` is a pure decision function whose sentences are
   // returned to `hub/push.ts` and surfaced as that verb's refusal or warnings.
-  // Only push: nothing on the READ path consults this module at all — a reader
-  // branches on the bundle file's suffix — which is the property `bundle-io.ts`
-  // exists to keep, so a `pull` here would be a sign that it had been lost.
-  "src/hub/encryption.ts": ["push"],
+  // `hub rekey` surfaces the OTHER half of the module — `checkSelfIsRecipient`,
+  // the self/no-recipient check the two verbs share — so its refusals are read
+  // by a user running either. Still nothing on the READ path: a reader branches
+  // on the bundle file's suffix and consults this module not at all, which is
+  // the property `bundle-io.ts` exists to keep, so a `pull` here would be a
+  // sign that it had been lost.
+  "src/hub/encryption.ts": ["push", "rekey"],
   // `hub encrypt`'s own verb, keyed by the sub-command name the CLI declares
   // (`.command("encrypt")`), not by "hub encrypt".
   "src/hub/encrypt.ts": ["encrypt"],
   "src/hub/push.ts": ["push"],
   "src/hub/reindex.ts": ["reindex"],
+  "src/hub/rekey.ts": ["rekey"],
   // Retirement's two verbs share one module, so a flag named there is read by a
   // user running either — which is why the `--project-id` line has to work for
   // both (it does; both declare it) and the `--undo` lines name `retire`

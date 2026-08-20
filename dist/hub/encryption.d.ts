@@ -153,6 +153,16 @@ export interface HubEncryptionPolicy {
  */
 export declare function resolveHubEncryption(hub: HubJson, preference: boolean): HubEncryptionPolicy;
 /**
+ * One census entry, rendered for a human. Never a path — `machineId` is display
+ * only.
+ *
+ * Exported because `hub rekey` reaches the same conclusion about the same
+ * machines and says something DIFFERENT about it (see `checkSelfIsRecipient`
+ * for why the two verbs' premises differ). Sharing the rendering keeps the four
+ * reasons described one way; sharing the decision would have been wrong.
+ */
+export declare function describeUnkeyed(u: UnkeyedMachine): string;
+/**
  * The push's answer to "this hub is sealed — encrypt to whom, or refuse".
  *
  * Pure, and separate from `push.ts`, so the decision can be argued and tested
@@ -202,6 +212,78 @@ export type BundleEncryptionPlan = {
  */
 export type EncryptionRefusal = "unkeyed-machines" | "self-unkeyed" | "no-recipients";
 /**
+ * "Can this machine read back what it is about to write to this hub, and to
+ * whom would it be writing?" — the half of the encryption decision that is the
+ * same for every verb that produces ciphertext.
+ *
+ * ### Why it is a function of its own, and what it deliberately leaves out
+ *
+ * It answers the two questions whose answers cannot differ between callers: the
+ * SELF check (refusals 1 and 3 below) and the empty-set check (refusal 2). It
+ * says nothing about machines OTHER than this one, because that is exactly
+ * where two callers legitimately disagree:
+ *
+ * - **`hub push` refuses** when another registered machine publishes no usable
+ *   key, and takes `--force-unkeyed` to proceed. Its premise is permanence: the
+ *   bundle is written once, and a machine left out of that one recipient list
+ *   cannot be added to it by anything the pushing machine does later.
+ * - **`hub rekey` proceeds** and discloses, with no flag at all. Its premise is
+ *   the opposite, and it is a fact rather than a preference: a re-wrap is
+ *   idempotent and re-runnable, so a machine left out of THIS re-wrap is added
+ *   by the NEXT one, as soon as it publishes a key. Refusing would block a
+ *   strictly widening operation to prevent a loss that does not occur.
+ *
+ * Those are two different decisions over one census, which is why the census is
+ * data (`HubRecipientSet`) and this function stops short of it.
+ *
+ * ### The self check is decided from the KEY THIS MACHINE HOLDS, never from the
+ * hub's roster
+ *
+ * `registerMachine` deliberately CARRIES FORWARD a previously published
+ * `ageRecipient` when the identity file cannot be read this run — the right
+ * call there, because a transient read failure must not de-register this
+ * machine as a recipient for everyone else. But it means the roster can say
+ * this machine is keyed while the key is gone, so a self-check that asked the
+ * census would pass, encrypt to a stanza nobody here can open, and fill the hub
+ * with bundles this machine can never read back. The same hole opens the other
+ * way if the identity file is REPLACED: the roster still carries the old public
+ * half until the next successful check-in.
+ *
+ * So the test is membership: **the recipient this machine can derive right now
+ * must be one of the recipients this file will be addressed to.** That is exact
+ * in both directions, and it is a local fact rather than a hub one.
+ *
+ * ORDER IS LOAD-BEARING, and all three arms are reachable only in it. The local
+ * no-key case comes first because it is the sharpest and most actionable, and
+ * it subsumes the others: a machine that cannot read its own key has one
+ * problem to fix and the state of the roster is beside the point. The empty
+ * census comes next, so "nobody on this hub publishes a key" is not reported as
+ * "your own registration is stale" — which is what the membership test would
+ * say about it, since nothing is a member of an empty list. Only then the
+ * membership test, which by that point really does mean what it says.
+ */
+export type SelfRecipientCheck = {
+    ok: true;
+    recipients: string[];
+} | {
+    ok: false;
+    /** `self-unkeyed` covers both self arms — see `EncryptionRefusal`. */
+    refusal: Exclude<EncryptionRefusal, "unkeyed-machines">;
+    error: string;
+    suggestion: string;
+};
+export declare function checkSelfIsRecipient(input: {
+    census: HubRecipientSet;
+    /** `loadOrCreateMachineId().id` — this operation's own machine. Display only. */
+    thisMachineId: string;
+    /**
+     * The `age1…` recipient this machine can derive from its own identity file
+     * RIGHT NOW, or `null` when that file is absent or unreadable. Deliberately
+     * not read from the census; see above.
+     */
+    thisMachineRecipient: string | null;
+}): SelfRecipientCheck;
+/**
  * ## The decision: an un-keyed machine REFUSES the push, and the override is a flag
  *
  * `collectHubRecipients` hands back a census precisely so this call site has to
@@ -209,13 +291,13 @@ export type EncryptionRefusal = "unkeyed-machines" | "self-unkeyed" | "no-recipi
  * third is not:
  *
  * - **Silently encrypt to everyone else.** Rejected outright. The push
- *   succeeds, and the machine that was dropped can never read that bundle —
- *   not after it upgrades, not after it publishes a key, not ever, because a
- *   bundle is written once and only its owning machine could re-wrap it
- *   (per-machine ownership). The loss surfaces on the OTHER machine, at an
- *   arbitrary later time, as `no-matching-identity`, which reads like
- *   corruption. Every property of that failure is wrong: permanent, silent,
- *   remote, and misdiagnosed.
+ *   succeeds, and the machine that was dropped cannot read that bundle — not
+ *   after it upgrades, not after it publishes a key, not until the machine that
+ *   WROTE it runs `hub rekey`, and not ever if that machine is gone, because
+ *   only its owner may re-wrap it (per-machine ownership). The loss surfaces on
+ *   the OTHER machine, at an arbitrary later time, as `no-matching-identity`,
+ *   which reads like corruption. Every property of that failure is wrong:
+ *   silent, remote, misdiagnosed, and repairable only from a third place.
  * - **Refuse.** The default, because the push side is the only moment where the
  *   fact is known, the remedy is cheap, and nothing has been lost yet. A push
  *   COPIES — nothing local is deleted and nothing on the hub is overwritten —
@@ -237,22 +319,10 @@ export type EncryptionRefusal = "unkeyed-machines" | "self-unkeyed" | "no-recipi
  * MACHINE HOLDS — never from the hub's roster.** If the pushing machine cannot
  * read back what it is about to write, `--force-unkeyed` is refused, because the
  * override's premise ("I know those machines do not need this bundle") is
- * definitionally false about the machine writing it.
- *
- * The source of truth matters more than the rule, and getting it wrong is
- * silent. `registerMachine` deliberately CARRIES FORWARD a previously published
- * `ageRecipient` when the identity file cannot be read this run — the right
- * call there, because a transient read failure must not de-register this machine
- * as a recipient for everyone else. But it means the roster can say this machine
- * is keyed while the key is gone, so a self-check that asked the census would
- * pass, encrypt to a stanza nobody here can open, and fill the hub with bundles
- * this machine can never read back. The same hole opens the other way if the
- * identity file is REPLACED: the roster still carries the old public half until
- * the next successful check-in.
- *
- * So the test is membership: **the recipient this machine can derive right now
- * must be one of the recipients this bundle will be encrypted to.** That is
- * exact in both directions, and it is a local fact rather than a hub one.
+ * definitionally false about the machine writing it. That half lives in
+ * `checkSelfIsRecipient`, shared with `hub rekey`, together with the reason the
+ * roster is the wrong source for it — this function adds only the decision
+ * about OTHER machines, which is the half the two verbs answer differently.
  *
  * **An empty recipient list refuses whatever the flags say.** `AgeEncryptStream`
  * refuses it too, but as a throw at the moment bytes start moving; answered here
@@ -267,9 +337,9 @@ export declare function planBundleEncryption(input: {
      * The `age1…` recipient this machine can derive from its own identity file
      * RIGHT NOW, or `null` when that file is absent or unreadable.
      *
-     * Deliberately not read from the census: see the self-exception note above for
-     * why the roster's answer to this question can be stale in both directions,
-     * and why a stale answer is silent and permanent.
+     * Deliberately not read from the census: see `checkSelfIsRecipient` for why
+     * the roster's answer to this question can be stale in both directions, and
+     * why a stale answer is silent and permanent.
      */
     thisMachineRecipient: string | null;
     forceUnkeyed: boolean;

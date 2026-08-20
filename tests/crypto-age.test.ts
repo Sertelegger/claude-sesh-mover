@@ -36,6 +36,7 @@ import {
   AgeDecryptStream,
   AgeEncryptStream,
   AgeError,
+  AgeRewrapStream,
   encodeIdentity,
   encodeRecipient,
   generateIdentity,
@@ -436,4 +437,168 @@ it("encrypts a source that never writes", async () => {
     empty.pipe(enc);
   });
   expect((await decrypt(Buffer.concat(out))).length).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// Re-wrapping (`hub rekey`)
+//
+// The operation that adds a recipient to a file that already exists. Its whole
+// value is that it does NOT decrypt, so the tests have to pin two things a
+// round trip cannot see on its own: that the payload really is the same bytes
+// (not a re-encryption that happens to produce the same plaintext), and that
+// the real `age` binary reads what comes out. The differential half matters
+// more here than anywhere except the payload chunking itself — a header we
+// rebuild is a header no self-test can vouch for.
+// ---------------------------------------------------------------------------
+
+/** Offset of the payload nonce: one past the LF ending the header MAC line. */
+function payloadStart(file: Buffer): number {
+  const mark = file.indexOf(Buffer.from("\n--- ", "utf-8"));
+  expect(mark).toBeGreaterThan(-1);
+  return file.indexOf(0x0a, mark + 1) + 1;
+}
+
+function rewrap(
+  file: Buffer,
+  recipients: Uint8Array[],
+  identity: Uint8Array = identityRaw
+): Promise<Buffer> {
+  return through(file, new AgeRewrapStream(identity, recipients));
+}
+
+describe("AgeRewrapStream", () => {
+  it("adds a recipient without locking out the original one", async () => {
+    // >= 2 chunks deliberately: a payload that fits in one chunk cannot observe
+    // anything the STREAM layer does, and this is the operation most likely to
+    // be "optimised" into a decrypt/re-encrypt one day.
+    const plain = payload(CHUNK * 2 + 5);
+    const second = generateIdentity();
+    const before = await encrypt(plain, [recipientRaw]);
+    const after = await rewrap(before, [recipientRaw, parseRecipient(second.recipient)]);
+
+    expect((await decrypt(after)).equals(plain)).toBe(true);
+    expect((await decrypt(after, parseIdentity(second.identity))).equals(plain)).toBe(true);
+    // ...and the machine that could not read it before still cannot read the
+    // file it was never added to.
+    expect(await ageErrorCode(decrypt(before, parseIdentity(second.identity)))).toBe(
+      "no-matching-identity"
+    );
+  });
+
+  it("copies the payload byte for byte, and only the header changes", async () => {
+    const plain = payload(CHUNK + 7);
+    const second = generateIdentity();
+    const before = await encrypt(plain, [recipientRaw]);
+    const after = await rewrap(before, [recipientRaw, parseRecipient(second.recipient)]);
+
+    // THE CLAIM THAT MAKES A REKEY CHEAP, as bytes rather than as prose: the
+    // payload nonce and every sealed chunk are the same object they were, so
+    // the file key and the payload key were never regenerated. A re-encryption
+    // would round-trip identically and fail here.
+    expect(after.subarray(payloadStart(after)).equals(before.subarray(payloadStart(before)))).toBe(
+      true
+    );
+    expect(after.subarray(0, payloadStart(after)).equals(before.subarray(0, payloadStart(before)))).toBe(
+      false
+    );
+  });
+
+  it("reports how many recipient stanzas the original carried", async () => {
+    const second = generateIdentity();
+    const file = await encrypt(payload(64), [recipientRaw, parseRecipient(second.recipient)]);
+    const t = new AgeRewrapStream(identityRaw, [recipientRaw]);
+    expect(t.previousRecipientStanzas).toBeNull();
+    await through(file, t);
+    // The only observable of a set that cannot otherwise be recovered — it is
+    // what lets a caller notice that a re-wrap NARROWED the readership, which
+    // this one did (2 -> 1).
+    expect(t.previousRecipientStanzas).toBe(2);
+  });
+
+  it("refuses a file this identity is not a recipient of", async () => {
+    const stranger = generateIdentity();
+    const file = await encrypt(payload(100), [recipientRaw]);
+    expect(
+      await ageErrorCode(rewrap(file, [recipientRaw], parseIdentity(stranger.identity)))
+    ).toBe("no-matching-identity");
+  });
+
+  it("refuses a header whose stanzas were edited, instead of re-issuing a valid MAC over it", async () => {
+    // THE LAUNDERING GUARD. Unwrapping succeeds — our own stanza is untouched —
+    // so a re-wrapper that verified nothing would happily emit a freshly MAC'd
+    // header over this file, turning bytes every reader refuses loudly into
+    // bytes that verify. Deleting the MAC check in `openHeader` makes this test
+    // the only thing that fails.
+    const second = generateIdentity();
+    const file = await encrypt(payload(100), [recipientRaw, parseRecipient(second.recipient)]);
+    const text = file.toString("binary");
+    // The SECOND stanza's share, altered to another valid base64 character so
+    // the header still parses and only the MAC disagrees.
+    const at = text.lastIndexOf("-> X25519 ") + "-> X25519 ".length;
+    const tampered = Buffer.from(
+      text.slice(0, at) + (text[at] === "a" ? "b" : "a") + text.slice(at + 1),
+      "binary"
+    );
+    expect(await ageErrorCode(rewrap(tampered, [recipientRaw]))).toBe("header-mac-mismatch");
+  });
+
+  it("refuses an empty recipient list", () => {
+    expect(() => new AgeRewrapStream(identityRaw, [])).toThrow(AgeError);
+  });
+
+  it("refuses a payload too short to be one", async () => {
+    // A source that de-hydrated to its header is the shape this catches. What
+    // it does NOT catch is a cut anywhere else, which only the AEAD can, on the
+    // machine holding the key — so the message says "too short", not "damaged".
+    const file = await encrypt(payload(100), [recipientRaw]);
+    const headerOnly = file.subarray(0, payloadStart(file));
+    // THE MESSAGE, not only the code. Both truncation arms raise `truncated`,
+    // so a code-only assertion passes with either guard deleted — measured:
+    // removing the header arm left this pair green, because a source that stops
+    // inside the header also has a zero-length payload.
+    await expect(rewrap(headerOnly, [recipientRaw])).rejects.toThrow(
+      /too short to be an age payload/
+    );
+  });
+
+  it("refuses a source that stops inside the header", async () => {
+    const file = await encrypt(payload(100), [recipientRaw]);
+    await expect(rewrap(file.subarray(0, 30), [recipientRaw])).rejects.toThrow(/truncated header/);
+  });
+
+  for (const { name, bin } of ORACLES) {
+    it(`${name} decrypts a file we re-wrapped, with both keys`, async () => {
+      // The load-bearing half. Our own decryptor shares `buildHeader` with the
+      // re-wrapper, so a header that is wrong in a way both sides agree on is
+      // invisible to every test above this one.
+      const plain = payload(CHUNK * 2 + 5);
+      const second = generateIdentity();
+      const key2 = join(dir, `${name}-rewrap-key2.txt`);
+      writeFileSync(key2, `${second.identity}\n`, { mode: 0o600 });
+      const file = join(dir, `${name}-rewrapped.age`);
+      writeFileSync(
+        file,
+        await rewrap(await encrypt(plain, [recipientRaw]), [
+          recipientRaw,
+          parseRecipient(second.recipient),
+        ])
+      );
+      for (const k of [keyFile, key2]) {
+        expect(oracleDecrypt(bin, k, file).equals(plain)).toBe(true);
+      }
+    });
+
+    it(`${name} rejects a bit flip in the payload of a file we re-wrapped`, async () => {
+      // A re-wrap copies the payload without authenticating it, which is the
+      // documented trade. This pins the other half of that trade: the AEAD is
+      // still what answers, and it still answers loudly.
+      const file = await rewrap(await encrypt(payload(CHUNK * 2 + 5), [recipientRaw]), [
+        recipientRaw,
+      ]);
+      file[file.length - 20] ^= 0x01;
+      const p = join(dir, `${name}-rewrap-flipped.age`);
+      writeFileSync(p, file);
+      expect(() => oracleDecrypt(bin, keyFile, p)).toThrow();
+    });
+  }
 });
