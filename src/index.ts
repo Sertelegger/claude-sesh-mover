@@ -26,6 +26,9 @@ export * from "./hub/backend.js";
 export * from "./hub/layout.js";
 export * from "./hub/machines.js";
 export * from "./hub/encryption.js";
+// The plaintext/ciphertext seam and the verb that flips the hub-wide switch.
+export * from "./hub/bundle-io.js";
+export * from "./hub/encrypt.js";
 export * from "./hub/identity.js";
 export * from "./hub/threads.js";
 export * from "./hub/index-file.js";

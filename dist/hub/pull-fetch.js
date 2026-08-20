@@ -1,6 +1,6 @@
-import { createWriteStream, existsSync, mkdirSync } from "node:fs";
-import { finished, pipeline } from "node:stream/promises";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { fetchBundleArchive } from "./bundle-io.js";
 import { stageAbort, stageOk } from "./pull-stages.js";
 import { extractArchive } from "../archiver.js";
 import { readManifest, verifySessionsDigest } from "../manifest.js";
@@ -23,12 +23,21 @@ import { readManifest, verifySessionsDigest } from "../manifest.js";
  *   shape is not available to write.
  *
  * FIVE `aborted` outcomes — one per untrusted-input call, in the order they
- * run: the download, the unpack, the manifest parse, the manifest's own digest,
+ * run: the retrieval, the unpack, the manifest parse, the manifest's own digest,
  * and the transcript that manifest declares. The count is worth stating because
  * it only moves in one direction: every call in this stage is handed bytes off
  * the hub, so a new one without a `try` is a new way for the stage to leave
  * `hubPull` as a throw — which is exactly what the download and the unpack were
  * until now.
+ *
+ * The retrieval is one abort with FOUR diagnoses, because decryption lives
+ * inside it (`fetchBundleArchive`) and its failures are not the transfer's. Two
+ * of them — "this machine holds no key" and "this machine is not a recipient" —
+ * are key-management facts with remedies that share nothing with each other or
+ * with a share that went away, so they get their own sentences. None of them is
+ * a throw: an uncaught throw here costs the `suggestion` AND every disclosure
+ * the bundles already applied in this chain collected, which is the whole
+ * reason this stage is shaped the way it is.
  *
  * The caller's only correct handling of any of them is
  * `return fetched.terminal!` immediately. `break` falls through to the carry
@@ -38,16 +47,27 @@ import { readManifest, verifySessionsDigest } from "../manifest.js";
  * records* the next bundle, foreclosing the remedy.
  */
 /**
- * Tear a stream down and swallow whatever it reports on the way.
+ * The `suggestion` for each way a bundle can fail to arrive as a readable local
+ * archive. One sentence set per `BundleFetchFailureKind`, because the remedies
+ * share nothing — and in particular because two of them are permanent for this
+ * bundle while the third is a retry.
  *
- * Used only on a failure path where the real diagnosis is already in hand. A
- * stream that has lost its `pipeline` has no error listener left, so an error
- * still in flight becomes an unhandled one — a run-failing event under vitest,
- * and in production a crash on the path whose whole job is to fail politely.
+ * Every one of them opens with "Nothing from this bundle was applied", which is
+ * the pull's failure contract rather than politeness: bundles earlier in the
+ * chain ARE applied and recorded and will not be refetched, and a message that
+ * did not say so would be untruthful about what the command did.
  */
-async function absorbLateError(s) {
-    s.destroy?.();
-    await finished(s).catch(() => { });
+function retrievalSuggestion(failure) {
+    switch (failure.kind) {
+        case "no-identity":
+            return "Nothing from this bundle was applied. The bundle is encrypted and this machine has no usable identity key, so it could not even attempt to open it — which is a different situation from not being one of its recipients, and the difference matters: the key may be perfectly intact behind a permission problem or a dead mount. Check that ~/.sesh-mover/identity.age exists and is readable by you and nobody else (mode 0600). Restore it from a backup if you have one. Deleting it mints a fresh identity, which can read nothing already on the hub, so try the first two first. The bundles applied before it in this chain are recorded and will not be refetched.";
+        case "no-matching-identity":
+            return "Nothing from this bundle was applied. This machine holds a key and it is not one of this bundle's recipients: either this machine joined the hub after the bundle was pushed, or its ~/.sesh-mover/identity.age has been replaced since. An encrypted bundle is never re-wrapped in place — one machine rewriting another machine's files is exactly what per-machine ownership forbids — so no amount of retrying reaches it from here. The remedy belongs to the machine that wrote it, which can re-send the thread whole with `sesh-mover push --full` once this machine has checked in and published its key; a later pull then finds a bundle addressed to this machine too. The bundles applied before it in this chain are recorded and will not be refetched.";
+        case "ciphertext-rejected":
+            return "Nothing from this bundle was applied. The bundle is encrypted and its authentication failed: either the header MAC or one chunk's AEAD tag rejected the bytes. That is damage or tampering and the tag does not say which — a partially written or partially synced file is by far the likeliest cause. If the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again. The bundles applied before it in this chain are recorded and will not be refetched.";
+        case "transfer":
+            return "Nothing from this bundle was applied. The file was listed in the hub's index and was still there when this pull checked, so something made it unreadable in between: the share went away mid-pull, a synced folder replaced or de-hydrated it, another machine removed it, or this machine could not write the temporary copy. Retry — the bundles applied before it in this chain are recorded and will not be refetched. A retry that answers with a not-yet-synced refusal naming this same file is that file still arriving, not a second fault.";
+    }
 }
 export async function runFetchStage(input) {
     const { backend, record, machineId, bundleIndex: i, chainLength, tempRoot, state: st } = input;
@@ -60,13 +80,12 @@ export async function runFetchStage(input) {
         phase: "hub-pull",
         percent: chainLength > 0 ? Math.round((i / chainLength) * 100) : 0,
     });
+    // The local copy is always spelled `.tar.gz`, whatever the hub-side name was:
+    // `fetchBundleArchive` decrypts on the way in when the hub-side suffix says
+    // so, and `extractArchive` picks its container format from this LOCAL name.
     const tarPath = join(tempRoot, `${record.bundleId}.tar.gz`);
-    const out = createWriteStream(tarPath);
-    // Declared out here so the catch can reach it: whichever end fails first,
-    // the OTHER one still has an error in flight that nobody is listening for.
-    let src;
     /**
-     * The download is a GUARD, for the same reason the manifest parse below is:
+     * The retrieval is a GUARD, for the same reason the manifest parse below is:
      * this is hub-fetched input and the failure is the user's to act on, not an
      * internal fault. #78 typed the parse in the middle of this stage and left
      * the two calls either side of it throwing — uncaught, they leave `hubPull`
@@ -74,10 +93,12 @@ export async function runFetchStage(input) {
      * builds its `ErrorResult` from the exception alone they also discard every
      * disclosure the bundles already applied in this chain collected.
      *
-     * The `pipeline` is inside the `try` and not merely the call that looks
-     * risky: `createFsBackend`'s `readStream` is `createReadStream`, which is
-     * lazy, so an ENOENT never comes out of `readStream` at all — it arrives as a
-     * stream error and surfaces as the `pipeline` rejection.
+     * `fetchBundleArchive` returns a result and never throws, which is why there
+     * is no `try` here any more — including around decryption, whose refusals are
+     * exactly the kind of typed, user-actionable fact that must not arrive as an
+     * exception. The stream-teardown care that used to live here (destroy BOTH
+     * ends and await the close, or a late error lands on a stream with no
+     * listener) moved with it; see `bundle-io.ts`.
      *
      * **Deliberately not worded as `not-yet-synced`**, which models a neighbouring
      * condition for a different code path. That result is decided by the select
@@ -88,54 +109,25 @@ export async function runFetchStage(input) {
      * readable now. The suggestion says so, and names the overlap explicitly,
      * because a user who meets both inside a minute would otherwise read one
      * arriving file as two faults.
+     *
+     * `record.file` is hub-sourced (read out of another machine's index file) and
+     * becomes a path inside the backend — `assertHubRelPath` (hub/layout.ts,
+     * enforced inside every `HubBackend` method) is the containment that rejects
+     * traversal and absolute paths before anything touches the filesystem.
      */
-    try {
-        // record.file is hub-sourced (read out of another machine's index
-        // file) and used as a path immediately below — the backend's
-        // assertHubRelPath (hub/layout.ts, enforced inside every HubBackend
-        // method, see hub/backend.ts) is the containment that rejects
-        // traversal/absolute paths before anything touches the filesystem.
-        src = await backend.readStream(record.file);
-        await pipeline(src, out);
-    }
-    catch (e) {
-        // ABSORB THE DESTINATION'S LATE ERROR before returning, or it lands on a
-        // stream nobody is listening to any more and Node reports it as an
-        // unhandled error — which vitest fails the whole run for, and which in
-        // production is a crash on a path whose entire purpose is to fail politely.
-        //
-        // `createWriteStream` opens lazily and ASYNCHRONOUSLY, and `out` is created
-        // above the `try` (it has to be — `pipeline` needs it). So when the SOURCE
-        // errors first, which is the common case here because a missing hub file
-        // fails fast, `pipeline` rejects and detaches while `out`'s `open()` is
-        // still in flight. That open then resolves against a temp directory the
-        // caller may already have torn down. Observed as an intermittent
-        // `ENOENT … temp/<bundleId>.tar.gz` on a loaded CI runner, never locally.
-        //
-        // Same shape, same reason as `FsBackend.abort()`: destroy, then AWAIT the
-        // close, swallowing whatever it reports. The error being discarded here is
-        // never the one worth reporting — `e` already describes why the download
-        // failed, and this one only says the scratch copy could not be finished.
-        // BOTH ENDS, not just the destination — macOS proved the asymmetry was a
-        // bug. `pipeline` settles on whichever stream fails FIRST and then detaches
-        // its listeners; the other one's error arrives afterwards with nobody
-        // listening. Absorbing only `out` covered the case where the source lost
-        // the race (the common one on Linux, where a missing hub file fails fast)
-        // and left the mirror image uncovered, which is exactly what macOS hit when
-        // the destination's ENOTDIR won instead.
-        //
-        // Destroy-then-await, the shape `FsBackend.abort()` already uses. The
-        // errors discarded here are never the ones worth reporting: `e` already
-        // says why the download failed, and these two only say that a stream being
-        // torn down was torn down.
-        await absorbLateError(out);
-        if (src !== undefined)
-            await absorbLateError(src);
+    const got = await fetchBundleArchive({ backend, file: record.file, destPath: tarPath });
+    if (!got.ok) {
+        // One abort, four diagnoses. The failure's own message is kept WHOLE after
+        // ours because it is the discriminator inside a kind — which of the age
+        // header/payload refusals fired, `ENOENT` versus a mid-transfer reset —
+        // exactly as the unpack abort below keeps node-tar's.
         return stageAbort({
             success: false,
             command: "pull",
-            error: `Bundle ${record.bundleId} could not be read from the hub (${record.file}): ${e.message}`,
-            suggestion: "Nothing from this bundle was applied. The file was listed in the hub's index and was still there when this pull checked, so something made it unreadable in between: the share went away mid-pull, a synced folder replaced or de-hydrated it, another machine removed it, or this machine could not write the temporary copy. Retry — the bundles applied before it in this chain are recorded and will not be refetched. A retry that answers with a not-yet-synced refusal naming this same file is that file still arriving, not a second fault.",
+            error: got.failure.kind === "transfer"
+                ? `Bundle ${record.bundleId} could not be read from the hub (${record.file}): ${got.failure.message}`
+                : `Bundle ${record.bundleId} is encrypted and could not be decrypted on this machine (${record.file}): ${got.failure.message}`,
+            suggestion: retrievalSuggestion(got.failure),
         });
     }
     const extractDir = join(tempRoot, record.bundleId);

@@ -2,10 +2,17 @@
  * The two questions encryption at rest asks of the HUB, answered here and
  * nowhere else: *must this hub's bundles be encrypted*, and *to whom*.
  *
- * Nothing in this file encrypts anything. It is the seam the wiring change
- * plugs into, and it is separate from that change on purpose: "does the crypto
- * work" (`crypto/age.ts`) and "does the bundle path use it correctly" stay
- * separately judgeable.
+ * Nothing in this file encrypts anything, and that survives the wiring change:
+ * the bytes move in `bundle-io.ts` and the primitives live in `crypto/age.ts`,
+ * so "does the crypto work" and "does the bundle path use it correctly" stay
+ * separately judgeable. What was added here is the third question the first two
+ * do not answer — *what happens when a registered machine cannot be encrypted
+ * to* — as a pure function, because that is a decision to be argued rather than
+ * a pipeline to be wired (`planBundleEncryption`).
+ *
+ * **Nothing in this file is on the READ path.** A reader branches on the bundle
+ * file's suffix and never on `resolveHubEncryption`; see `bundle-io.ts` for why
+ * reaching for this module there fails in both directions at once.
  */
 import type { HubBackend } from "./backend.js";
 import type { HubJson } from "./layout.js";
@@ -145,4 +152,126 @@ export interface HubEncryptionPolicy {
  * push plaintext. That is a diagnosis offered to the user, never an enforcement.
  */
 export declare function resolveHubEncryption(hub: HubJson, preference: boolean): HubEncryptionPolicy;
+/**
+ * The push's answer to "this hub is sealed — encrypt to whom, or refuse".
+ *
+ * Pure, and separate from `push.ts`, so the decision can be argued and tested
+ * without a hub, an export and an archive around it.
+ */
+export type BundleEncryptionPlan = {
+    kind: "plaintext";
+    warnings: string[];
+} | {
+    kind: "encrypt";
+    recipients: string[];
+    warnings: string[];
+} | {
+    kind: "refuse";
+    refusal: EncryptionRefusal;
+    error: string;
+    suggestion: string;
+    /**
+     * Disclosures collected before the refusal. **A refusal is not a reason to
+     * withhold what was already found** — the same rule `ErrorResult.warnings`
+     * states. The case that makes it load-bearing rather than tidy: a
+     * malformed `encrypt` value is WHY encryption was required at all, so a
+     * refusal that reports the un-keyed machine and drops that note explains
+     * the symptom and hides the cause.
+     */
+    warnings: string[];
+};
+/**
+ * WHICH of the three refusals, as a discriminator rather than as prose.
+ *
+ * It exists because the three have different remedies and only ONE of them
+ * takes `--force-unkeyed`, so a caller has to tell them apart — and the obvious
+ * way to do that, checking whether `unkeyedMachines` is empty, is wrong for two
+ * of the three: the census is reported WHOLE, so `self-unkeyed` carries this
+ * machine's own entry and `no-recipients` carries every machine on the hub.
+ * Branching on the message text is banned everywhere else in this codebase for
+ * the same reason it would be wrong here.
+ *
+ * - `unkeyed-machines` — machines OTHER than this one publish no usable key.
+ *   The only one `--force-unkeyed` applies to.
+ * - `self-unkeyed` — the pushing machine publishes no usable key of its own.
+ *   Not overridable; the remedy is local (`~/.sesh-mover/identity.age`).
+ * - `no-recipients` — nobody on the hub publishes a usable key, so there is
+ *   nothing to encrypt to. Not overridable: a bundle encrypted to an empty
+ *   recipient list is readable by nobody, which is worse than the plaintext
+ *   being refused.
+ */
+export type EncryptionRefusal = "unkeyed-machines" | "self-unkeyed" | "no-recipients";
+/**
+ * ## The decision: an un-keyed machine REFUSES the push, and the override is a flag
+ *
+ * `collectHubRecipients` hands back a census precisely so this call site has to
+ * choose, and there are only three choices. Two of them are defensible and the
+ * third is not:
+ *
+ * - **Silently encrypt to everyone else.** Rejected outright. The push
+ *   succeeds, and the machine that was dropped can never read that bundle —
+ *   not after it upgrades, not after it publishes a key, not ever, because a
+ *   bundle is written once and only its owning machine could re-wrap it
+ *   (per-machine ownership). The loss surfaces on the OTHER machine, at an
+ *   arbitrary later time, as `no-matching-identity`, which reads like
+ *   corruption. Every property of that failure is wrong: permanent, silent,
+ *   remote, and misdiagnosed.
+ * - **Refuse.** The default, because the push side is the only moment where the
+ *   fact is known, the remedy is cheap, and nothing has been lost yet. A push
+ *   COPIES — nothing local is deleted and nothing on the hub is overwritten —
+ *   so a refusal costs a retry and no data. That asymmetry is the whole
+ *   argument: refusing costs bytes and time, proceeding costs a machine's
+ *   access to a thread, forever.
+ * - **Proceed on an explicit override, with the excluded machines named.**
+ *   `--force-unkeyed`, because a blanket refusal has a real dead end: nothing
+ *   in this codebase ever deletes a `machines/<id>.json` (`hub retire` deletes
+ *   a project's files, never a machine record), so one decommissioned machine
+ *   would block every encrypted push on the hub for good. The override is a
+ *   FLAG and deliberately not a config key — same rule as `push --full` — so
+ *   the unattended SessionEnd auto-push can never take it. The cost of that
+ *   rule is worth stating: with encryption on and one un-keyed machine, the
+ *   auto-push refuses at every session end, and the only place the user sees it
+ *   is `hub status`'s `lastAutoPush`.
+ *
+ * **The self-exception is not overridable, and it is decided from the KEY THIS
+ * MACHINE HOLDS — never from the hub's roster.** If the pushing machine cannot
+ * read back what it is about to write, `--force-unkeyed` is refused, because the
+ * override's premise ("I know those machines do not need this bundle") is
+ * definitionally false about the machine writing it.
+ *
+ * The source of truth matters more than the rule, and getting it wrong is
+ * silent. `registerMachine` deliberately CARRIES FORWARD a previously published
+ * `ageRecipient` when the identity file cannot be read this run — the right
+ * call there, because a transient read failure must not de-register this machine
+ * as a recipient for everyone else. But it means the roster can say this machine
+ * is keyed while the key is gone, so a self-check that asked the census would
+ * pass, encrypt to a stanza nobody here can open, and fill the hub with bundles
+ * this machine can never read back. The same hole opens the other way if the
+ * identity file is REPLACED: the roster still carries the old public half until
+ * the next successful check-in.
+ *
+ * So the test is membership: **the recipient this machine can derive right now
+ * must be one of the recipients this bundle will be encrypted to.** That is
+ * exact in both directions, and it is a local fact rather than a hub one.
+ *
+ * **An empty recipient list refuses whatever the flags say.** `AgeEncryptStream`
+ * refuses it too, but as a throw at the moment bytes start moving; answered here
+ * it is a diagnosis instead of a stack trace.
+ */
+export declare function planBundleEncryption(input: {
+    policy: HubEncryptionPolicy;
+    census: HubRecipientSet;
+    /** `loadOrCreateMachineId().id` — this push's own machine. Display only. */
+    thisMachineId: string;
+    /**
+     * The `age1…` recipient this machine can derive from its own identity file
+     * RIGHT NOW, or `null` when that file is absent or unreadable.
+     *
+     * Deliberately not read from the census: see the self-exception note above for
+     * why the roster's answer to this question can be stale in both directions,
+     * and why a stale answer is silent and permanent.
+     */
+    thisMachineRecipient: string | null;
+    forceUnkeyed: boolean;
+}): BundleEncryptionPlan;
 //# sourceMappingURL=encryption.d.ts.map

@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, mkdtempSync, createWriteStream, readdirSync } from "node:fs";
-import { pipeline } from "node:stream/promises";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { type HubBackend } from "./backend.js";
+import { fetchBundleArchive } from "./bundle-io.js";
 import { type HubBundleRecord } from "./layout.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "../payload/workspace.js";
 import { mergeWorkspaceTrees, type WorkspaceMergeReport } from "./merge.js";
@@ -83,7 +83,18 @@ async function fetchAncestorWorkspace(
     }
     const work = mkdtempSync(join(tempRoot, "ancestor-"));
     const tarPath = join(work, "ancestor.tar.gz");
-    await pipeline(await backend.readStream(ref.file), createWriteStream(tarPath));
+    // Suffix-driven, exactly like the pull's own fetch: a generation recorded
+    // before this hub was sealed is a plaintext `.tar.gz` and stays readable,
+    // and one recorded after it is an encrypted `.tar.gz.age` — a MIXED
+    // `workspaceGenerations` list is the ordinary state of any hub that has
+    // ever flipped the switch, so branching on the hub's policy here would
+    // break the merge ancestor for the older half.
+    //
+    // A decryption failure degrades like every other failure in this function:
+    // no-ancestor mode never overwrites anything, so a generation we cannot
+    // open is a worse merge and never a wrong one.
+    const got = await fetchBundleArchive({ backend, file: ref.file, destPath: tarPath });
+    if (!got.ok) return degraded(`could not be read back (${got.failure.message})`);
     const bundleDir = join(work, "bundle");
     mkdirSync(bundleDir, { recursive: true });
     await extractArchive(tarPath, bundleDir);

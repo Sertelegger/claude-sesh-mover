@@ -22,7 +22,7 @@ behaves like a shared filesystem path — a network share or a synced folder (On
 Dropbox/Syncthing/iCloud Drive). Project identity, git-remote matching, cross-machine
 thread lineage, and git-less workspace snapshots are all in place; see the README's
 "The Hub" section and [CHANGELOG.md](./CHANGELOG.md#050--2026-07-21) for the full surface.
-Sessions are plaintext at rest in the hub directory until Slice 3 ships.
+Sessions are plaintext at rest in the hub directory unless encryption is enabled (0.10.0, below) — and enabling it seals only what is pushed afterwards.
 
 **Git backend: not planned.** The original direction here was "a private git repo first,
 auth via existing SSH keys, history for free" — dropped after Slice 1's design pass:
@@ -46,8 +46,17 @@ See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
   a thread whose bundles are split across several machines' indexes by walking the
   `fromEntryUuid`/`headEntryUuid` links, so a third machine can pull it whole
   ([#35](https://github.com/Sertelegger/claude-sesh-mover/issues/35) — v0.6.0 discloses
-  what it could not fetch, it does not assemble it); age/gpg encryption of bundles in the
-  hub (closing the plaintext-at-rest gap called out in Slice 1's security notes);
+  what it could not fetch, it does not assemble it); ~~age/gpg encryption of bundles in
+  the hub~~ — **shipped in 0.10.0**
+  ([#91](https://github.com/Sertelegger/claude-sesh-mover/issues/91)), and neither binary
+  was used: the design pass concluded that a *hard failure rule* (no plaintext fallback,
+  ever) lands on the unattended, TTY-less session-end auto-push, where gpg's agent and
+  pinentry can wedge a detached process and where age's absence on Windows would mean "this
+  machine cannot push". It is age's wire FORMAT implemented over `node:crypto` instead —
+  zero new dependencies, nothing to be missing, and `age -d -i` still works as the
+  recovery path. It closes the plaintext-at-rest gap **going forward only**: existing
+  bundles are never rewritten, because that would be one machine rewriting another's
+  files. Per-machine *signing* is a separate step and is not in it;
   compaction of superseded bundles so a long-lived hub directory doesn't grow unbounded.
   Two hardening items belong to the same pass because Slice 2 made them reachable:
   [#38](https://github.com/Sertelegger/claude-sesh-mover/issues/38) (stop re-implementing
