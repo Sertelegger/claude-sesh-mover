@@ -47,6 +47,20 @@ import { isEncryptedBundleFile } from "./layout.js";
  * still in flight becomes an unhandled one — a run-failing event under vitest,
  * and in production a crash on the path whose whole job is to fail politely.
  */
+/**
+ * Attach a no-op `'error'` listener so the stream can never emit an unhandled
+ * one, for as long as it exists.
+ *
+ * This is a companion to `absorbLateError`, not a replacement: that one tears a
+ * stream down and awaits its close on the failure path, this one guarantees
+ * there is no instant — before `pipeline` is wired, between its rejection and
+ * the `catch`, or after everything has settled — at which an emitted error has
+ * nobody listening. `pipeline` is unaffected; it tracks completion itself
+ * rather than by being the sole listener.
+ */
+function swallowErrors(s) {
+    s.on?.("error", () => { });
+}
 async function absorbLateError(s) {
     s.destroy?.();
     await finished(s).catch(() => { });
@@ -124,6 +138,20 @@ export async function fetchBundleArchive(input) {
         }
     }
     const out = createWriteStream(input.destPath);
+    // ATTACHED AT CREATION, and that timing is the whole point. `absorbLateError`
+    // below closes the window *after* `pipeline` settles; it does not close the
+    // window *before* it, and an `'error'` emitted in between lands on a stream
+    // with no listener, which Node reports as an unhandled error — a run-failing
+    // event under vitest and a crash in production, on the path whose entire job
+    // is to fail politely.
+    //
+    // Measured: with only the after-the-fact absorber, the download-abort test
+    // failed roughly 1 run in 12 on a loaded runner (macOS CI and locally alike),
+    // and it failed at HEAD too — so narrowing the window was never the same as
+    // closing it. A permanently attached no-op listener means there is no moment
+    // at which an error is unhandled. `pipeline` still rejects: it tracks
+    // completion itself rather than relying on being the only listener.
+    swallowErrors(out);
     // Declared out here so the catch can reach them: whichever end fails first,
     // the OTHERS still have an error in flight that nobody is listening for.
     let src;
@@ -139,8 +167,10 @@ export async function fetchBundleArchive(input) {
         // risky: an ENOENT never comes out of `readStream` at all on some backends —
         // it arrives as a stream error and surfaces as the `pipeline` rejection.
         src = await input.backend.readStream(input.file);
+        swallowErrors(src);
         if (identityRaw) {
             dec = new AgeDecryptStream(identityRaw);
+            swallowErrors(dec);
             await pipeline(src, dec, out);
         }
         else {
