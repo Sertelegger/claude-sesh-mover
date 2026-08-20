@@ -244,6 +244,16 @@ function appendEntry(path: string, entry: Record<string, unknown>): void {
  *   would make the sessions stage compute `isCarrySuppressed`, which reads
  *   `lastCarry`, which is carry's. A cross-stage fact belongs to the
  *   sequencer.
+ *
+ * RAISED 340 -> 346 by the workspace split (#91). The change added two
+ * arguments to an existing stage call and nothing else: `workspaceFile` (where
+ * this bundle's tree is, straight off its own manifest) and `projectId` (our
+ * own identity, the other half of the containment the stage applies to that
+ * pointer). Both are facts the sequencer already holds and the stage cannot
+ * re-derive — `local.projectId` comes from the resolve stage, and reading it
+ * inside `apply.workspace` would mean a second identity resolution. All of the
+ * new WORK is in `pull-apply-workspace.ts`, which is where the ratchet wants
+ * it; what landed here is the wiring plus its explanation.
  */
 describe("hubPull is sequencing", () => {
   it("keeps hubPull's body within the ratchet", () => {
@@ -251,7 +261,7 @@ describe("hubPull is sequencing", () => {
     expect(
       lines,
       "hubPull grew — extract the new work into a stage, or raise this ratchet in the same commit and say why"
-    ).toBeLessThan(340);
+    ).toBeLessThan(346);
   });
 
   it("spreads each in-loop stage's reasons inside the loop, not after it", () => {

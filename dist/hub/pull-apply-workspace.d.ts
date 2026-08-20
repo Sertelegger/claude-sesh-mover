@@ -19,8 +19,26 @@ export interface ApplyWorkspaceStageInput {
      * `chooseMergeAncestor`.
      */
     machineId: string;
+    /**
+     * The hub project this pull resolved to — OUR OWN identity, never anything
+     * out of a bundle. It is one half of the containment the split workspace
+     * pointer is checked against (`workspaceDir(projectId, machineId)`), which is
+     * why it has to come from the resolve stage rather than from the manifest
+     * carrying the pointer.
+     */
+    projectId: string;
     hubId: string;
     record: Pick<HubBundleRecord, "bundleId" | "file" | "pushedAt">;
+    /**
+     * `manifest.workspace.file` as the bundle declared it, or `undefined`.
+     *
+     * **This is the whole of the shape decision** — present means the tree is a
+     * separate hub artifact (#91), absent means it is inside the bundle at
+     * `workspace/`, and a hub carries both forever. Passed through raw and
+     * validated HERE rather than in the caller so the refusal is one of this
+     * stage's own outcomes; see the containment check in `runApplyWorkspaceStage`.
+     */
+    workspaceFile?: string;
     tempRoot: string;
 }
 export interface WorkspaceStageValue {
@@ -51,9 +69,19 @@ export interface WorkspaceStageValue {
  * |---|---|
  * | no payload on this bundle | `skipped`, zero reasons, no value |
  * | manifest declares one the bundle lacks | `skipped`, one reason, `declaredMissing` |
+ * | manifest points its snapshot outside the pushing machine's own hub directory | `skipped`, one reason, `declaredMissing` |
+ * | split snapshot that could not be fetched | `skipped`, one reason, `declaredMissing` |
  * | merged, or unpacked | `applied`, `unpacked` plus `merge`/`refused` |
  * | no generation common to both trees | `skipped`, the ancestor reasons PLUS the no-common-point sentence |
  * | explicit --target-path, not empty, no force | `aborted` — see below |
+ *
+ * The three `declaredMissing` rows are one FIELD and three SENTENCES, and that
+ * is the right split: the field drives the skill layer's advice, and the advice
+ * is the same for all three (`--force-workspace` and `--target-path` cannot
+ * deliver a payload nothing could retrieve), while the causes have nothing in
+ * common — a tree that was never in the bundle is gone for good, an artifact
+ * still syncing is a retry, and a pointer outside the pushing machine's own
+ * directory is a bundle nobody should trust.
  *
  * **The abort is not a refusal.** `WorkspaceTargetNotEmptyError` returns an
  * `ErrorResult` the caller must return VERBATIM, stopping the pull before this

@@ -59,6 +59,7 @@ import { HAVE_ORACLE, ORACLES, oracleDecrypt } from "./helpers/age-oracle.js";
 import { identityFilePath } from "../src/crypto/identity-file.js";
 import { readIdentityFile } from "../src/crypto/identity-file.js";
 import { encodeProjectPath } from "../src/platform.js";
+import { readSyncState } from "../src/sync-state.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { readConfigOverrides } from "../src/config.js";
 import { projectSeshMoverDir, userSeshMoverDir } from "../src/paths.js";
@@ -1369,6 +1370,158 @@ describe("hub pull from a mixed hub", () => {
       // Nothing landed: B's project folder was never even created, because the
       // abort is taken before the first session is imported.
       expect(existsSync(join(configDirB, "projects", encodeProjectPath(projectB)))).toBe(false);
+    } finally {
+      restore.restore();
+      for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
+      if (projectB) rmSync(projectB, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The workspace artifact (#91), on a sealed hub
+//
+// The split gave the snapshot a hub file of its own so that compaction (#92)
+// can retire a stale tree without deleting the transcript that used to ride
+// with it. Two things had to stay true across that move, and neither announces
+// itself when it breaks:
+//
+//  1. The artifact goes through the SAME seam as a bundle. A second writer that
+//     skipped `bundleEncryptStream` would put the project's whole working tree
+//     on a hub the user believes is sealed — in plaintext, under a name nothing
+//     flags, and every other encryption test would still pass.
+//  2. `fetchAncestorWorkspace` can read one back. That reader degrades to
+//     `{dir: null}` plus a warning by design, so a decryption failure there
+//     costs merge QUALITY and nothing else: the merge silently falls back to
+//     no-ancestor mode and the pull still reports success. It had no coverage
+//     under encryption at all (#96), and the split moved the file it opens.
+// ---------------------------------------------------------------------------
+
+/** Nine numbered lines, so two machines can edit far apart and merge cleanly. */
+function wsLines(edits: Record<number, string> = {}): string {
+  return Array.from({ length: 9 }, (_, i) => edits[i + 1] ?? `L${i + 1}`).join("\n") + "\n";
+}
+
+describe("the workspace artifact on a sealed hub", () => {
+  it("is encrypted at rest, and is read back as the merge ancestor", async () => {
+    const homeA = mkdtempSync(join(tmpdir(), "sesh-encws-homeA-"));
+    const homeB = mkdtempSync(join(tmpdir(), "sesh-encws-homeB-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-encws-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-encws-fix-"));
+    let projectB: string | undefined;
+    let restore = overrideHome(homeA);
+    try {
+      const { configDir: configDirA } = createFixtureTree(base);
+      const projectA = createRealProject(base, configDirA, "projA-encws");
+      writeFileSync(join(projectA, "shared.txt"), wsLines());
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeA });
+
+      // B joins BEFORE anything is encrypted, so it is a recipient of every
+      // bundle and artifact A writes. A bundle is wrapped once and never
+      // re-wrapped, so a machine that joins later can never read what came
+      // before it.
+      restore.restore();
+      restore = overrideHome(homeB);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: homeB });
+
+      restore.restore();
+      restore = overrideHome(homeA);
+      const sealed = (await hubEncrypt({
+        hubPath: hub, enable: true, cwd: homeA,
+      })) as HubEncryptResult;
+      expect(sealed.success).toBe(true);
+      expect(sealed.recipients).toHaveLength(2);
+
+      const first = (await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        createProject: true, claudeVersion: CLAUDE_VERSION,
+      })) as HubPushResult;
+      expect(first.success).toBe(true);
+      expect(first.bundleEncrypted).toBe(true);
+      expect(first.hasWorkspace).toBe(true);
+
+      // (1) THE ARTIFACT IS REALLY CIPHERTEXT — asserted on the bytes, not on
+      // the name, because a renamed tarball would pass a suffix check. It is
+      // also a genuinely separate hub file from the bundle.
+      const genA = readSyncState(projectA).hub?.lastWorkspace;
+      expect(genA?.file).toMatch(/\/workspaces\//);
+      expect(isEncryptedBundleFile(genA!.file)).toBe(true);
+      const artifactBytes = readFileSync(join(hub, ...genA!.file.split("/")));
+      expect(artifactBytes.subarray(0, 21).toString()).toBe("age-encryption.org/v1");
+      // ...and nothing anywhere under the hub's workspace directories is a
+      // plain gzip archive, which is the shape a second, unencrypted writer
+      // would leave behind.
+      const wsRoot = join(hub, "projects", first.projectId, "workspaces");
+      const wsFiles = readdirSync(wsRoot, { recursive: true, withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => join(e.parentPath, e.name));
+      expect(wsFiles).toHaveLength(1);
+      for (const f of wsFiles) {
+        const head = readFileSync(f);
+        expect([head[0], head[1]]).not.toEqual([0x1f, 0x8b]);
+      }
+
+      // B bootstraps: it decrypts the artifact to unpack it, and records that
+      // generation as its ancestor.
+      restore.restore();
+      restore = overrideHome(homeB);
+      const configDirB = join(homeB, ".claude");
+      projectB = mkdtempSync(join(tmpdir(), "sesh-encws-projB-"));
+      writeLocalProjectId(projectB, {
+        projectId: first.projectId, name: "projA-encws",
+        createdAt: new Date().toISOString(), createdByMachine: "machine-a",
+      });
+      const boot = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, noAppend: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(boot.success).toBe(true);
+      expect((boot as HubPullResult).workspaceUnpacked).not.toBeNull();
+      expect(readFileSync(join(projectB, "shared.txt"), "utf-8")).toBe(wsLines());
+      const genB = readSyncState(projectB).hub?.lastWorkspace;
+      expect(genB?.bundleId).toBe(first.bundleId);
+      expect(isEncryptedBundleFile(genB!.file)).toBe(true);
+
+      // Both machines edit the same file, far apart.
+      writeFileSync(join(projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      restore.restore();
+      restore = overrideHome(homeA);
+      writeFileSync(join(projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      appendEntries(
+        sessionJsonlPath(configDirA, projectA),
+        plainEntries(FIXTURE_HEAD_UUID, FIXTURE_SESSION_ID, projectA)
+      );
+      const second = (await hubPush({
+        configDir: configDirA, projectPath: projectA, hubPath: hub,
+        claudeVersion: CLAUDE_VERSION,
+      })) as HubPushResult;
+      expect(second.success).toBe(true);
+      expect(second.hasWorkspace).toBe(true);
+
+      // (2) THE MERGE ANCESTOR IS FETCHED AND DECRYPTED. Reaching this branch
+      // means `fetchAncestorWorkspace` opened an ENCRYPTED artifact recorded by
+      // an earlier pull. If it could not, the pull would still say
+      // `success: true` and would simply skip the payload — B's edit would
+      // survive, A's would not, and no assertion on the sessions would notice.
+      restore.restore();
+      restore = overrideHome(homeB);
+      const pull = await hubPull({
+        configDir: configDirB, projectPath: projectB, hubPath: hub,
+        latest: true, noAppend: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge).toBeDefined();
+      expect(p.workspaceMerge?.merged ?? []).toContain("shared.txt");
+      expect(p.workspaceMerge?.conflicted ?? []).toEqual([]);
+      // Neither machine's work was lost, which is only true of a real 3-way
+      // merge: no-ancestor mode on a non-empty tree skips and writes nothing.
+      const merged = readFileSync(join(projectB, "shared.txt"), "utf-8");
+      expect(merged).toContain("A-EDIT");
+      expect(merged).toContain("B-EDIT");
+      // ...and no warning claims the ancestor could not be read.
+      expect(p.warnings.join(" ")).not.toMatch(/could not be merged 3-way/i);
     } finally {
       restore.restore();
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });

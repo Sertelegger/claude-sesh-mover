@@ -376,11 +376,16 @@ export async function hubPull(opts) {
                 targetPathGiven: !!opts.targetPath,
                 forceWorkspace: !!opts.forceWorkspace,
                 bundleDeclaresWorkspace: i === st.workspaceBundleIndex && !!bundleManifest.workspace,
+                // Where the tree is, off the bundle's own manifest (#91), forwarded
+                // RAW: the stage contains it against `projectId`/`machineId`, so a bad
+                // pointer is one of its outcomes rather than a throw from here.
+                workspaceFile: bundleManifest.workspace?.file,
                 chainWorkspaceBases: st.chainWorkspaceBases,
                 // This bundle's own machine, like the sessions stage's ledger below:
                 // when this stage acts, this IS the machine whose workspace payload is
                 // applied, and only its declared bases are legal ancestors.
                 machineId: bundleMachineId,
+                projectId: local.projectId,
                 hubId: hub.hubId,
                 record,
                 tempRoot,

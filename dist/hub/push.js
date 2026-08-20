@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, createReadStream, } from "node:fs";
+import { mkdtempSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, createReadStream, } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
-import { bundleDir, bundleFileName } from "./layout.js";
+import { bundleDir, bundleFileName, workspaceDir, } from "./layout.js";
 import { bundleEncryptStream } from "./bundle-io.js";
 import { collectHubRecipients, planBundleEncryption, resolveHubEncryption } from "./encryption.js";
 import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
@@ -559,8 +559,54 @@ export async function hubPush(opts) {
                 discoverIgnored: !opts.quiet,
             });
             warnings.push(...payload.warnings);
+            // Stamped once, here, and spent on FOUR things that have to agree: the
+            // bundle's hub file name, the workspace artifact's hub file name, every
+            // index record's `pushedAt`, and the workspace generation recorded in
+            // sync-state. It used to be read immediately above the archive step; it
+            // moved up because the artifact's hub path now has to be stamped into the
+            // manifest that is about to be archived.
+            const pushedAt = new Date().toISOString();
             const hasWorkspace = payload.workspace !== undefined;
+            /**
+             * The workspace snapshot LEAVES THE BUNDLE (#91).
+             *
+             * A transcript is small and is kept forever; a snapshot is the whole
+             * project tree and is superseded by the next generation. Welded together
+             * there is no compaction move that reclaims the second without destroying
+             * the first, which is what #92 exists to do. Split, they are two hub files
+             * with two lifetimes.
+             *
+             * Two things it deliberately is NOT:
+             *
+             * - **Not a second encryption path.** The artifact is written through the
+             *   same `bundleEncryptStream` and read back through the same
+             *   `fetchBundleArchive`, under the same `bundleFileName` naming, so
+             *   `isEncryptedBundleFile` stays the whole of the reader's branch. A
+             *   plaintext workspace artifact on a sealed hub would be a hole in a hub
+             *   the user believes is closed, and the only way to guarantee it cannot
+             *   happen is for the bytes to go through the one seam.
+             * - **Not a second archive shape.** The staged directory holds exactly one
+             *   entry, `workspace/`, so an extracted artifact and an extracted
+             *   old-style bundle both expose the tree at `<extractDir>/workspace`.
+             *   That is what lets the ancestor fetch and the incoming fetch share ONE
+             *   reader across both shapes — and it is why the tree is not tarred at
+             *   the archive root, where a project that happens to contain a directory
+             *   called `workspace` would make the two shapes ambiguous.
+             *
+             * MOVED rather than copied: the tree is routinely the largest thing this
+             * push touches, both paths are inside the same `mkdtemp`, and a copy would
+             * leave the bundle carrying a duplicate of the payload the split exists to
+             * take out of it.
+             */
+            let workspaceUpload = null;
             if (payload.workspace) {
+                const wsRoot = join(staging, "workspace-artifact");
+                mkdirSync(wsRoot, { recursive: true });
+                renameSync(join(bundleStaging, "workspace"), join(wsRoot, "workspace"));
+                workspaceUpload = {
+                    staging: wsRoot,
+                    hubFile: `${workspaceDir(local.projectId, machine.id)}/${bundleFileName(pushedAt, bundleId, { encrypted: encryption.kind === "encrypt" })}`,
+                };
                 const manifestPath = join(bundleStaging, "manifest.json");
                 const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
                 // Declare what this snapshot descends from — read BEFORE the new
@@ -583,6 +629,11 @@ export async function hubPush(opts) {
                     basedOn: basedOnRef
                         ? { bundleId: basedOnRef.bundleId, file: basedOnRef.file, pushedAt: basedOnRef.pushedAt }
                         : null,
+                    // Where the tree actually is. The puller reads THIS to decide which
+                    // of the two shapes it is holding — never a config value and never a
+                    // version — and refuses a value that does not sit under this
+                    // machine's own workspace directory. See the field's doc in types.ts.
+                    file: workspaceUpload.hubFile,
                 };
                 writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
             }
@@ -610,33 +661,59 @@ export async function hubPush(opts) {
             // uploaded", which the AEAD tag already answers per chunk and better —
             // and it would have nowhere to live, since `manifest.json` is inside the
             // archive and therefore inside the ciphertext.
-            const pushedAt = new Date().toISOString();
-            const archiveTmp = join(staging, "bundle.tar.gz");
-            await createArchive(bundleStaging, archiveTmp, "gzip");
+            /**
+             * Archive one staged directory and stream it to the hub — the ONE upload
+             * path, used by the bundle and by the workspace artifact alike.
+             *
+             * Shared rather than written twice, because the thing that must not drift
+             * between the two is the encryption branch: a second copy is precisely how
+             * a workspace artifact ends up as plaintext on a hub the user sealed.
+             */
+            const uploadArchive = async (sourceDir, tmpArchive, hubPath) => {
+                await createArchive(sourceDir, tmpArchive, "gzip");
+                const w = await backend.writeStreamAtomic(hubPath);
+                try {
+                    // Streaming, deliberately: `AgeEncryptStream` goes INTO the existing
+                    // pipeline rather than around it. Buffering the archive to encrypt it
+                    // would undo the memory ceiling on the largest writer in this codebase,
+                    // which is the unattended session-end auto-push — and the workspace
+                    // artifact is the biggest thing that goes through here.
+                    //
+                    // Two spellings rather than a spread, because the discriminant has to be
+                    // read HERE for the recipient list to narrow with it: a hoisted boolean
+                    // would let `kind: "plaintext"` reach `bundleEncryptStream`.
+                    if (encryption.kind === "encrypt") {
+                        await pipeline(createReadStream(tmpArchive), bundleEncryptStream(encryption.recipients), w.stream);
+                    }
+                    else {
+                        await pipeline(createReadStream(tmpArchive), w.stream);
+                    }
+                    await w.commit();
+                }
+                catch (e) {
+                    await w.abort();
+                    throw e;
+                }
+            };
             const hubFile = `${bundleDir(local.projectId, machine.id)}/${bundleFileName(pushedAt, bundleId, { encrypted: encryption.kind === "encrypt" })}`;
-            const w = await backend.writeStreamAtomic(hubFile);
-            try {
-                // Streaming, deliberately: `AgeEncryptStream` goes INTO the existing
-                // pipeline rather than around it. Buffering the archive to encrypt it
-                // would undo the memory ceiling on the largest writer in this codebase,
-                // which is the unattended session-end auto-push.
-                //
-                // Two spellings rather than a spread, because the discriminant has to be
-                // read HERE for the recipient list to narrow with it: a hoisted boolean
-                // would let `kind: "plaintext"` reach `bundleEncryptStream`.
-                if (encryption.kind === "encrypt") {
-                    await pipeline(createReadStream(archiveTmp), bundleEncryptStream(encryption.recipients), w.stream);
-                }
-                else {
-                    await pipeline(createReadStream(archiveTmp), w.stream);
-                }
-                await w.commit();
-                commits.bundleCommitted = true;
+            // WORKSPACE ARTIFACT FIRST, BUNDLE SECOND, and the order is the failure
+            // contract rather than a preference. Each write is atomic on its own, so a
+            // push that dies between them leaves one of two states:
+            //
+            // - this order: an artifact nothing references. No index record names it,
+            //   no manifest points at it, and the next push writes a fresh one under a
+            //   fresh bundle id — so it costs bytes and confuses nothing. (#92's
+            //   compaction is what eventually reclaims it; until then it is inert.)
+            // - the other order: a bundle on the hub whose manifest points at an
+            //   artifact that does not exist, which every puller has to discover the
+            //   hard way, one download at a time.
+            //
+            // Same principle as #92's "a failed run leaves the LARGER state".
+            if (workspaceUpload) {
+                await uploadArchive(workspaceUpload.staging, join(staging, "workspace.tar.gz"), workspaceUpload.hubFile);
             }
-            catch (e) {
-                await w.abort();
-                throw e;
-            }
+            await uploadArchive(bundleStaging, join(staging, "bundle.tar.gz"), hubFile);
+            commits.bundleCommitted = true;
             // The bundle is on the hub, so this push has delivered: link the project.
             // Deferred all the way to here (rather than to just after the export) so
             // that a workspace snapshot that trips over an unreadable file, a carry
@@ -670,10 +747,19 @@ export async function hubPush(opts) {
             // early return above never reaches here, so changed memory with no new
             // session content travels with the next push that has some. That matches
             // the workspace and carry payloads, which the same early return skips.
-            if (hasWorkspace || manifest.memoryDigest) {
+            if (workspaceUpload || manifest.memoryDigest) {
                 const stateWs = readSyncState(opts.projectPath);
-                if (hasWorkspace) {
-                    setLastWorkspace(stateWs, hub.hubId, { bundleId, file: hubFile, pushedAt });
+                if (workspaceUpload) {
+                    // THE ARTIFACT'S path, not the bundle's. A generation is still
+                    // identified by `bundleId` — the split moved where the tree lives, not
+                    // what names it — but `file` is the thing `fetchAncestorWorkspace`
+                    // actually opens, and a bundle no longer holds a tree to find. Pointing
+                    // it at the bundle would leave every ancestor fetch degrading to
+                    // "carries no workspace tree" and every merge falling back to
+                    // no-ancestor: safe, silent and permanently wrong.
+                    setLastWorkspace(stateWs, hub.hubId, {
+                        bundleId, file: workspaceUpload.hubFile, pushedAt,
+                    });
                 }
                 if (manifest.memoryDigest) {
                     setPeerMemoryDigest(stateWs, { id: hubPeerId, name: "hub" }, manifest.memoryDigest);

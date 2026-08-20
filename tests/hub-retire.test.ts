@@ -17,7 +17,7 @@ import { RETIREMENT_GRACE_MS, readTombstones } from "../src/hub/tombstone.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { listHubProjects, writeLocalProjectId } from "../src/hub/identity.js";
 import {
-  HUB_JSON, bundleDir, indexPath, projectJsonPath, tombstonePath,
+  HUB_JSON, bundleDir, indexPath, projectJsonPath, tombstonePath, workspaceDir,
 } from "../src/hub/layout.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { projectJsonFilePath } from "../src/paths.js";
@@ -88,6 +88,18 @@ describe("hub retire / hub delete", () => {
     const bundle = join(hubDir, bundleDir(PROJECT_ID, meId), "2026-08-01T00-00-00.000Z-b1.tar.gz");
     mkdirSync(dirname(bundle), { recursive: true });
     writeFileSync(bundle, "not-a-real-archive");
+    // Since #91 the workspace snapshot is its OWN hub file, in its own
+    // directory — and it is the most sensitive thing a project can have on a
+    // shared hub, because it is a copy of the working tree. `hub delete`
+    // enumerates `backend.list(projectDir(...))`, which recurses, so nothing
+    // names this subtree anywhere; the point of putting one here is that a
+    // future enumeration built from a list of KNOWN subdirectories would leave
+    // it behind silently while still reporting a clean delete.
+    const artifact = join(
+      hubDir, workspaceDir(PROJECT_ID, meId), "2026-08-01T00-00-00.000Z-b1.tar.gz"
+    );
+    mkdirSync(dirname(artifact), { recursive: true });
+    writeFileSync(artifact, "not-a-real-workspace-archive");
   }
 
   /** Pretend the tombstone was written `ms` in the past. */

@@ -12,6 +12,7 @@ import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
 import { readAllIndexes } from "../src/hub/index-file.js";
 import { createFsBackend } from "../src/hub/backend.js";
+import { workspaceDir } from "../src/hub/layout.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { encodeProjectPath } from "../src/platform.js";
 import { extractArchive } from "../src/archiver.js";
@@ -644,6 +645,76 @@ describe("hub push", () => {
       const manifest = JSON.parse(readFileSync(join(extractDir, "manifest.json"), "utf-8"));
       expect(manifest.workspace).toBeDefined();
       expect(manifest.workspace.fileCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("the workspace snapshot travels as its own hub file and the bundle carries none (#91)", async () => {
+    // The whole point of the split: a transcript is small and kept forever, a
+    // snapshot is the project tree and is superseded by the next generation.
+    // Welded together, reclaiming the second destroys the first — which is why
+    // bundle-granularity compaction (#92) had no move.
+    const home = mkdtempSync(join(tmpdir(), "sesh-wssplit-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-wssplit-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-wssplit-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      const result = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.hasWorkspace).toBe(true);
+
+      const backend = createFsBackend(hub);
+      const { indexes } = await readAllIndexes(backend, result.projectId);
+      const bundleFile = Object.values(indexes[0].threads)[0].bundles[0].file;
+
+      const archiveTmp = join(base, "bundle2.tar.gz");
+      writeFileSync(archiveTmp, await backend.read(bundleFile));
+      const extractDir = join(base, "extracted2");
+      mkdirSync(extractDir, { recursive: true });
+      await extractArchive(archiveTmp, extractDir);
+
+      // THE BUNDLE NO LONGER CARRIES THE TREE — the bytes moved, they were not
+      // copied. A bundle that still held a `workspace/` would make the split
+      // pure overhead and leave compaction exactly where it was.
+      expect(existsSync(join(extractDir, "workspace"))).toBe(false);
+
+      // ...and the manifest says where they went. This pointer is the reader's
+      // whole shape decision: absent means the legacy inline shape.
+      const manifest = JSON.parse(readFileSync(join(extractDir, "manifest.json"), "utf-8"));
+      expect(manifest.workspace.fileCount).toBeGreaterThanOrEqual(1);
+      const machineId = loadOrCreateMachineId().id;
+      expect(manifest.workspace.file.startsWith(`${workspaceDir(result.projectId, machineId)}/`))
+        .toBe(true);
+      expect(manifest.workspace.file).not.toBe(bundleFile);
+      expect(await backend.exists(manifest.workspace.file)).toBe(true);
+
+      // The artifact holds exactly one entry, `workspace/`, so an extracted
+      // artifact and an extracted legacy bundle expose the tree at the same
+      // relative path — which is what lets ONE reader serve both shapes.
+      const wsTmp = join(base, "ws.tar.gz");
+      writeFileSync(wsTmp, await backend.read(manifest.workspace.file));
+      const wsOut = join(base, "ws-extracted");
+      mkdirSync(wsOut, { recursive: true });
+      await extractArchive(wsTmp, wsOut);
+      expect(readdirSync(wsOut)).toEqual(["workspace"]);
+      expect(readFileSync(join(wsOut, "workspace", "README.md"), "utf-8")).toBe("hello\n");
+
+      // The recorded generation points at the ARTIFACT. `fetchAncestorWorkspace`
+      // opens exactly this file on some later pull, and a bundle no longer holds
+      // a tree for it to find — pointing it there degrades every future merge to
+      // no-ancestor, silently.
+      const gen = readSyncState(projectPath).hub?.lastWorkspace;
+      expect(gen?.file).toBe(manifest.workspace.file);
+      expect(gen?.bundleId).toBe(result.bundleId);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
