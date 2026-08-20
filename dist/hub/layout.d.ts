@@ -2,12 +2,89 @@ export interface HubJson {
     schemaVersion: 1;
     hubId: string;
     createdAt: string;
+    /**
+     * The plugin version that last wrote HUB-LEVEL state — in practice, the
+     * version that created this hub, since `hub.json` is written once by `hub
+     * init` and never rewritten by push or pull.
+     *
+     * **It is a notice mechanism, not an enforcement one, and the distinction is
+     * the whole of what it buys.** A plugin predating this field never reads it,
+     * so it cannot be a gate against one: push and pull read `hubId` out of
+     * `hub.json` and check nothing else, `schemaVersion` included. What it does
+     * buy is the other direction — a NEWER plugin meeting a hub stamped by a
+     * version above its own can say so instead of silently mis-reading fields it
+     * does not know about.
+     *
+     * The question "is any machine on this hub still running a version that will
+     * push plaintext" is answered by `HubMachineJson.pluginVersion`, not by this:
+     * that one is refreshed on every push and pull, per machine, while this one is
+     * a fact about the hub's creation. They are two different facts and the second
+     * is the useful one.
+     *
+     * **Not refreshed on join.** `hub.json` is the one hub file no single machine
+     * owns, and per-machine ownership is what makes concurrent push/pull safe
+     * without a distributed lock. Opportunistically rewriting a shared file to
+     * advertise a version would trade that for nothing.
+     *
+     * Optional: every hub written before this field exists, and stays valid.
+     */
+    pluginVersion?: string;
+    /**
+     * **The authoritative switch for encryption at rest.** Absent or `false`:
+     * bundles are pushed as plaintext archives. `true`: they must be encrypted.
+     *
+     * It lives here rather than only in local config because a local-only flag has
+     * a silent failure — one machine that never set it keeps pushing plaintext
+     * into a hub the user believes is sealed. `hub.encrypt` in config is the local
+     * *preference*; this field is what a push obeys. `resolveHubEncryption` in
+     * `encryption.ts` is the single place that reads the pair, including why a
+     * malformed value here resolves toward encryption rather than away from it.
+     *
+     * Enabling it does not make an existing hub private — it makes it private
+     * going forward. The reader branches on the bundle's file SUFFIX, never on
+     * this field, so a mixed hub stays readable and flipping the switch never
+     * strands your own history.
+     */
+    encrypt?: boolean;
 }
 export interface HubMachineJson {
     id: string;
     name: string;
     platform: string;
     lastSeenAt: string;
+    /**
+     * The plugin version this machine last checked in with, refreshed by
+     * `registerMachine` on every push and pull.
+     *
+     * This is the roster entry that makes "will any machine on this hub push
+     * plaintext into it" answerable at all. It is still only a diagnosis: it lets
+     * a new plugin NAME a stale machine, and it cannot stop one, because the stale
+     * machine is not reading anything we write here.
+     *
+     * Optional: records written before this field exist on real hubs.
+     */
+    pluginVersion?: string;
+    /**
+     * This machine's age recipient (`age1…`) — the PUBLIC half of the X25519
+     * identity in `~/.sesh-mover/identity.age`. The private half is never
+     * transported, which is the entire point of per-machine identities.
+     *
+     * Published here rather than distributed, so that the recipient list is
+     * derivable from the hub itself and joining a machine is `hub init` plus one
+     * re-push from each existing machine — no key exchange, no flag day.
+     *
+     * **Optional, permanently.** A machine on an older version, or one whose
+     * identity file was unreadable when it last checked in, has no key here. Such
+     * a machine is reported by `collectHubRecipients` as `unkeyed` and is never
+     * silently dropped from the census: encrypting a bundle to a list that omits a
+     * machine locks that machine out of it forever, and a filtered list makes that
+     * indistinguishable at the call site from the machine not existing.
+     *
+     * A public key discloses nothing — it sits beside this machine's id, name,
+     * platform and last-seen time, all of which the plaintext index already
+     * carries.
+     */
+    ageRecipient?: string;
 }
 export interface HubProjectJson {
     schemaVersion: 1;

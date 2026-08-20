@@ -21,6 +21,7 @@ import { discoverSessionById } from "./discovery.js";
 // classification is runtime behavior that lives beside the result union it
 // classifies, so a new result shape and its exit class are edited in one file.
 import { EXIT_FAILED, exitCodeForResult } from "./types.js";
+import { PLUGIN_VERSION } from "./version.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
 import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
@@ -29,7 +30,7 @@ const program = new Command();
 program
     .name("sesh-mover")
     .description("Export, import, and migrate Claude Code sessions")
-    .version("0.9.0");
+    .version(PLUGIN_VERSION);
 // --- Export ---
 program
     .command("export")

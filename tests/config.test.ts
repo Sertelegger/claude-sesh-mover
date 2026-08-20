@@ -123,7 +123,7 @@ describe("config", () => {
       expect(cfg.hub).toEqual({
         path: "", noWorkspace: false, autoPush: true, startupNotice: true,
         pullAppend: true, onDivergence: "fragment", carryDiff: true,
-        carryMaxMb: 50, workspaceMaxMb: 50,
+        carryMaxMb: 50, workspaceMaxMb: 50, encrypt: false,
       });
       const updated = setConfigValue(cfg, "hub.path", "/mnt/share/hub");
       expect(updated.hub.path).toBe("/mnt/share/hub");
@@ -136,6 +136,12 @@ describe("config", () => {
       expect(setConfigValue(cfg, "hub.autoPush", false).hub.autoPush).toBe(false);
       expect(setConfigValue(cfg, "hub.startupNotice", false).hub.startupNotice).toBe(false);
       expect(setConfigValue(cfg, "hub.pullAppend", false).hub.pullAppend).toBe(false);
+      // `hub.encrypt` is the LOCAL PREFERENCE, not the switch — the
+      // authoritative one is `encrypt` in the hub's own hub.json. It has to be
+      // in the defaults all the same, for the reason above: without it
+      // `configure --set hub.encrypt=true` throws "Invalid config path", so a
+      // documented key would be unsettable.
+      expect(setConfigValue(cfg, "hub.encrypt", true).hub.encrypt).toBe(true);
       expect(setConfigValue(cfg, "hub.onDivergence", "adopt-hub").hub.onDivergence).toBe(
         "adopt-hub"
       );

@@ -2,6 +2,7 @@
 // NOTE: decodeProjectPath intentionally not provided — encoding is lossy for hyphenated paths.
 // Use readProjectPathFromJsonl in discovery.ts or read cwd from JSONL entries instead.
 export * from "./types.js";
+export * from "./version.js";
 export * from "./platform.js";
 export * from "./paths.js";
 export * from "./config.js";
@@ -23,6 +24,8 @@ export * from "./machine.js";
 export * from "./sync-state.js";
 export * from "./hub/backend.js";
 export * from "./hub/layout.js";
+export * from "./hub/machines.js";
+export * from "./hub/encryption.js";
 export * from "./hub/identity.js";
 export * from "./hub/threads.js";
 export * from "./hub/index-file.js";
