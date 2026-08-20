@@ -882,6 +882,54 @@ hub
         outputError("hub-delete", e);
     }
 });
+// --- Encryption at rest (#91) ---
+//
+// One verb, two modes: a bare `hub encrypt` REPORTS and writes nothing, and
+// `--enable` flips the hub-wide switch. There is deliberately no `--disable`.
+// Turning encryption off is a confidentiality-reducing act with no urgency
+// attached to it — nothing breaks while it stays on, because the reader
+// branches on each bundle's own suffix and a plaintext bundle stays readable
+// forever — so the one-keystroke path exists only in the direction that fails
+// safe. Hand-editing `encrypt` in hub.json is the deliberate friction for the
+// other direction.
+hub
+    .command("encrypt")
+    .description("Report this hub's encryption-at-rest setting, or turn it on for every machine")
+    .option("--enable", "Seal this hub: every machine's later pushes must be encrypted bundles")
+    .option("--scope <scope>", "Config scope to record the local hub.encrypt preference in: user or project", "user")
+    .option("--project-path <path>", "Override project path (default: cwd)")
+    .option("--source-config-dir <path>", "Override Claude config dir")
+    .action(async (opts) => {
+    try {
+        const configDir = resolveConfigDir(opts.sourceConfigDir);
+        const projectPath = opts.projectPath ?? process.cwd();
+        const config = loadEffectiveConfig(configDir, projectPath);
+        const { resolveHubPath } = await import("./hub/init.js");
+        const hubPath = resolveHubPath(config);
+        if (!hubPath) {
+            outputError("hub-encrypt", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+            return;
+        }
+        const { hubEncrypt } = await import("./hub/encrypt.js");
+        output(await hubEncrypt({
+            hubPath,
+            enable: !!opts.enable,
+            configScope: parseStorage(opts.scope),
+            // The local preference as it stands now, so the result reports what
+            // this machine actually has rather than echoing the hub's setting back.
+            preference: config.hub.encrypt,
+            // `projectPath`, NOT `process.cwd()`. The config this verb read came
+            // from `loadEffectiveConfig(configDir, projectPath)`, so writing the
+            // preference under the cwd instead would record it in a scope the next
+            // command does not read back — silently, and only when both
+            // `--project-path` and `--scope project` are given.
+            cwd: projectPath,
+        }));
+    }
+    catch (e) {
+        outputError("hub-encrypt", e);
+    }
+});
 hub
     .command("reindex")
     .description("Rebuild this machine's hub index for the current project from its own bundles")
@@ -950,6 +998,12 @@ hub
             // unless this is set, and THIS is the push that uploads it unattended
             // with no channel to say what it sent.
             noSummary: config.export.noSummary,
+            // The local preference, so the auto-push discloses an unapplied one in
+            // its durable breadcrumb (`hub status`'s `lastAutoPush`) — which is the
+            // ONLY channel this push has. `--force-unkeyed` deliberately has no
+            // counterpart here: an unattended push may never be the thing that
+            // permanently excludes a machine from a bundle.
+            encryptPreference: config.hub.encrypt,
             budgets: resolveHubBudgets(config),
             // Nothing this push produces is read by a human: stdout is closed to it
             // and stderr only carries failures. `quiet` keeps it from computing the
@@ -1080,6 +1134,7 @@ program
     .option("--no-workspace", "Skip the workspace snapshot (taken for projects with no git remote, including a git repo that has none)")
     .option("--no-carry", "Do not carry uncommitted changes (taken for projects that have a git remote)")
     .option("--full", "Re-send every session in scope WHOLE — forget what the hub is recorded as already holding (recovery for a hub that can no longer serve it)")
+    .option("--force-unkeyed", "On an encrypted hub, upload even though registered machines publish no key — they can never read this bundle")
     .option("--progress", "Emit NDJSON progress events on stderr")
     .action(async (opts) => {
     try {
@@ -1107,6 +1162,12 @@ program
             // end, with no channel to disclose that it did. `--full` is a recovery
             // action a human takes once, watching it.
             full: !!opts.full,
+            // Flag-only for the identical reason, and one step further: this one
+            // permanently excludes a named machine from a bundle nothing will ever
+            // re-wrap, so a config key would let the unattended auto-push do that
+            // at every session end. It also cannot override the case where THIS
+            // machine is the un-keyed one — see `planBundleEncryption`.
+            forceUnkeyed: !!opts.forceUnkeyed,
             // Deliberately NO `--carry-max-mb` flag to override this. The decline
             // is not retryable on demand — the carry rides a bundle, so an
             // immediate re-push answers `upToDate` and a flag on the retry would be
@@ -1117,6 +1178,11 @@ program
             // Config-only, deliberately — see HubPushOptions.noSummary for why
             // `push` grows no `--no-summary` flag to go with it.
             noSummary: config.export.noSummary,
+            // The local PREFERENCE, never the switch: the hub's own `encrypt` field
+            // is what a push obeys. Passed only so a push can disclose the one case
+            // the hub cannot — this machine wants encryption and the hub does not
+            // require it — which is a machine-local fact by definition.
+            encryptPreference: config.hub.encrypt,
             projectIdOverride: opts.projectId,
             createProject: !!opts.createProject,
             claudeVersion: getClaudeVersion(),

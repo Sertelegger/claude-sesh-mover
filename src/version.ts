@@ -16,4 +16,4 @@
  * which pins this against `package.json`, `.claude-plugin/plugin.json` and
  * `.claude-plugin/marketplace.json` — all four move together or the suite fails.
  */
-export const PLUGIN_VERSION = "0.9.0";
+export const PLUGIN_VERSION = "0.10.0";

@@ -5,11 +5,14 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { bundleDir, bundleFileName } from "./layout.js";
+import { bundleEncryptStream } from "./bundle-io.js";
+import { collectHubRecipients, planBundleEncryption, resolveHubEncryption } from "./encryption.js";
 import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, readLocalProjectId, removeLocalProjectIdIfMatches, } from "./identity.js";
 import { scanGitRemotes } from "../payload/git-scan.js";
 import { capturePayload } from "../payload/capture.js";
 import { registerMachine } from "./init.js";
+import { readIdentityFile } from "../crypto/identity-file.js";
 import { hubUnreachableRefusal, preflightHub } from "./preflight.js";
 import { HubIoTimeoutError } from "./io-timeout.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex } from "./index-file.js";
@@ -328,11 +331,92 @@ export async function hubPush(opts) {
                 writeLocalProjectId(opts.projectPath, commits.local);
                 commits.linkWritten = true;
             };
+            // BEFORE the encryption decision, and that ordering is load-bearing:
+            // `registerMachine` publishes THIS machine's public key on every push, so
+            // the census below can only see this machine as a recipient once it has
+            // run. Gating publication on encryption being enabled is what would make
+            // enabling it a flag day rather than a switch — see `registerMachine`.
             await registerMachine(opts.hubPath);
             // Read once, by the preflight above — a second read here would put back the
             // very `ENOENT` the `hub-unreachable` refusal replaces (#75).
             const hub = pre.hub;
             const hubPeerId = `hub:${hub.hubId}`;
+            /**
+             * Encrypt or not, to whom, or refuse — decided HERE, at the top, for the
+             * same reason the preflight is (#75): a refusal is worth having only
+             * while nothing has happened yet. Nothing below this line has run — no
+             * export, no hub-side project, no bundle, and above all no local link,
+             * which is the consent gate that arms the SessionEnd auto-push.
+             *
+             * The hub's `encrypt` field is authoritative and the local config key is
+             * a preference, so a machine that has never enabled encryption still
+             * refuses to push plaintext into a sealed hub. The refusal has no
+             * plaintext fallback by design: confidentiality has no lesser version to
+             * degrade to, unlike zstd→gzip or `git merge-file`→no-ancestor.
+             *
+             * The cost of deciding this early, stated rather than discovered: a push
+             * that would have answered `upToDate` refuses too, because the export has
+             * not run yet and nothing here knows there is nothing to send. That is
+             * the direction to fail in — the fact being reported (this hub is sealed
+             * and a registered machine cannot read what you send it) is true of the
+             * next push that DOES have content, and on the unattended session-end
+             * path `hub status`'s `lastAutoPush` is the only place it would ever
+             * surface.
+             */
+            const encPolicy = resolveHubEncryption(hub, opts.encryptPreference === true);
+            // Read ONLY on a sealed hub. The census is a directory listing plus one
+            // read per machine, on a path that may be a network share, and an unsealed
+            // hub has no use for the answer — `planBundleEncryption` returns before it
+            // looks at this.
+            //
+            // Taken here rather than beside the upload, which widens the window in
+            // which a machine can register and miss this bundle. That window is
+            // inherent — a machine can always register one millisecond after the list
+            // is read — so the choice is between a slightly wider one and a refusal
+            // that arrives after the export, the hub-side project and the payload
+            // capture have all already happened. The refusal is worth more.
+            const census = encPolicy.required
+                ? await collectHubRecipients(backend)
+                : { recipients: [], unkeyed: [] };
+            // Read from the identity FILE, not from this machine's row in the census.
+            // `registerMachine` carries a previously published recipient forward when
+            // the file cannot be read, which is right for everyone else and would make
+            // the roster lie to us about ourselves — see the self-exception note in
+            // `planBundleEncryption`. Only on a sealed hub: a machine that never
+            // encrypts anything must not read a key file it does not need.
+            const selfKey = encPolicy.required ? readIdentityFile() : null;
+            const encryption = planBundleEncryption({
+                policy: encPolicy,
+                census,
+                thisMachineId: machine.id,
+                thisMachineRecipient: selfKey?.state === "present" ? selfKey.recipient : null,
+                forceUnkeyed: opts.forceUnkeyed === true,
+            });
+            if (encryption.kind === "refuse") {
+                return {
+                    success: false,
+                    command: "push",
+                    reason: "encryption-refused",
+                    // The discriminator, so a caller never has to read the prose or guess
+                    // from `unkeyedMachines.length` — which is wrong for two of the three
+                    // refusals, since the census below is reported whole.
+                    refusal: encryption.refusal,
+                    error: encryption.error,
+                    suggestion: encryption.suggestion,
+                    // The census as collected, not a re-rendering of the message: a caller
+                    // deciding whether to offer the override needs the machines and each
+                    // one's reason. `unsafe-id` in particular is reported and must never
+                    // be turned back into a path.
+                    unkeyedMachines: census.unkeyed,
+                    // Everything found before the refusal, push's own `warnings` (a stolen
+                    // lock, a malformed budget) included. Absent rather than `[]` when
+                    // there is nothing — see the field's doc.
+                    ...(warnings.length + encryption.warnings.length > 0
+                        ? { warnings: [...warnings, ...encryption.warnings] }
+                        : {}),
+                };
+            }
+            warnings.push(...encryption.warnings);
             // Thread minting for every session in scope
             let sessions = discoverSessions(opts.configDir, opts.projectPath);
             if (sessionIds)
@@ -437,7 +521,10 @@ export async function hubPush(opts) {
                 commitLocalLink();
                 return {
                     success: true, command: "push", projectId: local.projectId,
-                    bundleId: null, pushedSessions: [], upToDate: true, hasWorkspace: false, warnings,
+                    bundleId: null, pushedSessions: [], upToDate: true, hasWorkspace: false,
+                    // Nothing was uploaded, so nothing was encrypted. The hub's policy is
+                    // reported by `hub encrypt`, not inferred from a no-op push.
+                    bundleEncrypted: false, warnings,
                     // Unreachable under `--full` in practice — a forgotten ledger makes
                     // every discovered session a full one, and a project with no sessions
                     // at all fails in the exporter above. Reported anyway so the field's
@@ -507,13 +594,42 @@ export async function hubPush(opts) {
                 writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
             }
             // Archive + stream into hub
+            //
+            // ARCHIVE THEN ENCRYPT, one `Transform` at one seam. The tar headers name
+            // every session id and reveal whether a workspace tree is present, so
+            // encrypting the archive rather than its members puts them inside the
+            // ciphertext. (Both facts are already conceded to the plaintext index via
+            // `HubBundleRecord.sessionIdInBundle` and `.hasWorkspace`, so this is
+            // tidiness rather than a new property — it is still free.)
+            //
+            // The three hash layers are NOT touched by any of this and must not be.
+            // `integrityHash`, `layerDigests` and `sessionsDigest` were computed by
+            // the exporter inside `bundleStaging`, long before this line, and their
+            // question is about PLAINTEXT: "is this the file the exporter wrote". A
+            // ciphertext hash would answer "is this the ciphertext the pusher
+            // uploaded", which the AEAD tag already answers per chunk and better —
+            // and it would have nowhere to live, since `manifest.json` is inside the
+            // archive and therefore inside the ciphertext.
             const pushedAt = new Date().toISOString();
             const archiveTmp = join(staging, "bundle.tar.gz");
             await createArchive(bundleStaging, archiveTmp, "gzip");
-            const hubFile = `${bundleDir(local.projectId, machine.id)}/${bundleFileName(pushedAt, bundleId)}`;
+            const hubFile = `${bundleDir(local.projectId, machine.id)}/${bundleFileName(pushedAt, bundleId, { encrypted: encryption.kind === "encrypt" })}`;
             const w = await backend.writeStreamAtomic(hubFile);
             try {
-                await pipeline(createReadStream(archiveTmp), w.stream);
+                // Streaming, deliberately: `AgeEncryptStream` goes INTO the existing
+                // pipeline rather than around it. Buffering the archive to encrypt it
+                // would undo the memory ceiling on the largest writer in this codebase,
+                // which is the unattended session-end auto-push.
+                //
+                // Two spellings rather than a spread, because the discriminant has to be
+                // read HERE for the recipient list to narrow with it: a hoisted boolean
+                // would let `kind: "plaintext"` reach `bundleEncryptStream`.
+                if (encryption.kind === "encrypt") {
+                    await pipeline(createReadStream(archiveTmp), bundleEncryptStream(encryption.recipients), w.stream);
+                }
+                else {
+                    await pipeline(createReadStream(archiveTmp), w.stream);
+                }
                 await w.commit();
                 commits.bundleCommitted = true;
             }
@@ -619,7 +735,8 @@ export async function hubPush(opts) {
             const ignoredNotCarried = payload.ignoredNotCarried;
             return {
                 success: true, command: "push", projectId: local.projectId,
-                bundleId, pushedSessions, upToDate: false, hasWorkspace, warnings,
+                bundleId, pushedSessions, upToDate: false, hasWorkspace,
+                bundleEncrypted: encryption.kind === "encrypt", warnings,
                 ...(ignoredNotCarried ? { ignoredNotCarried } : {}),
                 ...(carryMeta ? { carry: carryMeta } : {}),
                 ...(fullResend ? { fullResend } : {}),

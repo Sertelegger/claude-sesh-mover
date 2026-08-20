@@ -1,9 +1,9 @@
-import { mkdtempSync, rmSync, mkdirSync, createWriteStream } from "node:fs";
-import { pipeline } from "node:stream/promises";
+import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsBackend } from "./backend.js";
 import { bundleDir } from "./layout.js";
+import { fetchBundleArchive } from "./bundle-io.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { readLocalProjectId } from "./identity.js";
 import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
@@ -21,7 +21,12 @@ import { readSyncState, getThreadId } from "../sync-state.js";
 // UUID dashes on the right), so splitting on '-' generically is ambiguous —
 // anchor on the sanitized-ISO's fixed shape (YYYY-MM-DDTHH-MM-SS.mmmZ)
 // instead; everything between that and ".tar.gz" is the bundleId.
-const BUNDLE_FILE_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z)-(.+)\.tar\.gz$/;
+// The optional `.age` tail is the ENCRYPTED spelling (layout.ts's
+// `ENCRYPTED_BUNDLE_SUFFIX`). Both spellings are parsed here because a hub is
+// permanently mixed — enabling encryption never rewrites an existing bundle —
+// so a rebuild that recognised only one of them would silently drop half a
+// machine's own history from the index it is repairing.
+const BUNDLE_FILE_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z)-(.+)\.tar\.gz(?:\.age)?$/;
 // Reverse bundleFileName's ':' -> '-' sanitization. An ISO timestamp from
 // Date#toISOString() contains exactly two ':', both inside the
 // "THH:MM:SS" section, so this regex swap recovers the original exactly.
@@ -163,7 +168,21 @@ export async function hubReindex(opts) {
                 continue;
             }
             const tarPath = join(tempRoot, `bundle-${i}.tar.gz`);
-            await pipeline(await backend.readStream(file), createWriteStream(tarPath));
+            // Suffix-driven decryption, exactly as the pull's fetch does it: this
+            // machine's own bundle list is MIXED the moment the hub's switch is
+            // flipped, since enabling encryption never rewrites what is already
+            // there, so the format is a per-file fact and never a policy lookup.
+            //
+            // THROWS rather than skipping, on the same rule the narrow catch below
+            // states for the download and the extract: a bundle this machine cannot
+            // open is an environment fact (here, a lost or replaced
+            // `~/.sesh-mover/identity.age`), and quietly skipping every one of them
+            // would publish a rebuilt index referencing none of this machine's work —
+            // which is how a repair tool makes the damage worse and invisible. The
+            // whole rebuild refuses instead, and nothing is written.
+            const got = await fetchBundleArchive({ backend, file, destPath: tarPath });
+            if (!got.ok)
+                throw new Error(`${file}: ${got.failure.message}`);
             const extractDir = join(tempRoot, `extract-${i}`);
             mkdirSync(extractDir, { recursive: true });
             // All bundles here are this machine's own pushes (bundleDir is keyed

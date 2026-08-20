@@ -76,6 +76,19 @@ const REASON_EXIT_CODE = {
     "not-owner": EXIT_REFUSED,
     "not-retired": EXIT_REFUSED,
     "grace-period": EXIT_REFUSED,
+    // Encryption at rest (#91), both refusals rather than failures: each is a
+    // command that ran, read the hub, decided, and changed NOTHING — the push
+    // refusal is taken before the export and before any hub write.
+    //
+    // Deliberately not class 3, even though `encryption-refused` reads like "wait
+    // for the other machine to check in". Class 3 is the set worth retrying
+    // UNCHANGED in a moment, and this one is not: the same invocation refuses
+    // identically until a human upgrades a machine, fixes a key file, deletes a
+    // decommissioned record, or passes `--force-unkeyed`. Class 3 would invite a
+    // caller to loop on it, and the unattended session-end auto-push is exactly
+    // the caller that would.
+    "encryption-refused": EXIT_REFUSED,
+    "stale-machines": EXIT_REFUSED,
     // Environment-not-ready: same invocation, retry once the machine catches up.
     "hub-unreachable": EXIT_NOT_READY,
     "lock-busy": EXIT_NOT_READY,

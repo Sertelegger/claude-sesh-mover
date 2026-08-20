@@ -52,11 +52,39 @@ export function bundleDir(projectId, machineId) {
     assertSafeHubId(machineId, "machineId");
     return `${projectDir(projectId)}/bundles/${machineId}`;
 }
+/**
+ * The suffix an ENCRYPTED bundle carries, appended to the plaintext one.
+ *
+ * **This is the whole of the reader's branch.** A hub is permanently MIXED —
+ * enabling encryption never rewrites an existing bundle (that would be one
+ * machine rewriting another machine's files, which per-machine ownership
+ * forbids outright), so plaintext and ciphertext sit side by side forever. The
+ * reader therefore decides per FILE, from the name the index recorded, and
+ * never from local config: a reader that consulted `hub.json.encrypt` or the
+ * local `hub.encrypt` preference would strand its own history the moment the
+ * switch was flipped, and would fail in the other direction on a machine that
+ * has not enabled it yet.
+ *
+ * `.tar.gz` remains the plaintext spelling, so an older plugin's
+ * `BUNDLE_FILE_RE` still parses the bundles it can actually read and simply
+ * does not recognise the ones it cannot.
+ */
+export const ENCRYPTED_BUNDLE_SUFFIX = ".age";
+/**
+ * Is this bundle file encrypted? **Suffix only — see `ENCRYPTED_BUNDLE_SUFFIX`.**
+ *
+ * Takes any hub-relative path or bare file name, because the three readers that
+ * ask (the pull fetch, the merge-ancestor fetch, and `hub reindex`) hold it in
+ * different shapes and must not each grow their own copy of the rule.
+ */
+export function isEncryptedBundleFile(fileOrPath) {
+    return fileOrPath.endsWith(ENCRYPTED_BUNDLE_SUFFIX);
+}
 // ':' is invalid in Windows file names — sanitize the ISO timestamp.
-export function bundleFileName(pushedAtIso, bundleId) {
+export function bundleFileName(pushedAtIso, bundleId, opts = {}) {
     assertSafeHubId(bundleId, "bundleId");
     const ts = pushedAtIso.replace(/:/g, "-");
     assertSafeHubId(ts, "bundle timestamp");
-    return `${ts}-${bundleId}.tar.gz`;
+    return `${ts}-${bundleId}.tar.gz${opts.encrypted ? ENCRYPTED_BUNDLE_SUFFIX : ""}`;
 }
 //# sourceMappingURL=layout.js.map

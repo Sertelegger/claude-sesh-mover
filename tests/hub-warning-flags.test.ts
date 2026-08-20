@@ -630,6 +630,43 @@ const REGISTRY: FlagUse[] = [
       reruns: "migrateSession",
     },
   },
+
+  // ---- encryption at rest (src/hub/encryption.ts, src/hub/pull-fetch.ts) ----
+  {
+    file: "src/hub/encryption.ts",
+    match: "Seal the hub with `sesh-mover hub encrypt --enable`",
+    klass: "future-only",
+    why: "Emitted on a SUCCESSFUL push whose bundle has already reached the hub as plaintext. Sealing the hub cannot un-send it — nothing ever rewrites a bundle in place — so the flag applies strictly to later pushes, and the sentence scopes it that way. It names `encrypt` because --enable is that command's flag, not push's.",
+  },
+  {
+    file: "src/hub/encryption.ts",
+    match: "re-run with --force-unkeyed",
+    klass: "retry-works",
+    why: "The refusal is taken immediately after the preflight and before the export, the hub-side project, the bundle and the local link — nothing is exported, uploaded or recorded — so the same invocation plus the flag runs from the top and reaches the upload. That the upload then permanently excludes a machine is a separate matter from whether it is reachable; the sentence says so.",
+    provenBy: {
+      test: "hub-encryption-wiring.test.ts",
+      name: "refuses to push into a sealed hub when a registered machine publishes no key, and --force-unkeyed uploads anyway",
+      reruns: "hubPush",
+    },
+  },
+  {
+    file: "src/hub/encryption.ts",
+    match: "--force-unkeyed: this bundle was encrypted WITHOUT",
+    klass: "descriptive",
+    why: "Names the flag as the cause of an outcome the caller explicitly chose, on a push that succeeded. Nothing is being asked; the sentence exists so the permanence of the exclusion is on the record.",
+  },
+  {
+    file: "src/hub/encrypt.ts",
+    match: "local hub.encrypt preference could not be recorded",
+    klass: "descriptive",
+    why: "Reports an outcome of the run that just happened — the hub-wide switch landed, the local preference file did not — on a command that SUCCEEDED. `configure --show` is named as the thing that would report the stale value, not as a remedy to apply, and the key is the subject of the sentence rather than something the user is told to set. It names `configure` because --show is that command's flag, not this one's.",
+  },
+  {
+    file: "src/hub/pull-fetch.ts",
+    match: "re-send the thread whole with `sesh-mover push --full`",
+    klass: "future-only",
+    why: "This bundle is foreclosed for this machine in the strongest sense available: an encrypted bundle is never re-wrapped, so no pull ever reaches it. The remedy is a different command on a different machine producing a NEW bundle, which a later pull finds — which is exactly what the sentence scopes it to. It names `push` because --full is that command's flag, not pull's.",
+  },
 ];
 
 const ROOT = join(import.meta.dirname, "..");
@@ -840,12 +877,22 @@ const SURFACES: Record<string, string[]> = {
   "src/hub/pull-apply-carry.ts": ["pull"],
   "src/hub/pull-apply-sessions.ts": ["pull"],
   "src/hub/pull-apply-workspace.ts": ["pull"],
+  "src/hub/pull-fetch.ts": ["pull"],
   "src/hub/pull-resolve.ts": ["pull"],
   // The one file BOTH verbs surface verbatim: `preflightHub` is called by
   // `hub/push.ts` and `hub/pull-resolve.ts` alike, so a flag named here is read
   // by a user running either. `--create-project` is push's, which is why both
   // lines that name it also say "push".
   "src/hub/preflight.ts": ["push", "pull"],
+  // `planBundleEncryption` is a pure decision function whose sentences are
+  // returned to `hub/push.ts` and surfaced as that verb's refusal or warnings.
+  // Only push: nothing on the READ path consults this module at all — a reader
+  // branches on the bundle file's suffix — which is the property `bundle-io.ts`
+  // exists to keep, so a `pull` here would be a sign that it had been lost.
+  "src/hub/encryption.ts": ["push"],
+  // `hub encrypt`'s own verb, keyed by the sub-command name the CLI declares
+  // (`.command("encrypt")`), not by "hub encrypt".
+  "src/hub/encrypt.ts": ["encrypt"],
   "src/hub/push.ts": ["push"],
   "src/hub/reindex.ts": ["reindex"],
   // Retirement's two verbs share one module, so a flag named there is read by a

@@ -2,6 +2,81 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.10.0] — unreleased
+
+### Added
+
+- **Encryption at rest for hub bundles ([#91]).** `sesh-mover hub encrypt --enable` (`/sesh-mover:hub-encrypt`)
+  seals a hub: from then on every machine's pushes upload an encrypted bundle, `.tar.gz.age` instead
+  of `.tar.gz`. The format is [age](https://age-encryption.org/) v1, implemented in-process against
+  `node:crypto` — no external binary, nothing that can be missing on Windows, and nothing that can
+  prompt on the unattended session-end push. `age -d -i ~/.sesh-mover/identity.age <bundle>` recovers a
+  bundle with this plugin uninstalled.
+
+  > **Enabling encryption does not make an existing hub private. It makes it private going forward.**
+  > Every bundle already on the hub stays readable by anyone with read access, forever. Nothing
+  > rewrites them — one machine rewriting *other machines'* files is what per-machine ownership
+  > forbids, and that rule is what makes concurrent push and pull safe without a distributed lock. If
+  > the existing bundles matter, start a fresh hub.
+
+  A hub is therefore permanently **mixed**, and readers branch on each bundle's file **suffix**, never
+  on config — so flipping the switch never strands your own history, and one pull reads a thread that
+  spans it.
+
+  Each machine mints an X25519 identity at `~/.sesh-mover/identity.age` (0600) on first use; the
+  private half is never transported and the public half is published in that machine's hub record on
+  every push and pull. A machine that joins later gets new bundles immediately and does **not**
+  retroactively gain access to old ones.
+
+  **What this buys, stated precisely.** An authentication tag proves the payload came from someone
+  holding the file key — which, under a shared-recipient design, is every participating machine. It
+  authenticates the **group, not the sender**. Gained: a hub operator who is not one of your machines
+  can no longer read a bundle or author one at all ([#36]'s last remedy, for the host-and-transport
+  threat). Not gained: anything against a peer machine, which is a recipient by construction, and no
+  attestation of what a bundle descends from ([#37]). Per-machine signing is the next step and is not
+  in this release.
+
+- **`push --force-unkeyed`.** On a sealed hub, `push` refuses when a registered machine publishes no
+  usable public key, naming each one — because a bundle is encrypted once and never re-wrapped, so a
+  machine left out of the recipient list can never read that thread, and it would find out much later
+  on the *other* machine as an unreadable bundle. The flag uploads anyway and records which machines
+  were excluded. There is no config key for it, so the default-on session-end auto-push can never make
+  that choice unattended; and it does not override the case where the pushing machine is itself the
+  un-keyed one.
+
+- **`HubPushResult.bundleEncrypted`** — whether *this* bundle went out as ciphertext. A fact about the
+  bundle, never the hub's policy; ask `hub encrypt` for that.
+
+- **`hub encrypt --enable` refuses while any registered machine last checked in on a version older
+  than 0.10.0**, and names it. Such a machine does not read the hub's setting at all, so sealing the
+  hub would not stop it uploading in the clear — it would only stop you noticing. A version field
+  cannot stop an old plugin; it can only let a new one notice.
+
+- **Four distinguishable decrypt failures on `pull`**, because their remedies share nothing: no usable
+  local key, not a recipient of this bundle, authentication failed (damage or tampering), or the file
+  could not be read. Each is a typed refusal with its own `suggestion` — never a throw — and nothing
+  from a refused bundle is applied while bundles applied earlier in the chain stay applied and
+  recorded.
+
+### Changed
+
+- `hub.encrypt` in config is no longer inert. It remains the local **preference** rather than the
+  switch: the authoritative one is `encrypt` in the hub's own `hub.json`, so a machine that never set
+  the preference still refuses to push plaintext into a sealed hub. A push whose preference is set on
+  an unsealed hub now says so.
+
+### Unchanged, deliberately
+
+- **All three manifest hash layers stay exactly where they are, over plaintext.** `integrityHash`,
+  `layerDigests` and `sessionsDigest` are computed during export in the staging directory, long before
+  the archive exists and therefore long before any encryption. There is no ciphertext hash: the AEAD
+  tag answers that question per chunk and better, and `manifest.json` lives inside the archive, so on
+  an encrypted bundle there is nowhere for one to sit.
+
+[#36]: https://github.com/Sertelegger/claude-sesh-mover/issues/36
+[#37]: https://github.com/Sertelegger/claude-sesh-mover/issues/37
+[#91]: https://github.com/Sertelegger/claude-sesh-mover/issues/91
+
 ## [0.9.0] — 2026-08-17
 
 > [!IMPORTANT]

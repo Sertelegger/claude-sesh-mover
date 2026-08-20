@@ -1,4 +1,4 @@
-import type { ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubEncryptionRefusedResult, HubLockBusyResult, HubNoSuchProjectResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult, ProgressEvent } from "../types.js";
 export interface HubPushOptions {
     configDir: string;
     projectPath: string;
@@ -9,8 +9,7 @@ export interface HubPushOptions {
      * the hub already holds (`peers["hub:<hubId>"]`) before planning the export.
      *
      * The escape hatch for a hub that can no longer serve what its ledger claims
-     * — bundles deleted, or (once encryption lands) encrypted to a key that is
-     * gone. Without it the next push ships a delta anchored on a base nobody can
+     * — bundles deleted, or encrypted to a key that is gone. Without it the next push ships a delta anchored on a base nobody can
      * read, which is an unreconstructable thread for every other machine. See
      * `forgetSentToPeer` for the exact set of ledgers this covers and the ones it
      * pointedly does not.
@@ -44,6 +43,37 @@ export interface HubPushOptions {
      * its changes and no carry rule filters the patch — see `trackedIgnored`.)
      */
     noCarry?: boolean;
+    /**
+     * Upload an encrypted bundle even though registered machines on this hub
+     * publish no usable public key — accepting that those machines can never read
+     * it.
+     *
+     * The override for the refusal `planBundleEncryption` documents at length. Two
+     * properties, both deliberate:
+     *
+     * - **Flag-only, never a config key, and therefore never reachable from the
+     *   SessionEnd auto-push** — the same rule as `full`. A config key would arm
+     *   the unattended push to permanently exclude a machine at every session end
+     *   with no channel to disclose it.
+     * - **It cannot override the SELF case.** A machine that publishes no usable
+     *   key of its own is refused whatever this says, because "I know those
+     *   machines do not need this bundle" is definitionally false about the
+     *   machine writing it.
+     */
+    forceUnkeyed?: boolean;
+    /**
+     * This machine's local `hub.encrypt` config value — a PREFERENCE, never the
+     * switch.
+     *
+     * The authoritative switch is `encrypt` in the hub's own `hub.json`, so this
+     * is used for exactly one thing: disclosing that this machine wants
+     * encryption and the hub it is pushing to does not require it. A machine that
+     * encrypted unilaterally would push bundles the rest of the hub cannot read.
+     *
+     * Resolved by the CALLER, for the reason `budgets` states: this module is
+     * handed a decision, not a config directory.
+     */
+    encryptPreference?: boolean;
     /**
      * Byte budgets for the two optional payloads, resolved from `hub.carryMaxMb`
      * and `hub.workspaceMaxMb`, plus whatever resolving them had to say.
@@ -105,7 +135,7 @@ export interface HubPushOptions {
  * `HubPullOutcome`. The two refusals at the end arrive from the shared
  * preflight (#75) and are the two that used to be a raw throw.
  */
-export type HubPushOutcome = HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | HubUnreachableResult | HubNoSuchProjectResult | ErrorResult;
+export type HubPushOutcome = HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | HubUnreachableResult | HubNoSuchProjectResult | HubEncryptionRefusedResult | ErrorResult;
 /**
  * `onProgress`'s contract, which is invisible from any single call site — the
  * same note `hubPull` carries, and deliberately the same shape (#74, #78).

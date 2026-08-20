@@ -4,6 +4,7 @@
 // guarantee the copies drift apart. Type-only means nothing is imported at
 // runtime, so neither creates a module cycle.
 import type { WorkspaceMergeReport } from "./hub/merge.js";
+import type { EncryptionRefusal, UnkeyedMachine } from "./hub/encryption.js";
 import type { ApplyResult, CarryMeta } from "./payload/carry.js";
 
 // --- Platform ---
@@ -385,8 +386,8 @@ export interface SeshMoverConfig {
      * **It is not the switch.** The authoritative one is `encrypt` in the hub's
      * own `hub.json`, because a local-only flag has a silent failure: one
      * machine that never set it keeps pushing plaintext into a hub the user
-     * believes is sealed, and nothing anywhere says so. This key is what a
-     * future `hub encrypt --enable` writes THROUGH to the hub, and what
+     * believes is sealed, and nothing anywhere says so. This key is what
+     * `hub encrypt --enable` writes THROUGH to the hub, and what
      * `resolveHubEncryption` reports as `unappliedPreference` when it is on and
      * the hub's is not.
      *
@@ -395,8 +396,11 @@ export interface SeshMoverConfig {
      * defaults, so an absent key makes `configure --set hub.encrypt=true` fail
      * outright.
      *
-     * **Inert as of 0.9.0** — nothing encrypts a bundle yet. Setting it records
-     * an intention and changes no byte that leaves this machine.
+     * **Setting it alone still changes no byte that leaves this machine** — it
+     * is a preference, and the hub decides. On an unsealed hub a push obeys the
+     * hub and discloses the gap as a warning; it never encrypts unilaterally,
+     * because a machine that did would push bundles the rest of the hub cannot
+     * read.
      */
     encrypt: boolean;
   };
@@ -1158,6 +1162,15 @@ export interface HubPushResult {
   pushedSessions: Array<{ threadId: string; sessionId: string; type: "full" | "continuation" }>;
   upToDate: boolean;
   hasWorkspace: boolean;
+  /**
+   * This push's bundle went to the hub as ciphertext (`.tar.gz.age`).
+   *
+   * A fact about THIS bundle, never the hub's policy: a hub is permanently
+   * mixed — enabling encryption never rewrites an existing bundle — so the only
+   * honest thing a push can report is what it just did. `false` on an
+   * `upToDate` push, which uploaded nothing. Ask `hub encrypt` for the policy.
+   */
+  bundleEncrypted: boolean;
   warnings: string[];
   /**
    * Discovery aid (design §6.0): gitignored paths that this push did NOT carry,
@@ -1207,6 +1220,117 @@ export interface HubPushResult {
     forgottenSessions: number;
     forgottenMemoryDigest: boolean;
   };
+}
+
+/**
+ * A push refused because this hub requires encrypted bundles and this machine
+ * could not produce one every registered machine can read.
+ *
+ * **A refusal, not a failure, and the distinction is the whole shape.** It is
+ * decided immediately after the preflight — before the export, before any hub
+ * write, before the local link that arms the SessionEnd auto-push — so nothing
+ * happened and there is nothing to roll back. That is why it is a `reason` of
+ * its own rather than a `HubPushFailedResult`, whose fields all describe damage
+ * this one cannot have done.
+ *
+ * There is deliberately **no plaintext fallback**. Confidentiality is not a
+ * property with a lesser version: unlike the `zstd`→gzip and
+ * `git merge-file`→no-ancestor degradations elsewhere in this codebase, whose
+ * fallbacks satisfy the same property more weakly, the only thing a failed
+ * encryptor could fall back to is plaintext — invisible to everyone except the
+ * machine that pushed.
+ *
+ * **`refusal` is the discriminator, not `unkeyedMachines.length`.** Three
+ * refusals share this shape and only ONE of them takes `--force-unkeyed`, so a
+ * caller has to tell them apart — and the obvious test is wrong for two of the
+ * three, because `unkeyedMachines` is the census reported WHOLE: on
+ * `self-unkeyed` it carries this machine's own entry, and on `no-recipients` it
+ * carries every machine on the hub. See `EncryptionRefusal`.
+ *
+ * `unkeyedMachines` is that census as `collectHubRecipients` reported it, never
+ * a rendering of the message: a caller deciding whether to offer the override
+ * needs the machines and the reason each one is un-keyed. `unsafe-id` in
+ * particular is reported and must never be turned back into a path.
+ */
+export interface HubEncryptionRefusedResult {
+  success: false;
+  command: "push";
+  reason: "encryption-refused";
+  /** Which refusal. Branch on this — see the docblock above. */
+  refusal: EncryptionRefusal;
+  error: string;
+  suggestion: string;
+  unkeyedMachines: UnkeyedMachine[];
+  /**
+   * Disclosures collected before the refusal — a lock this push stole, a
+   * malformed budget, a malformed `encrypt` value on the hub. **Absent, never
+   * `[]`**, on the same rule as `ErrorResult.warnings`, so a reader can tell
+   * "disclosed nothing" from "had nothing to disclose".
+   *
+   * A refusal is not a reason to withhold what already happened. The malformed
+   * `encrypt` note is the case that makes this load-bearing: it is *why*
+   * encryption was required at all, so dropping it would explain the symptom and
+   * hide the cause.
+   */
+  warnings?: string[];
+}
+
+/**
+ * `hub encrypt` — read the hub-wide switch, or turn it on.
+ *
+ * `enabled` is what `hub.json` says AFTER this command, so a plain
+ * `hub encrypt` (no `--enable`) reports the current state and `changed: false`.
+ *
+ * **`staleMachines` is the gate `--enable` refuses on**, and it is the reason
+ * `pluginVersion` is on the machine record at all: a plugin that predates
+ * encryption does not read `hub.json.encrypt`, so it keeps pushing plaintext
+ * into a hub the user now believes is sealed, and nothing anywhere says so. A
+ * version field cannot stop an old plugin — it can only let a new one notice,
+ * and this is where the noticing happens.
+ */
+export interface HubEncryptResult {
+  success: true;
+  command: "hub-encrypt";
+  hubId: string;
+  /** The hub-wide switch as it stands after this command. */
+  enabled: boolean;
+  /** This command wrote `hub.json`. False for a read, and for an enable that was already on. */
+  changed: boolean;
+  /** This machine's local `hub.encrypt` preference after this command. */
+  preference: boolean;
+  /**
+   * Registered machines that publish a usable key, and those that do not — the
+   * same census a push would take, reported here so the answer to "what will my
+   * next push refuse on" is available before the push.
+   */
+  recipients: Array<{ machineId: string; name: string | null }>;
+  unkeyedMachines: UnkeyedMachine[];
+  /**
+   * Registered machines whose last check-in was on a plugin version that
+   * predates encryption (or that recorded no version at all). Populated on a
+   * read as well as on an enable, because the refusal is more useful early.
+   */
+  staleMachines: Array<{ machineId: string; name: string | null; pluginVersion: string | null; lastSeenAt: string | null }>;
+  /**
+   * **The statement a user will otherwise assume the opposite of.** Present on
+   * every successful enable: enabling encryption does not make an existing hub
+   * private, it makes it private going forward, and everything already on the
+   * hub stays readable by anyone with read access, forever.
+   */
+  warnings: string[];
+}
+
+/**
+ * `hub encrypt --enable` refused. Its own shape, because the refusal carries
+ * the roster it refused on and a caller needs that without parsing prose.
+ */
+export interface HubEncryptRefusedResult {
+  success: false;
+  command: "hub-encrypt";
+  reason: "stale-machines";
+  error: string;
+  suggestion: string;
+  staleMachines: Array<{ machineId: string; name: string | null; pluginVersion: string | null; lastSeenAt: string | null }>;
 }
 
 /**
@@ -1445,7 +1569,7 @@ export interface HubNoSuchProjectResult {
  */
 export interface HubUnreachableResult {
   success: false;
-  command: "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete";
+  command: "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-encrypt";
   reason: "hub-unreachable";
   /**
    * Which of the two shapes it is — an enum rather than prose, because the
@@ -2135,6 +2259,9 @@ export type CliResult =
   | NotYetSyncedResult
   | HubReindexResult
   | HubReindexFailedResult
+  | HubEncryptResult
+  | HubEncryptRefusedResult
+  | HubEncryptionRefusedResult
   | ErrorResult;
 
 // --- Exit codes ---
@@ -2232,6 +2359,19 @@ const REASON_EXIT_CODE: Record<CliResultReason, ExitCode> = {
   "not-owner": EXIT_REFUSED,
   "not-retired": EXIT_REFUSED,
   "grace-period": EXIT_REFUSED,
+  // Encryption at rest (#91), both refusals rather than failures: each is a
+  // command that ran, read the hub, decided, and changed NOTHING — the push
+  // refusal is taken before the export and before any hub write.
+  //
+  // Deliberately not class 3, even though `encryption-refused` reads like "wait
+  // for the other machine to check in". Class 3 is the set worth retrying
+  // UNCHANGED in a moment, and this one is not: the same invocation refuses
+  // identically until a human upgrades a machine, fixes a key file, deletes a
+  // decommissioned record, or passes `--force-unkeyed`. Class 3 would invite a
+  // caller to loop on it, and the unattended session-end auto-push is exactly
+  // the caller that would.
+  "encryption-refused": EXIT_REFUSED,
+  "stale-machines": EXIT_REFUSED,
   // Environment-not-ready: same invocation, retry once the machine catches up.
   "hub-unreachable": EXIT_NOT_READY,
   "lock-busy": EXIT_NOT_READY,
