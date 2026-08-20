@@ -136,7 +136,16 @@ describe("age keys", () => {
     expect(() => parseIdentity(recipient)).toThrow(AgeError);
     expect(() => encodeRecipient(randomBytes(31))).toThrow(/32 bytes, got 31/);
     expect(() => encodeIdentity(randomBytes(33))).toThrow(/32 bytes, got 33/);
-    expect(() => parseRecipient(`${recipient.slice(0, -1)}q`)).toThrow(AgeError);
+    // The substitute must DIFFER from the character it replaces, or the
+    // "corrupted" key is byte-identical to the valid one and parsing correctly
+    // succeeds. Hardcoding `q` failed ~1 run in 32 — measured at 65/2000, which
+    // is exactly the 1-in-32 chance that a bech32 string ends in the first
+    // character of its 32-symbol charset. It read as a platform flake because
+    // it moved between runners; it is pure chance and has nothing to do with
+    // the platform.
+    const last = recipient.slice(-1);
+    const flipped = last === "q" ? "p" : "q";
+    expect(() => parseRecipient(`${recipient.slice(0, -1)}${flipped}`)).toThrow(AgeError);
     expect(() => new AgeDecryptStream(randomBytes(31))).toThrow(/identity must be 32 bytes/);
   });
 

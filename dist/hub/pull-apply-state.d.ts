@@ -119,9 +119,10 @@ export interface ApplyState {
     workspaceMerge: WorkspaceMergeReport | undefined;
     workspaceRefused: string[] | undefined;
     /**
-     * Set when a manifest declares a workspace payload the bundle does not
-     * contain. A FIELD, not just the warning — see the declaration comment in
-     * `initApplyState`.
+     * Set when a manifest declares a workspace payload that could not be
+     * retrieved — not in the bundle, or a split artifact (#91) that could not be
+     * fetched or whose pointer was refused. A FIELD, not just the warning — see
+     * the declaration comment in `initApplyState`.
      */
     workspaceDeclaredMissing: boolean | undefined;
     /** Which bundle in this chain carries the workspace generation to apply. */

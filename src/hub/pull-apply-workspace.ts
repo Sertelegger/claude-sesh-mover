@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { type HubBackend } from "./backend.js";
 import { fetchBundleArchive } from "./bundle-io.js";
-import { type HubBundleRecord } from "./layout.js";
+import { workspaceDir, type HubBundleRecord } from "./layout.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "../payload/workspace.js";
 import { mergeWorkspaceTrees, type WorkspaceMergeReport } from "./merge.js";
 import { isReadableDir } from "./fs-probe.js";
@@ -31,8 +31,26 @@ export interface ApplyWorkspaceStageInput {
    * `chooseMergeAncestor`.
    */
   machineId: string;
+  /**
+   * The hub project this pull resolved to — OUR OWN identity, never anything
+   * out of a bundle. It is one half of the containment the split workspace
+   * pointer is checked against (`workspaceDir(projectId, machineId)`), which is
+   * why it has to come from the resolve stage rather than from the manifest
+   * carrying the pointer.
+   */
+  projectId: string;
   hubId: string;
   record: Pick<HubBundleRecord, "bundleId" | "file" | "pushedAt">;
+  /**
+   * `manifest.workspace.file` as the bundle declared it, or `undefined`.
+   *
+   * **This is the whole of the shape decision** — present means the tree is a
+   * separate hub artifact (#91), absent means it is inside the bundle at
+   * `workspace/`, and a hub carries both forever. Passed through raw and
+   * validated HERE rather than in the caller so the refusal is one of this
+   * stage's own outcomes; see the containment check in `runApplyWorkspaceStage`.
+   */
+  workspaceFile?: string;
   tempRoot: string;
 }
 
@@ -44,66 +62,101 @@ export interface WorkspaceStageValue {
 }
 
 /**
- * Fetch one candidate workspace generation off the hub and unpack it into a
- * temp dir: the common-ancestor tree a 3-way merge needs (design §5.2).
- * `chooseMergeAncestor` decides WHICH generation; this only retrieves it.
+ * Pull one archive off the hub and hand back the workspace tree inside it —
+ * **the single reader for both shapes a hub can hold, and for both of this
+ * stage's two reads.**
  *
- * The hub already stores every generation — each workspace payload is a full
- * snapshot — so sync-state only holds a POINTER, and the tree comes back down
- * the same validated path as any other bundle (`record.file` and this
- * `ref.file` both go through the backend's `assertHubRelPath`, and
- * `extractArchive` rejects absolute/traversing/symlink tar entries before
- * anything is written).
+ * The two shapes (#91): an OLD bundle carries the tree at `workspace/` inside
+ * itself, and a bundle written since the split points at a separate workspace
+ * artifact whose staged root holds exactly one entry, also `workspace/`. So
+ * both extract to `<scratch>/unpacked/workspace` and the function needs no
+ * branch at all — which is why the artifact is not tarred at its own root,
+ * where a project containing a directory called `workspace` would make the two
+ * indistinguishable. A hub is permanently mixed and stays readable for free.
  *
- * Every failure degrades to `{ dir: null }` with a warning rather than
- * throwing, and the caller then runs no-ancestor mode (§5.4). The reasons are
- * all ordinary: the bundle was pruned from the hub, the hub folder has not
- * finished syncing it, an older generation predates workspace payloads, or the
- * archive is unreadable. None of them is a reason to fail a pull whose sessions
- * are perfectly fine — and no-ancestor mode never overwrites anything.
+ * The two callers are `fetchAncestorWorkspace` (the common-ancestor tree a
+ * 3-way merge needs, design §5.2) and the incoming payload itself. They used to
+ * be different code because the incoming tree was already on disk; the split
+ * made the incoming payload a hub fetch too, and giving it its OWN fetch is how
+ * a workspace artifact ends up read by something that is not
+ * `fetchBundleArchive` — i.e. how a sealed hub grows a reader that has never
+ * heard of `.age`. There is one such reader in `src/`, and this keeps it that
+ * way.
+ *
+ * Encryption is SUFFIX-DRIVEN, exactly like the pull's own bundle fetch: a
+ * generation recorded before this hub was sealed is a plaintext `.tar.gz` and
+ * stays readable, one recorded after is a `.tar.gz.age`, and a mixed history is
+ * the ordinary state of any hub that has ever flipped the switch. Branching on
+ * the hub's policy here would break the older half.
+ *
+ * **Every failure degrades — it never throws.** The reasons are all ordinary:
+ * the file was pruned from the hub, the folder has not finished syncing it, an
+ * older generation predates workspace payloads, the archive is unreadable, this
+ * machine is not a recipient. None of them is a reason to fail a pull whose
+ * sessions are perfectly fine, and both callers fail toward writing nothing.
  *
  * Each attempt gets its OWN scratch directory: `chooseMergeAncestor` can call
  * this twice, and a failed extraction may already have written part of a tree.
- * Sharing one directory would silently hand back a blend of two generations.
+ * Sharing one would silently hand back a blend of two generations.
+ */
+async function retrieveWorkspaceTree(
+  backend: HubBackend,
+  file: string,
+  tempRoot: string,
+  scratchPrefix: string
+): Promise<{ dir: string } | { dir: null; why: string }> {
+  try {
+    if (!(await backend.exists(file))) {
+      return {
+        dir: null,
+        why: "is no longer on the hub (pruned, or not yet synced to this machine)",
+      };
+    }
+    const work = mkdtempSync(join(tempRoot, scratchPrefix));
+    const tarPath = join(work, "payload.tar.gz");
+    const got = await fetchBundleArchive({ backend, file, destPath: tarPath });
+    if (!got.ok) return { dir: null, why: `could not be read back (${got.failure.message})` };
+    const unpacked = join(work, "unpacked");
+    mkdirSync(unpacked, { recursive: true });
+    await extractArchive(tarPath, unpacked);
+    const tree = join(unpacked, "workspace");
+    // `isReadableDir`, not `existsSync`, for the reason the inline guard below
+    // states: an archive whose `workspace` entry is a FILE otherwise passes here
+    // and throws ENOTDIR out of the merge, which is the terminal shape this
+    // whole function exists to avoid.
+    if (!isReadableDir(tree)) return { dir: null, why: "carries no workspace tree" };
+    return { dir: tree };
+  } catch (e) {
+    return { dir: null, why: `could not be read back (${(e as Error).message})` };
+  }
+}
+
+/**
+ * The common-ancestor tree, phrased as the merge's own disclosure.
+ *
+ * `chooseMergeAncestor` decides WHICH generation; this only retrieves it, and
+ * every failure comes back as `{ dir: null }` plus a sentence so the caller can
+ * run no-ancestor mode (§5.4) instead of merging against a guess.
+ *
+ * The hub already stores every generation — each workspace payload is a full
+ * snapshot — so sync-state holds only a POINTER, and the tree comes back down
+ * the same validated path as any other hub file (`ref.file` goes through the
+ * backend's `assertHubRelPath`, and `extractArchive` rejects
+ * absolute/traversing/symlink tar entries before anything is written).
  */
 async function fetchAncestorWorkspace(
   backend: HubBackend,
   ref: { bundleId: string; file: string },
   tempRoot: string
 ): Promise<{ dir: string | null; warning?: string }> {
-  const degraded = (why: string): { dir: null; warning: string } => ({
+  const got = await retrieveWorkspaceTree(backend, ref.file, tempRoot, "ancestor-");
+  if (got.dir !== null) return { dir: got.dir };
+  return {
     dir: null,
     warning:
       `The workspace generation ${ref.bundleId}, which this pull would have merged against, ` +
-      `${why} — so that payload could not be merged 3-way against it.`,
-  });
-  try {
-    if (!(await backend.exists(ref.file))) {
-      return degraded("is no longer on the hub (pruned, or not yet synced to this machine)");
-    }
-    const work = mkdtempSync(join(tempRoot, "ancestor-"));
-    const tarPath = join(work, "ancestor.tar.gz");
-    // Suffix-driven, exactly like the pull's own fetch: a generation recorded
-    // before this hub was sealed is a plaintext `.tar.gz` and stays readable,
-    // and one recorded after it is an encrypted `.tar.gz.age` — a MIXED
-    // `workspaceGenerations` list is the ordinary state of any hub that has
-    // ever flipped the switch, so branching on the hub's policy here would
-    // break the merge ancestor for the older half.
-    //
-    // A decryption failure degrades like every other failure in this function:
-    // no-ancestor mode never overwrites anything, so a generation we cannot
-    // open is a worse merge and never a wrong one.
-    const got = await fetchBundleArchive({ backend, file: ref.file, destPath: tarPath });
-    if (!got.ok) return degraded(`could not be read back (${got.failure.message})`);
-    const bundleDir = join(work, "bundle");
-    mkdirSync(bundleDir, { recursive: true });
-    await extractArchive(tarPath, bundleDir);
-    const tree = join(bundleDir, "workspace");
-    if (!existsSync(tree)) return degraded("carries no workspace tree");
-    return { dir: tree };
-  } catch (e) {
-    return degraded(`could not be read back (${(e as Error).message})`);
-  }
+      `${got.why} — so that payload could not be merged 3-way against it.`,
+  };
 }
 
 /**
@@ -336,9 +389,19 @@ function describeWorkspaceMerge(r: WorkspaceMergeReport): string[] {
  * |---|---|
  * | no payload on this bundle | `skipped`, zero reasons, no value |
  * | manifest declares one the bundle lacks | `skipped`, one reason, `declaredMissing` |
+ * | manifest points its snapshot outside the pushing machine's own hub directory | `skipped`, one reason, `declaredMissing` |
+ * | split snapshot that could not be fetched | `skipped`, one reason, `declaredMissing` |
  * | merged, or unpacked | `applied`, `unpacked` plus `merge`/`refused` |
  * | no generation common to both trees | `skipped`, the ancestor reasons PLUS the no-common-point sentence |
  * | explicit --target-path, not empty, no force | `aborted` — see below |
+ *
+ * The three `declaredMissing` rows are one FIELD and three SENTENCES, and that
+ * is the right split: the field drives the skill layer's advice, and the advice
+ * is the same for all three (`--force-workspace` and `--target-path` cannot
+ * deliver a payload nothing could retrieve), while the causes have nothing in
+ * common — a tree that was never in the bundle is gone for good, an artifact
+ * still syncing is a retry, and a pointer outside the pushing machine's own
+ * directory is a bundle nobody should trust.
  *
  * **The abort is not a refusal.** `WorkspaceTargetNotEmptyError` returns an
  * `ErrorResult` the caller must return VERBATIM, stopping the pull before this
@@ -410,11 +473,46 @@ export async function runApplyWorkspaceStage(
 ): Promise<StageOutcome<WorkspaceStageValue>> {
   const {
     backend, extractDir, effectiveProjectPath, targetPathGiven, forceWorkspace,
-    bundleDeclaresWorkspace, chainWorkspaceBases, machineId, hubId, record, tempRoot,
+    bundleDeclaresWorkspace, chainWorkspaceBases, machineId, projectId, hubId, record,
+    tempRoot,
   } = input;
   const reasons: string[] = [];
 
-  const incomingDir = join(extractDir, "workspace");
+  const inlineDir = join(extractDir, "workspace");
+
+  /**
+   * WHERE THIS BUNDLE'S TREE IS — decided from the bundle's own manifest and
+   * from nothing else (#91).
+   *
+   * `manifest.workspace.file` present means the tree is a separate hub
+   * artifact; absent means it is inside the bundle, which is what every bundle
+   * written before the split says and goes on saying forever. No local config,
+   * no plugin version and no `hub.json` field is consulted, for the same reason
+   * `isEncryptedBundleFile` consults none: a hub is permanently MIXED, so the
+   * answer has to be a property of the file in hand.
+   *
+   * The pointer is CONTAINED to `workspaceDir(projectId, machineId)` — our own
+   * resolved project, and the machine whose index listed this bundle. A bundle
+   * may only point at a snapshot the machine that wrote it owns. This is
+   * strictly tighter than the containment `record.file` gets (the backend's
+   * `assertHubRelPath`, which only bans traversal), and it is cheap: the
+   * pushing machine already knows both halves, so an honest pointer always
+   * passes.
+   */
+  let incoming: { kind: "inline" } | { kind: "artifact"; file: string };
+  if (bundleDeclaresWorkspace && input.workspaceFile !== undefined) {
+    const declared = input.workspaceFile;
+    const owned = `${workspaceDir(projectId, machineId)}/`;
+    if (typeof declared !== "string" || !declared.startsWith(owned)) {
+      reasons.push(
+        `The bundle's manifest points its workspace snapshot somewhere other than the hub directory the machine that pushed it owns (${owned}*), so nothing was fetched and this project's files were left untouched. The sessions imported normally. A bundle may only point at a snapshot in its own machine's workspace directory; this one was edited after it was written, or was not produced by sesh-mover at all.`
+      );
+      return stageSkip<WorkspaceStageValue>(reasons, { unpacked: null, declaredMissing: true });
+    }
+    incoming = { kind: "artifact", file: declared };
+  } else {
+    incoming = { kind: "inline" };
+  }
 
   // First, a payload the manifest declares and the bundle does not contain.
   // Both application paths below start by READING that directory, so an
@@ -432,12 +530,69 @@ export async function runApplyWorkspaceStage(
   // before the session import — the identical terminal shape this guard
   // exists to close. No sesh-mover produces that, but the sentence below
   // claims to cover a hand-made bundle, so the check has to mean it.
-  if (bundleDeclaresWorkspace && !isReadableDir(incomingDir)) {
+  //
+  // Only for the INLINE shape: a split bundle carries no `workspace/` of its
+  // own by construction, so running this check against one would refuse every
+  // bundle written since the split. The artifact's own "is it there" is
+  // answered by `materializeIncoming` below, at the point it is needed and with
+  // its own sentence, because the two facts have different remedies — a tree
+  // that was never in the bundle is gone for good, while an artifact that has
+  // not arrived yet is a retry.
+  if (incoming.kind === "inline" && bundleDeclaresWorkspace && !isReadableDir(inlineDir)) {
     reasons.push(
       "The bundle's manifest declares a workspace payload but the bundle does not contain one, so there was nothing to apply and this project's files were left untouched. It was written by an older sesh-mover whose snapshot carried no files, damaged in transit, or not produced by sesh-mover at all."
     );
     return stageSkip<WorkspaceStageValue>(reasons, { unpacked: null, declaredMissing: true });
   } else if (bundleDeclaresWorkspace) {
+    /**
+     * Get the incoming tree onto local disk — for the inline shape it already
+     * is, and for a split one this is the download.
+     *
+     * **Called only from the two branches that APPLY**, never before the
+     * decision, and that is the split's second dividend rather than an
+     * optimization: the routine "no common generation, so skip" path — the one
+     * a non-git project hits on every repeat pull — now costs nothing at all,
+     * where before the whole tree came down inside the bundle whether or not a
+     * single byte of it was ever written. (The first dividend is bigger and is
+     * free: a chain of N bundles used to carry N full snapshots and download
+     * them all; only the one that is applied is fetched now.)
+     *
+     * A failure here is a SKIP, never an abort. The sessions are the point of a
+     * pull and they have already imported by the time anything here runs on a
+     * later bundle; an optional payload that could not be retrieved must not
+     * cost them.
+     *
+     * **The artifact is NOT covered by `pull-select.ts`'s `not-yet-synced`
+     * sweep**, which checks the bundle files an index names and knows nothing
+     * about a pointer that lives inside one of them. So on a synced folder that
+     * has delivered a bundle but not its snapshot, a pull applies the sessions
+     * and lands here rather than refusing up front. Stated rather than fixed:
+     * this direction writes nothing, records no generation, and the message
+     * says to pull again — while widening the sweep would mean either putting
+     * the pointer in the plaintext index or downloading every bundle before
+     * deciding anything.
+     */
+    const materializeIncoming = async (): Promise<{ dir: string } | { dir: null }> => {
+      if (incoming.kind === "inline") return { dir: inlineDir };
+      const got = await retrieveWorkspaceTree(backend, incoming.file, tempRoot, "incoming-ws-");
+      if (got.dir !== null) return { dir: got.dir };
+      reasons.push(
+        `The bundle's workspace snapshot travels as its own file on the hub (${incoming.file}) and that file ${got.why}, so there was nothing to apply and this project's files were left untouched. The sessions imported normally. The snapshot and the bundle are separate hub files and can go missing independently — pruned, or a synced folder that has delivered one and not yet the other. THIS PULL CANNOT BE RE-RUN TO GET IT: its bundles are recorded now, so an immediate repeat answers "already up to date" without ever reaching the files. No generation was recorded either — recording one for files that were never written is what makes a later merge read the whole payload as deleted — so the next snapshot that machine pushes is what can deliver them, and if this directory has content by then that payload needs --force-workspace for the same reason a skipped one does.`
+      );
+      return { dir: null };
+    };
+    /**
+     * The hub file this generation is recorded against — the ARTIFACT's path
+     * when there is one, the bundle's when the tree was inline.
+     *
+     * `fetchAncestorWorkspace` opens exactly this later, on some future pull, so
+     * pointing it at the bundle for a split payload would make every ancestor
+     * fetch degrade to "carries no workspace tree" and every merge fall back to
+     * no-ancestor — safe, silent, and permanently wrong. The generation's
+     * IDENTITY is `record.bundleId` either way: the split moved where the tree
+     * lives, not what names it.
+     */
+    const generationFile = incoming.kind === "artifact" ? incoming.file : record.file;
     const entries = existsSync(effectiveProjectPath) ? readdirSync(effectiveProjectPath) : [];
     const hasRealContent = entries.some((n) => !isPluginStateName(n));
 
@@ -468,9 +623,13 @@ export async function runApplyWorkspaceStage(
       // "install git and re-pull" would be advice that cannot work. The
       // merge degrades per file instead (sidecars + `gitUnavailable`), and
       // describeWorkspaceMerge says so.
+      const inc = await materializeIncoming();
+      if (inc.dir === null) {
+        return stageSkip<WorkspaceStageValue>(reasons, { unpacked: null, declaredMissing: true });
+      }
       const report = await mergeWorkspaceTrees({
         ancestorDir,
-        incomingDir,
+        incomingDir: inc.dir,
         targetDir: effectiveProjectPath,
       });
       const unpacked = {
@@ -486,7 +645,7 @@ export async function runApplyWorkspaceStage(
       // base and manufacture conflicts out of work that was already done.
       const stateWs = readSyncState(effectiveProjectPath);
       setLastWorkspace(stateWs, hubId, {
-        bundleId: record.bundleId, file: record.file, pushedAt: record.pushedAt,
+        bundleId: record.bundleId, file: generationFile, pushedAt: record.pushedAt,
       });
       writeSyncState(stateWs);
       reasons.push(...describeWorkspaceMerge(report));
@@ -514,13 +673,17 @@ export async function runApplyWorkspaceStage(
       // HERE. Measured: skip -> --target-path <fresh> -> zero
       // workspaceGenerations under the project's own key -> identical skip.
       reasons.push(
-        "Bundle carries a workspace payload but the project directory already has content and no workspace generation is shared between this machine and the payload, so there is no common point to merge from and NOTHING was written. The sessions imported normally, and the payload is still in the bundle on the hub. This pull cannot be re-run to get it — its bundles are recorded now — and it will not resolve itself: no generation is recorded for a payload that was not applied, so the next payload from that machine skips for the same reason. Only one thing ends that repetition for THIS directory: --force-workspace on a LATER pull, which unpacks the hub's copy over it, OVERWRITING any file of the same name, after which the two machines share a generation and later payloads merge 3-way. --target-path <fresh-dir> on a later pull is the non-destructive way to SEE a payload — it unpacks elsewhere and touches nothing here — but the generation it records belongs to that fresh directory, so pulls into this one go on skipping exactly like this."
+        "Bundle carries a workspace payload but the project directory already has content and no workspace generation is shared between this machine and the payload, so there is no common point to merge from and NOTHING was written. The sessions imported normally, and the payload is still on the hub. This pull cannot be re-run to get it — its bundles are recorded now — and it will not resolve itself: no generation is recorded for a payload that was not applied, so the next payload from that machine skips for the same reason. Only one thing ends that repetition for THIS directory: --force-workspace on a LATER pull, which unpacks the hub's copy over it, OVERWRITING any file of the same name, after which the two machines share a generation and later payloads merge 3-way. --target-path <fresh-dir> on a later pull is the non-destructive way to SEE a payload — it unpacks elsewhere and touches nothing here — but the generation it records belongs to that fresh directory, so pulls into this one go on skipping exactly like this."
       );
       return stageSkip<WorkspaceStageValue>(reasons);
     } else {
+      const inc = await materializeIncoming();
+      if (inc.dir === null) {
+        return stageSkip<WorkspaceStageValue>(reasons, { unpacked: null, declaredMissing: true });
+      }
       try {
         const ws = await unpackWorkspace(
-          incomingDir,
+          inc.dir,
           effectiveProjectPath,
           { force: forceWorkspace || !hasRealContent }
         );
@@ -558,7 +721,7 @@ export async function runApplyWorkspaceStage(
         // this tree.
         const stateWs = readSyncState(effectiveProjectPath);
         setLastWorkspace(stateWs, hubId, {
-          bundleId: record.bundleId, file: record.file, pushedAt: record.pushedAt,
+          bundleId: record.bundleId, file: generationFile, pushedAt: record.pushedAt,
         });
         writeSyncState(stateWs);
         return stageOk<WorkspaceStageValue>({ unpacked, refused }, reasons);

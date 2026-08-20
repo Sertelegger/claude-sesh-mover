@@ -234,6 +234,39 @@ export interface ExportManifest {
             file: string;
             pushedAt?: string;
         } | null;
+        /**
+         * Hub-relative path of the SEPARATE archive holding this snapshot's tree
+         * (#91) — present iff the tree is not inside this bundle.
+         *
+         * **This field is the reader's whole shape decision, and it is a fact about
+         * the artifact rather than about the reader.** Absent means the tree sits at
+         * `workspace/` inside the bundle, which is what every bundle written before
+         * the split says and will go on saying forever — a hub is permanently
+         * MIXED, because enabling the split never rewrites an existing bundle (one
+         * machine rewriting another machine's files is what per-machine ownership
+         * forbids). Neither local config nor a plugin version is consulted, for the
+         * same reason `isEncryptedBundleFile` consults neither.
+         *
+         * Written only by `hub push`. `sesh-mover export` never writes it: an export
+         * bundle is a self-contained directory or archive with nowhere to point at,
+         * and `importer.ts` reads `workspace/` unconditionally.
+         *
+         * **The one workspace field that becomes a PATH on the puller**, which is
+         * why it is contained: the apply side requires it to sit under
+         * `workspaceDir(projectId, machineId)` for the machine whose index listed
+         * the bundle, and refuses the payload otherwise. `basedOn.file` stays
+         * diagnostic-only by contrast — it names a GENERATION, and a generation's
+         * identity must not be steerable. Suffix decides encryption here exactly as
+         * it does for the bundle, so a mixed-suffix history stays readable.
+         *
+         * What an OLDER plugin does with a bundle carrying it: it does not know the
+         * field, looks for `workspace/`, does not find it, and takes the
+         * already-shipped "declares a payload the bundle does not contain" branch —
+         * a warning, no crash, and the sessions import normally. That degradation is
+         * the reason the field lives beside `fileCount`/`basedOn` instead of
+         * replacing the `workspace` block with a new key.
+         */
+        file?: string;
     };
     /**
      * Uncommitted work captured beside the sessions (design §6.1), for a project
@@ -1797,18 +1830,31 @@ export interface HubPullResult extends HubPullFindings, SharedLayerFindings {
      */
     workspaceRefused?: string[];
     /**
-     * `true` when a bundle's manifest declared a workspace payload the bundle
-     * does not actually contain, so there was nothing to apply and the project
-     * directory was left untouched. Absent otherwise.
+     * `true` when a bundle's manifest declared a workspace payload that **could
+     * not be retrieved**, so there was nothing to apply and the project directory
+     * was left untouched. Absent otherwise.
+     *
+     * THREE causes since the workspace split (#91), one field, because the field
+     * exists to drive advice and the advice is identical for all three:
+     *
+     *  - the tree is declared inline and the bundle does not contain it (an
+     *    older sesh-mover whose snapshot carried no files, or damage);
+     *  - the tree travels as its own hub artifact and that file could not be
+     *    fetched — pruned, still syncing, unreadable, or encrypted to a key this
+     *    machine does not hold;
+     *  - the manifest points its snapshot outside the hub directory the pushing
+     *    machine owns, and the pointer was refused unread.
+     *
+     * The warnings distinguish them; this does not, deliberately.
      *
      * A field rather than warning prose for the usual reason (warning text is not
      * an interface — see `commands/pull.md`), and here it is the ONLY signal:
      * `workspaceUnpacked` is `null` and `workspaceMerge` is absent in this case
      * exactly as they are for the routine "no shared generation, so the payload
      * was skipped" branch, whose remedies (`--force-workspace`,
-     * `--target-path <fresh-dir>`) can do nothing for a payload that is not in
-     * the bundle. It is the workspace counterpart of `carryAvailable` present
-     * with `carryApplied` absent.
+     * `--target-path <fresh-dir>`) can do nothing for a payload nothing could
+     * retrieve. It is the workspace counterpart of `carryAvailable` present with
+     * `carryApplied` absent.
      */
     workspaceDeclaredMissing?: boolean;
     /**

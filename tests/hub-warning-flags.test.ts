@@ -170,6 +170,12 @@ const REGISTRY: FlagUse[] = [
   },
   {
     file: "src/hub/pull-apply-workspace.ts",
+    match: "travels as its own file on the hub",
+    klass: "future-only",
+    why: "The split workspace artifact (#91) could not be fetched. It reads like a transient — a synced folder mid-delivery — and it is not re-runnable for that reason: this pull imported the sessions and RECORDED its bundles, so `selectNeededBundles` drops them on a repeat and the pull answers 'already up to date' without ever reaching the artifact. Nor does it self-heal, for the same reason the no-ancestor skip above does not: no generation is recorded for a payload that was not applied, so the next snapshot from that machine also finds nothing common to merge against and needs --force-workspace on a directory with content. The message states both, because 'give it a moment and pull again' was the obvious wording and would have been a tenth foreclosure.",
+  },
+  {
+    file: "src/hub/pull-apply-workspace.ts",
     match: "no 3-way merge was attempted even though this machine has workspace generations",
     klass: "descriptive",
     why: "Restates what --force-workspace just did. Nothing is being asked of the user.",

@@ -814,8 +814,12 @@ describe("hub pull", () => {
       expect(pushResult.success).toBe(true);
       if (!pushResult.success || !pushResult.bundleId) return;
 
-      // Rewrite the bundle ON THE HUB to say what no pusher would say.
-      await mutateBundleTree(hub, pushResult.projectId, pushResult.bundleId, (dir) => {
+      // Rewrite the WORKSPACE ARTIFACT ON THE HUB to say what no pusher would
+      // say. Since #91 the tree is its own hub file rather than a directory
+      // inside the bundle — rewriting the bundle here would leave the artifact
+      // the pull actually applies untouched, and the test would pass by
+      // arranging for the defect it names to be impossible.
+      await mutateWorkspaceArtifact(hub, pushResult.projectId, pushResult.bundleId, (dir) => {
         const ws = join(dir, "workspace");
         mkdirSync(join(ws, ".sesh-mover"), { recursive: true });
         mkdirSync(join(ws, ".git"), { recursive: true });
@@ -3160,23 +3164,20 @@ async function patchBundleManifest(
   });
 }
 
-/** Round-trip a bundle archive on the hub, letting a test rewrite its tree. */
-async function mutateBundleTree(
+/**
+ * Round-trip ANY archive on the hub, letting a test rewrite its extracted tree.
+ *
+ * PLAINTEXT ONLY — it reads and writes the hub bytes directly, so a sealed hub
+ * would hand it ciphertext. Every caller below pushes to an unsealed hub, which
+ * is what these tests are about; the encrypted path has its own coverage in
+ * `hub-encryption-wiring.test.ts`.
+ */
+async function roundTripHubArchive(
   hubPath: string,
-  projectId: string,
-  bundleId: string,
-  mutate: (bundleDir: string) => void
+  file: string,
+  mutate: (root: string) => void
 ): Promise<void> {
   const backend = createFsBackend(hubPath);
-  const { indexes } = await readAllIndexes(backend, projectId);
-  let file: string | null = null;
-  for (const idx of indexes) {
-    for (const thread of Object.values(idx.threads)) {
-      for (const r of thread.bundles) if (r.bundleId === bundleId) file = r.file;
-    }
-  }
-  if (!file) throw new Error(`patchBundleManifest: no hub record for bundle ${bundleId}`);
-
   const work = mkdtempSync(join(tmpdir(), "sesh-ws-patch-"));
   try {
     const tar = join(work, "in.tar.gz");
@@ -3191,6 +3192,82 @@ async function mutateBundleTree(
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+/** The hub-relative path of a bundle archive, as this machine's index records it. */
+async function bundleHubFile(
+  hubPath: string,
+  projectId: string,
+  bundleId: string
+): Promise<string> {
+  const backend = createFsBackend(hubPath);
+  const { indexes } = await readAllIndexes(backend, projectId);
+  let file: string | null = null;
+  for (const idx of indexes) {
+    for (const thread of Object.values(idx.threads)) {
+      for (const r of thread.bundles) if (r.bundleId === bundleId) file = r.file;
+    }
+  }
+  if (!file) throw new Error(`bundleHubFile: no hub record for bundle ${bundleId}`);
+  return file;
+}
+
+/** Round-trip a bundle archive on the hub, letting a test rewrite its tree. */
+async function mutateBundleTree(
+  hubPath: string,
+  projectId: string,
+  bundleId: string,
+  mutate: (bundleDir: string) => void
+): Promise<void> {
+  await roundTripHubArchive(hubPath, await bundleHubFile(hubPath, projectId, bundleId), mutate);
+}
+
+/**
+ * Read one bundle's manifest off the hub without rewriting it.
+ *
+ * Needed because `manifest.workspace.file` — the split's pointer at the
+ * separate workspace artifact (#91) — is inside the bundle, not in the index,
+ * which is exactly where the pull reads it from.
+ */
+async function readHubBundleManifest(
+  hubPath: string,
+  projectId: string,
+  bundleId: string
+): Promise<Record<string, any>> {
+  const backend = createFsBackend(hubPath);
+  const file = await bundleHubFile(hubPath, projectId, bundleId);
+  const work = mkdtempSync(join(tmpdir(), "sesh-ws-read-"));
+  try {
+    const tar = join(work, "in.tar.gz");
+    writeFileSync(tar, await backend.read(file));
+    const dir = join(work, "bundle");
+    mkdirSync(dir, { recursive: true });
+    await extractArchive(tar, dir);
+    return JSON.parse(readFileSync(join(dir, "manifest.json"), "utf-8"));
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Round-trip the SEPARATE WORKSPACE ARTIFACT a bundle points at (#91).
+ *
+ * The mutate callback is handed the archive root, which holds exactly one entry
+ * — `workspace/` — so a callback written for the old inline shape works
+ * unchanged. That is the same property the production reader relies on.
+ */
+async function mutateWorkspaceArtifact(
+  hubPath: string,
+  projectId: string,
+  bundleId: string,
+  mutate: (root: string) => void
+): Promise<void> {
+  const manifest = await readHubBundleManifest(hubPath, projectId, bundleId);
+  const file = manifest.workspace?.file;
+  if (typeof file !== "string") {
+    throw new Error(`mutateWorkspaceArtifact: bundle ${bundleId} declares no workspace artifact`);
+  }
+  await roundTripHubArchive(hubPath, file, mutate);
 }
 
 describe("hub pull — workspace 3-way merge", () => {
@@ -4078,13 +4155,26 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(push.success).toBe(true);
       if (!push.success || !push.bundleId) return;
       expect(push.hasWorkspace).toBe(true);
-      // Strip the payload the manifest keeps declaring, and put a plain FILE
-      // where the directory was. Both reach the same `readdirSync`: a missing
-      // path throws ENOENT, a file throws ENOTDIR, and either one escapes
-      // hubPull BEFORE the session import. Checking existence alone would only
-      // have closed the first, while the warning below claims to cover a
-      // hand-made bundle — so the guard asks whether it is a directory.
+      // Turn this into a LEGACY-SHAPED bundle and then break it, which is what
+      // the bundles this guard defends actually look like: drop
+      // `manifest.workspace.file` so the manifest declares an INLINE payload
+      // (the only shape that existed before #91), and put a plain FILE where
+      // the directory would have been. Both reach the same `readdirSync`: a
+      // missing path throws ENOENT, a file throws ENOTDIR, and either one
+      // escapes hubPull BEFORE the session import. Checking existence alone
+      // would only have closed the first, while the warning below claims to
+      // cover a hand-made bundle — so the guard asks whether it is a directory.
+      //
+      // Dropping the pointer is load-bearing, not tidying: leave it in and the
+      // pull fetches the split artifact, which is intact, and this test passes
+      // while testing nothing. The split's own "declared payload could not be
+      // retrieved" case is a separate test below.
       await mutateBundleTree(hub, push.projectId, push.bundleId, (dir) => {
+        const manifestPath = join(dir, "manifest.json");
+        const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+        expect(typeof m.workspace.file).toBe("string");
+        delete m.workspace.file;
+        writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
         rmSync(join(dir, "workspace"), { recursive: true, force: true });
         writeFileSync(join(dir, "workspace"), "not a directory\n");
       });
@@ -4122,6 +4212,199 @@ describe("hub pull — workspace 3-way merge", () => {
       for (const d of [homeA, homeB, hub, base, projectB]) {
         rmSync(d, { recursive: true, force: true });
       }
+    }
+  });
+
+  /**
+   * Turn one bundle on the hub back into the shape every pre-#91 sesh-mover
+   * wrote: the workspace tree INSIDE the bundle, and no `workspace.file`
+   * pointer in the manifest. The separate artifact is then removed, because a
+   * legacy hub never had one.
+   *
+   * Doing it this way round — push with the real code, then downgrade the file
+   * — rather than hand-building a legacy bundle keeps everything else about it
+   * (the digests, the continuation header, the index record) exactly what the
+   * production writer produces, so what the test varies is the one thing it is
+   * about.
+   */
+  async function downgradeToInlineWorkspace(
+    hubPath: string,
+    projectId: string,
+    bundleId: string
+  ): Promise<void> {
+    const manifest = await readHubBundleManifest(hubPath, projectId, bundleId);
+    const artifact = manifest.workspace?.file as string | undefined;
+    if (typeof artifact !== "string") {
+      throw new Error("downgradeToInlineWorkspace: bundle declares no workspace artifact");
+    }
+    const backend = createFsBackend(hubPath);
+    const work = mkdtempSync(join(tmpdir(), "sesh-ws-downgrade-"));
+    try {
+      const tar = join(work, "ws.tar.gz");
+      writeFileSync(tar, await backend.read(artifact));
+      const out = join(work, "ws");
+      mkdirSync(out, { recursive: true });
+      await extractArchive(tar, out);
+      await mutateBundleTree(hubPath, projectId, bundleId, (dir) => {
+        cpSync(join(out, "workspace"), join(dir, "workspace"), { recursive: true });
+        const manifestPath = join(dir, "manifest.json");
+        const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+        delete m.workspace.file;
+        writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+      });
+      rmSync(join(hubPath, ...artifact.split("/")), { force: true });
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+
+  /** The one bundle A has pushed so far, as this machine's index records it. */
+  async function soleBundle(
+    hubPath: string,
+    projectId: string
+  ): Promise<{ bundleId: string; file: string }> {
+    const { indexes } = await readAllIndexes(createFsBackend(hubPath), projectId);
+    const bundles = Object.values(indexes[0].threads).flatMap((t) => t.bundles);
+    expect(bundles).toHaveLength(1);
+    return { bundleId: bundles[0].bundleId, file: bundles[0].file };
+  }
+
+  it("a MIXED hub merges a split payload against an INLINE ancestor (#91)", async () => {
+    // A hub is permanently mixed: the split never rewrites an existing bundle,
+    // because one machine rewriting another machine's files is exactly what
+    // per-machine ownership forbids. So both shapes must stay readable forever
+    // and the choice between them must come from the artifact in hand — never
+    // from local config and never from a version number.
+    //
+    // This is the crossing case rather than two separate ones: the ANCESTOR is
+    // a legacy bundle with the tree inside it, and the INCOMING payload is a
+    // split artifact, and one pull reads both.
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    try {
+      const first = await soleBundle(w.hub, w.projectId);
+      await downgradeToInlineWorkspace(w.hub, w.projectId, first.bundleId);
+
+      // B bootstraps off the LEGACY bundle. The generation it records therefore
+      // names the bundle, which is what every pre-#91 pull wrote.
+      const boot = await w.pullOnB();
+      expect(boot.success).toBe(true);
+      expect((boot as HubPullResult).workspaceUnpacked).not.toBeNull();
+      expect(readSyncState(w.projectB).hub?.lastWorkspace?.file).toBe(first.file);
+      expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines());
+
+      // Both machines now edit the same file in places that merge cleanly.
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      const second = await w.pushFromA();
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      // THE MERGE RAN. Reaching the ancestor meant reading a LEGACY bundle
+      // through the same code that reads a split artifact; applying the payload
+      // meant reading the artifact. Either reader missing its other shape shows
+      // up here as a skip, which writes nothing and looks like success.
+      expect(p.workspaceMerge).toBeDefined();
+      expect(p.workspaceMerge?.merged ?? []).toContain("shared.txt");
+      expect(p.workspaceMerge?.conflicted ?? []).toEqual([]);
+      const merged = readFileSync(join(w.projectB, "shared.txt"), "utf-8");
+      expect(merged).toContain("A-EDIT");
+      expect(merged).toContain("B-EDIT");
+
+      // ...and the generation B now holds names the ARTIFACT, so the NEXT pull
+      // can reach it. Identity is still the bundle id: the split moved where
+      // the tree lives, not what names it.
+      const gen = readSyncState(w.projectB).hub?.lastWorkspace;
+      expect(gen?.bundleId).toBe(second.bundleId);
+      expect(gen?.file).toMatch(/\/workspaces\//);
+      expect(gen?.file).not.toBe(first.file);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("a split workspace artifact missing from the hub warns and writes nothing (#91)", async () => {
+    // The transcripts are the point of a pull and the tree is the optional
+    // half, so an artifact that cannot be retrieved must cost the workspace and
+    // nothing else. Since the split, a bundle and its snapshot are separate hub
+    // files that can go missing independently — a compaction ran, or a synced
+    // folder has only delivered one of them so far.
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    try {
+      const first = await soleBundle(w.hub, w.projectId);
+      const manifest = await readHubBundleManifest(w.hub, w.projectId, first.bundleId);
+      const artifact = manifest.workspace.file as string;
+      rmSync(join(w.hub, ...artifact.split("/")), { force: true });
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      // The sessions arrived; only the optional half was lost.
+      expect(p.importedSessions).toHaveLength(1);
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(p.workspaceDeclaredMissing).toBe(true);
+      // The warning NAMES the file, because "somewhere on the hub" is not
+      // something a user can go and look at.
+      const said = p.warnings.join(" ");
+      expect(said).toContain(artifact);
+      expect(said).toMatch(/no longer on the hub|not yet synced/i);
+
+      // Nothing was applied, so nothing is recorded as applied: a generation
+      // this tree never held would make the next merge read the whole payload
+      // as "deleted here" and withhold it permanently.
+      expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeUndefined();
+      expect(readdirSync(w.projectB).sort()).toEqual([".sesh-mover-project.json"]);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("refuses a workspace pointer aimed outside the pushing machine's own hub directory (#91)", async () => {
+    // The hub is a plain directory, so a manifest is peer-supplied data. This
+    // pointer is the ONE workspace field that becomes a path on the puller, so
+    // it is held to a rule the pushing machine always satisfies: a bundle may
+    // only point at a snapshot in its OWN machine's workspace directory.
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    try {
+      const first = await soleBundle(w.hub, w.projectId);
+      const manifest = await readHubBundleManifest(w.hub, w.projectId, first.bundleId);
+      const artifact = manifest.workspace.file as string;
+
+      // A perfectly good, perfectly unpackable artifact — parked under ANOTHER
+      // machine's directory. Without the containment check the pull fetches and
+      // applies it, so this fixture distinguishes the check from the ordinary
+      // "file isn't there" degradation.
+      const elsewhere = `projects/${w.projectId}/workspaces/some-other-machine/planted.tar.gz`;
+      const backend = createFsBackend(w.hub);
+      await backend.writeAtomic(elsewhere, await backend.read(artifact));
+      await mutateBundleTree(w.hub, w.projectId, first.bundleId, (dir) => {
+        const manifestPath = join(dir, "manifest.json");
+        const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+        m.workspace.file = elsewhere;
+        writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
+      });
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      expect(p.importedSessions).toHaveLength(1);
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.workspaceDeclaredMissing).toBe(true);
+      expect(p.warnings.join(" ")).toMatch(/owns/i);
+      // Nothing of the planted payload reached the project directory, and no
+      // generation was recorded for it.
+      expect(readdirSync(w.projectB).sort()).toEqual([".sesh-mover-project.json"]);
+      expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeUndefined();
+    } finally {
+      w.cleanup();
     }
   });
 });
