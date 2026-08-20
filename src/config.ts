@@ -38,6 +38,11 @@ export function getDefaultConfig(): SeshMoverConfig {
       carryDiff: true,
       carryMaxMb: DEFAULT_CARRY_MAX_MB,
       workspaceMaxMb: DEFAULT_WORKSPACE_MAX_MB,
+      // The local PREFERENCE for encryption at rest, not the switch — the
+      // authoritative one is `encrypt` in the hub's own hub.json. Present here
+      // and not only in the type for the reason `startupNotice` is: an absent
+      // key makes `configure --set hub.encrypt=true` fail outright.
+      encrypt: false,
     },
   };
 }

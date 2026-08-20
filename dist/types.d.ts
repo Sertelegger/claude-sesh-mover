@@ -304,6 +304,26 @@ export interface SeshMoverConfig {
         carryDiff: boolean;
         carryMaxMb: number;
         workspaceMaxMb: number;
+        /**
+         * This machine's PREFERENCE for encryption at rest. Default false.
+         *
+         * **It is not the switch.** The authoritative one is `encrypt` in the hub's
+         * own `hub.json`, because a local-only flag has a silent failure: one
+         * machine that never set it keeps pushing plaintext into a hub the user
+         * believes is sealed, and nothing anywhere says so. This key is what a
+         * future `hub encrypt --enable` writes THROUGH to the hub, and what
+         * `resolveHubEncryption` reports as `unappliedPreference` when it is on and
+         * the hub's is not.
+         *
+         * It must exist in `getDefaultConfig()` and not merely in this type:
+         * `setConfigValue` only accepts dot-paths that already exist in the
+         * defaults, so an absent key makes `configure --set hub.encrypt=true` fail
+         * outright.
+         *
+         * **Inert as of 0.9.0** — nothing encrypts a bundle yet. Setting it records
+         * an intention and changes no byte that leaves this machine.
+         */
+        encrypt: boolean;
     };
 }
 /**

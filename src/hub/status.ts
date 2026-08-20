@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { createFsBackend, type HubBackend } from "./backend.js";
 import { machinePath } from "./layout.js";
+import { listMachineIds } from "./machines.js";
 import { describeHubUnreachable, probeHubReachable } from "./preflight.js";
 import { resolveHubPath } from "./init.js";
 import { readLockStealRecord } from "./lock.js";
@@ -12,43 +13,22 @@ import { projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 import type { HubStatusResult } from "../types.js";
 
 /**
- * How many machines this hub knows about (#28) — `machines/<id>.json`, counted
- * the way `readAllIndexes` counts `index/<id>.json`, and for the identical
- * reason.
+ * How many machines this hub knows about (#28).
  *
- * `backend.list` walks RECURSIVELY and filters only `.tmp-` in a basename, so
- * `(await backend.list("machines")).length` was every file underneath
- * `machines/`. The hub is documented as a shared or synced directory, which
- * makes foreign entries the EXPECTED case rather than a hostile one: a
- * Syncthing `.stversions/` directory added one per RETAINED VERSION of a single
- * machine's record; a `.DS_Store`, a `Thumbs.db`, an editor swap file or a
- * `~syncthing~…tmp` each added one. The displayed count then said
- * more machines had joined the hub than ever had — silently, with no way for a
- * reader to tell.
+ * **The enumeration rule itself now lives in `machines.ts`**, shared with the
+ * recipient list (`encryption.ts`). It used to be private here, and the moment a
+ * second reader needed the same question the private copy became the kind of
+ * thing that ends up implemented twice: a hub where `hub status` says three
+ * machines and the recipient list encrypts to two is a hub where one machine
+ * silently cannot read anything. One rule, two callers.
  *
- * Immediate `.json` children only, deduped by the id the filename carries. The
- * dedupe is what a plain `.endsWith(".json")` filter would still get wrong on a
- * Dropbox conflict copy (`machines/<name>'s conflicted copy 2026-08-03/<id>.json`)
- * — that is nested, so the immediate-children rule already excludes it, and the
- * `seen` set is the belt for a future backend whose `list` is a flat prefix
- * listing over an object store with no real directories.
- *
- * Deliberately does NOT read or validate the files: this is a count for a
- * status line, and a machine record that is present but corrupt is still a
- * machine that joined. `isSafeSessionId` is not applied either — nothing here
- * turns the name into a path (contrast `readAllIndexes`, which does).
+ * What stays here is what is specific to a COUNT for a status line: the ids are
+ * neither read nor validated, because a machine record that is present but
+ * corrupt is still a machine that joined, and nothing here turns a name into a
+ * path (contrast `readMachineRecord`, which does and so checks).
  */
 async function countKnownMachines(backend: HubBackend): Promise<number> {
-  const prefix = "machines/";
-  const seen = new Set<string>();
-  for (const file of await backend.list("machines")) {
-    if (!file.startsWith(prefix)) continue;
-    const name = file.slice(prefix.length);
-    if (name.includes("/")) continue;
-    if (!name.endsWith(".json")) continue;
-    seen.add(name.slice(0, -".json".length));
-  }
-  return seen.size;
+  return (await listMachineIds(backend)).length;
 }
 
 /**
