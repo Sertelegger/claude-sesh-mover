@@ -15,6 +15,7 @@
     "./commands/configure.md",
     "./commands/hub-init.md",
     "./commands/hub-encrypt.md",
+    "./commands/hub-rekey.md",
     "./commands/hub-unlink.md",
     "./commands/hub-retire.md",
     "./commands/hub-delete.md",

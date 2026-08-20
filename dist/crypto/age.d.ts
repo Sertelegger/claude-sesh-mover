@@ -88,6 +88,11 @@
  *   hand-built. That is fiddly, not dangerous — see `bech32.ts`'s header for
  *   why key handling fails loudly.
  *
+ * A third stream, `AgeRewrapStream`, re-addresses an existing file to a new
+ * recipient set without decrypting it. It is deliberately the only thing in
+ * this module that touches a file key it did not generate, and it stays out of
+ * block #3 entirely — see its own header.
+ *
  * ---------------------------------------------------------------------------
  * Deliberate non-features
  * ---------------------------------------------------------------------------
@@ -217,6 +222,74 @@ export declare class AgeDecryptStream extends Transform {
     /** @param identity a raw 32-byte X25519 secret key (see `parseIdentity`). */
     constructor(identity: Uint8Array);
     /** Returns false while the header is still incomplete. Throws if it is wrong. */
+    private tryHeader;
+    _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback): void;
+    _flush(cb: TransformCallback): void;
+}
+/**
+ * Streaming RE-WRAPPER: replace an age file's header with one addressed to a
+ * new recipient set, and leave the payload ciphertext byte for byte alone.
+ *
+ * This is the whole of `hub rekey`'s cryptography, and what it does NOT do is
+ * why it exists. The file key is unwrapped and re-wrapped, never changed, so
+ * the payload key — HKDF over that same file key and the same payload nonce,
+ * both copied through untouched — is unchanged and every sealed chunk stays
+ * valid where it lies. No plaintext is produced, none is written to disk, and
+ * the cost is one header regardless of how large the bundle is.
+ *
+ * **It does not touch SECURITY-CRITICAL #3 at all.** No chunk is opened, no
+ * chunk is sealed, no nonce is constructed and the STREAM counter is never
+ * incremented, which is the property that keeps the silent block out of this
+ * path entirely. It does touch #1 and #2, and both of those fail loudly.
+ *
+ * Three consequences, each a decision rather than a side effect:
+ *
+ * - **The payload is copied, not authenticated.** Nothing here opens a chunk,
+ *   so damage inside the payload survives a re-wrap and is found by the reader
+ *   exactly as it would have been before. Authenticating would mean decrypting
+ *   the whole file, which is the cost this operation exists to avoid, and the
+ *   AEAD answers the question at read time either way. What IS checked is the
+ *   one thing a copy can get wrong on its own: a payload too short to be one
+ *   (see `_flush`).
+ * - **The header MAC is verified** — in `openHeader`, shared with the
+ *   decryptor, because emitting a fresh header over a tampered one would
+ *   launder it.
+ * - **The same file key reaches the new recipients.** A machine that already
+ *   unwrapped this file's key from the OLD header can still read the re-wrapped
+ *   file. Re-wrapping therefore GRANTS access and can never revoke it;
+ *   revocation would need a new file key, which is a full re-encryption and a
+ *   different operation.
+ */
+export declare class AgeRewrapStream extends Transform {
+    private pending;
+    /** How far the mark search has already looked; keeps the scan linear. */
+    private scannedTo;
+    private headerDone;
+    private stanzasSeen;
+    private payloadBytes;
+    private readonly identityRaw;
+    private readonly recipients;
+    /**
+     * @param identity a raw 32-byte X25519 secret key (see `parseIdentity`). It
+     *   must be a recipient of the file being re-wrapped; if it is not, the
+     *   stream fails with `no-matching-identity`, exactly as decryption would.
+     * @param recipients raw 32-byte X25519 public keys — the NEW set, in full.
+     *   This is not a list to add: the old stanzas are dropped, because a stanza
+     *   carries an ephemeral share and never the recipient's public key, so the
+     *   old set cannot be recovered and therefore cannot be preserved. An empty
+     *   list is refused for the same reason `AgeEncryptStream` refuses one.
+     */
+    constructor(identity: Uint8Array, recipients: readonly Uint8Array[]);
+    /**
+     * How many X25519 recipient stanzas the ORIGINAL header carried, or `null`
+     * until the header has been read.
+     *
+     * The only observable of a set that cannot be recovered. A caller compares it
+     * with the size of the new set to notice that a re-wrap NARROWED the
+     * readership — which is all that can be noticed, since *which* machines could
+     * read the file before is unanswerable from the file.
+     */
+    get previousRecipientStanzas(): number | null;
     private tryHeader;
     _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback): void;
     _flush(cb: TransformCallback): void;

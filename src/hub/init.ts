@@ -27,10 +27,11 @@ export function resolveHubPath(config: SeshMoverConfig): string | null {
  * push, not after it. Gate publication on `hub.encrypt` and enabling encryption
  * on machine A produces bundles readable only by A — machine B is absent from
  * the recipient list until its own next push, and A's bundles from that window
- * stay unreadable to B afterwards, because only A can re-wrap A's bundles
- * (per-machine ownership) and there is no rekey verb. Publishing on every
- * check-in is what makes enabling encryption later a switch rather than a flag
- * day.
+ * stay unreadable to B afterwards until A runs `hub rekey` — only A may re-wrap
+ * A's bundles (per-machine ownership), so the repair depends on A still
+ * existing. Publishing on every check-in is what makes enabling encryption
+ * later a switch rather than a flag day, and it is also what keeps that repair
+ * cheap instead of impossible.
  *
  * The cost is that a machine which has never encrypted anything mints a keypair
  * on its next ordinary push and publishes 62 characters beside the id, name,

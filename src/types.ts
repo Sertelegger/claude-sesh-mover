@@ -5,6 +5,7 @@
 // runtime, so neither creates a module cycle.
 import type { WorkspaceMergeReport } from "./hub/merge.js";
 import type { EncryptionRefusal, UnkeyedMachine } from "./hub/encryption.js";
+import type { BundleFetchFailureKind } from "./hub/bundle-io.js";
 import type { ApplyResult, CarryMeta } from "./payload/carry.js";
 
 // --- Platform ---
@@ -1309,6 +1310,84 @@ export interface HubEncryptionRefusedResult {
 }
 
 /**
+ * `hub rekey` — this machine re-addressed its OWN bundles to the hub's current
+ * recipient set.
+ *
+ * Everything here is per machine and per project, because that is the only
+ * scope in which the operation is defined: a machine may re-wrap the bundles it
+ * wrote and nobody else's, so "the hub has been rekeyed" is never a thing this
+ * result can say. A hub is fully rekeyed when every machine that ever pushed to
+ * it has run this — and a machine that no longer exists never will, which is
+ * the residual `warnings` names rather than hides.
+ *
+ * **Four disjoint lists, and a caller should read all four.** `rewrapped` is
+ * the work done; `skipped` is what was deliberately left (plaintext bundles,
+ * which cannot become ciphertext without changing their name); `failed` is what
+ * this machine could not open, which is the shape a lost or replaced identity
+ * takes; and `narrowed` is the one that reports a LOSS — a file that came out
+ * addressed to fewer machines than it went in.
+ */
+export interface HubRekeyResult {
+  success: true;
+  command: "hub-rekey";
+  projectId: string;
+  /** This machine. Its own files are the only ones in scope. */
+  machineId: string;
+  /** The set every re-wrapped file is now addressed to. */
+  recipients: Array<{ machineId: string; name: string | null }>;
+  /** Files considered: everything under this machine's bundle and workspace directories. */
+  scanned: number;
+  /** Hub-relative paths whose header was replaced. The names did not change. */
+  rewrapped: string[];
+  /**
+   * Files left exactly as they were, with why. `plaintext` is the only reason
+   * today, and it is not a failure: making a plaintext bundle encrypted renames
+   * it, and a rename is a hub-wide state change (every index records the name)
+   * that also has to delete the original — which belongs to retirement and to
+   * compaction, not here.
+   */
+  skipped: Array<{ file: string; reason: "plaintext" }>;
+  /**
+   * Files this machine could not re-address. `no-matching-identity` is the one
+   * to read carefully: those are this machine's OWN bundles, encrypted to a key
+   * it no longer holds. A rekey cannot recover them — it can only widen access
+   * to files it can already open — and nothing else can either.
+   */
+  failed: Array<{ file: string; reason: BundleFetchFailureKind; message: string }>;
+  /**
+   * Files whose recipient count went DOWN. A stanza carries an ephemeral share
+   * and never a public key, so which machines were dropped is not recoverable
+   * from the file — only how many. Reversible in principle: fix the roster and
+   * run this again.
+   */
+  narrowed: Array<{ file: string; before: number; after: number }>;
+  /** Registered machines the new headers could not be addressed to. */
+  unkeyedMachines: UnkeyedMachine[];
+  warnings: string[];
+}
+
+/**
+ * `hub rekey` refused before touching a single file.
+ *
+ * `encryption-refused` carries the same `refusal` discriminator a push does,
+ * minus `unkeyed-machines`: an un-keyed peer is a refusal for a push, whose
+ * bundle is written once, and a disclosure for a rekey, which is idempotent and
+ * can simply be run again once that machine publishes a key. See
+ * `checkSelfIsRecipient`.
+ */
+export interface HubRekeyRefusedResult {
+  success: false;
+  command: "hub-rekey";
+  reason: "unlinked" | "encryption-refused";
+  /** Present only for `encryption-refused`. Branch on it, never on the prose. */
+  refusal?: Exclude<EncryptionRefusal, "unkeyed-machines">;
+  error: string;
+  suggestion: string;
+  /** Present only for `encryption-refused` — the census as it was read. */
+  unkeyedMachines?: UnkeyedMachine[];
+}
+
+/**
  * `hub encrypt` — read the hub-wide switch, or turn it on.
  *
  * `enabled` is what `hub.json` says AFTER this command, so a plain
@@ -1602,7 +1681,8 @@ export interface HubNoSuchProjectResult {
  */
 export interface HubUnreachableResult {
   success: false;
-  command: "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-encrypt";
+  command:
+    | "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-encrypt" | "hub-rekey";
   reason: "hub-unreachable";
   /**
    * Which of the two shapes it is — an enum rather than prose, because the
@@ -1693,7 +1773,8 @@ export interface LockStealRecord {
 
 export interface HubLockBusyResult {
   success: false;
-  command: "push" | "pull" | "hub-unlink" | "hub-reindex" | "hub-retire" | "hub-delete";
+  command:
+    | "push" | "pull" | "hub-unlink" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-rekey";
   reason: "lock-busy";
   holderPid: number | null;
   ageSeconds: number | null;
@@ -2305,6 +2386,8 @@ export type CliResult =
   | NotYetSyncedResult
   | HubReindexResult
   | HubReindexFailedResult
+  | HubRekeyResult
+  | HubRekeyRefusedResult
   | HubEncryptResult
   | HubEncryptRefusedResult
   | HubEncryptionRefusedResult

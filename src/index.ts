@@ -48,6 +48,7 @@ export * from "./hub/push.js";
 export * from "./hub/whereis.js";
 export * from "./hub/pull.js";
 export * from "./hub/reindex.js";
+export * from "./hub/rekey.js";
 export * from "./hub/unlink.js";
 export * from "./hub/tombstone.js";
 export * from "./hub/retire.js";

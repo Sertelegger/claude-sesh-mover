@@ -1078,6 +1078,35 @@ hub
     }
   });
 
+// `hub rekey` re-addresses THIS machine's own encrypted bundles to the hub's
+// current recipient set — the answer to "a machine joined and cannot read
+// anything older than itself". No flags, deliberately: the recipient set is the
+// hub's roster and there is nothing here to choose. In particular there is no
+// --force-unkeyed, because an un-keyed peer is a disclosure rather than a
+// refusal for an operation that can simply be run again (src/hub/rekey.ts).
+hub
+  .command("rekey")
+  .description("Re-address this machine's own encrypted bundles on the hub to every machine registered now")
+  .option("--project-path <path>", "Override project path (default: cwd)")
+  .option("--source-config-dir <path>", "Override Claude config dir")
+  .action(async (opts) => {
+    try {
+      const configDir = resolveConfigDir(opts.sourceConfigDir);
+      const projectPath = opts.projectPath ?? process.cwd();
+      const config = loadEffectiveConfig(configDir, projectPath);
+      const { resolveHubPath } = await import("./hub/init.js");
+      const hubPath = resolveHubPath(config);
+      if (!hubPath) {
+        outputError("hub-rekey", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+        return;
+      }
+      const { hubRekey } = await import("./hub/rekey.js");
+      output(await hubRekey({ projectPath, hubPath }));
+    } catch (e) {
+      outputError("hub-rekey", e as Error);
+    }
+  });
+
 hub
   .command("reindex")
   .description("Rebuild this machine's hub index for the current project from its own bundles")

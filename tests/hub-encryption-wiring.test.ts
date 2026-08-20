@@ -1140,7 +1140,7 @@ describe("hub pull from a mixed hub", () => {
       expect(pull.error).toMatch(/identity\.age is unreadable \(malformed\)/);
       expect(pull.suggestion).toMatch(/different situation from not being one of its recipients/);
       // And NOT the other diagnosis, whose remedy lives on another machine.
-      expect(pull.suggestion ?? "").not.toMatch(/never re-wrapped in place/);
+      expect(pull.suggestion ?? "").not.toMatch(/Only the machine that wrote a bundle can re-address it/);
     } finally {
       restore.restore();
       for (const d of [homeA, homeB, hub, base]) rmSync(d, { recursive: true, force: true });
@@ -1366,7 +1366,11 @@ describe("hub pull from a mixed hub", () => {
       // The diagnosis a user can act on: not a recipient, distinct from having
       // no key at all, and permanent for this bundle.
       expect(pull.error).toMatch(/no identity matched any recipient stanza/);
-      expect(pull.suggestion).toMatch(/never re-wrapped in place/);
+      expect(pull.suggestion).toMatch(/Only the machine that wrote a bundle can re-address it/);
+      // And it names the cheap remedy, not only the expensive one: `hub rekey`
+      // on the writing machine re-addresses what is already there, where
+      // `push --full` re-uploads the whole thread.
+      expect(pull.suggestion).toMatch(/hub rekey/);
       // Nothing landed: B's project folder was never even created, because the
       // abort is taken before the first session is imported.
       expect(existsSync(join(configDirB, "projects", encodeProjectPath(projectB)))).toBe(false);

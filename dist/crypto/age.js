@@ -88,6 +88,11 @@
  *   hand-built. That is fiddly, not dangerous — see `bech32.ts`'s header for
  *   why key handling fails loudly.
  *
+ * A third stream, `AgeRewrapStream`, re-addresses an existing file to a new
+ * recipient set without decrypting it. It is deliberately the only thing in
+ * this module that touches a file key it did not generate, and it stays out of
+ * block #3 entirely — see its own header.
+ *
  * ---------------------------------------------------------------------------
  * Deliberate non-features
  * ---------------------------------------------------------------------------
@@ -426,6 +431,75 @@ function parseHeader(header) {
     }
     return { stanzas, upToMark, mac, payloadOffset: macLineEnd + 1 };
 }
+function scanForHeaderEnd(pending, scannedTo) {
+    // Search raw bytes rather than converting to a string: until the mark is
+    // found we do not know where the header ends, and stringifying the whole
+    // buffer on every write is quadratic in the size of the file.
+    const markIdx = pending.indexOf(HEADER_MARK, scannedTo);
+    if (markIdx === -1) {
+        if (pending.length > MAX_HEADER_BYTES) {
+            throw new AgeError("malformed-header", "no age header found within the header size limit");
+        }
+        return { done: false, scannedTo: Math.max(0, pending.length - (HEADER_MARK.length - 1)) };
+    }
+    const macLineEnd = pending.indexOf(LF, markIdx + 1);
+    if (macLineEnd === -1) {
+        if (pending.length > MAX_HEADER_BYTES) {
+            throw new AgeError("malformed-header", "header MAC line exceeds the header size limit");
+        }
+        // Deliberately NOT advanced past the mark: the next call re-finds the same
+        // one, which costs a bounded rescan and keeps this function's only state in
+        // its argument.
+        return { done: false, scannedTo };
+    }
+    return { done: true, macLineEnd };
+}
+/**
+ * Unwrap the file key from a complete header — AND VERIFY THE HEADER MAC.
+ *
+ * The MAC check is not defence in depth here, it is load-bearing for the second
+ * caller. A header whose stanzas have been edited still yields a file key to
+ * whichever stanza is genuinely ours, so a re-wrap that skipped the check would
+ * emit a freshly MAC'd header over that key and LAUNDER the tampered one: a
+ * file every reader refuses loudly (`header-mac-mismatch`) becomes a file that
+ * verifies. Sharing this function is what makes "the re-wrapper cannot forget"
+ * structural rather than a thing to remember.
+ *
+ * Returns the parse alongside the key because both callers need `payloadOffset`
+ * — one to derive the payload key, the other to know where the bytes it copies
+ * verbatim begin.
+ */
+function openHeader(header, identityRaw) {
+    const parsed = parseHeader(header);
+    let fileKey = null;
+    for (const s of parsed.stanzas) {
+        // §: "MUST ignore any stanza that does not have X25519 as the first
+        // argument". Enforcement, not politeness — rage emits a GREASE stanza on
+        // every file. See the file header.
+        if (s.args[0] !== "X25519" || s.args.length !== 2)
+            continue;
+        let share;
+        try {
+            share = unb64(s.args[1]);
+        }
+        catch {
+            continue;
+        }
+        const k = unwrapFileKey(share, s.body, identityRaw);
+        if (k) {
+            fileKey = k;
+            break;
+        }
+    }
+    if (!fileKey) {
+        throw new AgeError("no-matching-identity", "no identity matched any recipient stanza");
+    }
+    const expected = headerMac(fileKey, parsed.upToMark);
+    if (parsed.mac.length !== expected.length || !timingSafeEqual(parsed.mac, expected)) {
+        throw new AgeError("header-mac-mismatch", "header MAC mismatch");
+    }
+    return { fileKey, parsed };
+}
 // ===========================================================================
 // SECURITY-CRITICAL #3 — STREAM payload chunking. THE SILENT ONE.
 //
@@ -586,56 +660,16 @@ export class AgeDecryptStream extends Transform {
     tryHeader() {
         if (this.headerDone)
             return true;
-        // Search raw bytes rather than converting to a string: until the mark is
-        // found we do not know where the header ends, and stringifying the whole
-        // buffer on every write is quadratic in the size of the file.
-        const markIdx = this.pending.indexOf(HEADER_MARK, this.scannedTo);
-        if (markIdx === -1) {
-            this.scannedTo = Math.max(0, this.pending.length - (HEADER_MARK.length - 1));
-            if (this.pending.length > MAX_HEADER_BYTES) {
-                throw new AgeError("malformed-header", "no age header found within the header size limit");
-            }
-            return false;
-        }
-        const macLineEnd = this.pending.indexOf(LF, markIdx + 1);
-        if (macLineEnd === -1) {
-            if (this.pending.length > MAX_HEADER_BYTES) {
-                throw new AgeError("malformed-header", "header MAC line exceeds the header size limit");
-            }
+        const scan = scanForHeaderEnd(this.pending, this.scannedTo);
+        if (!scan.done) {
+            this.scannedTo = scan.scannedTo;
             return false;
         }
         // The payload nonce follows the header immediately and is needed to derive
         // the payload key, so the header is not "done" until it has arrived too.
-        if (this.pending.length < macLineEnd + 1 + PAYLOAD_NONCE_SIZE)
+        if (this.pending.length < scan.macLineEnd + 1 + PAYLOAD_NONCE_SIZE)
             return false;
-        const parsed = parseHeader(this.pending.subarray(0, macLineEnd + 1));
-        let fileKey = null;
-        for (const s of parsed.stanzas) {
-            // §: "MUST ignore any stanza that does not have X25519 as the first
-            // argument". Enforcement, not politeness — rage emits a GREASE stanza on
-            // every file. See the file header.
-            if (s.args[0] !== "X25519" || s.args.length !== 2)
-                continue;
-            let share;
-            try {
-                share = unb64(s.args[1]);
-            }
-            catch {
-                continue;
-            }
-            const k = unwrapFileKey(share, s.body, this.identityRaw);
-            if (k) {
-                fileKey = k;
-                break;
-            }
-        }
-        if (!fileKey) {
-            throw new AgeError("no-matching-identity", "no identity matched any recipient stanza");
-        }
-        const expected = headerMac(fileKey, parsed.upToMark);
-        if (parsed.mac.length !== expected.length || !timingSafeEqual(parsed.mac, expected)) {
-            throw new AgeError("header-mac-mismatch", "header MAC mismatch");
-        }
+        const { fileKey, parsed } = openHeader(this.pending.subarray(0, scan.macLineEnd + 1), this.identityRaw);
         const nonce = this.pending.subarray(parsed.payloadOffset, parsed.payloadOffset + PAYLOAD_NONCE_SIZE);
         this.payloadKey = hkdf(fileKey, nonce, PAYLOAD_INFO);
         this.pending = this.pending.subarray(parsed.payloadOffset + PAYLOAD_NONCE_SIZE);
@@ -676,6 +710,149 @@ export class AgeDecryptStream extends Transform {
             }
             if (plain.length > 0)
                 this.push(plain);
+            cb();
+        }
+        catch (e) {
+            cb(e);
+        }
+    }
+}
+/**
+ * Streaming RE-WRAPPER: replace an age file's header with one addressed to a
+ * new recipient set, and leave the payload ciphertext byte for byte alone.
+ *
+ * This is the whole of `hub rekey`'s cryptography, and what it does NOT do is
+ * why it exists. The file key is unwrapped and re-wrapped, never changed, so
+ * the payload key — HKDF over that same file key and the same payload nonce,
+ * both copied through untouched — is unchanged and every sealed chunk stays
+ * valid where it lies. No plaintext is produced, none is written to disk, and
+ * the cost is one header regardless of how large the bundle is.
+ *
+ * **It does not touch SECURITY-CRITICAL #3 at all.** No chunk is opened, no
+ * chunk is sealed, no nonce is constructed and the STREAM counter is never
+ * incremented, which is the property that keeps the silent block out of this
+ * path entirely. It does touch #1 and #2, and both of those fail loudly.
+ *
+ * Three consequences, each a decision rather than a side effect:
+ *
+ * - **The payload is copied, not authenticated.** Nothing here opens a chunk,
+ *   so damage inside the payload survives a re-wrap and is found by the reader
+ *   exactly as it would have been before. Authenticating would mean decrypting
+ *   the whole file, which is the cost this operation exists to avoid, and the
+ *   AEAD answers the question at read time either way. What IS checked is the
+ *   one thing a copy can get wrong on its own: a payload too short to be one
+ *   (see `_flush`).
+ * - **The header MAC is verified** — in `openHeader`, shared with the
+ *   decryptor, because emitting a fresh header over a tampered one would
+ *   launder it.
+ * - **The same file key reaches the new recipients.** A machine that already
+ *   unwrapped this file's key from the OLD header can still read the re-wrapped
+ *   file. Re-wrapping therefore GRANTS access and can never revoke it;
+ *   revocation would need a new file key, which is a full re-encryption and a
+ *   different operation.
+ */
+export class AgeRewrapStream extends Transform {
+    pending = Buffer.alloc(0);
+    /** How far the mark search has already looked; keeps the scan linear. */
+    scannedTo = 0;
+    headerDone = false;
+    stanzasSeen = null;
+    payloadBytes = 0;
+    identityRaw;
+    recipients;
+    /**
+     * @param identity a raw 32-byte X25519 secret key (see `parseIdentity`). It
+     *   must be a recipient of the file being re-wrapped; if it is not, the
+     *   stream fails with `no-matching-identity`, exactly as decryption would.
+     * @param recipients raw 32-byte X25519 public keys — the NEW set, in full.
+     *   This is not a list to add: the old stanzas are dropped, because a stanza
+     *   carries an ephemeral share and never the recipient's public key, so the
+     *   old set cannot be recovered and therefore cannot be preserved. An empty
+     *   list is refused for the same reason `AgeEncryptStream` refuses one.
+     */
+    constructor(identity, recipients) {
+        super();
+        assertKeySize(identity, "identity");
+        if (recipients.length === 0) {
+            throw new AgeError("no-recipients", "refusing to re-wrap to an empty recipient list");
+        }
+        this.identityRaw = Buffer.from(identity);
+        this.recipients = recipients.map((r) => {
+            assertKeySize(r, "recipient");
+            return Buffer.from(r);
+        });
+    }
+    /**
+     * How many X25519 recipient stanzas the ORIGINAL header carried, or `null`
+     * until the header has been read.
+     *
+     * The only observable of a set that cannot be recovered. A caller compares it
+     * with the size of the new set to notice that a re-wrap NARROWED the
+     * readership — which is all that can be noticed, since *which* machines could
+     * read the file before is unanswerable from the file.
+     */
+    get previousRecipientStanzas() {
+        return this.stanzasSeen;
+    }
+    tryHeader() {
+        if (this.headerDone)
+            return true;
+        const scan = scanForHeaderEnd(this.pending, this.scannedTo);
+        if (!scan.done) {
+            this.scannedTo = scan.scannedTo;
+            return false;
+        }
+        // Unlike the decryptor, this one does not wait for the payload nonce: it
+        // never derives a payload key, so those 16 bytes are just the first 16
+        // bytes of the copy.
+        const { fileKey, parsed } = openHeader(this.pending.subarray(0, scan.macLineEnd + 1), this.identityRaw);
+        this.stanzasSeen = parsed.stanzas.filter((s) => s.args[0] === "X25519").length;
+        this.push(buildHeader(fileKey, this.recipients));
+        this.pending = this.pending.subarray(parsed.payloadOffset);
+        this.headerDone = true;
+        return true;
+    }
+    _transform(chunk, _enc, cb) {
+        try {
+            this.pending = this.pending.length === 0 ? chunk : Buffer.concat([this.pending, chunk]);
+            if (!this.tryHeader())
+                return cb();
+            // Nothing is held back. The encryptor and the decryptor both hold a chunk
+            // until they know whether it is the last one, because the final flag
+            // lives in its nonce; here no nonce is built, so the payload is a byte
+            // stream with no structure to get wrong.
+            if (this.pending.length > 0) {
+                this.payloadBytes += this.pending.length;
+                this.push(this.pending);
+                this.pending = Buffer.alloc(0);
+            }
+            cb();
+        }
+        catch (e) {
+            cb(e);
+        }
+    }
+    _flush(cb) {
+        try {
+            if (!this.headerDone)
+                return cb(new AgeError("truncated", "truncated header"));
+            if (this.pending.length > 0) {
+                this.payloadBytes += this.pending.length;
+                this.push(this.pending);
+            }
+            // THE ONE INTEGRITY CHECK A COPY CAN MAKE ON ITS OWN, and its limits are
+            // worth stating because they are easy to over-read. A valid age payload
+            // is at minimum a 16-byte nonce plus one final chunk, which is at minimum
+            // a bare 16-byte tag; anything shorter cannot be a payload at all. That
+            // catches a source truncated to nothing — the shape a de-hydrated file on
+            // a synced share takes — and it does NOT catch a source truncated
+            // anywhere else, which only the AEAD can, at read time, on the machine
+            // that has the key. The caller replaces a file with what comes out of
+            // here, so refusing the one case that is decidable is worth the two
+            // comparisons.
+            if (this.payloadBytes < PAYLOAD_NONCE_SIZE + TAG_SIZE) {
+                return cb(new AgeError("truncated", "truncated payload: too short to be an age payload"));
+            }
             cb();
         }
         catch (e) {
