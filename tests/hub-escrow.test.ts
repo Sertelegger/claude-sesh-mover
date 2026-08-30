@@ -16,15 +16,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { homeEnv, overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 import { runCli } from "./helpers/run-cli.js";
 import {
   checkEscrowDestination,
   escrowRecordPath,
+  homeDirs,
   hubEscrow,
   type EscrowPassphraseInput,
 } from "../src/hub/escrow.js";
@@ -52,10 +53,25 @@ describe("hub escrow", () => {
   let project: string;
   let restore: HomeOverrideHandle;
 
+  /**
+   * REALPATH'd, on every side.
+   *
+   * `checkEscrowDestination` resolves the parent directory before it decides
+   * anything — deliberately, since a symlink named `~/safe` pointing into a
+   * repository would otherwise pass every check lexically — and it reports the
+   * resolved path, which is the one the bytes actually land at. On macOS
+   * `mkdtempSync(tmpdir())` hands back `/var/folders/…`, a symlink to
+   * `/private/var/folders/…`, so a fixture that keeps the lexical spelling
+   * compares the two spellings of the same directory and fails on macOS alone.
+   */
+  function scratch(prefix: string): string {
+    return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  }
+
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "sesh-escrow-home-"));
-    outside = mkdtempSync(join(tmpdir(), "sesh-escrow-out-"));
-    project = mkdtempSync(join(tmpdir(), "sesh-escrow-proj-"));
+    home = scratch("sesh-escrow-home-");
+    outside = scratch("sesh-escrow-out-");
+    project = scratch("sesh-escrow-proj-");
     restore = overrideHome(home);
   });
 
@@ -461,6 +477,25 @@ describe("hub escrow", () => {
       expect(v.ok).toBe(false);
       if (v.ok) return;
       expect(v.rule).toBe("inside-project");
+    });
+
+    /**
+     * The end-to-end effect of this — a user-scope store in an ancestor no
+     * longer reading as a project — can only be staged on Windows, where the
+     * temp root is under the profile, and staging it anywhere would mean
+     * writing `.sesh-mover` into the real home, which is the pollution that
+     * caused the failure in the first place. So what is pinned here is the
+     * property the fix rests on: the exemption consults BOTH spellings of
+     * home, and under an override they genuinely differ. Drop the
+     * `userInfo()` arm and this fails; the Windows job proves the consequence.
+     */
+    it("exempts both spellings of home, which an override makes differ", () => {
+      const dirs = homeDirs();
+      // `home` is this fixture's override, which is what homedir() now reports.
+      expect(dirs).toContain(home);
+      // And the OS's own answer, which no environment variable moved.
+      expect(dirs).toContain(realpathSync(userInfo().homedir));
+      expect(realpathSync(userInfo().homedir)).not.toBe(home);
     });
 
     it("refuses a destination inside any git work tree", () => {

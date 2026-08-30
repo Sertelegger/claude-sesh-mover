@@ -1798,10 +1798,20 @@ describe("cli", () => {
     it("errors when --to names an unknown peer", () => {
       const outputDir = join(tempDir, "cli-inc-unknown");
       mkdirSync(outputDir, { recursive: true });
+      // `--storage user` resolves against $HOME, so without this override the
+      // child creates `.sesh-mover` in the DEVELOPER'S REAL HOME — the hazard
+      // the runCli wrapper above already guards one spelling of. It is not
+      // only untidy: on Windows the temp root lives under the profile, so that
+      // stray user-scope directory becomes an ancestor of every other test's
+      // fixtures. It made 18 `hub escrow` destination assertions fail on the
+      // Windows runner and nowhere else.
+      const incHome = join(tempDir, "cli-inc-unknown-home");
+      mkdirSync(incHome, { recursive: true });
       let caught: { stdout: string; status: number } | null = null;
       try {
         runCli(
-          `export --scope all --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name inc-unknown --output "${outputDir}" --incremental --to nonexistent-peer`
+          `export --scope all --source-config-dir "${configDir}" --project-path /Users/testuser/Projects/testproject --storage user --format dir --name inc-unknown --output "${outputDir}" --incremental --to nonexistent-peer`,
+          homeEnv(incHome)
         );
       } catch (e) {
         const err = e as { stdout?: Buffer; status?: number };

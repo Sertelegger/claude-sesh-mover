@@ -72,7 +72,7 @@
  * their own shell and must never ask them in-chat.
  */
 import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -189,6 +189,41 @@ function realish(p) {
     }
 }
 /**
+ * Every directory that is a home on this machine, realpath'd.
+ *
+ * TWO answers, because they disagree and the disagreement is the bug. `homedir()`
+ * reads $HOME (or $USERPROFILE), so it MOVES whenever a test, a sandbox, a
+ * service manager or a shell relocates the environment; `userInfo().homedir` is
+ * the OS's own passwd/profile answer and does not move. `<home>/.sesh-mover` is
+ * the USER-scope export store rather than a project under EITHER spelling, so
+ * both are exempted below.
+ *
+ * This is a Windows problem and essentially only a Windows problem: the temp
+ * root lives UNDER the profile there, so with $HOME pointed elsewhere the real
+ * profile's user-scope store becomes an ancestor of every temp path and the
+ * whole tree reads as "inside a sesh-mover project". On Linux and macOS the
+ * temp root is not under the home and nothing notices. Measured: it turned all
+ * 18 destination assertions into `inside-project`, and it would do the same to
+ * any Windows user whose $HOME does not match their profile.
+ *
+ * Widening an exemption inside a security check is worth stating plainly: what
+ * stops it mattering is that the OTHER two markers still fire on the same
+ * directory. A home that genuinely is a project still carries
+ * `.sesh-mover-project.json`, which is checked unconditionally, and a home that
+ * is the invoking project is caught by the cwd rule.
+ */
+export function homeDirs() {
+    const dirs = [realish(homedir())];
+    try {
+        dirs.push(realish(userInfo().homedir));
+    }
+    catch {
+        // userInfo() throws when the uid has no passwd entry — containers and some
+        // CI images. homedir()'s answer is then the only one there is.
+    }
+    return dirs;
+}
+/**
  * Decide whether `outPath` is a safe place to put a passphrase-wrapped copy of
  * this machine's private key.
  *
@@ -227,7 +262,7 @@ export function checkEscrowDestination(outPath, ctx) {
         };
     }
     const chain = ancestors(dir);
-    const home = realish(homedir());
+    const homes = homeDirs();
     // Priority is fixed rather than "whichever ancestor is nearest": the rules
     // answer different questions and the most specific answer is the most useful
     // one to print, regardless of how deep the directory that triggered it was.
@@ -246,8 +281,9 @@ export function checkEscrowDestination(outPath, ctx) {
     const cwdReal = realish(resolve(ctx.cwd));
     const projectDir = chain.find((d) => existsSync(join(d, PROJECT_JSON_FILE_NAME)) ||
         // `~/.sesh-mover` is the USER-scope directory and is not a project. The
-        // marker only means "project" below the home directory.
-        (d !== home && existsSync(join(d, PROJECT_DIR_NAME))));
+        // marker only means "project" below a home directory — see homeDirs()
+        // for why "a home" is two answers rather than one.
+        (!homes.includes(d) && existsSync(join(d, PROJECT_DIR_NAME))));
     if (isInside(dir, cwdReal) || projectDir) {
         return {
             ok: false,

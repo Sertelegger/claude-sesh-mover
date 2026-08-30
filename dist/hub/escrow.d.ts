@@ -146,6 +146,31 @@ export interface HubEscrowOptions {
     logN?: number;
 }
 /**
+ * Every directory that is a home on this machine, realpath'd.
+ *
+ * TWO answers, because they disagree and the disagreement is the bug. `homedir()`
+ * reads $HOME (or $USERPROFILE), so it MOVES whenever a test, a sandbox, a
+ * service manager or a shell relocates the environment; `userInfo().homedir` is
+ * the OS's own passwd/profile answer and does not move. `<home>/.sesh-mover` is
+ * the USER-scope export store rather than a project under EITHER spelling, so
+ * both are exempted below.
+ *
+ * This is a Windows problem and essentially only a Windows problem: the temp
+ * root lives UNDER the profile there, so with $HOME pointed elsewhere the real
+ * profile's user-scope store becomes an ancestor of every temp path and the
+ * whole tree reads as "inside a sesh-mover project". On Linux and macOS the
+ * temp root is not under the home and nothing notices. Measured: it turned all
+ * 18 destination assertions into `inside-project`, and it would do the same to
+ * any Windows user whose $HOME does not match their profile.
+ *
+ * Widening an exemption inside a security check is worth stating plainly: what
+ * stops it mattering is that the OTHER two markers still fire on the same
+ * directory. A home that genuinely is a project still carries
+ * `.sesh-mover-project.json`, which is checked unconditionally, and a home that
+ * is the invoking project is caught by the cwd rule.
+ */
+export declare function homeDirs(): string[];
+/**
  * Decide whether `outPath` is a safe place to put a passphrase-wrapped copy of
  * this machine's private key.
  *
