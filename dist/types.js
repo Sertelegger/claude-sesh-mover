@@ -89,6 +89,8 @@ const REASON_EXIT_CODE = {
     // the caller that would.
     "encryption-refused": EXIT_REFUSED,
     "stale-machines": EXIT_REFUSED,
+    "escrow-refused": EXIT_REFUSED,
+    "escrow-verify-failed": EXIT_FAILED,
     // Environment-not-ready: same invocation, retry once the machine catches up.
     "hub-unreachable": EXIT_NOT_READY,
     "lock-busy": EXIT_NOT_READY,

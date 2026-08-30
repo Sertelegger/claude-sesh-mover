@@ -60,6 +60,26 @@ jobs:
           echo "7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50  /tmp/age.tgz" | sha256sum -c -
           tar xzf /tmp/age.tgz -C /tmp
           echo "/tmp/age" >> "$GITHUB_PATH"
+      # The PASSPHRASE half of the differential test (src/crypto/age.ts block
+      # #4, the scrypt escrow recipient) needs a pty, because `age` reads a
+      # passphrase from /dev/tty and nowhere else — there is no AGE_PASSPHRASE
+      # and a piped stdin is refused outright. tests/helpers/pty-run.py is that
+      # pty, and this step is here so the dependency is DECLARED rather than
+      # inherited from whatever the runner image happens to ship.
+      #
+      # It is not optional cover: SIX parameter defects in that block round-trip
+      # through our own code perfectly and reach a user as "my escrow passphrase
+      # doesn't work", during the recovery the feature exists for. Without
+      # python3 the whole scrypt matrix skips, and SESH_MOVER_REQUIRE_AGE makes
+      # that a failure rather than a quiet gap.
+      #
+      # Linux only, for the same reason as the age install: that is where the
+      # oracle lives. Windows has no pty of this kind at all, which is a stated
+      # gap in tests/helpers/age-oracle.ts and not something this step can fix.
+      - uses: actions/setup-python@v5
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          python-version: '3.12'
       - run: npm run lint
       - run: npm run build
       - name: dist freshness (committed dist/ must match src/)

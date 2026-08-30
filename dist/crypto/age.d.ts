@@ -94,6 +94,21 @@
  * block #3 entirely — see its own header.
  *
  * ---------------------------------------------------------------------------
+ * The fourth block, and why it does NOT widen the bundle path
+ * ---------------------------------------------------------------------------
+ *
+ * Block #4 is the scrypt (passphrase) recipient. It exists for ONE caller —
+ * `hub/escrow.ts`, which passphrase-wraps a copy of this machine's own
+ * `identity.age` — and no bundle, workspace artifact or hub file is ever
+ * addressed to a passphrase. That restraint is not tidiness: the age spec
+ * forbids mixing an scrypt stanza with X25519 ones ("An scrypt stanza, if
+ * present, MUST be the only stanza in the header"), and a hand-built mixed
+ * header was MEASURED against age 1.2.1 to read fine with `-i` and to be
+ * rejected only when someone reaches for the passphrase — i.e. only during the
+ * recovery the feature exists for. Both sides of block #4 therefore enforce
+ * "exactly one stanza" rather than tolerating a mix.
+ *
+ * ---------------------------------------------------------------------------
  * Deliberate non-features
  * ---------------------------------------------------------------------------
  *
@@ -103,8 +118,6 @@
  *   module, 2026-08-19; the spike measured 96.8 MB on its own). A convenience
  *   helper is how a whole-archive buffer gets reintroduced by someone who did
  *   not read this. Callers pipe.
- * - NO scrypt/passphrase recipient. That is separate security-critical code
- *   (work factor, params) and a separate decision, default off.
  * - NO armor, and no post-quantum X-Wing recipient.
  * - Nothing in this module runs at import time beyond constructing a handful of
  *   constant Buffers from hex/ASCII literals. No randomness, no filesystem, no
@@ -118,7 +131,16 @@ import { Transform, type TransformCallback } from "node:stream";
  * without string-matching a message. The abort behaviour is the same for all of
  * them; only the diagnosis differs.
  */
-export type AgeErrorCode = "no-recipients" | "bad-key" | "malformed-header" | "unsupported-version" | "no-matching-identity" | "header-mac-mismatch" | "payload-authentication-failed" | "truncated";
+export type AgeErrorCode = "no-recipients" | "bad-key" | "malformed-header" | "unsupported-version" | "no-matching-identity"
+/**
+ * The passphrase did not unwrap the file key. Distinct from
+ * `no-matching-identity` because the remedy is different and because six
+ * distinct PARAMETER defects in block #4 are indistinguishable from a wrong
+ * passphrase (measured against age 1.2.1) — so this code is what a caller
+ * must never present as a bare "wrong passphrase" without also saying that a
+ * mismatched work factor, salt or label looks exactly the same.
+ */
+ | "bad-passphrase" | "header-mac-mismatch" | "payload-authentication-failed" | "truncated";
 export declare class AgeError extends Error {
     readonly code: AgeErrorCode;
     constructor(code: AgeErrorCode, message: string);
@@ -167,6 +189,34 @@ interface ParsedHeader {
  */
 declare function parseHeader(header: Buffer): ParsedHeader;
 /**
+ * The work factor we WRITE, fixed at age 1.2.1's own constant (measured across
+ * three runs of `age -e -p`), so a file this module writes is indistinguishable
+ * from an age-written one.
+ *
+ * It is deliberately not a CLI option. **There is no minimum work factor** —
+ * logN 1, 2 and 10 all decrypt cleanly under `age`, so a silently weak file is
+ * accepted by every tool and the writer's choice is the only protection that
+ * exists. A flag would move that protection to whoever typed the command.
+ *
+ * Cost, so it is chosen rather than discovered: one derivation is a ~256 MiB
+ * transient allocation and ~0.5 s on the reference machine. That is acceptable
+ * ONLY because the single caller is one-time and attended; nothing on the
+ * unattended SessionEnd push path may ever call this.
+ */
+export declare const AGE_SCRYPT_LOG_N = 18;
+/**
+ * The largest work factor we will READ, matching age's own cap. Not a
+ * preference: 128 * 2^logN * r bytes is allocated to derive the key, so a file
+ * claiming logN 30 is a 1 TiB allocation request from a file this process was
+ * handed. age 1.2.1 rejects 23 with "scrypt work factor too large: 23"
+ * (measured); we reject it identically.
+ *
+ * Even at the cap this is expensive on purpose: logN 22 measured 4 GiB and
+ * 8.2 s on Node 22. A caller that accepts a file from anywhere but the user's
+ * own hands should be aware that it is buying that.
+ */
+export declare const AGE_SCRYPT_MAX_LOG_N = 22;
+/**
  * Streaming encryptor. Pipe into it; it emits a complete age v1 file.
  *
  *   const enc = new AgeEncryptStream(recipients);
@@ -184,6 +234,25 @@ declare function parseHeader(header: Buffer): ParsedHeader;
  * garbage-collected runtime that would be theatre — V8 may already have copied
  * the buffer — and pretending otherwise is worse than saying so here.
  */
+/**
+ * How a writer or reader names a passphrase. An object rather than a bare
+ * `Uint8Array` so it cannot be confused at a call site with a key: the two
+ * argument shapes below are discriminated structurally, and "the second
+ * argument happened to be bytes" is exactly the confusion that would address a
+ * bundle to a passphrase.
+ *
+ * The bytes are NOT copied and NOT zeroed here. Zeroing in a garbage-collected
+ * runtime is theatre — V8 may already have copied the buffer — and the same
+ * statement is made about the file key above. The caller owns the lifetime.
+ */
+export interface AgePassphraseTarget {
+    passphrase: Uint8Array;
+    /**
+     * Defaults to `AGE_SCRYPT_LOG_N`. A lower value exists so tests can run the
+     * shape without paying 0.5 s and 256 MiB per case; production passes nothing.
+     */
+    logN?: number;
+}
 export declare class AgeEncryptStream extends Transform {
     private pending;
     private counter;
@@ -198,6 +267,12 @@ export declare class AgeEncryptStream extends Transform {
      *   nothing if "encrypted to no one" is a silent success.
      */
     constructor(recipients: readonly Uint8Array[]);
+    /**
+     * Address the file to a PASSPHRASE instead (block #4). One caller only —
+     * `hub/escrow.ts`. Never a bundle: an scrypt stanza must be the only stanza,
+     * so a passphrase-addressed file is readable by NO machine key at all.
+     */
+    constructor(target: AgePassphraseTarget);
     private emitHeaderOnce;
     _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback): void;
     _flush(cb: TransformCallback): void;
@@ -219,8 +294,14 @@ export declare class AgeDecryptStream extends Transform {
     /** How far the mark search has already looked; keeps the scan linear. */
     private scannedTo;
     private readonly identityRaw;
+    private readonly passphrase;
     /** @param identity a raw 32-byte X25519 secret key (see `parseIdentity`). */
     constructor(identity: Uint8Array);
+    /**
+     * Open a PASSPHRASE-addressed file (block #4). The single-stanza rule is
+     * enforced, so this refuses a file that a key could also open.
+     */
+    constructor(target: AgePassphraseTarget);
     /** Returns false while the header is still incomplete. Throws if it is wrong. */
     private tryHeader;
     _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback): void;

@@ -102,7 +102,13 @@ export function readIdentityFile() {
     catch (e) {
         return { state: "unreadable", cause: "malformed", detail: e.message };
     }
-    return { state: "present", identity: secretLine, recipient, insecureMode: hasInsecureMode(p) };
+    return {
+        state: "present",
+        identity: secretLine,
+        recipient,
+        raw,
+        insecureMode: hasInsecureMode(p),
+    };
 }
 /**
  * Read this machine's identity, minting one on first use.

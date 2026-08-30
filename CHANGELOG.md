@@ -58,6 +58,68 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   from a refused bundle is applied while bundles applied earlier in the chain stay applied and
   recorded.
 
+- **Key escrow: `sesh-mover hub escrow` (`/sesh-mover:hub-escrow`), off by default ([#91]).** Encryption
+  at rest makes a lost key a permanent loss, and this is the answer to that: `--enable
+  --passphrase-stdin --out <path>` writes a passphrase-wrapped copy of **this machine's own**
+  `~/.sesh-mover/identity.age` to a path you name. Recovery is standard `age` and needs nothing from
+  this plugin — `age -d -i <escrow> <bundle>.tar.gz.age` reads a bundle directly (age accepts a
+  passphrase-encrypted file as an identity file), and `age -d <escrow> > ~/.sesh-mover/identity.age &&
+  chmod 600 ~/.sesh-mover/identity.age` restores the machine's identity.
+
+  > **The passphrase unwraps this machine's identity, which unwraps every hub bundle addressed to this
+  > machine — past and future — for anyone who learns it. A leak cannot be revoked:** `hub rekey`
+  > re-addresses bundles to a new roster but never changes a file key, so everything a leaked key could
+  > already read stays readable by it permanently. No command in this plugin, and none in age, takes
+  > that back.
+
+  **RECOVERY ONLY, and the distinction is not pedantry.** Restoring an escrow on a rebuilt machine
+  restores *that machine's own* identity, so no key moves anywhere. Using it to give a **different**
+  machine access does move one and collapses two machines into a single identity — revoking either then
+  revokes both, and per-machine revocation is why the identities are per-machine at all. For backfill,
+  `hub rekey` gives a machine the history without moving a key.
+
+  **The shape changed from the spec, because the spec's shape cannot be built.** The design was an
+  scrypt stanza alongside the X25519 ones on every bundle — one field, no key transported. The age spec
+  forbids that mix with a MUST, and a hand-built mixed header measured against age 1.2.1 reads fine
+  with `-i` and is **rejected** with a passphrase: it would work on every ordinary pull forever and fail
+  at exactly one moment, when someone reaches for the escrow passphrase, which is by definition after
+  the key is already lost. Escrowing the identity instead is one small file, one-time and attended, and
+  it changes nothing on the bundle path — `push`, `pull`, `rekey`, `retire` and `reindex` do not know
+  this file exists, and no bundle is ever addressed to a passphrase. What it gives up is the *no private
+  key is ever transported* property, which is the whole of the trade and why it is off by default.
+
+  **The passphrase is read from stdin, once, and from nowhere else.** Not a flag (shell history), not a
+  config key (plaintext beside what it protects), and not an environment variable — it leaks through
+  `/proc/<pid>/environ` and is inherited by every subprocess, including the `git` this plugin runs on
+  your project, since `gitChildEnv()` scrubs `GIT_*` and would pass anything else straight through to
+  git, its credential helper and its hooks. **It is also never collected in-chat**, which is the
+  dangerous obvious answer: a passphrase typed into a Claude Code session is written to the JSONL that
+  the default-on session-end auto-push then uploads, encrypted to a key that very passphrase unwraps.
+  The slash command prints a line to run in your own shell instead. Exactly one trailing newline is
+  stripped, so `printf '%s'` and `echo` agree and both match what `age` does with what you type at its
+  prompt; a newline in the middle, an empty passphrase, and a stdin that is a terminal are each refused
+  rather than read.
+
+  **`--out` is refused** when the containing directory does not exist (it is not created for you — a
+  typo would silently make one), when a file is already there, or when the destination is inside the
+  configured hub, inside a sesh-mover project, inside a git work tree, or under a directory that looks
+  like a cloud-sync folder by name or marker file. The parent is realpath'd first, so a symlink into a
+  repository cannot slip past. There is **no override flag**: a false positive is worked around by
+  writing elsewhere and moving the file yourself. And the limit is stated rather than implied away — it
+  matches directory names, marker files, git work trees, sesh-mover projects and the hub directory, and
+  **cannot** tell that your home directory, or any parent of it, is itself a synced folder, a network
+  mount, a backup target or a shared volume. That statement ships in a `limits` array on every result,
+  successes included, because a refusal that fires makes the check look more capable than it is.
+
+  The work factor is fixed at scrypt logN 18 (N = 262144, r = 8, p = 1), age 1.2.1's own constant, so
+  the file is indistinguishable from an age-written one. It is deliberately not configurable: there is
+  **no minimum** work factor in the format — logN 1 decrypts cleanly under `age`, measured — so a
+  silently weak escrow is accepted by every tool and the writer's choice is the only protection there
+  is. The read side caps logN at 22, matching age, because a file claiming logN 30 is a 1 TiB
+  allocation request. The escrow is written 0600 with `wx` and then **read back through the real reader
+  and compared** before success is reported; one that does not read back is removed and the command
+  fails, because that failure otherwise arrives during a recovery as "my passphrase doesn't work".
+
 ### Changed
 
 - `hub.encrypt` in config is no longer inert. It remains the local **preference** rather than the
