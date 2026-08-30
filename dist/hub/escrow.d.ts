@@ -168,6 +168,12 @@ export interface HubEscrowOptions {
  * directory. A home that genuinely is a project still carries
  * `.sesh-mover-project.json`, which is checked unconditionally, and a home that
  * is the invoking project is caught by the cwd rule.
+ *
+ * Exported for the same reason `checkEscrowDestination` is — a test can prove
+ * both spellings are consulted without staging a fake profile, which is the one
+ * thing that cannot work here (see the test). `src/index.ts` re-exports this
+ * module wholesale, so that also puts it on the library's public surface;
+ * deliberate rather than overlooked, and it is a pure function over `node:os`.
  */
 export declare function homeDirs(): string[];
 /**
