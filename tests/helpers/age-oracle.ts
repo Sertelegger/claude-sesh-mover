@@ -17,8 +17,9 @@
  * available exercise of the "ignore unrecognized stanzas" rule end to end.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { Readable, type Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -92,6 +93,132 @@ export function oracleDecrypt(bin: string, keyFile: string, encFile: string): Bu
 
 export function oracleEncrypt(bin: string, recipient: string, inFile: string, outFile: string): void {
   execFileSync(bin, ["-e", "-r", recipient, "-o", outFile, inFile], { stdio: ["ignore", "pipe", "pipe"] });
+}
+
+// ---------------------------------------------------------------------------
+// The PASSPHRASE oracle (crypto/age.ts block #4). Needs a pty; see below.
+// ---------------------------------------------------------------------------
+
+/**
+ * `age` reads a passphrase from `/dev/tty` and from nowhere else — no
+ * `AGE_PASSPHRASE`, and a piped stdin gets "standard input is not a terminal"
+ * (measured, age 1.2.1). So the two `oracle*` functions above cannot drive it,
+ * and the passphrase differential needs a real pty. `script(1)` is unavailable
+ * in some sandboxes; Python's `pty` module is the portable POSIX answer, and
+ * `tests/helpers/pty-run.py` is the whole of it.
+ *
+ * WINDOWS HAS NO PTY OF THIS KIND, so this half is POSIX-only by construction.
+ * That is a real gap and is stated rather than hidden: on Windows the scrypt
+ * shape is covered only by this repo's own round-trip, which is exactly the
+ * test a symmetric parameter defect survives.
+ */
+const PYTHON = process.platform === "win32" ? null : which("python3");
+
+const PTY_RUNNER = join(import.meta.dirname, "pty-run.py");
+
+/**
+ * A pty is available. Exported on its own because one caller needs a pty and
+ * no oracle: `hub escrow` must REFUSE when stdin is a terminal rather than
+ * echoing the passphrase, and the only way to hand a child a terminal is this.
+ */
+export const HAVE_PTY = PYTHON !== null;
+
+/** Both halves present: an age implementation AND a way to answer its prompt. */
+export const HAVE_PASSPHRASE_ORACLE = HAVE_ORACLE && PYTHON !== null;
+
+/**
+ * The same contract as `announceOracleAvailability`, for the same measured
+ * reason (vitest swallows `console.error` even from module scope), and with one
+ * extra case: the oracle binary is there and `python3` is not. That is the
+ * silent-skip this repo has already been bitten by, so under
+ * `SESH_MOVER_REQUIRE_AGE=1` it is a hard failure rather than a banner.
+ */
+export function announcePassphraseOracleAvailability(): void {
+  if (HAVE_PASSPHRASE_ORACLE) return;
+  const why =
+    !HAVE_ORACLE
+      ? "no age/rage binary"
+      : process.platform === "win32"
+        ? "Windows has no pty for this"
+        : "python3 is missing";
+  const message =
+    "\n*** THE PASSPHRASE DIFFERENTIAL IS SKIPPED (" +
+    why.padEnd(31) +
+    ") ***\n" +
+    "*** age reads passphrases from /dev/tty only, so this half needs a pty ***\n" +
+    "*** driven by python3. Without it, SIX parameter defects in age.ts     ***\n" +
+    "*** block #4 round-trip through our own code perfectly and nothing     ***\n" +
+    "*** here would notice — they reach a user as 'my escrow passphrase     ***\n" +
+    "*** doesn't work', during the recovery it exists for.                  ***\n" +
+    "*** Set SESH_MOVER_REQUIRE_AGE=1 to make this a failure instead.       ***\n";
+  if (process.env.SESH_MOVER_REQUIRE_AGE === "1" && process.platform !== "win32") {
+    throw new Error(message);
+  }
+  process.stderr.write(message);
+}
+
+export interface PtyOracleRun {
+  /** The CHILD's exit code — from `waitpid`, never a pipeline's. */
+  status: number;
+  /** The child's terminal output, prompts included. */
+  transcript: string;
+}
+
+/**
+ * Run `argv` with a controlling terminal, answering `prompts` prompts with
+ * `input`. `prompts: 0` means "give it a tty and answer nothing", which is the
+ * shape a refusal test wants.
+ */
+export function runUnderPty(prompts: number, argv: string[], passphrase: string): PtyOracleRun {
+  const r = spawnSync(PYTHON!, [PTY_RUNNER, String(prompts), ...argv], {
+    input: passphrase,
+    encoding: "utf-8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return { status: r.status ?? -1, transcript: r.stderr ?? "" };
+}
+
+/**
+ * `age -d -o outFile encFile`, answering one passphrase prompt.
+ *
+ * Returns the status rather than throwing, because every caller here is asking
+ * "did the oracle accept this?" and a thrown exception makes "rejected" and
+ * "the harness broke" the same observation — which is precisely how the
+ * investigation's first harness reported ACCEPTED for impossible cases.
+ */
+export function oracleDecryptPassphrase(
+  bin: string,
+  passphrase: string,
+  encFile: string,
+  outFile: string
+): PtyOracleRun {
+  return runUnderPty(1, [bin, "-d", "-o", outFile, encFile], passphrase);
+}
+
+/** `age -e -p -o outFile inFile` — two prompts: the passphrase and its confirmation. */
+export function oracleEncryptPassphrase(
+  bin: string,
+  passphrase: string,
+  inFile: string,
+  outFile: string
+): PtyOracleRun {
+  return runUnderPty(2, [bin, "-e", "-p", "-o", outFile, inFile], passphrase);
+}
+
+/**
+ * `age -d -i identityFile encFile`, where `identityFile` is itself
+ * passphrase-encrypted. This is THE escrow claim: age documents a
+ * passphrase-encrypted age file as usable as an identity file, and this is the
+ * call that proves our escrow is one.
+ */
+export function oracleDecryptWithEncryptedIdentity(
+  bin: string,
+  passphrase: string,
+  identityFile: string,
+  encFile: string,
+  outFile: string
+): PtyOracleRun {
+  return runUnderPty(1, [bin, "-d", "-i", identityFile, "-o", outFile, encFile], passphrase);
 }
 
 /** Deterministic filler, so a failure is reproducible rather than a one-off. */

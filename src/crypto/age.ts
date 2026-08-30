@@ -94,6 +94,21 @@
  * block #3 entirely — see its own header.
  *
  * ---------------------------------------------------------------------------
+ * The fourth block, and why it does NOT widen the bundle path
+ * ---------------------------------------------------------------------------
+ *
+ * Block #4 is the scrypt (passphrase) recipient. It exists for ONE caller —
+ * `hub/escrow.ts`, which passphrase-wraps a copy of this machine's own
+ * `identity.age` — and no bundle, workspace artifact or hub file is ever
+ * addressed to a passphrase. That restraint is not tidiness: the age spec
+ * forbids mixing an scrypt stanza with X25519 ones ("An scrypt stanza, if
+ * present, MUST be the only stanza in the header"), and a hand-built mixed
+ * header was MEASURED against age 1.2.1 to read fine with `-i` and to be
+ * rejected only when someone reaches for the passphrase — i.e. only during the
+ * recovery the feature exists for. Both sides of block #4 therefore enforce
+ * "exactly one stanza" rather than tolerating a mix.
+ *
+ * ---------------------------------------------------------------------------
  * Deliberate non-features
  * ---------------------------------------------------------------------------
  *
@@ -103,8 +118,6 @@
  *   module, 2026-08-19; the spike measured 96.8 MB on its own). A convenience
  *   helper is how a whole-archive buffer gets reintroduced by someone who did
  *   not read this. Callers pipe.
- * - NO scrypt/passphrase recipient. That is separate security-critical code
- *   (work factor, params) and a separate decision, default off.
  * - NO armor, and no post-quantum X-Wing recipient.
  * - Nothing in this module runs at import time beyond constructing a handful of
  *   constant Buffers from hex/ASCII literals. No randomness, no filesystem, no
@@ -120,6 +133,7 @@ import {
   diffieHellman,
   hkdfSync,
   randomBytes,
+  scryptSync,
   timingSafeEqual,
   type KeyObject,
 } from "node:crypto";
@@ -177,6 +191,15 @@ export type AgeErrorCode =
   | "malformed-header"
   | "unsupported-version"
   | "no-matching-identity"
+  /**
+   * The passphrase did not unwrap the file key. Distinct from
+   * `no-matching-identity` because the remedy is different and because six
+   * distinct PARAMETER defects in block #4 are indistinguishable from a wrong
+   * passphrase (measured against age 1.2.1) — so this code is what a caller
+   * must never present as a bare "wrong passphrase" without also saying that a
+   * mismatched work factor, salt or label looks exactly the same.
+   */
+  | "bad-passphrase"
   | "header-mac-mismatch"
   | "payload-authentication-failed"
   | "truncated";
@@ -406,32 +429,54 @@ function headerMac(fileKey: Buffer, headerUpToMark: string): Buffer {
   return createHmac("sha256", macKey).update(headerUpToMark, "utf-8").digest();
 }
 
+/**
+ * Serialise ONE stanza: an argument line, then the base64 body.
+ *
+ * §Recipient stanza: the body is base64 wrapped at 64 columns and MUST end with
+ * a line SHORTER than 64 characters — so a body whose length is an exact
+ * multiple of 64 needs a trailing EMPTY line.
+ *
+ * Both stanza types this module writes have a 32-byte body (a 16-byte file key
+ * plus a 16-byte tag = 43 base64 characters), so both are always one short line
+ * and the wrap loop always takes the trivial path. It is written in the general
+ * form anyway, because the READ side must handle the general case (see the
+ * GREASE note in the file header) and a writer that hardcodes "one 43-character
+ * line" is a writer nobody can add a stanza type to.
+ *
+ * ONE COPY, shared by the X25519 writer and block #4's scrypt writer — the
+ * wrap rule is exactly the kind of detail two copies would come to disagree
+ * about, silently, in the direction of "our files are fine, other tools reject
+ * them".
+ */
+function stanzaText(args: readonly string[], body: Buffer): string {
+  const encoded = b64(body);
+  const lines: string[] = [];
+  for (let i = 0; i < encoded.length; i += STANZA_WRAP_COLUMNS) {
+    lines.push(encoded.slice(i, i + STANZA_WRAP_COLUMNS));
+  }
+  if (lines.length === 0 || lines[lines.length - 1]!.length === STANZA_WRAP_COLUMNS) {
+    lines.push("");
+  }
+  return `-> ${args.join(" ")}\n${lines.join("\n")}\n`;
+}
+
+/**
+ * Close a header: version line, the stanzas as given, the `---` mark and the
+ * MAC. The mark-but-not-the-space boundary lives here and nowhere else, which
+ * is what stops block #4 from acquiring a second, subtly different copy of it.
+ */
+function sealHeader(fileKey: Buffer, stanzas: string): Buffer {
+  const upToMark = `${VERSION_LINE}\n${stanzas}---`;
+  return Buffer.from(`${upToMark} ${b64(headerMac(fileKey, upToMark))}\n`, "utf-8");
+}
+
 function buildHeader(fileKey: Buffer, recipients: readonly Buffer[]): Buffer {
   let stanzas = "";
   for (const r of recipients) {
     const { share, body } = wrapFileKey(fileKey, r);
-    // §Recipient stanza: the body is base64 wrapped at 64 columns and MUST end
-    // with a line SHORTER than 64 characters — so a body whose length is an
-    // exact multiple of 64 needs a trailing EMPTY line.
-    //
-    // An X25519 body is the 16-byte file key plus a 16-byte tag = 32 bytes = 43
-    // base64 characters, so it is always one short line and the wrap loop below
-    // always takes the trivial path. It is written in the general form anyway,
-    // because the READ side must handle the general case (see the GREASE note
-    // in the file header) and a writer that hardcodes "one 43-character line"
-    // is a writer nobody can add a stanza type to.
-    const encoded = b64(body);
-    const lines: string[] = [];
-    for (let i = 0; i < encoded.length; i += STANZA_WRAP_COLUMNS) {
-      lines.push(encoded.slice(i, i + STANZA_WRAP_COLUMNS));
-    }
-    if (lines.length === 0 || lines[lines.length - 1]!.length === STANZA_WRAP_COLUMNS) {
-      lines.push("");
-    }
-    stanzas += `-> X25519 ${b64(share)}\n${lines.join("\n")}\n`;
+    stanzas += stanzaText(["X25519", b64(share)], body);
   }
-  const upToMark = `${VERSION_LINE}\n${stanzas}---`;
-  return Buffer.from(`${upToMark} ${b64(headerMac(fileKey, upToMark))}\n`, "utf-8");
+  return sealHeader(fileKey, stanzas);
 }
 
 interface ParsedHeader {
@@ -559,10 +604,185 @@ function openHeader(header: Buffer, identityRaw: Buffer): { fileKey: Buffer; par
   if (!fileKey) {
     throw new AgeError("no-matching-identity", "no identity matched any recipient stanza");
   }
+  verifyHeaderMac(fileKey, parsed);
+  return { fileKey, parsed };
+}
+
+/**
+ * ONE COPY of the MAC check, shared by both header openers. Extracted for the
+ * reason `openHeader`'s own doc gives: a reader that skips it can be handed a
+ * header whose stanzas were edited and still recover the file key from the one
+ * stanza that is genuinely ours. Block #4 gets the check by construction rather
+ * than by remembering to write it.
+ */
+function verifyHeaderMac(fileKey: Buffer, parsed: ParsedHeader): void {
   const expected = headerMac(fileKey, parsed.upToMark);
   if (parsed.mac.length !== expected.length || !timingSafeEqual(parsed.mac, expected)) {
     throw new AgeError("header-mac-mismatch", "header MAC mismatch");
   }
+}
+
+// ===========================================================================
+// SECURITY-CRITICAL #4 — the scrypt (passphrase) recipient stanza.
+//
+// Numbered last because it was added last. It sits HERE, between #2 and #3,
+// because it is a header concern like the two blocks above it and touches
+// nothing below the mark: a passphrase-addressed file has the same file key,
+// the same payload nonce and the same STREAM chunking as any other age file.
+// ===========================================================================
+
+/**
+ * §The scrypt recipient type:
+ *
+ *   -> scrypt <base64(salt)> <logN>
+ *   <base64(ChaCha20-Poly1305(scrypt(...), file key))>
+ *
+ *   scrypt salt = "age-encryption.org/v1/scrypt" || salt   (16 random bytes)
+ *   wrap key    = scrypt(passphrase, that, N = 2^logN, r = 8, p = 1, len = 32)
+ *   body        = ChaCha20-Poly1305(key = wrap key, plaintext = file key)
+ *
+ * with the same all-zero 12-byte nonce as #1, safe for the same reason: the
+ * salt is fresh, so the wrap key is used for exactly one encryption.
+ *
+ * WHAT MAKES THIS BLOCK DANGEROUS IS NOT THAT IT FAILS — it is HOW it fails.
+ * Measured against age 1.2.1: SIX distinct parameter defects here (a
+ * one-character label typo, an unprefixed salt, r, p, the nonce, a logN that
+ * disagrees with the N actually used) reach the user as *"the passphrase does
+ * not work"*, which is the least debuggable message there is, arriving at the
+ * one moment the user has no other copy of the key. That is why the parameter
+ * matrix in `tests/crypto-age-mutations.test.ts` is not optional and why every
+ * constant below is spelled once.
+ */
+const SCRYPT_LABEL = Buffer.from("age-encryption.org/v1/scrypt", "utf-8");
+const SCRYPT_SALT_SIZE = 16;
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const SCRYPT_DK_LEN = 32;
+
+/**
+ * The work factor we WRITE, fixed at age 1.2.1's own constant (measured across
+ * three runs of `age -e -p`), so a file this module writes is indistinguishable
+ * from an age-written one.
+ *
+ * It is deliberately not a CLI option. **There is no minimum work factor** —
+ * logN 1, 2 and 10 all decrypt cleanly under `age`, so a silently weak file is
+ * accepted by every tool and the writer's choice is the only protection that
+ * exists. A flag would move that protection to whoever typed the command.
+ *
+ * Cost, so it is chosen rather than discovered: one derivation is a ~256 MiB
+ * transient allocation and ~0.5 s on the reference machine. That is acceptable
+ * ONLY because the single caller is one-time and attended; nothing on the
+ * unattended SessionEnd push path may ever call this.
+ */
+export const AGE_SCRYPT_LOG_N = 18;
+
+/**
+ * The largest work factor we will READ, matching age's own cap. Not a
+ * preference: 128 * 2^logN * r bytes is allocated to derive the key, so a file
+ * claiming logN 30 is a 1 TiB allocation request from a file this process was
+ * handed. age 1.2.1 rejects 23 with "scrypt work factor too large: 23"
+ * (measured); we reject it identically.
+ *
+ * Even at the cap this is expensive on purpose: logN 22 measured 4 GiB and
+ * 8.2 s on Node 22. A caller that accepts a file from anywhere but the user's
+ * own hands should be aware that it is buying that.
+ */
+export const AGE_SCRYPT_MAX_LOG_N = 22;
+
+/**
+ * Derive the wrap key. Both directions go through this ONE function, which is
+ * the property that makes the parameter matrix meaningful: a defect here breaks
+ * writing and reading identically, so it is invisible to a self-round-trip and
+ * only the real binary catches it.
+ *
+ * `maxmem` is passed EXPLICITLY and that is load-bearing, not defensive. Node's
+ * default is 32 MiB and the check is a refusal rather than an allocation
+ * ceiling, so every work factor from logN 15 up throws `ERR_CRYPTO_INVALID_SCRYPT_PARAMS`
+ * without it — including the one we write.
+ */
+function scryptWrapKey(passphrase: Uint8Array, salt: Buffer, logN: number): Buffer {
+  if (!Number.isInteger(logN) || logN < 1 || logN > AGE_SCRYPT_MAX_LOG_N) {
+    throw new AgeError("malformed-header", `scrypt work factor out of range: ${logN}`);
+  }
+  const n = 2 ** logN;
+  const maxmem = 128 * n * SCRYPT_R + 128 * SCRYPT_R * SCRYPT_P + (1 << 20);
+  return scryptSync(passphrase, Buffer.concat([SCRYPT_LABEL, salt]), SCRYPT_DK_LEN, {
+    N: n,
+    r: SCRYPT_R,
+    p: SCRYPT_P,
+    maxmem,
+  });
+}
+
+function buildScryptHeader(fileKey: Buffer, passphrase: Uint8Array, logN: number): Buffer {
+  const salt = randomBytes(SCRYPT_SALT_SIZE);
+  const wrapKey = scryptWrapKey(passphrase, salt, logN);
+  const c = createCipheriv("chacha20-poly1305", wrapKey, Buffer.alloc(12), {
+    authTagLength: TAG_SIZE,
+  });
+  const body = Buffer.concat([c.update(fileKey), c.final(), c.getAuthTag()]);
+  // `String(logN)` is plain decimal with no leading zeros, which is required
+  // and not merely conventional: age 1.2.1 rejects "018" outright with
+  // "scrypt work factor encoding invalid" (measured).
+  return sealHeader(fileKey, stanzaText(["scrypt", b64(salt), String(logN)], body));
+}
+
+/**
+ * Unwrap the file key from a passphrase-addressed header — and verify the MAC.
+ *
+ * The single-stanza rule is ENFORCED here, on the read side, even though this
+ * module is also the writer. It is not a check on our own output: it is the
+ * refusal to open a file that a KEY holder could also open, because such a file
+ * lets whoever holds that key author a payload the passphrase holder decrypts
+ * believing their passphrase authenticated it. age states the reason itself —
+ * "This is to uphold an expectation of authentication that is implicit in
+ * password-based encryption."
+ */
+function openHeaderWithPassphrase(
+  header: Buffer,
+  passphrase: Uint8Array
+): { fileKey: Buffer; parsed: ParsedHeader } {
+  const parsed = parseHeader(header);
+  if (parsed.stanzas.length !== 1) {
+    throw new AgeError("malformed-header", "an scrypt recipient must be the only one");
+  }
+  const s = parsed.stanzas[0]!;
+  if (s.args[0] !== "scrypt" || s.args.length !== 3) {
+    throw new AgeError("no-matching-identity", "this file is not addressed to a passphrase");
+  }
+  const salt = unb64(s.args[1]!);
+  if (salt.length !== SCRYPT_SALT_SIZE) {
+    throw new AgeError("malformed-header", "scrypt salt is not 16 bytes");
+  }
+  const logNText = s.args[2]!;
+  // Canonical decimal only — the same canonicity rule `unb64` applies to
+  // base64, and age applies it too.
+  if (!/^(?:0|[1-9][0-9]{0,8})$/.test(logNText)) {
+    throw new AgeError("malformed-header", "scrypt work factor encoding invalid");
+  }
+  const logN = Number(logNText);
+  if (logN > AGE_SCRYPT_MAX_LOG_N) {
+    throw new AgeError("malformed-header", `scrypt work factor too large: ${logN}`);
+  }
+  // Spec-mandated and the same partitioning-oracle mitigation as #1's, and it
+  // matters MORE here: the key is derived from a low-entropy secret, so an
+  // attacker crafting a body that opens under many passphrases is exactly the
+  // attack this length check closes.
+  if (s.body.length !== FILE_KEY_SIZE + TAG_SIZE) {
+    throw new AgeError("malformed-header", "scrypt stanza body is not 32 bytes");
+  }
+  const wrapKey = scryptWrapKey(passphrase, salt, logN);
+  const d = createDecipheriv("chacha20-poly1305", wrapKey, Buffer.alloc(12), {
+    authTagLength: TAG_SIZE,
+  });
+  d.setAuthTag(s.body.subarray(FILE_KEY_SIZE));
+  let fileKey: Buffer;
+  try {
+    fileKey = Buffer.concat([d.update(s.body.subarray(0, FILE_KEY_SIZE)), d.final()]);
+  } catch {
+    throw new AgeError("bad-passphrase", "the passphrase did not decrypt this file");
+  }
+  verifyHeaderMac(fileKey, parsed);
   return { fileKey, parsed };
 }
 
@@ -637,6 +857,26 @@ function openChunk(payloadKey: Buffer, counter: bigint, final: boolean, enc: Buf
  * garbage-collected runtime that would be theatre — V8 may already have copied
  * the buffer — and pretending otherwise is worse than saying so here.
  */
+/**
+ * How a writer or reader names a passphrase. An object rather than a bare
+ * `Uint8Array` so it cannot be confused at a call site with a key: the two
+ * argument shapes below are discriminated structurally, and "the second
+ * argument happened to be bytes" is exactly the confusion that would address a
+ * bundle to a passphrase.
+ *
+ * The bytes are NOT copied and NOT zeroed here. Zeroing in a garbage-collected
+ * runtime is theatre — V8 may already have copied the buffer — and the same
+ * statement is made about the file key above. The caller owns the lifetime.
+ */
+export interface AgePassphraseTarget {
+  passphrase: Uint8Array;
+  /**
+   * Defaults to `AGE_SCRYPT_LOG_N`. A lower value exists so tests can run the
+   * shape without paying 0.5 s and 256 MiB per case; production passes nothing.
+   */
+  logN?: number;
+}
+
 export class AgeEncryptStream extends Transform {
   private pending: Buffer = Buffer.alloc(0);
   private counter = 0n;
@@ -651,17 +891,35 @@ export class AgeEncryptStream extends Transform {
    *   readable by nobody, and the failure rule this module serves is worth
    *   nothing if "encrypted to no one" is a silent success.
    */
-  constructor(recipients: readonly Uint8Array[]) {
+  constructor(recipients: readonly Uint8Array[]);
+  /**
+   * Address the file to a PASSPHRASE instead (block #4). One caller only —
+   * `hub/escrow.ts`. Never a bundle: an scrypt stanza must be the only stanza,
+   * so a passphrase-addressed file is readable by NO machine key at all.
+   */
+  constructor(target: AgePassphraseTarget);
+  constructor(arg: readonly Uint8Array[] | AgePassphraseTarget) {
     super();
-    if (recipients.length === 0) {
-      throw new AgeError("no-recipients", "refusing to encrypt to an empty recipient list");
-    }
-    const raw = recipients.map((r) => {
-      assertKeySize(r, "recipient");
-      return Buffer.from(r);
-    });
     const fileKey = randomBytes(FILE_KEY_SIZE);
-    this.header = buildHeader(fileKey, raw);
+    if (Array.isArray(arg)) {
+      const recipients = arg as readonly Uint8Array[];
+      if (recipients.length === 0) {
+        throw new AgeError("no-recipients", "refusing to encrypt to an empty recipient list");
+      }
+      const raw = recipients.map((r) => {
+        assertKeySize(r, "recipient");
+        return Buffer.from(r);
+      });
+      this.header = buildHeader(fileKey, raw);
+    } else {
+      const target = arg as AgePassphraseTarget;
+      if (target.passphrase.length === 0) {
+        // An empty passphrase is the #4 analogue of an empty recipient list:
+        // age would happily read the file back, and everyone else could too.
+        throw new AgeError("no-recipients", "refusing to encrypt to an empty passphrase");
+      }
+      this.header = buildScryptHeader(fileKey, target.passphrase, target.logN ?? AGE_SCRYPT_LOG_N);
+    }
     this.payloadNonce = randomBytes(PAYLOAD_NONCE_SIZE);
     this.payloadKey = hkdf(fileKey, this.payloadNonce, PAYLOAD_INFO);
   }
@@ -718,13 +976,26 @@ export class AgeDecryptStream extends Transform {
   private headerDone = false;
   /** How far the mark search has already looked; keeps the scan linear. */
   private scannedTo = 0;
-  private readonly identityRaw: Buffer;
+  private readonly identityRaw: Buffer | null;
+  private readonly passphrase: Uint8Array | null;
 
   /** @param identity a raw 32-byte X25519 secret key (see `parseIdentity`). */
-  constructor(identity: Uint8Array) {
+  constructor(identity: Uint8Array);
+  /**
+   * Open a PASSPHRASE-addressed file (block #4). The single-stanza rule is
+   * enforced, so this refuses a file that a key could also open.
+   */
+  constructor(target: AgePassphraseTarget);
+  constructor(arg: Uint8Array | AgePassphraseTarget) {
     super();
-    assertKeySize(identity, "identity");
-    this.identityRaw = Buffer.from(identity);
+    if (ArrayBuffer.isView(arg)) {
+      assertKeySize(arg, "identity");
+      this.identityRaw = Buffer.from(arg);
+      this.passphrase = null;
+    } else {
+      this.identityRaw = null;
+      this.passphrase = arg.passphrase;
+    }
   }
 
   /** Returns false while the header is still incomplete. Throws if it is wrong. */
@@ -739,10 +1010,14 @@ export class AgeDecryptStream extends Transform {
     // the payload key, so the header is not "done" until it has arrived too.
     if (this.pending.length < scan.macLineEnd + 1 + PAYLOAD_NONCE_SIZE) return false;
 
-    const { fileKey, parsed } = openHeader(
-      this.pending.subarray(0, scan.macLineEnd + 1),
-      this.identityRaw
-    );
+    const header = this.pending.subarray(0, scan.macLineEnd + 1);
+    // Exactly one of the two is set — the constructor overloads guarantee it,
+    // and which one is set is the ONLY difference between the two readers. The
+    // payload below is opened identically either way, which is the point: block
+    // #3 stays one copy.
+    const { fileKey, parsed } = this.identityRaw
+      ? openHeader(header, this.identityRaw)
+      : openHeaderWithPassphrase(header, this.passphrase!);
     const nonce = this.pending.subarray(parsed.payloadOffset, parsed.payloadOffset + PAYLOAD_NONCE_SIZE);
     this.payloadKey = hkdf(fileKey, nonce, PAYLOAD_INFO);
     this.pending = this.pending.subarray(parsed.payloadOffset + PAYLOAD_NONCE_SIZE);

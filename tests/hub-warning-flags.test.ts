@@ -442,6 +442,39 @@ const REGISTRY: FlagUse[] = [
     },
   },
   {
+    file: "src/hub/escrow.ts",
+    match: "Enabling the escrow needs a passphrase, and the only way to supply one is --passphrase-stdin.",
+    klass: "retry-works",
+    why: "Nothing was written and nothing was recorded: the passphrase is validated before the identity is read, before the destination is checked and long before any file is created. The same command with the flag added reaches the work. It is the FIRST of the enable checks precisely so that the advice is always true.",
+    provenBy: {
+      test: "hub-escrow.test.ts",
+      name: "refuses to enable without --passphrase-stdin, and prints the shell recipe",
+      reruns: "hubEscrow",
+    },
+  },
+  {
+    file: "src/hub/escrow.ts",
+    match: "sesh-mover hub escrow --enable --passphrase-stdin --out <path>",
+    klass: "retry-works",
+    why: "The shell recipe, and it is the load-bearing sentence in this module — it is what keeps the passphrase out of the chat transcript that the SessionEnd auto-push then uploads. It appears in two refusals (no flag; stdin is a terminal) and neither writes anything, so running it is the remedy in both.",
+    provenBy: {
+      test: "hub-escrow.test.ts",
+      name: "refuses to enable without --passphrase-stdin, and prints the shell recipe",
+      reruns: "hubEscrow",
+    },
+  },
+  {
+    file: "src/hub/escrow.ts",
+    match: "--out is required: the escrow is written to a path you name.",
+    klass: "retry-works",
+    why: "Same shape: refused before anything is read or written, so the same command with --out added does the work. There is deliberately no default for it — a default would put a passphrase-wrapped private key somewhere the user did not choose.",
+    provenBy: {
+      test: "hub-escrow.test.ts",
+      name: "refuses --enable with no --out, and the same command with one added writes it",
+      reruns: "hubEscrow",
+    },
+  },
+  {
     file: "src/hub/merge.ts",
     match: "no-ancestor mode (unpack into an empty target, else skip unless --force-workspace)",
     klass: "descriptive",
@@ -913,6 +946,10 @@ const SURFACES: Record<string, string[]> = {
   // `hub encrypt`'s own verb, keyed by the sub-command name the CLI declares
   // (`.command("encrypt")`), not by "hub encrypt".
   "src/hub/encrypt.ts": ["encrypt"],
+  // `hub escrow`'s own verb, same keying rule. Every flag it names is one it
+  // declares itself — there is no cross-command advice here on purpose, since
+  // the whole point of the passphrase text is that ONE invocation may carry it.
+  "src/hub/escrow.ts": ["escrow"],
   "src/hub/push.ts": ["push"],
   "src/hub/reindex.ts": ["reindex"],
   "src/hub/rekey.ts": ["rekey"],

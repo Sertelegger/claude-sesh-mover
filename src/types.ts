@@ -6,6 +6,7 @@
 import type { WorkspaceMergeReport } from "./hub/merge.js";
 import type { EncryptionRefusal, UnkeyedMachine } from "./hub/encryption.js";
 import type { BundleFetchFailureKind } from "./hub/bundle-io.js";
+import type { EscrowRefusal, UnsafeOutRule } from "./hub/escrow.js";
 import type { ApplyResult, CarryMeta } from "./payload/carry.js";
 
 // --- Platform ---
@@ -1446,6 +1447,82 @@ export interface HubEncryptRefusedResult {
 }
 
 /**
+ * `hub escrow` — a passphrase-wrapped copy of this machine's own identity,
+ * default off. See `src/hub/escrow.ts` for what it is and is not.
+ *
+ * **No field here ever carries the passphrase or any key material.**
+ * `recipient` is the PUBLIC half (`age1…`), which is already published in this
+ * machine's hub record; `escrowPath` is a path the user typed. That is the
+ * whole of it, and `tests/hub-escrow.test.ts` asserts the serialized body
+ * contains neither the passphrase nor `AGE-SECRET-KEY`.
+ */
+export interface HubEscrowResult {
+  success: true;
+  command: "hub-escrow";
+  action: "status" | "enabled" | "disabled";
+  /** An escrow is recorded on this machine. `false` is the default state. */
+  enabled: boolean;
+  escrowPath: string | null;
+  /** The public key the escrowed identity corresponds to. Never the secret. */
+  recipient: string | null;
+  createdAt: string | null;
+  /** A file exists at `escrowPath` right now. */
+  filePresent: boolean;
+  /**
+   * That file begins like a passphrase-addressed age file. A SHAPE check, not a
+   * validation — telling whether an escrow still opens needs the passphrase,
+   * which no read-only path collects.
+   */
+  fileLooksLikeEscrow: boolean;
+  /**
+   * The escrow is for the identity this machine holds now. `null` when there is
+   * no escrow, or no readable identity to compare against.
+   */
+  current: boolean | null;
+  workFactorLogN: number | null;
+  /**
+   * The exact `age` commands that use this escrow, with the real paths filled
+   * in. Empty when there is no escrow to use.
+   *
+   * They are `age` commands and not `sesh-mover` ones on purpose: key loss and
+   * plugin loss must not be the same event as session loss, so a recovery step
+   * that needs this plugin installed is a recovery step that fails on a machine
+   * rebuilt from nothing. Spelled ONCE, in `escrowRecoverySteps`, so the CLI
+   * and the command doc cannot drift into telling a user two different things
+   * at the moment they have no way to check.
+   */
+  recovery: string[];
+  warnings: string[];
+  /**
+   * What the `--out` safety check cannot detect, stated on every result. It is
+   * on successes too, deliberately: a refusal that fires makes the check look
+   * more capable than it is, and that is exactly when a user concludes the next
+   * destination they pick must therefore be safe.
+   */
+  limits: string[];
+}
+
+/** `hub escrow` declined, or wrote nothing it could stand behind. */
+export interface HubEscrowRefusedResult {
+  success: false;
+  command: "hub-escrow";
+  /**
+   * `escrow-refused` is class 2 — understood and declined, nothing written.
+   * `escrow-verify-failed` is class 1: the escrow was written and did not read
+   * back, so it was removed. That is an internal failure, not a refusal, and it
+   * is worth its own code because it is the one failure that would otherwise
+   * reach the user during a recovery as "my passphrase doesn't work".
+   */
+  reason: "escrow-refused" | "escrow-verify-failed";
+  refusal?: EscrowRefusal;
+  error: string;
+  suggestion: string;
+  /** Only for `refusal: "unsafe-out"` — which rule fired, and on what path. */
+  unsafeOut?: { rule: UnsafeOutRule; path: string };
+  limits: string[];
+}
+
+/**
  * A push that threw AFTER the point where it could have linked this project.
  * Structurally an `ErrorResult` (`success: false`, `command: "push"`, `error`,
  * optional `details`/`suggestion`) with the link state added as FIELDS.
@@ -2390,6 +2467,8 @@ export type CliResult =
   | HubRekeyRefusedResult
   | HubEncryptResult
   | HubEncryptRefusedResult
+  | HubEscrowResult
+  | HubEscrowRefusedResult
   | HubEncryptionRefusedResult
   | ErrorResult;
 
@@ -2501,6 +2580,8 @@ const REASON_EXIT_CODE: Record<CliResultReason, ExitCode> = {
   // the caller that would.
   "encryption-refused": EXIT_REFUSED,
   "stale-machines": EXIT_REFUSED,
+  "escrow-refused": EXIT_REFUSED,
+  "escrow-verify-failed": EXIT_FAILED,
   // Environment-not-ready: same invocation, retry once the machine catches up.
   "hub-unreachable": EXIT_NOT_READY,
   "lock-busy": EXIT_NOT_READY,

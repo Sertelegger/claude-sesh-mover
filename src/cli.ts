@@ -51,6 +51,9 @@ import { PLUGIN_VERSION } from "./version.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
 import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
+// Type-only, so it is erased at compile time and costs the lazy-import
+// discipline in this file nothing.
+import type { EscrowPassphraseInput } from "./hub/escrow.js";
 import type {
   ExportLayer,
   ExportManifest,
@@ -1107,6 +1110,72 @@ hub
     }
   });
 
+// `hub escrow` writes a passphrase-wrapped copy of THIS machine's own identity
+// to a path the user names. Default off; a user who never asks never meets it.
+//
+// THE PASSPHRASE IS READ FROM STDIN AND FROM NOWHERE ELSE, and the three
+// alternatives are each excluded for a specific reason rather than by taste: a
+// flag lands in shell history, a config key sits in plaintext beside what it
+// protects, and an environment variable leaks through /proc AND is inherited by
+// every subprocess — including the `git` this plugin runs on user data, since
+// gitChildEnv() scrubs GIT_* and would pass anything else straight through to
+// git, its credential helper and its hooks.
+//
+// It is also NOT collected in-chat. A passphrase typed into a Claude Code
+// session is written to the JSONL that the default-on SessionEnd auto-push then
+// uploads — encrypted to a key that very passphrase unwraps. commands/
+// hub-escrow.md tells the user what to run in their own shell instead.
+//
+// Unlike the other hub verbs this one does NOT require a configured hub: it is
+// about a machine's key, not about a hub. The hub path is looked up only so the
+// --out check can refuse a destination inside it, and its absence is disclosed.
+hub
+  .command("escrow")
+  .description("Report, create or forget a passphrase-wrapped escrow of this machine's identity key")
+  .option("--enable", "Write the escrow. Requires --passphrase-stdin and --out")
+  .option("--disable", "Forget the recorded escrow. Does not delete the escrow file")
+  .option("--out <path>", "Where to write the escrow. No default, and it is refused if it looks unsafe")
+  .option("--passphrase-stdin", "Read the passphrase from standard input. The only way to supply one")
+  .option("--project-path <path>", "Override project path (default: cwd)")
+  .option("--source-config-dir <path>", "Override Claude config dir")
+  .action(async (opts) => {
+    try {
+      const configDir = resolveConfigDir(opts.sourceConfigDir);
+      const projectPath = opts.projectPath ?? process.cwd();
+      const config = loadEffectiveConfig(configDir, projectPath);
+      const { resolveHubPath } = await import("./hub/init.js");
+      const { hubEscrow } = await import("./hub/escrow.js");
+
+      if (opts.enable && opts.disable) {
+        outputError("hub-escrow", new Error("--enable and --disable are mutually exclusive"));
+        return;
+      }
+      const action = opts.enable ? "enable" : opts.disable ? "disable" : "status";
+
+      let passphrase: EscrowPassphraseInput = { kind: "not-requested" };
+      if (opts.passphraseStdin) {
+        // Refuse rather than read when stdin is a terminal: reading would echo
+        // the passphrase into the user's scrollback, and a `read -rs` in their
+        // own shell is what the doc tells them to use instead.
+        passphrase = process.stdin.isTTY
+          ? { kind: "terminal" }
+          : { kind: "given", bytes: await readPassphraseFromStdin() };
+      }
+
+      output(
+        await hubEscrow({
+          action,
+          outPath: opts.out,
+          passphrase,
+          cwd: projectPath,
+          hubPath: resolveHubPath(config),
+        })
+      );
+    } catch (e) {
+      outputError("hub-escrow", e as Error);
+    }
+  });
+
 hub
   .command("reindex")
   .description("Rebuild this machine's hub index for the current project from its own bundles")
@@ -1735,6 +1804,45 @@ function parseFormat(value: string): ExportFormat {
         `Invalid --format value: "${value}". Valid: dir, archive (tar.gz), zstd (tar.zst).`
       );
   }
+}
+
+/**
+ * Read an escrow passphrase from stdin. The ONE place a passphrase enters this
+ * process; see the comment on `hub escrow` for why every other channel is
+ * excluded.
+ *
+ * **Exactly one trailing newline is stripped**, and that is a compatibility
+ * decision rather than tidiness. `printf '%s'` sends no newline and `echo`
+ * sends one, so without this the same typed passphrase produces two different
+ * keys depending on how it was piped — and the mismatch would be discovered
+ * only during a recovery, as "my escrow passphrase doesn't work", with no other
+ * copy of the key. Stripping it also matches what `age` does with what you type
+ * at its own prompt, which is the tool recovery actually uses. A newline in the
+ * MIDDLE is refused further in (`hub/escrow.ts`) for the same reason: it could
+ * never be typed back at that prompt.
+ *
+ * Bounded, because stdin here is a pipe someone else can hold open: a
+ * passphrase is not a stream.
+ */
+async function readPassphraseFromStdin(): Promise<Buffer> {
+  const LIMIT = 4096;
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const c of process.stdin) {
+    const b = c as Buffer;
+    total += b.length;
+    if (total > LIMIT) {
+      throw new Error(
+        `Refusing to read more than ${LIMIT} bytes as a passphrase. ` +
+          "Pipe the passphrase itself, not a file."
+      );
+    }
+    chunks.push(b);
+  }
+  let bytes = Buffer.concat(chunks);
+  if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0a) bytes = bytes.subarray(0, -1);
+  if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0d) bytes = bytes.subarray(0, -1);
+  return bytes;
 }
 
 function loadEffectiveConfig(_configDir: string, projectDir: string) {

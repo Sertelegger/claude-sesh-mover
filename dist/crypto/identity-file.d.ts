@@ -97,6 +97,22 @@ export type IdentityFileState = {
     /** `age1…`, derived from the identity — never read from the file's comment. */
     recipient: string;
     /**
+     * The file's bytes exactly as they were read, for the one caller that
+     * must transport the FILE rather than the key it contains: the escrow
+     * (`hub/escrow.ts`) passphrase-wraps a copy, and age's own
+     * identity-file shape — comments and all — is what makes that copy
+     * usable as `age -d -i <escrow>` directly.
+     *
+     * It is here rather than obtained by a second `readFileSync` in the
+     * escrow so that the bytes escrowed are the same bytes that were
+     * validated. Two reads is a window in which a half-written file gets
+     * escrowed and reported as valid.
+     *
+     * As secret as `identity` and no more so — the same caution applies:
+     * never put this object in a result, a log or a JSON body.
+     */
+    raw: string;
+    /**
      * POSIX only: the file is readable by group or other. `false` on Windows,
      * where the mode bits mean nothing — see the header. Advisory: a caller
      * that acts on it should warn, not refuse, because refusing would turn a
