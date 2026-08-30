@@ -146,6 +146,31 @@ export interface HubEscrowOptions {
     logN?: number;
 }
 /**
+ * Canonicalize as far as the platform allows, degrading to the lexical path
+ * rather than throwing.
+ *
+ * `.native` FIRST, and on Windows that is the whole point. The JS
+ * implementation resolves symlinks but leaves an 8.3 SHORT NAME alone, so
+ * `os.tmpdir()`'s `C:\Users\RUNNER~1\AppData\Local\Temp` stays short while
+ * `userInfo().homedir` answers `C:\Users\runneradmin` — two spellings of one
+ * directory that no string comparison can reconcile. `realpathSync.native`
+ * asks the OS and gets the long form for both.
+ *
+ * EXPORTED, and one copy only. A test that compares against a path this module
+ * reports has to canonicalize it the same way, and a second copy of the rule
+ * in the fixture is precisely the disagreement being fixed here: the fixture
+ * used the JS `realpathSync`, kept `RUNNER~1`, and failed against a product
+ * that had correctly resolved it.
+ *
+ * Measured on the Windows runner, and it failed in BOTH directions, which is
+ * why this is a product fix and not a test one. The exemption for a home's
+ * user-scope store missed, so every temp path read as `inside-project`; and
+ * the invoking-project rule compares a chain-derived path against `cwd`, so
+ * the same mismatch would silently NOT fire it — a refusal that does not
+ * happen, which is the direction that matters.
+ */
+export declare function canonicalPath(p: string): string;
+/**
  * Every directory that is a home on this machine, realpath'd.
  *
  * TWO answers, because they disagree and the disagreement is the bug. `homedir()`

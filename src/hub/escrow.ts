@@ -278,6 +278,12 @@ function isInside(child: string, parent: string): boolean {
  * directory that no string comparison can reconcile. `realpathSync.native`
  * asks the OS and gets the long form for both.
  *
+ * EXPORTED, and one copy only. A test that compares against a path this module
+ * reports has to canonicalize it the same way, and a second copy of the rule
+ * in the fixture is precisely the disagreement being fixed here: the fixture
+ * used the JS `realpathSync`, kept `RUNNER~1`, and failed against a product
+ * that had correctly resolved it.
+ *
  * Measured on the Windows runner, and it failed in BOTH directions, which is
  * why this is a product fix and not a test one. The exemption for a home's
  * user-scope store missed, so every temp path read as `inside-project`; and
@@ -285,7 +291,7 @@ function isInside(child: string, parent: string): boolean {
  * the same mismatch would silently NOT fire it — a refusal that does not
  * happen, which is the direction that matters.
  */
-function realish(p: string): string {
+export function canonicalPath(p: string): string {
   try {
     return realpathSync.native(p);
   } catch {
@@ -337,9 +343,9 @@ const foldPath = (p: string): string =>
  * deliberate rather than overlooked, and it is a pure function over `node:os`.
  */
 export function homeDirs(): string[] {
-  const dirs = [realish(homedir())];
+  const dirs = [canonicalPath(homedir())];
   try {
-    dirs.push(realish(userInfo().homedir));
+    dirs.push(canonicalPath(userInfo().homedir));
   } catch {
     // userInfo() throws when the uid has no passwd entry — containers and some
     // CI images. homedir()'s answer is then the only one there is.
@@ -376,7 +382,7 @@ export function checkEscrowDestination(
         "directories at a path you named — a typo would silently make one.",
     };
   }
-  const dir = realish(parent);
+  const dir = canonicalPath(parent);
   const path = join(dir, basename(requested));
   if (existsSync(path)) {
     return {
@@ -397,7 +403,7 @@ export function checkEscrowDestination(
   // Priority is fixed rather than "whichever ancestor is nearest": the rules
   // answer different questions and the most specific answer is the most useful
   // one to print, regardless of how deep the directory that triggered it was.
-  const hubReal = ctx.hubPath ? realish(ctx.hubPath) : null;
+  const hubReal = ctx.hubPath ? canonicalPath(ctx.hubPath) : null;
   if (hubReal && isInside(dir, hubReal)) {
     return {
       ok: false,
@@ -411,7 +417,7 @@ export function checkEscrowDestination(
     };
   }
 
-  const cwdReal = realish(resolve(ctx.cwd));
+  const cwdReal = canonicalPath(resolve(ctx.cwd));
   const projectDir = chain.find(
     (d) =>
       existsSync(join(d, PROJECT_JSON_FILE_NAME)) ||
@@ -476,7 +482,7 @@ export function checkEscrowDestination(
   }
 
   const warnings: string[] = [];
-  if (isInside(dir, realish(userSeshMoverDir()))) {
+  if (isInside(dir, canonicalPath(userSeshMoverDir()))) {
     warnings.push(
       "The escrow is in ~/.sesh-mover, beside the identity file it copies. That is not a leak, " +
         "but it is not recovery either: anything that loses one loses both. An escrow earns its " +

@@ -16,13 +16,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { homeEnv, overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 import { runCli } from "./helpers/run-cli.js";
 import {
+  canonicalPath,
   checkEscrowDestination,
   escrowRecordPath,
   homeDirs,
@@ -63,9 +64,15 @@ describe("hub escrow", () => {
    * `mkdtempSync(tmpdir())` hands back `/var/folders/…`, a symlink to
    * `/private/var/folders/…`, so a fixture that keeps the lexical spelling
    * compares the two spellings of the same directory and fails on macOS alone.
+   *
+   * Through the PRODUCT'S OWN canonicalizer, not a local `realpathSync`. Two
+   * platforms rewrite these paths and they need different calls: macOS resolves
+   * a symlink, Windows expands an 8.3 short name, and only `.native` does the
+   * second. A fixture with its own copy of that rule got `RUNNER~1` where the
+   * product got `runneradmin` — the same class of disagreement twice over.
    */
   function scratch(prefix: string): string {
-    return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+    return canonicalPath(mkdtempSync(join(tmpdir(), prefix)));
   }
 
   beforeEach(() => {
@@ -494,8 +501,8 @@ describe("hub escrow", () => {
       // `home` is this fixture's override, which is what homedir() now reports.
       expect(dirs).toContain(home);
       // And the OS's own answer, which no environment variable moved.
-      expect(dirs).toContain(realpathSync(userInfo().homedir));
-      expect(realpathSync(userInfo().homedir)).not.toBe(home);
+      expect(dirs).toContain(canonicalPath(userInfo().homedir));
+      expect(canonicalPath(userInfo().homedir)).not.toBe(home);
     });
 
     it("refuses a destination inside any git work tree", () => {
