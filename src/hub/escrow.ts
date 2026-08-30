@@ -393,9 +393,15 @@ export function checkEscrowDestination(
       ok: false,
       rule: "inside-project",
       path,
+      // NAME THE DIRECTORY. Which ancestor tripped the rule is the only part
+      // the user can act on — "somewhere above you is a project" sends them
+      // hunting — and `looks-synced` below has always named its own. It is
+      // also the difference between diagnosing a cross-platform failure and
+      // guessing at it: this rule fires on an ancestor the caller never chose
+      // and, on Windows, may not know is above the temp root.
       detail: projectDir
-        ? "this is inside a sesh-mover project"
-        : "this is inside the project directory this command is running for",
+        ? `this is inside a sesh-mover project (${projectDir})`
+        : `this is inside the project directory this command is running for (${cwdReal})`,
       suggestion:
         "Put the escrow outside every project. A project's tree is what `push` uploads to the " +
         "hub — as a workspace snapshot when there is no git remote, and as a carry otherwise — " +
@@ -409,7 +415,7 @@ export function checkEscrowDestination(
       ok: false,
       rule: "inside-git-work-tree",
       path,
-      detail: "this is inside a git work tree",
+      detail: `this is inside a git work tree (${gitDir})`,
       suggestion:
         "Put the escrow outside every repository. One `git add -A` and one push and the escrow " +
         "is wherever that remote is, permanently and for everyone with read access — a dotfiles " +
@@ -428,7 +434,7 @@ export function checkEscrowDestination(
       ok: false,
       rule: "looks-synced",
       path,
-      detail: `an enclosing directory looks like a synced folder (${basename(synced)})`,
+      detail: `an enclosing directory looks like a synced folder (${synced})`,
       suggestion:
         "Put the escrow somewhere that is not uploaded anywhere. A synced folder hands the file " +
         "to a third party, which turns the escrow's strength into the strength of the " +

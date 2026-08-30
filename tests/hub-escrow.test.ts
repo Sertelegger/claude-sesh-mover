@@ -508,7 +508,11 @@ describe("hub escrow", () => {
       });
       expect(v.ok).toBe(false);
       if (v.ok) return;
-      expect(v.rule).toBe("inside-git-work-tree");
+      // The detail names the offending directory, so a rule that fires from an
+      // ancestor the fixture never chose says WHICH one rather than just which
+      // rule — the difference between diagnosing a platform-only failure and
+      // guessing at it.
+      expect(v.rule, v.detail).toBe("inside-git-work-tree");
     });
 
     it("refuses a directory that LOOKS synced, by name and by marker file", () => {
@@ -518,7 +522,7 @@ describe("hub escrow", () => {
         const v = checkEscrowDestination(join(d, "e.age"), { cwd: project, hubPath: null });
         expect(v.ok, `${name} was accepted`).toBe(false);
         if (v.ok) continue;
-        expect(v.rule).toBe("looks-synced");
+        expect(v.rule, v.detail).toBe("looks-synced");
       }
       const marked = join(outside, "unremarkable-name");
       mkdirSync(marked, { recursive: true });
@@ -526,7 +530,7 @@ describe("hub escrow", () => {
       const v = checkEscrowDestination(join(marked, "e.age"), { cwd: project, hubPath: null });
       expect(v.ok).toBe(false);
       if (v.ok) return;
-      expect(v.rule).toBe("looks-synced");
+      expect(v.rule, v.detail).toBe("looks-synced");
     });
 
     it.skipIf(!isPosix)("resolves the parent directory, so a symlink cannot slip past", () => {
