@@ -261,18 +261,50 @@ function ancestors(start: string): string[] {
 }
 
 function isInside(child: string, parent: string): boolean {
-  if (child === parent) return true;
-  return child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+  const c = foldPath(child);
+  const p = foldPath(parent);
+  if (c === p) return true;
+  return c.startsWith(p.endsWith(sep) ? p : p + sep);
 }
 
-/** `realpathSync` that degrades to the lexical path rather than throwing. */
+/**
+ * Canonicalize as far as the platform allows, degrading to the lexical path
+ * rather than throwing.
+ *
+ * `.native` FIRST, and on Windows that is the whole point. The JS
+ * implementation resolves symlinks but leaves an 8.3 SHORT NAME alone, so
+ * `os.tmpdir()`'s `C:\Users\RUNNER~1\AppData\Local\Temp` stays short while
+ * `userInfo().homedir` answers `C:\Users\runneradmin` — two spellings of one
+ * directory that no string comparison can reconcile. `realpathSync.native`
+ * asks the OS and gets the long form for both.
+ *
+ * Measured on the Windows runner, and it failed in BOTH directions, which is
+ * why this is a product fix and not a test one. The exemption for a home's
+ * user-scope store missed, so every temp path read as `inside-project`; and
+ * the invoking-project rule compares a chain-derived path against `cwd`, so
+ * the same mismatch would silently NOT fire it — a refusal that does not
+ * happen, which is the direction that matters.
+ */
 function realish(p: string): string {
   try {
-    return realpathSync(p);
+    return realpathSync.native(p);
   } catch {
-    return p;
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
   }
 }
+
+/**
+ * Windows path comparison is case-insensitive; POSIX is not, and folding case
+ * there would make `/home/Dev` and `/home/dev` the same directory when they
+ * are two. Belt-and-braces beside `realish` — the OS canonicalizes casing too,
+ * but only for a path that resolved.
+ */
+const foldPath = (p: string): string =>
+  process.platform === "win32" ? p.toLowerCase() : p;
 
 /**
  * Every directory that is a home on this machine, realpath'd.
@@ -386,7 +418,8 @@ export function checkEscrowDestination(
       // `~/.sesh-mover` is the USER-scope directory and is not a project. The
       // marker only means "project" below a home directory — see homeDirs()
       // for why "a home" is two answers rather than one.
-      (!homes.includes(d) && existsSync(join(d, PROJECT_DIR_NAME)))
+      (!homes.some((h) => foldPath(h) === foldPath(d)) &&
+        existsSync(join(d, PROJECT_DIR_NAME)))
   );
   if (isInside(dir, cwdReal) || projectDir) {
     return {
