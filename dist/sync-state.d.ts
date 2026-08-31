@@ -155,14 +155,24 @@ export interface ForgetSentResult {
  * every field it reaches is v1.
  *
  * @param opts.localSessionIds Forget only these sessions (compaction repair
- * knows exactly whose bundles it deleted). Omitted means the whole ledger — and
- * only the whole-ledger form drops `memoryDigest`, which is not per-session and
- * so has no targeted meaning.
+ * knows exactly whose bundles it deleted). Omitted means the whole ledger.
+ *
+ * @param opts.memoryDigest Drop the memory credit as well. It is not
+ * per-session, so the scoped form cannot infer it — but the scoped CALLER can
+ * know it, and `hub compact` does. The credit says "the hub already holds this
+ * exact memory directory", and it is true only for as long as the bundle
+ * carrying that copy is still on the hub. A compaction deletes exactly those
+ * bundles, so leaving the credit standing makes the consolidated bundle omit
+ * `memory/` while the only hub copy of it is being removed in the same run —
+ * and a machine bootstrapping from the consolidated root then never receives
+ * the project's memory at all, silently. The whole-ledger form still drops it
+ * unconditionally; this only lets a scoped caller ask for the same.
  */
 export declare function forgetSentToPeer(state: SyncState, peer: {
     id: string;
 }, opts?: {
     localSessionIds?: string[];
+    memoryDigest?: boolean;
 }): ForgetSentResult;
 export declare function getThreadId(state: SyncState, localSessionId: string): string | null;
 export declare function setThreadId(state: SyncState, hubId: string, localSessionId: string, threadId: string): void;
