@@ -2,7 +2,7 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
-## [0.10.0] — unreleased
+## [0.10.0] — 2026-08-31
 
 ### Added
 
@@ -120,12 +120,49 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   and compared** before success is reported; one that does not read back is removed and the command
   fails, because that failure otherwise arrives during a recovery as "my passphrase doesn't work".
 
+- **The workspace payload is now its own hub file, not a directory inside the bundle ([#91]).** A push
+  uploads the project tree beside the bundle rather than within it, so pulling a thread no longer
+  drags a whole workspace snapshot through the transfer when only the transcripts are wanted, and a
+  tree that cannot be retrieved is a skip rather than a failed pull — the transcripts are the point
+  of a pull and the tree is the optional half.
+
+  > **Nothing needs migrating and nothing goes stale.** Which shape a bundle uses is read from the
+  > artifact itself, never from config or a version number: a manifest that names a workspace file
+  > has one, and a manifest that does not carries the tree inside the bundle as every bundle written
+  > before this release does, permanently. An older plugin meeting a new bundle finds no workspace
+  > inside it and takes the already-shipped "declares a payload the bundle does not contain" path —
+  > it imports the sessions and skips the tree.
+
+- **`push --full`** re-sends every session in scope WHOLE, forgetting what the hub is recorded as
+  already holding. This is recovery for a hub that can no longer serve a chain — a missing base
+  bundle, a key that no machine can unwrap — where the incremental push would otherwise keep adding
+  continuations onto something unreadable. It is a **flag and never a config key**, so the unattended
+  session-end auto-push can never choose it: the cost is a whole transcript re-uploaded per session.
+
 ### Changed
 
 - `hub.encrypt` in config is no longer inert. It remains the local **preference** rather than the
   switch: the authoritative one is `encrypt` in the hub's own `hub.json`, so a machine that never set
   the preference still refuses to push plaintext into a sealed hub. A push whose preference is set on
   an unsealed hub now says so.
+
+### Fixed
+
+- **`hub escrow` refused safe destinations on Windows, and would have failed to refuse an unsafe one.**
+  The `--out` guard walks a path's ancestors, and it compared them using `fs.realpathSync`, a JS
+  implementation that resolves symlinks but leaves an 8.3 SHORT name alone — so `C:\Users\RUNNER~1\…`
+  never matched the `C:\Users\runneradmin` the OS reports. The loud half: a home's own user-scope
+  directory stopped being recognised, and paths under the temp root read as "inside a sesh-mover
+  project". The quiet half, which matters more: the same mismatch is used to test whether a
+  destination is inside the project being pushed, where it fails toward **not refusing**. Now
+  canonicalized with `realpathSync.native`, with case folded on Windows only.
+
+- **The same guard exempted the wrong home.** `os.homedir()` follows `$HOME`/`$USERPROFILE`, so any
+  relocation of the environment moved it; `os.userInfo().homedir` does not. Both are exempt now,
+  which matters for anyone whose `$HOME` does not match their Windows profile.
+
+- **Every `--out` refusal now names the directory responsible.** "This is inside a sesh-mover
+  project" gave no way to find which ancestor caused it.
 
 ### Unchanged, deliberately
 
