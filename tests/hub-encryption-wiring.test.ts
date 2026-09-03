@@ -66,6 +66,7 @@ import { projectSeshMoverDir, userSeshMoverDir } from "../src/paths.js";
 import { PLUGIN_VERSION } from "../src/version.js";
 import type {
   ErrorResult, HubEncryptRefusedResult, HubEncryptResult, HubPullResult, HubPushResult,
+  HubReindexResult,
 } from "../src/types.js";
 
 const CLAUDE_VERSION = "2.1.81";
@@ -102,7 +103,8 @@ function readHubJson(hub: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(hub, "hub.json"), "utf-8")) as Record<string, unknown>;
 }
 
-/** Every bundle file on the hub, hub-relative, in push order. */
+/** Every bundle file the machine INDEXES reference, hub-relative, in push
+ * order — a projection of the index files, never a listing of `bundles/`. */
 async function bundleFiles(hub: string, projectId: string): Promise<string[]> {
   const backend = createFsBackend(hub);
   const { indexes } = await readAllIndexes(backend, projectId);
@@ -131,6 +133,7 @@ describe("planBundleEncryption (pure)", () => {
     });
     expect(plan.kind).toBe("plaintext");
     expect(plan.kind === "plaintext" && plan.warnings).toEqual([]);
+    expect(plan.kind === "plaintext" && plan.uploadWarnings).toEqual([]);
   });
 
   it("an unapplied local preference is disclosed, never acted on", () => {
@@ -144,7 +147,12 @@ describe("planBundleEncryption (pure)", () => {
     // NOT "encrypt": a machine that encrypted unilaterally would push bundles
     // the rest of the hub cannot read.
     expect(plan.kind).toBe("plaintext");
-    expect(plan.kind === "plaintext" && plan.warnings.join(" ")).toMatch(/PLAINTEXT/);
+    // In `uploadWarnings`, not `warnings`: "this bundle went to the hub as
+    // PLAINTEXT" is a claim about the uploaded bundle, so the caller holds it
+    // until a bundle actually goes up — an upToDate push carries it nowhere
+    // (#96, and the CLI-level test below).
+    expect(plan.kind === "plaintext" && plan.uploadWarnings.join(" ")).toMatch(/PLAINTEXT/);
+    expect(plan.kind === "plaintext" && plan.warnings).toEqual([]);
   });
 
   it("refuses on an un-keyed machine, and --force-unkeyed proceeds while naming it", () => {
@@ -167,7 +175,9 @@ describe("planBundleEncryption (pure)", () => {
     });
     expect(forced.kind).toBe("encrypt");
     expect(forced.kind === "encrypt" && forced.recipients).toHaveLength(1);
-    expect(forced.kind === "encrypt" && forced.warnings.join(" ")).toMatch(/laptop/);
+    // An upload claim ("this bundle was encrypted WITHOUT…"), same rule as the
+    // unapplied-preference note: held until the push has something to upload.
+    expect(forced.kind === "encrypt" && forced.uploadWarnings.join(" ")).toMatch(/laptop/);
   });
 
   it("refuses when THIS machine holds no key, and --force-unkeyed does not override it", () => {
@@ -256,7 +266,10 @@ describe("planBundleEncryption (pure)", () => {
       forceUnkeyed: false,
     });
     expect(plan.kind).toBe("encrypt");
+    // In `warnings`, NOT `uploadWarnings`: the malformed value was read by this
+    // push whether or not it uploads, so an upToDate return may still carry it.
     expect(plan.kind === "encrypt" && plan.warnings.join(" ")).toMatch(/neither true nor false/);
+    expect(plan.kind === "encrypt" && plan.uploadWarnings).toEqual([]);
   });
 
   it("a refusal still carries the disclosures collected before it", () => {
@@ -305,7 +318,7 @@ describe("isEncryptionCapableVersion", () => {
 // ---------------------------------------------------------------------------
 
 describe("hub encrypt", () => {
-  it("reports without writing, then --enable seals the hub, preserves unknown fields, and says what enabling does NOT do", async () => {
+  it("a bare report still writes this machine's own record (never hub.json), then --enable seals the hub, preserves unknown fields, and says what enabling does NOT do", async () => {
     const home = mkdtempSync(join(tmpdir(), "sesh-enc-home-"));
     const hub = mkdtempSync(join(tmpdir(), "sesh-enc-hub-"));
     const restore = overrideHome(home);
@@ -755,6 +768,94 @@ describe("hub push into a sealed hub", () => {
   });
 
   /**
+   * The upToDate half of that disclosure (#96 finding 8). The warning is a
+   * past-tense claim about the uploaded bundle — "this bundle went to the hub
+   * as PLAINTEXT and nothing can change that after the fact" — and an upToDate
+   * push uploads nothing for it to be true of. It matters because the claim
+   * rides the default-on SessionEnd auto-push: before the hold, any machine
+   * with `hub.encrypt: true` pushing to an unsealed hub made that false
+   * statement at every session end, to a user who cannot see the context.
+   */
+  it("an upToDate push that uploads nothing makes no claim about a bundle", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-enc-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-enc-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-enc-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir, "projA");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+
+      // A push WITH content carries the claim — it is true of that bundle.
+      const first = (await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, noWorkspace: true,
+        claudeVersion: CLAUDE_VERSION, encryptPreference: true,
+      })) as HubPushResult;
+      expect(first.success).toBe(true);
+      expect(first.upToDate).toBe(false);
+      expect(first.warnings.join(" ")).toMatch(/went to the hub as PLAINTEXT/);
+
+      // The same push again with nothing new to send: same preference, same
+      // unsealed hub, no bundle. The claim must not survive the early return.
+      const again = (await hubPush({
+        configDir, projectPath, hubPath: hub, noWorkspace: true,
+        claudeVersion: CLAUDE_VERSION, encryptPreference: true,
+      })) as HubPushResult;
+      expect(again.success).toBe(true);
+      expect(again.upToDate).toBe(true);
+      expect(again.warnings.join(" ")).not.toMatch(/PLAINTEXT/);
+      expect(again.warnings.join(" ")).not.toMatch(/prefers encryption at rest/);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The counter-half that keeps the hold honest: the malformed-`encrypt` note
+   * is a fact about the push that just READ the value, not about an uploaded
+   * bundle, so the upToDate return still carries it. Holding the WHOLE plan's
+   * warnings would pass the test above and silently drop the one disclosure
+   * that explains why this hub is behaving as sealed.
+   */
+  it("an upToDate push still discloses a malformed hub.json encrypt value", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-enc-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-enc-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-enc-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir, "projA");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      const first = (await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, noWorkspace: true,
+        claudeVersion: CLAUDE_VERSION,
+      })) as HubPushResult;
+      expect(first.success).toBe(true);
+
+      // A hand-edited value that is neither true nor false. It resolves toward
+      // REQUIRED (encryption.ts), so this also pins that the malformed read is
+      // disclosed by a push that then uploads nothing under it.
+      const planted = readHubJson(hub);
+      planted.encrypt = "yes";
+      writeFileSync(join(hub, "hub.json"), JSON.stringify(planted, null, 2) + "\n");
+
+      const again = (await hubPush({
+        configDir, projectPath, hubPath: hub, noWorkspace: true, claudeVersion: CLAUDE_VERSION,
+      })) as HubPushResult;
+      expect(again.success).toBe(true);
+      expect(again.upToDate).toBe(true);
+      // Nothing was uploaded, so nothing was encrypted — but the malformed
+      // value was READ by this push, and that stays disclosed.
+      expect(again.bundleEncrypted).toBe(false);
+      expect(again.warnings.join(" ")).toMatch(/neither true nor false/);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
    * `hub reindex` REFUSES rather than skipping a bundle it cannot open, and the
    * distinction is the whole character of a repair tool: an index rebuilt
    * without this machine's own encrypted bundles references none of its work,
@@ -897,14 +998,32 @@ describe("hub push into a sealed hub", () => {
         await backend.delete(`projects/${first.projectId}/index/${i.machineId}.json`);
       }
 
-      const rebuilt = await hubReindex({ configDir, projectPath, hubPath: hub });
+      const rebuilt = (await hubReindex({
+        configDir, projectPath, hubPath: hub,
+      })) as HubReindexResult;
       expect(rebuilt.success).toBe(true);
-      // BOTH spellings parsed: a `BUNDLE_FILE_RE` that recognised only
-      // `.tar.gz` would silently drop half this machine's history from the very
-      // index it is repairing, and would report no error at all.
-      const files = await bundleFiles(hub, first.projectId);
-      expect(files.filter((f) => isEncryptedBundleFile(f))).toHaveLength(1);
-      expect(files.filter((f) => !isEncryptedBundleFile(f))).toHaveLength(1);
+      // BOTH spellings parsed, asserted on the REBUILT INDEX — the thing the
+      // repair writes — never on a listing of the hub directory, which a
+      // reindex does not touch and which stays mixed with the rebuild broken
+      // (#96 finding 10). A `BUNDLE_FILE_RE` that recognised only `.tar.gz`
+      // would silently drop half this machine's history from the very index it
+      // is repairing, and would report no error at all: `success` stays true,
+      // so the drop is visible only in the disclosure fields and in the index.
+      expect(rebuilt.projects).toEqual([
+        expect.objectContaining({ projectId: first.projectId, bundlesScanned: 2 }),
+      ]);
+      expect(rebuilt.unrecognizedBundleFiles).toBeUndefined();
+      expect(rebuilt.droppedBundles).toBeUndefined();
+      const { indexes: rebuiltIndexes } = await readAllIndexes(backend, first.projectId);
+      expect(rebuiltIndexes).toHaveLength(1);
+      const records = rebuiltIndexes.flatMap((i) =>
+        Object.values(i.threads).flatMap((t) => t.bundles)
+      );
+      expect(records.map((b) => b.bundleId).sort()).toEqual(
+        [first.bundleId, second.bundleId].sort()
+      );
+      expect(records.filter((b) => isEncryptedBundleFile(b.file))).toHaveLength(1);
+      expect(records.filter((b) => !isEncryptedBundleFile(b.file))).toHaveLength(1);
     } finally {
       restore.restore();
       for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });

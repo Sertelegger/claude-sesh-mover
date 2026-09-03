@@ -253,10 +253,24 @@ export function describeUnkeyed(u: UnkeyedMachine): string {
  *
  * Pure, and separate from `push.ts`, so the decision can be argued and tested
  * without a hub, an export and an archive around it.
+ *
+ * TWO warning arrays, split by what each sentence is true OF (#96). `warnings`
+ * holds facts about the push that just ran this decision — the malformed
+ * `encrypt` value — true whether or not anything is uploaded, so the caller
+ * may carry them on every outcome, the `upToDate` early return included.
+ * `uploadWarnings` holds the past-tense claims about the uploaded bundle
+ * itself ("went to the hub as PLAINTEXT", "was encrypted WITHOUT…"), which
+ * are FALSE of a push that uploads nothing — and the plaintext one rides the
+ * default-on SessionEnd auto-push, where a false claim reaches a user with no
+ * context to check it against. The caller appends them only on the branch
+ * that uploads. The refuse arm has no `uploadWarnings` because neither
+ * sentence can be minted on a refusing path: the unapplied preference implies
+ * an unsealed hub (the plaintext arm), and the force-unkeyed note exists only
+ * where that refusal was overridden.
  */
 export type BundleEncryptionPlan =
-  | { kind: "plaintext"; warnings: string[] }
-  | { kind: "encrypt"; recipients: string[]; warnings: string[] }
+  | { kind: "plaintext"; warnings: string[]; uploadWarnings: string[] }
+  | { kind: "encrypt"; recipients: string[]; warnings: string[]; uploadWarnings: string[] }
   | {
       kind: "refuse";
       refusal: EncryptionRefusal;
@@ -461,6 +475,7 @@ export function planBundleEncryption(input: {
 }): BundleEncryptionPlan {
   const { policy, census } = input;
   const warnings: string[] = [];
+  const uploadWarnings: string[] = [];
   if (policy.malformedSetting) {
     warnings.push(
       "This hub's hub.json has an `encrypt` value that is neither true nor false. It was read as ENCRYPTED, because a hand-edited `\"true\"` read the other way is a silent confidentiality loss and this direction is at worst a surprise on bundles you hold the keys to. Fix the value on the hub to settle it."
@@ -468,11 +483,13 @@ export function planBundleEncryption(input: {
   }
   if (!policy.required) {
     if (policy.unappliedPreference) {
-      warnings.push(
+      // An upload claim, not a policy note — the caller holds it until a
+      // bundle actually goes up (see the type's doc, #96).
+      uploadWarnings.push(
         "This machine prefers encryption at rest but this hub is not sealed, so this bundle went to the hub as PLAINTEXT and nothing can change that after the fact. The switch is hub-wide, not per machine — a machine that encrypted unilaterally would push bundles the rest of the hub cannot read. Seal the hub with `sesh-mover hub encrypt --enable` and later pushes from every machine are encrypted."
       );
     }
-    return { kind: "plaintext", warnings };
+    return { kind: "plaintext", warnings, uploadWarnings };
   }
 
   const self = checkSelfIsRecipient(input);
@@ -498,10 +515,10 @@ export function planBundleEncryption(input: {
         warnings,
       };
     }
-    warnings.push(
+    uploadWarnings.push(
       `--force-unkeyed: this bundle was encrypted WITHOUT ${census.unkeyed.length} registered machine(s), which therefore cannot read it — ${named.join("; ")}. A push writes a bundle once and never revisits it, so for everything this push uploaded that stands until those machines publish a key AND this machine re-addresses its own bundles with \`sesh-mover hub rekey\`; if this machine is decommissioned first, it stands for good.`
     );
   }
 
-  return { kind: "encrypt", recipients: self.recipients, warnings };
+  return { kind: "encrypt", recipients: self.recipients, warnings, uploadWarnings };
 }
