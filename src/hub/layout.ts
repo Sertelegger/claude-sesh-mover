@@ -186,6 +186,52 @@ export interface HubTombstoneJson {
   reason: string | null;
 }
 
+/**
+ * One machine's record of what it CONSOLIDATED and retired (#92).
+ *
+ * **A file of its own, per machine, for the tombstone's reason and one more.**
+ * Like a tombstone it is an ASSERTION — nothing on the hub or on this machine
+ * can re-derive "these bundle ids were deliberately retired" from what is left,
+ * because what is left is precisely their absence. Put it in the index and
+ * every writer of that index (a push through `buildIndexFile`, a `hub reindex`)
+ * becomes a writer that can silently drop it.
+ *
+ * The extra reason is that it answers a question asked by a machine that is not
+ * this one. **No writer ever removes a record from ANOTHER machine's index**,
+ * and per-machine ownership means the compacting machine cannot fix them. So
+ * after a compaction, a peer planning against its own stale record finds the
+ * file gone and — with nothing else to go on — reports `not-yet-synced`: exit
+ * class 3, "the hub folder has not finished syncing, retry in a moment", for a
+ * file that is never coming back. Told to retry forever, and told it by the one
+ * result class that exists to mean "retry and it will work".
+ *
+ * This is what a reader consults to say the true thing instead: the bundle was
+ * consolidated, here is the bundle that replaced it, and the remedy is to pull
+ * that rather than to wait. It also lets a peer discharge the other half —
+ * dropping its own stale records on its next run — which is the only way the
+ * reference itself ever goes away, since only that machine may write its index.
+ *
+ * Entries are self-limiting rather than eternal: once no machine's index still
+ * names a retired bundle, the entry has no reader left and the next compaction
+ * on this machine drops it.
+ */
+export interface HubCompactionEntry {
+  threadId: string;
+  /** The full bundle that replaced them, still on the hub. */
+  consolidatedBundleId: string;
+  /** Bundle ids this machine retired. Never another machine's. */
+  retiredBundleIds: string[];
+  /** ISO 8601, this machine's clock. Diagnostic only — no gate reads it. */
+  compactedAt: string;
+}
+
+export interface HubCompactionJson {
+  schemaVersion: 1;
+  projectId: string;
+  machineId: string;
+  compactions: HubCompactionEntry[];
+}
+
 // ---- Validation ----
 
 // Hub ids (project/machine/thread/bundle ids and session ids read from hub
@@ -246,6 +292,23 @@ export function tombstoneDirPath(projectId: string): string {
 export function tombstonePath(projectId: string, machineId: string): string {
   assertSafeHubId(machineId, "machineId");
   return `${tombstoneDirPath(projectId)}/${machineId}.json`;
+}
+
+export function compactionDirPath(projectId: string): string {
+  return `${projectDir(projectId)}/compactions`;
+}
+
+/**
+ * `compactions/<machineId>.json` — the file machine `<machineId>` owns.
+ *
+ * Same shape as `tombstonePath` and for the same reason: a machine asserts only
+ * about its own removals, so two machines compacting different threads of one
+ * project never contend and no distributed lock is needed. A reader merges
+ * every machine's file the way `readAllIndexes` merges every machine's index.
+ */
+export function compactionPath(projectId: string, machineId: string): string {
+  assertSafeHubId(machineId, "machineId");
+  return `${compactionDirPath(projectId)}/${machineId}.json`;
 }
 
 export function bundleDir(projectId: string, machineId: string): string {

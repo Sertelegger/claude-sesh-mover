@@ -61,6 +61,17 @@ import type {
  * sites so a second one cannot appear without a deliberate edit to that
  * allowlist. Every removal here goes through `deleteHubFile` below, so there is
  * one line in the codebase that removes a hub file.
+ *
+ * **Compaction is the second owner the spec named, and it borrows the funnel
+ * rather than opening one** (#92). `hub compact` imports `deleteHubFile` and
+ * calls no `backend.delete` of its own, so the sentence above stays literally
+ * true and the allowlist test needs no new entry — `deleteHubFile(` matches
+ * neither pattern it scans for. That is deliberate: an allowlist entry for
+ * `compact.ts` would have passed the test just as well while giving the
+ * codebase a second deletion path, which is the thing the test exists to
+ * notice. The two callers differ in scope and each says so at its own site:
+ * retirement destroys a whole project it owns, compaction removes bundles of
+ * ITS OWN that a consolidated bundle has demonstrably replaced.
  * ---------------------------------------------------------------------------
  */
 
@@ -99,8 +110,13 @@ export type HubDeleteOutcome =
  * A named funnel rather than three call sites, so "physical removal happens
  * here and nowhere else" is a property of the code and not of a convention. It
  * swallows nothing: the caller records every failure into `HubDeleteResult.failed`.
+ *
+ * Exported for `hub compact`, which is the other operation the slice-4 spec
+ * gave physical removal to. It swallows nothing there either — compaction
+ * records its failures and keeps going, because a bundle it could not delete is
+ * a file that still exists, which is the harmless direction.
  */
-async function deleteHubFile(backend: HubBackend, relPath: string): Promise<void> {
+export async function deleteHubFile(backend: HubBackend, relPath: string): Promise<void> {
   await backend.delete(relPath);
 }
 
