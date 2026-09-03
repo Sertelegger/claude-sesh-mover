@@ -386,6 +386,7 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
       resolved,
       machineId: machine.id,
       hubId: hub.hubId,
+      projectId: local.projectId,
       threadId: opts.threadId,
       latest: opts.latest,
       effectiveProjectPath,

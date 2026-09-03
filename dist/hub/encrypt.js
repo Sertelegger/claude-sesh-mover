@@ -166,7 +166,12 @@ export async function hubEncrypt(opts) {
         // allowed to write it, because it is an explicit user act rather than the
         // opportunistic restamping `hub init` deliberately refuses on join. Two
         // machines enabling at once both write `true`, so the absence of a hub-wide
-        // lock costs nothing here.
+        // lock costs nothing here — but only because `encrypt` is the only field
+        // anyone here writes. A future second writer of a different `hub.json`
+        // field, racing this same read-`hubRaw`-then-write-the-whole-object
+        // window, would have its write silently lost to whichever of the two
+        // lands second. Nothing today writes a second field; that is the entire
+        // reason this is safe.
         hubRaw.encrypt = true;
         await backend.writeAtomic(HUB_JSON, JSON.stringify(hubRaw, null, 2) + "\n");
         changed = true;

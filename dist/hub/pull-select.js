@@ -48,6 +48,10 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { alternateSource, findUnfetchableBundles, planThreadPull, pullSourceFor, sourcedKey, } from "./threads.js";
 import { createMachineNameLookup, shapeThreads } from "./whereis.js";
+// #92: the sweep below must be able to tell a RETIRED bundle from an unsynced
+// one. Type-only cycles are fine here and this is a value import, but the
+// direction is safe: compact.ts imports nothing from pull-select.
+import { explainRetiredBundles } from "./compact.js";
 import { readSyncState, peekSyncState, writeSyncState, getThreadId, setThreadId, } from "../sync-state.js";
 /**
  * The half of a thread this pull could not reach, in words.
@@ -270,7 +274,7 @@ async function describeAssembly(threadId, assembled, args) {
     return { notes, findings, reportOnly, reportOnlyFindings };
 }
 export async function runSelectStage(input) {
-    const { backend, resolved, machineId, hubId, effectiveProjectPath, targetProjectDir } = input;
+    const { backend, resolved, machineId, hubId, projectId, effectiveProjectPath, targetProjectDir } = input;
     const warnings = [];
     if (!input.threadId && !input.latest) {
         // Same project path the real pull below keys its sync-state off, so the
@@ -733,16 +737,35 @@ export async function runSelectStage(input) {
     // `reportOnlyFindings`, which is the typed half of the same judgement.
     warnings.push(...assembly.notes);
     const missing = [];
+    const missingIds = [];
     for (const { record } of needed) {
-        if (!(await backend.exists(record.file)))
+        if (!(await backend.exists(record.file))) {
             missing.push(record.file);
+            missingIds.push(record.bundleId);
+        }
     }
     if (missing.length > 0) {
+        // ASK WHY BEFORE ADVISING (#92). A bundle another machine deliberately
+        // RETIRED after consolidating the thread is, at this line, byte-for-byte
+        // the same observation as one that has not finished syncing — and the
+        // default advice, "retry in a moment", is the one sentence a result class
+        // exists to mean "retrying will work".
+        //
+        // Retrying does work here, so the CLASS is right and only the cause was
+        // wrong: a compaction removes its records from its own index before
+        // deleting the files, so this can only be seen while a synced copy of that
+        // index is still the old one. The next attempt reads the updated index and
+        // fetches the consolidated bundle instead. Saying so is the difference
+        // between a user waiting for a file that is never coming back and a user
+        // understanding that the thread was compacted.
+        const retired = await explainRetiredBundles(backend, projectId, missingIds);
         return {
             kind: "stop",
             result: {
                 success: false, command: "pull", reason: "not-yet-synced", missing,
-                suggestion: "The hub folder has not finished syncing these files — retry in a moment.",
+                suggestion: retired.size > 0
+                    ? `${retired.size === missing.length ? "Every" : "One or more"} missing bundle was RETIRED by a machine that consolidated this thread — replaced by ${[...new Set(retired.values())].join(", ")}, which is on the hub. Nothing is lost. This machine is still reading that machine's older index; retry once it has synced and the pull will fetch the consolidated bundle instead.`
+                    : "The hub folder has not finished syncing these files — retry in a moment.",
             },
         };
     }

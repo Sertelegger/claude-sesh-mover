@@ -167,14 +167,30 @@ export declare function describeUnkeyed(u: UnkeyedMachine): string;
  *
  * Pure, and separate from `push.ts`, so the decision can be argued and tested
  * without a hub, an export and an archive around it.
+ *
+ * TWO warning arrays, split by what each sentence is true OF (#96). `warnings`
+ * holds facts about the push that just ran this decision — the malformed
+ * `encrypt` value — true whether or not anything is uploaded, so the caller
+ * may carry them on every outcome, the `upToDate` early return included.
+ * `uploadWarnings` holds the past-tense claims about the uploaded bundle
+ * itself ("went to the hub as PLAINTEXT", "was encrypted WITHOUT…"), which
+ * are FALSE of a push that uploads nothing — and the plaintext one rides the
+ * default-on SessionEnd auto-push, where a false claim reaches a user with no
+ * context to check it against. The caller appends them only on the branch
+ * that uploads. The refuse arm has no `uploadWarnings` because neither
+ * sentence can be minted on a refusing path: the unapplied preference implies
+ * an unsealed hub (the plaintext arm), and the force-unkeyed note exists only
+ * where that refusal was overridden.
  */
 export type BundleEncryptionPlan = {
     kind: "plaintext";
     warnings: string[];
+    uploadWarnings: string[];
 } | {
     kind: "encrypt";
     recipients: string[];
     warnings: string[];
+    uploadWarnings: string[];
 } | {
     kind: "refuse";
     refusal: EncryptionRefusal;

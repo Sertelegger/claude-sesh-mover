@@ -20,6 +20,23 @@ export interface ResolvedThread {
 }
 export declare function newerThreadCopy(a: ThreadCopy, b: ThreadCopy): ThreadCopy;
 export declare function resolveThreads(indexes: HubIndexJson[]): ResolvedThread[];
+/**
+ * THE LINK RULE, in one place: `""` is never a link, on either side.
+ *
+ * Both a bundle's `headEntryUuid` and the `anchorEntryUuid` that names it can
+ * legitimately be `""` — `readLastEntryUuid(...) ?? ""` is how both index
+ * writers spell a head, and it returns `null` when the bounded tail scan finds
+ * no conversation entry (a bundle boundary landing on a run of uuid-less
+ * bookkeeping lines). Two empty strings are not a match: treating them as one
+ * would silently join two unrelated bundles, and a head-keyed map that admitted
+ * `""` as a key would let two empty-headed records collide so that one vanishes
+ * from the chain entirely.
+ *
+ * Used by `findUnfetchableBundles`'s recorded-head comparison and by
+ * `assembleChain`'s walk, deliberately as ONE function rather than two inline
+ * spellings of the same sentence.
+ */
+export declare function isLinkUuid(uuid: string | null | undefined): uuid is string;
 /** One machine's bundles for a thread that a given pull cannot fetch. */
 export interface UnfetchableBundleSet {
     machineId: string;

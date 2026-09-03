@@ -2481,6 +2481,10 @@ describe("select stage", () => {
       resolved: resolveThreads(over.indexes ?? currentThreadIndexes({ machineId: ME })),
       machineId: ME,
       hubId: HUB_ID,
+      // #92: the stage asks the compaction markers why a needed bundle is
+      // absent, so a bundle another machine RETIRED is not reported as one
+      // that has not finished syncing.
+      projectId: "select-stage-project",
       threadId: over.threadId,
       latest: over.latest,
       effectiveProjectPath: projectPath,

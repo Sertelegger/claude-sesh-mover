@@ -293,6 +293,7 @@ export async function hubPull(opts) {
             resolved,
             machineId: machine.id,
             hubId: hub.hubId,
+            projectId: local.projectId,
             threadId: opts.threadId,
             latest: opts.latest,
             effectiveProjectPath,

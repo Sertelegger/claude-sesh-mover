@@ -232,14 +232,17 @@ export function checkSelfIsRecipient(input) {
 export function planBundleEncryption(input) {
     const { policy, census } = input;
     const warnings = [];
+    const uploadWarnings = [];
     if (policy.malformedSetting) {
         warnings.push("This hub's hub.json has an `encrypt` value that is neither true nor false. It was read as ENCRYPTED, because a hand-edited `\"true\"` read the other way is a silent confidentiality loss and this direction is at worst a surprise on bundles you hold the keys to. Fix the value on the hub to settle it.");
     }
     if (!policy.required) {
         if (policy.unappliedPreference) {
-            warnings.push("This machine prefers encryption at rest but this hub is not sealed, so this bundle went to the hub as PLAINTEXT and nothing can change that after the fact. The switch is hub-wide, not per machine — a machine that encrypted unilaterally would push bundles the rest of the hub cannot read. Seal the hub with `sesh-mover hub encrypt --enable` and later pushes from every machine are encrypted.");
+            // An upload claim, not a policy note — the caller holds it until a
+            // bundle actually goes up (see the type's doc, #96).
+            uploadWarnings.push("This machine prefers encryption at rest but this hub is not sealed, so this bundle went to the hub as PLAINTEXT and nothing can change that after the fact. The switch is hub-wide, not per machine — a machine that encrypted unilaterally would push bundles the rest of the hub cannot read. Seal the hub with `sesh-mover hub encrypt --enable` and later pushes from every machine are encrypted.");
         }
-        return { kind: "plaintext", warnings };
+        return { kind: "plaintext", warnings, uploadWarnings };
     }
     const self = checkSelfIsRecipient(input);
     if (!self.ok) {
@@ -262,8 +265,8 @@ export function planBundleEncryption(input) {
                 warnings,
             };
         }
-        warnings.push(`--force-unkeyed: this bundle was encrypted WITHOUT ${census.unkeyed.length} registered machine(s), which therefore cannot read it — ${named.join("; ")}. A push writes a bundle once and never revisits it, so for everything this push uploaded that stands until those machines publish a key AND this machine re-addresses its own bundles with \`sesh-mover hub rekey\`; if this machine is decommissioned first, it stands for good.`);
+        uploadWarnings.push(`--force-unkeyed: this bundle was encrypted WITHOUT ${census.unkeyed.length} registered machine(s), which therefore cannot read it — ${named.join("; ")}. A push writes a bundle once and never revisits it, so for everything this push uploaded that stands until those machines publish a key AND this machine re-addresses its own bundles with \`sesh-mover hub rekey\`; if this machine is decommissioned first, it stands for good.`);
     }
-    return { kind: "encrypt", recipients: self.recipients, warnings };
+    return { kind: "encrypt", recipients: self.recipients, warnings, uploadWarnings };
 }
 //# sourceMappingURL=encryption.js.map

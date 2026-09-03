@@ -90,6 +90,14 @@ const REASON_EXIT_CODE = {
     "encryption-refused": EXIT_REFUSED,
     "stale-machines": EXIT_REFUSED,
     "escrow-refused": EXIT_REFUSED,
+    /**
+     * Compaction declining to delete yet (#92) — waiting on a machine to
+     * acknowledge, or on the grace window. A refusal for `grace-period`'s exact
+     * reason: class 3 invites a caller to loop, and this wait is measured in
+     * hours or days by design. Nothing is broken meanwhile — the consolidated
+     * bundle is already on the hub and already what a reader fetches.
+     */
+    "compaction-pending": EXIT_REFUSED,
     "escrow-verify-failed": EXIT_FAILED,
     // Environment-not-ready: same invocation, retry once the machine catches up.
     "hub-unreachable": EXIT_NOT_READY,

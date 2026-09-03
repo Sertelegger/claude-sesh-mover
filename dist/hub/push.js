@@ -416,6 +416,8 @@ export async function hubPush(opts) {
                         : {}),
                 };
             }
+            // Policy facts only — what the plan claims about the uploaded bundle is
+            // held until past the upToDate early return below (#96).
             warnings.push(...encryption.warnings);
             // Thread minting for every session in scope
             let sessions = discoverSessions(opts.configDir, opts.projectPath);
@@ -533,6 +535,23 @@ export async function hubPush(opts) {
                     ...(fullResend ? { fullResend } : {}),
                 };
             }
+            /**
+             * HELD until here, and held rather than reworded (#96): these are the
+             * plan's past-tense claims about the uploaded bundle itself — "this
+             * bundle went to the hub as PLAINTEXT and nothing can change that after
+             * the fact", "this bundle was encrypted WITHOUT…" — and the upToDate
+             * return above uploads nothing for them to be true of. The plaintext one
+             * rides the default-on SessionEnd auto-push, so before this hold a
+             * machine preferring encryption made that false statement at every
+             * session end, to a user with no context to check it against. Rewording
+             * the sentences as policy would have let them ride every return, but the
+             * past-tense specificity is the disclosure's whole value on the push
+             * that DID upload — and policy is `hub encrypt`'s to report. A push that
+             * fails past this line drops the warnings array with the failure
+             * (`failedAfterLink` carries none), so the claim never outruns the
+             * upload it is about.
+             */
+            warnings.push(...encryption.uploadWarnings);
             // Memoized: `git remote -v` is read by the payload capture below AND by
             // the ignored-path discovery aid inside it, and neither runs on the
             // up-to-date early return above — so a quiet auto-push with no workspace
@@ -691,6 +710,12 @@ export async function hubPush(opts) {
                     await w.commit();
                 }
                 catch (e) {
+                    // `abort()` removes the temp and never throws, so the hub is exactly
+                    // what it was — and `pipeline` already destroyed every stream it was
+                    // handed, so there is no cleanup left to do here. (The extra
+                    // absorb-the-late-errors step in `bundle-io.ts`'s catches is not the
+                    // model for this site — see `fetchBundleArchive`'s catch for the
+                    // measured hazard that earns it there.)
                     await w.abort();
                     throw e;
                 }

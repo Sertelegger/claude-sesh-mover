@@ -71,6 +71,7 @@
 
 import { createFsBackend, type HubBackend } from "./backend.js";
 import {
+  compactionDirPath,
   compactionPath,
   type HubBundleRecord,
   type HubCompactionEntry,
@@ -532,7 +533,7 @@ async function retirePhase(args: {
         ageSeconds: e.ageMs === null ? null : Math.round(e.ageMs / 1000),
         error: e.message,
         suggestion:
-          "Another sesh-mover hub operation is running for this project — wait for it and re-run. There is deliberately no --force: what it could be racing is a push writing new bundles into the very thread being compacted.",
+          "Another sesh-mover hub operation is running for this project — wait for it and re-run. There is deliberately no override here: what it would be racing is a push writing new bundles into the very thread being compacted.",
       };
     }
     throw e;
@@ -670,4 +671,87 @@ async function retirePhase(args: {
   } finally {
     lock.release();
   }
+}
+
+/**
+ * Every machine's compaction assertions for a project.
+ *
+ * IMMEDIATE `.json` children only, the same #28 rule `readAllIndexes` applies
+ * to `index/` and for the same measured reason: `backend.list` recurses, the
+ * hub is a synced directory by design, and sync clients park superseded copies
+ * in nested folders (`.stversions/`, "conflicted copy" directories). Recursing
+ * would read one machine's stale backup as a second machine's assertion.
+ *
+ * Never throws and never refuses. A marker that cannot be read simply does not
+ * explain anything, which returns the caller to the answer it would have given
+ * without this — a worse message, not a wrong action.
+ */
+export async function readAllCompactions(
+  backend: HubBackend,
+  projectId: string
+): Promise<HubCompactionEntry[]> {
+  const dir = compactionDirPath(projectId);
+  const prefix = `${dir}/`;
+  const out: HubCompactionEntry[] = [];
+  let files: string[];
+  try {
+    files = await backend.list(dir);
+  } catch {
+    return out;
+  }
+  for (const file of files) {
+    if (!file.startsWith(prefix)) continue;
+    const name = file.slice(prefix.length);
+    if (name.includes("/") || !name.endsWith(".json")) continue;
+    try {
+      const parsed = JSON.parse((await backend.read(file)).toString()) as HubCompactionJson;
+      if (!Array.isArray(parsed?.compactions)) continue;
+      for (const c of parsed.compactions) {
+        if (Array.isArray(c?.retiredBundleIds)) out.push(c);
+      }
+    } catch {
+      // Unreadable or malformed: explains nothing. See above.
+    }
+  }
+  return out;
+}
+
+/**
+ * Which of these bundle ids a compaction retired, and what replaced each.
+ *
+ * The reason this exists: without it, a bundle deliberately retired by another
+ * machine is indistinguishable from one that has not finished syncing, and the
+ * reader tells the user to "retry in a moment" — from the one result class that
+ * exists to mean a retry will work.
+ *
+ * A retry DOES work here, which is why this refines the message rather than the
+ * class: the file is missing because that machine's index and its files reached
+ * this one out of order, and the next attempt reads the updated index and
+ * fetches the consolidated bundle instead. What was wrong was the cause, never
+ * the remedy.
+ */
+export async function explainRetiredBundles(
+  backend: HubBackend,
+  projectId: string,
+  bundleIds: readonly string[]
+): Promise<Map<string, string>> {
+  const wanted = new Set(bundleIds);
+  const explained = new Map<string, string>();
+  if (wanted.size === 0) return explained;
+  // NOTHING HERE MAY THROW. This runs only on a path that has already decided
+  // to refuse, and its entire job is to make that refusal's wording truer. A
+  // throw would convert a clean typed result — with its `missing` list and its
+  // exit class — into an exit-1 stack trace, which is strictly worse than the
+  // imprecise sentence it was called to improve. `projectDir` asserts on the
+  // id, so even path building is inside the guard.
+  try {
+    for (const c of await readAllCompactions(backend, projectId)) {
+      for (const id of c.retiredBundleIds) {
+        if (wanted.has(id)) explained.set(id, c.consolidatedBundleId);
+      }
+    }
+  } catch {
+    // Explains nothing; the caller falls back to the generic sentence.
+  }
+  return explained;
 }
