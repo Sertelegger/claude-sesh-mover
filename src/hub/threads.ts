@@ -170,7 +170,7 @@ export function resolveThreads(indexes: HubIndexJson[]): ResolvedThread[] {
  * `assembleChain`'s walk, deliberately as ONE function rather than two inline
  * spellings of the same sentence.
  */
-function isLinkUuid(uuid: string | null | undefined): uuid is string {
+export function isLinkUuid(uuid: string | null | undefined): uuid is string {
   return typeof uuid === "string" && uuid !== "";
 }
 
