@@ -15,7 +15,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
@@ -328,6 +330,99 @@ describe("hub compact", () => {
     // The hub holds the only copy of it, so keeping the FILE is the assertion
     // that matters — not merely reporting it as retained.
     expect(existsSync(join(hubDir, forkFile))).toBe(true);
+  });
+
+  /**
+   * ## The ordering tests, and why the ones above cannot replace them
+   *
+   * Every assertion up to here reads the END state, and the end state of a
+   * correct run is byte-identical to the end state of a run that deleted the
+   * bundles FIRST and rewrote the index afterwards. So none of them can tell
+   * the two apart, and the ordering is the whole failure contract — it is what
+   * makes an interrupted run leave the larger state.
+   *
+   * The only way to observe an order is to interrupt it, so these two make a
+   * write fail part way and then ask what survived. Both are POSIX-only: they
+   * interrupt by removing write permission, which is not how Windows denies a
+   * write, so on Windows the ordering is unproved and says so rather than
+   * appearing covered.
+   */
+  const posixOnly = process.platform !== "win32";
+
+  it.skipIf(!posixOnly)("writes our index BEFORE deleting bytes, proved by breaking the index write", async () => {
+    await link();
+    await push();
+    extendSession(1);
+    await push();
+    await hubCompact({
+      configDir, projectPath, hubPath: hubDir, threadId: threadId(), claudeVersion: CLAUDE_VERSION,
+    });
+
+    const before = (await ownIndex()).threads[threadId()].bundles;
+    const consolidated = before[before.length - 1];
+    const doomed = before.filter((r) => r.bundleId !== consolidated.bundleId);
+    expect(doomed.length).toBeGreaterThan(0);
+
+    // Make the index unwritable, so the run fails at step 3 of the retire
+    // phase — after the marker, before any deletion.
+    const indexDir = join(hubDir, "projects", hubProjectId(), "index");
+    chmodSync(indexDir, 0o500);
+    try {
+      await expect(
+        hubCompact({
+          configDir, projectPath, hubPath: hubDir, threadId: threadId(),
+          claudeVersion: CLAUDE_VERSION,
+          nowMs: Date.now() + COMPACTION_GRACE_MS + 60_000,
+        })
+      ).rejects.toThrow();
+    } finally {
+      chmodSync(indexDir, 0o700);
+    }
+
+    // THE ASSERTION THAT DISTINGUISHES THE TWO IMPLEMENTATIONS. Delete-first
+    // would have removed these before ever touching the index, so their
+    // survival is the proof — and it is also the property that matters: a run
+    // that dies here has lost nothing, because the index still points at every
+    // file that still exists.
+    for (const r of doomed) expect(existsSync(join(hubDir, r.file))).toBe(true);
+    const after = (await ownIndex()).threads[threadId()].bundles;
+    expect(after.map((r) => r.bundleId).sort()).toEqual(before.map((r) => r.bundleId).sort());
+  });
+
+  it.skipIf(!posixOnly)("writes the marker BEFORE touching the index, proved by breaking the marker write", async () => {
+    await link();
+    await push();
+    extendSession(1);
+    await push();
+    await hubCompact({
+      configDir, projectPath, hubPath: hubDir, threadId: threadId(), claudeVersion: CLAUDE_VERSION,
+    });
+    const before = (await ownIndex()).threads[threadId()].bundles;
+
+    // The marker's directory, created unwritable so `writeAtomic`'s temp file
+    // cannot land. `mkdir -p` on an existing directory succeeds, so the failure
+    // arrives at the write itself — step 2, before the index is rewritten.
+    const markerDir = join(hubDir, "projects", hubProjectId(), "compactions");
+    mkdirSync(markerDir, { recursive: true });
+    chmodSync(markerDir, 0o500);
+    try {
+      await expect(
+        hubCompact({
+          configDir, projectPath, hubPath: hubDir, threadId: threadId(),
+          claudeVersion: CLAUDE_VERSION,
+          nowMs: Date.now() + COMPACTION_GRACE_MS + 60_000,
+        })
+      ).rejects.toThrow();
+    } finally {
+      chmodSync(markerDir, 0o700);
+    }
+
+    // Nothing removed from the index and nothing deleted: the marker is the
+    // bookkeeping that authorizes and enumerates the removal, so a run that
+    // could not write it has not started removing.
+    const after = (await ownIndex()).threads[threadId()].bundles;
+    expect(after.map((r) => r.bundleId).sort()).toEqual(before.map((r) => r.bundleId).sort());
+    for (const r of before) expect(existsSync(join(hubDir, r.file))).toBe(true);
   });
 
   it("is idempotent: a second retire run finds nothing left to do", async () => {
