@@ -9,6 +9,7 @@ import { readLocalProjectId } from "./identity.js";
 import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex, } from "./index-file.js";
+import { errorMessage } from "../errors.js";
 import { extractArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
@@ -215,7 +216,7 @@ export async function hubReindex(opts) {
                 manifest = readManifest(extractDir);
             }
             catch (e) {
-                warnings.push(`bundle file ${file} has no readable sesh-mover manifest (${e.message}) — skipped.`);
+                warnings.push(`bundle file ${file} has no readable sesh-mover manifest (${errorMessage(e)}) — skipped.`);
                 unrecognizedBundleFiles.push(file);
                 continue;
             }

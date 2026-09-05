@@ -8,6 +8,7 @@ import { captureCarry, gitChildEnv, type CarryMeta } from "./carry.js";
 import type { GitRemoteScan } from "./git-scan.js";
 import { includeFilePath } from "../paths.js";
 import type { ExportManifest } from "../types.js";
+import { errorMessage } from "../errors.js";
 
 /**
  * THE FILE PAYLOAD — one decision, one disclosure, two transports.
@@ -224,7 +225,10 @@ export async function capturePayload(
       measureOnly: opts.measureOnly,
       scope,
     }).catch(
-      (e: Error) => ({ captured: false, reason: "git-failed", detail: e.message } as const)
+      // `unknown`, and `errorMessage` rather than `.message`: this handler IS the
+      // containment the comment above promises, so it is the one place a hostile
+      // rejection reason must not itself be able to throw (#102).
+      (e: unknown) => ({ captured: false, reason: "git-failed", detail: errorMessage(e) } as const)
     );
     warnings.push(...diagnostics);
     if (cap.captured) {

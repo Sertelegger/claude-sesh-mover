@@ -90,6 +90,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { errorMessage } from "../errors.js";
 import { AGE_SCRYPT_LOG_N, AgeDecryptStream, AgeEncryptStream, AgeError } from "../crypto/age.js";
 import { identityFilePath, readIdentityFile } from "../crypto/identity-file.js";
 import { PROJECT_DIR_NAME, PROJECT_JSON_FILE_NAME, userSeshMoverDir } from "../paths.js";
@@ -686,7 +687,7 @@ export async function hubEscrow(
     } catch (e) {
       return refuse(
         "not-enabled",
-        `Could not remove the escrow record: ${(e as Error).message}`,
+        `Could not remove the escrow record: ${errorMessage(e)}`,
         "Remove ~/.sesh-mover/escrow.json by hand. It is a pointer, not a key."
       );
     }
@@ -805,7 +806,7 @@ export async function hubEscrow(
       success: false,
       command: "hub-escrow",
       reason: "escrow-verify-failed",
-      error: `The escrow could not be written: ${(e as Error).message}`,
+      error: `The escrow could not be written: ${errorMessage(e)}`,
       suggestion: "Nothing usable was left behind. Fix the cause and run it again.",
       limits: [...ESCROW_DESTINATION_LIMITS],
     };
@@ -839,7 +840,7 @@ export async function hubEscrow(
       success: false,
       command: "hub-escrow",
       reason: "escrow-verify-failed",
-      error: `The escrow was written but did not read back: ${(e as Error).message}`,
+      error: `The escrow was written but did not read back: ${errorMessage(e)}`,
       suggestion:
         "The file was removed. This is the failure mode worth catching now rather than during a " +
         "recovery: an escrow that does not open reaches you as \"my passphrase doesn't work\", " +
@@ -867,7 +868,7 @@ export async function hubEscrow(
     // must not be reported as a failed escrow — the file the user needs exists.
     warnings.push(
       `The escrow was written and verified, but the record of it could not be saved ` +
-        `(${(e as Error).message}). \`hub escrow\` will report "not enabled" until that is fixed; ` +
+        `(${errorMessage(e)}). \`hub escrow\` will report "not enabled" until that is fixed; ` +
         `the escrow file itself is fine and is at the path reported here.`
     );
   }

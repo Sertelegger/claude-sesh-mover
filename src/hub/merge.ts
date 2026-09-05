@@ -11,6 +11,7 @@ import {
   classifyDestination, DEFAULT_WORKSPACE_EXCLUDES, forEachCarriedFile, readIgnorePatterns,
   readIncludePatterns, type CarryDropReason, type CarryRules,
 } from "../payload/workspace.js";
+import { errorMessage } from "../errors.js";
 import { gitChildEnv } from "../payload/carry.js";
 import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "../sidecar.js";
 
@@ -644,7 +645,7 @@ export async function mergeWorkspaceTrees(opts: {
             // approved — so park the incoming copy instead of letting this fall
             // through to `io-error`, which parks nothing.
             sidecar(rel, incomingPath, "merge-failed",
-              `the incoming copy could not be written back: ${(e as Error).message}`);
+              `the incoming copy could not be written back: ${errorMessage(e)}`);
             continue;
           }
           report.taken.push(rel);
@@ -758,7 +759,7 @@ export async function mergeWorkspaceTrees(opts: {
             // `classifyDestination` already approved, so a sidecar is safe here
             // in a way it is not for a genuine skip.
             sidecar(rel, incomingPath, "merge-failed",
-              `the merge succeeded but its result could not be written back: ${(e as Error).message}`);
+              `the merge succeeded but its result could not be written back: ${errorMessage(e)}`);
             continue;
           }
           (status === 0 ? report.merged : report.conflicted).push(rel);
@@ -789,7 +790,7 @@ export async function mergeWorkspaceTrees(opts: {
       } catch (e) {
         // One unreadable/unwritable file must not abandon a half-merged tree.
         report.skipped.push({
-          path: rel, reason: "io-error", detail: (e as Error).message,
+          path: rel, reason: "io-error", detail: errorMessage(e),
         });
       }
     }

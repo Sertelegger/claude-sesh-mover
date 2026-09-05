@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { encodeProjectPath } from "./platform.js";
+import { errorMessage } from "./errors.js";
 function isWithin(child, parent) {
     const rel = relative(parent, child);
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
@@ -204,7 +205,7 @@ export async function migrateSession(options) {
                 directoryRenamed = true;
             }
             catch (e) {
-                imported.warnings.push(`Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${e.message}. You may need to rename it manually.`);
+                imported.warnings.push(`Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${errorMessage(e)}. You may need to rename it manually.`);
             }
         }
         return {

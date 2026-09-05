@@ -53,6 +53,10 @@ const CHUNK = 65536;
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const BUILT = join(repoRoot, "dist", "crypto", "age.js");
 const BUILT_BECH32 = join(repoRoot, "dist", "crypto", "bech32.js");
+// #102: `age.ts` now imports the shared `errorMessage`, which lives one level
+// UP from `crypto/`. The harness copies the built module flat into a temp dir,
+// so that specifier has to be relocated with it — see `materialize`.
+const BUILT_ERRORS = join(repoRoot, "dist", "errors.js");
 const SOURCE = join(repoRoot, "src", "crypto", "age.ts");
 
 // Announced here as well as in crypto-age.test.ts: this file is meaningful on
@@ -231,6 +235,7 @@ beforeAll(() => {
   // CommonJS and the ESM copy would fail to load.
   writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module" }));
   writeFileSync(join(dir, "bech32.js"), readFileSync(BUILT_BECH32));
+  writeFileSync(join(dir, "errors.js"), readFileSync(BUILT_ERRORS));
   runner = join(dir, "runner.mjs");
   writeFileSync(runner, RUNNER);
   ({ identity, recipient } = generateIdentity());
@@ -245,7 +250,13 @@ afterAll(() => {
 /** Write a copy of the built module with `m` applied (or verbatim for null). */
 function materialize(m: Mutation | null): string {
   const name = m ? `age-${m.id}.js` : "age-pristine.js";
-  let text = built;
+  // FLATTEN THE ONE PARENT-RELATIVE IMPORT (#102). Every copy lands directly in
+  // the temp dir, so `../errors.js` would resolve OUTSIDE it and Node would
+  // fail to load the module — which presents as every mutation "failing",
+  // indistinguishable from the matrix catching them. This rewrite is the same
+  // relocation `bech32.js` has always had; it moves a file, never a byte of
+  // logic, and the pristine control proves the relocated copy still works.
+  let text = built.replaceAll('from "../errors.js"', 'from "./errors.js"');
   if (m) {
     const hits = text.split(m.find).length - 1;
     expect(

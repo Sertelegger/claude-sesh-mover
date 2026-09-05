@@ -109,6 +109,56 @@ describe("archiver", () => {
       const { detectArchiveFormat } = await import("../src/archiver.js");
       expect(detectArchiveFormat("export-dir")).toBeNull();
     });
+
+    // Characterization, not a wish: an encrypted bundle name is NOT a
+    // recognized container, so every consumer of this function must branch on
+    // `.age` BEFORE calling extractArchive (cli.ts's import action does).
+    // Teaching this function a new "encrypted" return value would ripple its
+    // union type into hub callers; the null is the contract.
+    it("returns null for an age-encrypted bundle name", async () => {
+      const { detectArchiveFormat } = await import("../src/archiver.js");
+      expect(detectArchiveFormat("export.tar.gz.age")).toBeNull();
+    });
+  });
+
+  describe("extractArchive refuses unrecognized formats (#96 finding 4 sibling)", () => {
+    // Before the fix, a `null` format fell into the tar/gzip branch, so an
+    // unknown container was "diagnosed" by whatever zlib error its first bytes
+    // produced. Both tests here fail against that code: the first gets a zlib
+    // "incorrect header check" instead of the format message, the second gets
+    // an ENOENT. Mutation-proved in-session by reverting the `else if` to a
+    // bare `else`.
+    it("refuses an age-encrypted name with a format error, not a gzip error, and writes nothing", async () => {
+      const { extractArchive } = await import("../src/archiver.js");
+      const encPath = join(tempDir, "bundle.tar.gz.age");
+      // Realistic first bytes of an age file — exactly what the old code
+      // handed to gunzip.
+      writeFileSync(encPath, "age-encryption.org/v1\n-> X25519 notarealstanza\n");
+      const target = join(tempDir, "enc-extract-target");
+      mkdirSync(target, { recursive: true });
+      await expect(extractArchive(encPath, target)).rejects.toThrow(
+        /Not a recognized archive/
+      );
+      expect(readdirSync(target)).toEqual([]);
+    });
+
+    it("refuses by NAME before any IO — a missing path still gets the format refusal, not ENOENT", async () => {
+      const { extractArchive } = await import("../src/archiver.js");
+      const target = join(tempDir, "noio-extract-target");
+      mkdirSync(target, { recursive: true });
+      await expect(
+        extractArchive(join(tempDir, "does-not-exist.bin"), target)
+      ).rejects.toThrow(/Not a recognized archive/);
+    });
+
+    it("names the formats it does recognize, so the refusal is actionable", async () => {
+      const { extractArchive } = await import("../src/archiver.js");
+      const target = join(tempDir, "named-extract-target");
+      mkdirSync(target, { recursive: true });
+      await expect(
+        extractArchive(join(tempDir, "bundle.tar.gz.age"), target)
+      ).rejects.toThrow(/\.tar\.gz.*\.tgz.*\.tar\.zst.*\.tar\.zstd/);
+    });
   });
 
   describe("isZstdAvailable", () => {

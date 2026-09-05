@@ -63,6 +63,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync
 import { join } from "node:path";
 import { userSeshMoverDir } from "../paths.js";
 import { encodeRecipient, generateIdentity, parseIdentity, recipientFromIdentity } from "./age.js";
+import { errorMessage } from "../errors.js";
 
 /** The private half of this machine's identity. Never transported, ever. */
 export const IDENTITY_FILE_NAME = "identity.age";
@@ -146,7 +147,11 @@ export function readIdentityFile(): IdentityFileState {
   try {
     raw = readFileSync(p, "utf-8");
   } catch (e) {
-    return { state: "unreadable", cause: "io", detail: (e as Error).message };
+    // `errorMessage`, never a cast: this function's contract is the three-valued
+    // read, and a throw from inside a catch collapses `io` and `malformed` into
+    // the exception the caller was promised it would never see (#102). Only the
+    // text extraction is shared — the io/malformed split stays decided here.
+    return { state: "unreadable", cause: "io", detail: errorMessage(e) };
   }
 
   const secretLine = firstSecretLine(raw);
@@ -162,7 +167,7 @@ export function readIdentityFile(): IdentityFileState {
   try {
     recipient = encodeRecipient(recipientFromIdentity(parseIdentity(secretLine)));
   } catch (e) {
-    return { state: "unreadable", cause: "malformed", detail: (e as Error).message };
+    return { state: "unreadable", cause: "malformed", detail: errorMessage(e) };
   }
 
   return {
@@ -249,7 +254,7 @@ export function loadOrCreateIdentity(): IdentityLoad {
         return { ok: false, cause: again.cause, detail: again.detail };
       }
     }
-    return { ok: false, cause: "io", detail: (e as Error).message };
+    return { ok: false, cause: "io", detail: errorMessage(e) };
   }
 
   return { ok: true, identity, recipient, created: true, insecureMode: false };

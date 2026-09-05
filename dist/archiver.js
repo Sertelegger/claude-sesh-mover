@@ -6,6 +6,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
 import { assertSafeManifestIds, isBundleManifestShape } from "./manifest.js";
+import { errorMessage } from "./errors.js";
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 /**
  * How far a `.tar.zst` may expand before we abandon decompressing it, stated
@@ -139,9 +140,22 @@ export async function extractArchive(archivePath, targetDir, warnings) {
     if (format === "zstd") {
         await extractZstdArchive(archivePath, targetDir, warnings);
     }
-    else {
+    else if (format === "gzip") {
         await assertSafeEntries(archivePath);
         await tar.extract({ file: archivePath, cwd: targetDir, strip: 1 });
+    }
+    else {
+        // Refuse an unrecognized name rather than attempt it as gzip (#96 finding
+        // 4's sibling defect): the old bare `else` fell into the tar/gzip branch
+        // for a `null` format, so a wrong or unknown container was "diagnosed" by
+        // whatever zlib error its first bytes happened to produce. Thrown by NAME,
+        // before any IO, so the message is about the format and never about the
+        // bytes — an age-encrypted `.tar.gz.age` in particular must land here, not
+        // in gunzip. (The CLI import path refuses that case earlier and better,
+        // with the recovery command; this is the backstop for every other caller.
+        // All hub callers name their local temp file `.tar.gz`, so none of them
+        // can reach this branch.)
+        throw new Error(`Not a recognized archive: "${archivePath}" (expected a name ending in .tar.gz, .tgz, .tar.zst, or .tar.zstd)`);
     }
 }
 /**
@@ -209,7 +223,7 @@ export async function readManifestFromArchive(archivePath) {
             return {
                 ok: false,
                 reason: "unreadable",
-                detail: `manifest.json is not valid JSON: ${e.message}`,
+                detail: `manifest.json is not valid JSON: ${errorMessage(e)}`,
             };
         }
         // Valid JSON is not yet a manifest. Everything below is surfaced to the
@@ -229,12 +243,12 @@ export async function readManifestFromArchive(archivePath) {
             assertSafeManifestIds(manifest); // 0.3.2 chokepoint — surfaced data must be safe
         }
         catch (e) {
-            return { ok: false, reason: "unsafe-manifest", detail: e.message };
+            return { ok: false, reason: "unsafe-manifest", detail: errorMessage(e) };
         }
         return { ok: true, manifest };
     }
     catch (e) {
-        return { ok: false, reason: "unreadable", detail: e.message };
+        return { ok: false, reason: "unreadable", detail: errorMessage(e) };
     }
     finally {
         // Best-effort: `force: true` swallows ENOENT but NOT EBUSY/EPERM, which

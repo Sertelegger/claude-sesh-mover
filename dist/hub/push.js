@@ -9,6 +9,7 @@ import { bundleEncryptStream } from "./bundle-io.js";
 import { collectHubRecipients, planBundleEncryption, resolveHubEncryption } from "./encryption.js";
 import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, readLocalProjectId, removeLocalProjectIdIfMatches, } from "./identity.js";
+import { errorMessage } from "../errors.js";
 import { scanGitRemotes } from "../payload/git-scan.js";
 import { capturePayload } from "../payload/capture.js";
 import { registerMachine } from "./init.js";
@@ -69,7 +70,7 @@ function rollbackLocalLink(projectPath, local) {
  * branch on them. See that type for why the prose alone was not enough.
  */
 function failedAfterLink(projectPath, commits, error) {
-    const cause = error instanceof Error ? error.message : String(error);
+    const cause = errorMessage(error);
     const projectId = commits.local.projectId;
     // The bundle is atomic (`writeStreamAtomic`), so it is either on the hub or
     // it never existed — but the index that makes it findable is written after

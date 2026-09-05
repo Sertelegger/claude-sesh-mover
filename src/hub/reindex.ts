@@ -11,6 +11,7 @@ import { registerMachine } from "./init.js";
 import {
   buildIndexFile, readMachineIndex, writeMachineIndex, type PriorIndexView, type PriorThreadEntry,
 } from "./index-file.js";
+import { errorMessage } from "../errors.js";
 import { extractArchive } from "../archiver.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
@@ -238,7 +239,7 @@ export async function hubReindex(
       try {
         manifest = readManifest(extractDir);
       } catch (e) {
-        warnings.push(`bundle file ${file} has no readable sesh-mover manifest (${(e as Error).message}) — skipped.`);
+        warnings.push(`bundle file ${file} has no readable sesh-mover manifest (${errorMessage(e)}) — skipped.`);
         unrecognizedBundleFiles.push(file);
         continue;
       }

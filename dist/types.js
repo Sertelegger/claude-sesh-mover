@@ -98,6 +98,15 @@ const REASON_EXIT_CODE = {
      * bundle is already on the hub and already what a reader fetches.
      */
     "compaction-pending": EXIT_REFUSED,
+    /**
+     * `import --from <bundle>.tar.gz.age` (#96 finding 4). A refusal, not class
+     * 1: the invocation is well-formed, the command ran, understood exactly what
+     * the file is, declined, and changed nothing — the body says why and names
+     * the remedy. Not class 3 either: retrying unchanged refuses identically
+     * forever, and the remedy is a human running the `age` decrypt in
+     * `suggestion`, not waiting for the machine to catch up.
+     */
+    "encrypted-bundle": EXIT_REFUSED,
     "escrow-verify-failed": EXIT_FAILED,
     // Environment-not-ready: same invocation, retry once the machine catches up.
     "hub-unreachable": EXIT_NOT_READY,

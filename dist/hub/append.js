@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { finished, pipeline } from "node:stream/promises";
+import { errorMessage } from "../errors.js";
 import { isConversationEntry, readLastEntryUuid, MAX_ENTRY_SCAN_BYTES } from "../jsonl.js";
 import { rewriteJsonlStream, buildPathMappings } from "../rewriter.js";
 import { detectPlatform } from "../platform.js";
@@ -289,7 +290,7 @@ export async function tryAppendContinuation(a) {
         // mtime (which is how Claude Code orders /resume). Let the fault surface.
         if (!wroteBytes)
             throw e;
-        const cause = e.message;
+        const cause = errorMessage(e);
         // Rollback is a TRUNCATE, and a truncate is only ours to perform if every
         // byte past `rollbackBytes` is a byte we put there. Nothing upstream can
         // promise that: `rollbackBytes` is measured at step 3, and a live Claude
@@ -307,7 +308,7 @@ export async function tryAppendContinuation(a) {
             liveSize = statSync(a.basePath).size;
         }
         catch (statError) {
-            throw new Error(`append failed (${cause}) AND the base could not be re-measured, so no rollback was attempted — ${a.basePath} was left exactly as it is: ${statError.message}`);
+            throw new Error(`append failed (${cause}) AND the base could not be re-measured, so no rollback was attempted — ${a.basePath} was left exactly as it is: ${errorMessage(statError)}`);
         }
         const oursToUndo = rollbackBytes + appendedBytes;
         if (liveSize !== oursToUndo) {
@@ -317,7 +318,7 @@ export async function tryAppendContinuation(a) {
             truncateSync(a.basePath, rollbackBytes);
         }
         catch (rollbackError) {
-            throw new Error(`append failed (${cause}) AND rollback failed — ${a.basePath} may be corrupt (expected ${rollbackBytes} bytes): ${rollbackError.message}`);
+            throw new Error(`append failed (${cause}) AND rollback failed — ${a.basePath} may be corrupt (expected ${rollbackBytes} bytes): ${errorMessage(rollbackError)}`);
         }
         const restored = readLastEntryUuid(a.basePath);
         const detail = restored === baseHead
@@ -486,7 +487,7 @@ export async function adoptHubBranch(input) {
         };
     }
     catch (e) {
-        const cause = e.message;
+        const cause = errorMessage(e);
         // `mutatedSize === null` means the fault landed before the truncate — an
         // unreadable delta, a rewrite failure, an IO error during the O(delta)
         // prep. Every one of those happens while the base is still byte-identical
@@ -524,7 +525,7 @@ export async function adoptHubBranch(input) {
             catch {
                 /* best effort — the throw below is the message that matters */
             }
-            throw new Error(`adopt failed (${cause}) AND the base could not be re-measured, so no restore was attempted — ${input.basePath} was left exactly as it is, mid-adoption; a complete copy of the session as it was before adoption is at ${backup}: ${statError.message}`);
+            throw new Error(`adopt failed (${cause}) AND the base could not be re-measured, so no restore was attempted — ${input.basePath} was left exactly as it is, mid-adoption; a complete copy of the session as it was before adoption is at ${backup}: ${errorMessage(statError)}`);
         }
         if (liveSize !== mutatedSize) {
             keepWork = true; // the pre-mutation snapshot is the only intact copy
@@ -545,7 +546,7 @@ export async function adoptHubBranch(input) {
         }
         catch (restoreError) {
             keepWork = true; // the backup is the user's only intact copy — keep it
-            throw new Error(`adopt failed (${cause}) AND restoring ${input.basePath} failed — a complete copy of the session as it was is at ${backup}: ${restoreError.message}`);
+            throw new Error(`adopt failed (${cause}) AND restoring ${input.basePath} failed — a complete copy of the session as it was is at ${backup}: ${errorMessage(restoreError)}`);
         }
         return { kind: "failed", detail: cause };
     }

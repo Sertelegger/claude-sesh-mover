@@ -5,6 +5,7 @@ import { fetchBundleArchive, type BundleFetchFailure } from "./bundle-io.js";
 import type { HubBundleRecord } from "./layout.js";
 import type { ApplyState } from "./pull-apply-state.js";
 import { stageAbort, stageOk, type StageOutcome } from "./pull-stages.js";
+import { errorMessage } from "../errors.js";
 import { extractArchive } from "../archiver.js";
 import { readManifest, verifySessionsDigest } from "../manifest.js";
 import type { ExportManifest, ProgressEvent } from "../types.js";
@@ -227,10 +228,18 @@ export async function runFetchStage(
   try {
     await extractArchive(tarPath, extractDir);
   } catch (e) {
+    // `errorMessage`, never a cast (#102): `(e as Error).message` was itself a
+    // throw for a `null` rejection — a TypeError out of the one module whose
+    // contract is that every untrusted-input call returns a typed abort. That
+    // throw exits 1 through the CLI's outer catch, dropping this `suggestion`
+    // and every disclosure from bundles already applied and recorded — the
+    // exact loss the stageAbort exists to prevent. Same at every catch in this
+    // file: the reason is bytes an attacker chose, so nothing here may trust
+    // it to be an Error.
     return stageAbort({
       success: false,
       command: "pull",
-      error: `Bundle ${record.bundleId} could not be unpacked (${record.file}): ${(e as Error).message}`,
+      error: `Bundle ${record.bundleId} could not be unpacked (${record.file}): ${errorMessage(e)}`,
       suggestion:
         "Nothing from this bundle was applied. Either the archive on the hub is damaged or was only partially written — a truncated or bit-flipped .tar.gz fails gzip's own checksum, which is what makes this loud — or it holds an entry sesh-mover refuses to extract: an absolute path, a `..` segment, a symlink or a hard link. The message above says which. For the first, if the hub is a synced folder give it a moment and retry, otherwise ask the machine that pushed it to push again; for the second no retry and no re-push helps, because no bundle sesh-mover produces contains such an entry. The bundles applied before it in this chain are recorded and will not be refetched.",
     });
@@ -272,7 +281,7 @@ export async function runFetchStage(
       // thrown message is kept whole after it because it is the only thing that
       // distinguishes "no manifest.json" from "not one of ours" from a JSON
       // syntax error.
-      error: `Bundle ${record.bundleId} does not carry a readable sesh-mover manifest (${record.file}): ${(e as Error).message}`,
+      error: `Bundle ${record.bundleId} does not carry a readable sesh-mover manifest (${record.file}): ${errorMessage(e)}`,
       suggestion:
         "Nothing from this bundle was applied. Its manifest.json is missing, unreadable, or not a sesh-mover bundle manifest — the archive on the hub is damaged, was only partially written, or was not produced by sesh-mover. If the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again. The bundles applied before it in this chain are recorded and will not be refetched.",
     });

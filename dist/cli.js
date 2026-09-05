@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolveConfigDir } from "./platform.js";
 import { readConfig, readConfigOverrides, writeConfigOverrides, setConfigOverride, computeEffectiveConfig, resolveHubBudgets, resolvePayloadBudgets, configValueKind, } from "./config.js";
@@ -25,6 +25,14 @@ import { PLUGIN_VERSION } from "./version.js";
 import { hubInit } from "./hub/init.js";
 import { hubStatus } from "./hub/status.js";
 import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
+// Both of these are already in this file's STATIC import graph through
+// `./hub/init.js` above, so naming them here costs the lazy-import discipline
+// nothing. `isEncryptedBundleFile` is the one copy of the encrypted-or-not
+// grammar (hub/layout.ts) — the import refusal below must share it, not
+// respell ".age".
+import { ENCRYPTED_BUNDLE_SUFFIX, isEncryptedBundleFile } from "./hub/layout.js";
+import { identityFilePath } from "./crypto/identity-file.js";
+import { errorMessage } from "./errors.js";
 import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "./paths.js";
 const program = new Command();
 program
@@ -252,6 +260,46 @@ program
             onProgress?.({ phase: "extract", percent: 100 });
             fromPath = tempExtractDir;
         }
+        else if (
+        // An age-ENCRYPTED bundle (#96 finding 4). `.age` is not a container
+        // format, so this path used to fall through and reach `importSession`
+        // as though it were a DIRECTORY, failing with a nonsense
+        // missing-manifest error. Refuse it as what it is — and REFUSE, never
+        // decrypt: decryption needs this machine's HUB identity, which the
+        // non-hub transport has no business reading; the one
+        // plaintext/ciphertext seam is `hub/bundle-io.ts` and a second one
+        // here would be a hole in a hub the user believes is sealed; and the
+        // recovery is one documented command with the standard `age` tool,
+        // which also works on a machine holding only an escrow file — the case
+        // a built-in decrypt could not serve. The full argument lives on
+        // `EncryptedBundleRefusedResult` (types.ts).
+        //
+        // `isFile` gates it because the suffix check is pure spelling: a
+        // DIRECTORY named `*.age` is still a directory export and falls
+        // through to `importSession` like any other, and a MISSING path falls
+        // through to the ordinary unreadable-bundle failure — which is true of
+        // it, where "decrypt this file first" would not be.
+        isEncryptedBundleFile(fromPath) &&
+            existsSync(fromPath) &&
+            statSync(fromPath).isFile()) {
+            const decryptedPath = fromPath.slice(0, -ENCRYPTED_BUNDLE_SUFFIX.length);
+            const result = {
+                success: false,
+                command: "import",
+                reason: "encrypted-bundle",
+                error: `"${fromPath}" is an age-encrypted bundle — import reads plaintext ` +
+                    `archives (.tar.gz/.tgz, .tar.zst/.tar.zstd) and export directories only`,
+                bundlePath: fromPath,
+                decryptedPath,
+                suggestion: `The bundle is not damaged; it is encrypted. Decrypt it with the standard age tool, ` +
+                    `then import the result: age -d -i "${identityFilePath()}" "${fromPath}" > "${decryptedPath}" ` +
+                    `&& sesh-mover import --from "${decryptedPath}". An escrow file also works as the -i ` +
+                    `identity (age will prompt for its passphrase — type it only in your own shell, never ` +
+                    `into a Claude Code session).`,
+            };
+            output(result);
+            return;
+        }
         const targetConfigDir = resolveConfigDir(opts.targetConfigDir);
         const claudeVersion = getClaudeVersion();
         const result = await importSession({
@@ -443,7 +491,7 @@ function readDirectoryManifest(dir) {
         manifest = readManifest(dir);
     }
     catch (e) {
-        return { ok: false, detail: e.message };
+        return { ok: false, detail: errorMessage(e) };
     }
     // UNREACHABLE, AND IT STAYS. #77 folded `isBundleManifestShape` into
     // `readManifest` itself (manifest.ts step one of three), so a shapeless
@@ -720,7 +768,7 @@ program
                     parsedValue = JSON.parse(value);
                 }
                 catch (parseErr) {
-                    outputError("configure", new Error(`Invalid JSON for ${key}: ${parseErr.message}`));
+                    outputError("configure", new Error(`Invalid JSON for ${key}: ${errorMessage(parseErr)}`));
                     return;
                 }
             }
@@ -1170,7 +1218,7 @@ hub
         }
     }
     catch (e) {
-        writeHookDiagnostic(`sesh-mover auto-push failed: ${e.message}\n`);
+        writeHookDiagnostic(`sesh-mover auto-push failed: ${errorMessage(e)}\n`);
     }
     finally {
         // THE endpoint #71 is about. It is spawned detached with `async: true`
@@ -1249,7 +1297,7 @@ hub
         }) + "\n");
     }
     catch (e) {
-        writeHookDiagnostic(`sesh-mover startup notice failed: ${e.message}\n`);
+        writeHookDiagnostic(`sesh-mover startup notice failed: ${errorMessage(e)}\n`);
     }
     finally {
         // Safe after the write above rather than in place of it:
@@ -2052,10 +2100,14 @@ function output(result) {
  * did not. See `exitCodeForResult` for the full rule.
  */
 function outputError(command, error) {
+    // `unknown` + `errorMessage` (#102): every `catch` in this file funnels its
+    // thrown value here, so a `.message` read on an unchecked cast would let a
+    // `throw null` crash the failure chokepoint itself — no JSON, no exit code
+    // discipline. The `e as Error` casts at the call sites are now inert.
     const result = {
         success: false,
         command,
-        error: error.message,
+        error: errorMessage(error),
     };
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
     process.exitCode = EXIT_FAILED;

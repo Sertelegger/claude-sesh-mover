@@ -139,6 +139,7 @@ import {
 } from "node:crypto";
 import { Transform, type TransformCallback } from "node:stream";
 import { bech32Decode, bech32Encode } from "./bech32.js";
+import { errorMessage } from "../errors.js";
 
 // ---------------------------------------------------------------------------
 // Constants from the spec (c2sp.org/age). Section names below refer to it.
@@ -250,7 +251,7 @@ export function parseRecipient(s: string): Buffer {
   try {
     ({ hrp, data } = bech32Decode(s.trim()));
   } catch (e) {
-    throw new AgeError("bad-key", `not an age recipient: ${(e as Error).message}`);
+    throw new AgeError("bad-key", `not an age recipient: ${errorMessage(e)}`);
   }
   if (hrp !== RECIPIENT_HRP) throw new AgeError("bad-key", `not an age recipient: hrp ${hrp}`);
   if (data.length !== X25519_KEY_SIZE) {
@@ -266,7 +267,7 @@ export function parseIdentity(s: string): Buffer {
   try {
     ({ hrp, data } = bech32Decode(s.trim()));
   } catch (e) {
-    throw new AgeError("bad-key", `not an age identity: ${(e as Error).message}`);
+    throw new AgeError("bad-key", `not an age identity: ${errorMessage(e)}`);
   }
   // `bech32Decode` lowercases the HRP; the literal is uppercase by convention.
   if (hrp !== IDENTITY_HRP.toLowerCase()) {

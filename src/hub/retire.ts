@@ -13,6 +13,7 @@ import {
   RETIREMENT_GRACE_HOURS, writeTombstone,
 } from "./tombstone.js";
 import { createMachineNameLookup } from "./whereis.js";
+import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import type {
   HubDeleteResult, HubLockBusyResult, HubRetireFailedResult, HubRetireResult,
@@ -436,7 +437,7 @@ export async function hubDelete(opts: HubDeleteOptions): Promise<HubDeleteOutcom
         await deleteHubFile(backend, relPath);
         deletedFiles++;
       } catch (e) {
-        failed.push({ path: relPath, error: (e as Error).message });
+        failed.push({ path: relPath, error: errorMessage(e) });
       }
     }
 

@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync, rmSync } from "node:fs";
 import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
+import { errorMessage } from "../errors.js";
 import { projectJsonFilePath } from "../paths.js";
 /**
  * Remove this directory's hub link — the disarm path for the hub's automation.
@@ -135,7 +136,7 @@ export function hubUnlink(opts) {
             return {
                 success: false,
                 command: "hub-unlink",
-                error: `Could not remove this project's hub link (${path}): ${e.message}`,
+                error: `Could not remove this project's hub link (${path}): ${errorMessage(e)}`,
                 suggestion: "Check the permissions on that file and on the project directory, then try again — while the file is there, this project stays linked and the session-end auto-push stays armed for it.",
             };
         }

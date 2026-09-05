@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, createReadStream, readdirSync, statSync, } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { errorMessage } from "./errors.js";
 /**
  * The single place a bundle manifest is written, and therefore the single place
  * `sessionsDigest` is stamped. Recomputed here rather than by the caller so a
@@ -241,7 +242,7 @@ export async function verifyPatchDigest(patchPath, declared) {
         actual = await computeIntegrityHashFromFile(patchPath);
     }
     catch (e) {
-        return `the bundle declares a patch digest of ${declared || "(unreadable)"}, but changes.patch could not be read (${e.message})`;
+        return `the bundle declares a patch digest of ${declared || "(unreadable)"}, but changes.patch could not be read (${errorMessage(e)})`;
     }
     if (actual === declared)
         return null;
