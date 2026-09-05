@@ -46,6 +46,7 @@ import { finished, pipeline } from "node:stream/promises";
 import {
   AgeDecryptStream, AgeEncryptStream, AgeError, AgeRewrapStream, parseIdentity, parseRecipient,
 } from "../crypto/age.js";
+import { errorMessage } from "../errors.js";
 import { readIdentityFile, type IdentityFileState } from "../crypto/identity-file.js";
 import type { HubBackend } from "./backend.js";
 import { isEncryptedBundleFile } from "./layout.js";
@@ -123,31 +124,16 @@ async function absorbLateError(s: NodeJS.ReadableStream | NodeJS.WritableStream)
 }
 
 /**
- * The reason's text, extracted without trusting the reason to be an Error — or
- * an object at all. A rejection reason is whatever the failing code passed to
- * `reject` or `throw`, and `throw null`, `reject("boom")` and an Error whose
- * `message` was reassigned to a number are all legal; `(e as Error).message`
- * turned the first into a TypeError thrown from the one function documented as
- * never throwing (#96, finding 5).
+ * The reason's text. **`errors.ts` owns the extraction** (#102) — the same
+ * shape was found at ~45 further sites after #96's finding 5, so the guard
+ * lives in one place rather than being re-spelled per module.
  *
- * The duck-type on `message` rather than `instanceof Error` is deliberate: a
- * cross-realm Error fails `instanceof` and its `message` is still the diagnosis
- * worth keeping whole (the same "kept WHOLE" rule `BundleFetchFailure.message`
- * states). The outer catch is the part no shape check can replace — a property
- * read and `String()` both run code the reason's author controls (a getter, a
- * `toString`), so promising "never throws" means not trusting the extraction
- * itself either. What the fallback cannot do is diagnose: a reason that will
- * not even render says nothing about WHY the bundle failed, and only the kind
- * still carries a remedy.
+ * Aliased rather than called inline so the two no-throw contracts below keep
+ * naming what they depend on: the extraction cannot throw, for any rejection
+ * reason. What it cannot do is diagnose — a reason that will not even render
+ * says nothing about WHY the bundle failed, and only the KIND carries a remedy.
  */
-function failureMessage(e: unknown): string {
-  try {
-    const m = (e as { message?: unknown } | null | undefined)?.message;
-    return typeof m === "string" ? m : String(e);
-  } catch {
-    return "(rejection reason could not be rendered)";
-  }
-}
+const failureMessage = errorMessage;
 
 /**
  * One exception, one of the four kinds. **Shared by both directions**, which is

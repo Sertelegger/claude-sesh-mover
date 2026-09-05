@@ -110,7 +110,7 @@ describe("classifyBundleFailure never throws, whatever was thrown", () => {
     };
     const f = classifyBundleFailure(hostile);
     expect(f.kind).toBe("transfer");
-    expect(f.message).toBe("(rejection reason could not be rendered)");
+    expect(f.message).toBe("(error could not be rendered)");
   });
 
   it("survives a toString that throws", () => {
@@ -121,7 +121,7 @@ describe("classifyBundleFailure never throws, whatever was thrown", () => {
     };
     const f = classifyBundleFailure(hostile);
     expect(f.kind).toBe("transfer");
-    expect(f.message).toBe("(rejection reason could not be rendered)");
+    expect(f.message).toBe("(error could not be rendered)");
   });
 });
 
