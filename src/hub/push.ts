@@ -17,6 +17,7 @@ import {
   resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId,
   readLocalProjectId, removeLocalProjectIdIfMatches, type LocalProjectId,
 } from "./identity.js";
+import { errorMessage } from "../errors.js";
 import { scanGitRemotes, type GitRemoteScan } from "../payload/git-scan.js";
 import { capturePayload } from "../payload/capture.js";
 import { registerMachine } from "./init.js";
@@ -250,7 +251,7 @@ function failedAfterLink(
   commits: PushCommits,
   error: unknown
 ): HubPushFailedResult {
-  const cause = error instanceof Error ? error.message : String(error);
+  const cause = errorMessage(error);
   const projectId = commits.local.projectId;
   // The bundle is atomic (`writeStreamAtomic`), so it is either on the hub or
   // it never existed — but the index that makes it findable is written after

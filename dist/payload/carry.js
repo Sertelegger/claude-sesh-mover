@@ -10,6 +10,7 @@ import { DEFAULT_CARRY_MAX_MB } from "../config.js";
 // (`payload/` → the root modules, never `src/hub/`), and manifest.ts imports
 // nothing from here but a type.
 import { computePatchDigest, verifyPatchDigest } from "../manifest.js";
+import { errorMessage } from "../errors.js";
 /**
  * Byte budget for one carry payload: the diff plus every file copied beside it.
  *
@@ -780,7 +781,7 @@ export async function captureCarry(projectPath, destDir, opts) {
             catch (e) {
                 // One unreadable file must not cost the user the whole push: the
                 // session bundle this carry rides on is the point of the operation.
-                diagnostics.push(`Uncommitted file ${JSON.stringify(file.rel)} could not be copied into this push's carry payload (${e.message.slice(0, 120)}).`);
+                diagnostics.push(`Uncommitted file ${JSON.stringify(file.rel)} could not be copied into this push's carry payload (${errorMessage(e).slice(0, 120)}).`);
                 continue;
             }
             written++;
@@ -794,7 +795,7 @@ export async function captureCarry(projectPath, destDir, opts) {
     }
     catch (e) {
         cleanupPartial();
-        return { captured: false, reason: "write-failed", detail: e.message.slice(0, 200) };
+        return { captured: false, reason: "write-failed", detail: errorMessage(e).slice(0, 200) };
     }
 }
 // ---------------------------------------------------------------------------

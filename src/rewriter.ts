@@ -18,6 +18,7 @@ import {
   samePlatformFamily,
   translatePath,
 } from "./platform.js";
+import { errorMessage } from "./errors.js";
 
 export interface RewriteContext {
   mappings: PathMapping[];
@@ -329,7 +330,7 @@ export function transformLine(
       fieldsChanged: 0,
       adaptationsApplied: [],
       parseFailed: true,
-      parseError: (e as Error).message,
+      parseError: errorMessage(e),
     };
   }
 

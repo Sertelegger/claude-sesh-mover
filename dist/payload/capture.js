@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isNeverIncludable, snapshotWorkspace, } from "./workspace.js";
 import { captureCarry, gitChildEnv } from "./carry.js";
 import { includeFilePath } from "../paths.js";
+import { errorMessage } from "../errors.js";
 /**
  * THE FILE PAYLOAD — one decision, one disclosure, two transports.
  *
@@ -163,7 +164,11 @@ export async function capturePayload(opts) {
             maxBytes: opts.carryMaxBytes,
             measureOnly: opts.measureOnly,
             scope,
-        }).catch((e) => ({ captured: false, reason: "git-failed", detail: e.message }));
+        }).catch(
+        // `unknown`, and `errorMessage` rather than `.message`: this handler IS the
+        // containment the comment above promises, so it is the one place a hostile
+        // rejection reason must not itself be able to throw (#102).
+        (e) => ({ captured: false, reason: "git-failed", detail: errorMessage(e) }));
         warnings.push(...diagnostics);
         if (cap.captured) {
             warnings.push(...describeCarryCapture(cap.meta, scope, opts.measureOnly === true));

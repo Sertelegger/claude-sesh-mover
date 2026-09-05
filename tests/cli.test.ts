@@ -2534,6 +2534,71 @@ describe("cli", () => {
     });
   });
 
+  /**
+   * CLI-LEVEL (spawns `dist/cli.js`): these assertions exercise the wiring in
+   * `src/cli.ts`'s import action, which no unit test can reach (importing
+   * cli.ts runs `program.parse()`). They therefore require a rebuilt dist —
+   * `pretest` handles that on `npm test` — and cannot be mutation-tested by
+   * editing `src/` alone. The mutation-provable halves of #96 finding 4 live
+   * in tests/archiver.test.ts (the extractArchive refusal) and in the
+   * "classifies each result shape" case above (the exit class).
+   */
+  describe("import of an encrypted bundle (#96 finding 4)", () => {
+    it("refuses a .tar.gz.age file with a typed, actionable result instead of a missing-manifest error", () => {
+      const encPath = join(tempDir, "bundle.tar.gz.age");
+      writeFileSync(encPath, "age-encryption.org/v1\n-> X25519 notarealstanza\n");
+      const r = runCli([
+        "import",
+        "--from",
+        encPath,
+        "--target-project-path",
+        join(tempDir, "enc-import-target"),
+      ]);
+      expect(r.status).toBe(2);
+      const body = JSON.parse(r.stdout);
+      expect(body.success).toBe(false);
+      expect(body.command).toBe("import");
+      expect(body.reason).toBe("encrypted-bundle");
+      expect(body.bundlePath).toBe(encPath);
+      // The plaintext name the decrypt should produce: same path, minus .age.
+      expect(body.decryptedPath).toBe(encPath.slice(0, -".age".length));
+      // The misdiagnosis this replaces was a missing-manifest error.
+      expect(body.error).toMatch(/age-encrypted/);
+      expect(body.error).not.toMatch(/manifest/i);
+      // Actionable: says the bundle is intact, names the exact recovery
+      // command, and warns off in-chat passphrase collection.
+      expect(body.suggestion).toMatch(/not damaged/);
+      expect(body.suggestion).toContain(`age -d -i`);
+      expect(body.suggestion).toContain(encPath);
+      expect(body.suggestion).toContain(encPath.slice(0, -".age".length));
+      expect(body.suggestion).toMatch(/escrow/);
+    });
+
+    it("still treats a DIRECTORY whose name ends in .age as a directory export", () => {
+      // The refusal keys on spelling plus an isFile check — a directory named
+      // *.age must fall through to the ordinary directory-import path, whose
+      // failure here (no manifest in an empty dir) is the pre-existing one,
+      // NOT the encrypted-bundle refusal.
+      const dirPath = join(tempDir, "not-a-bundle.age");
+      mkdirSync(dirPath, { recursive: true });
+      const r = runCli([
+        "import",
+        "--from",
+        dirPath,
+        "--target-project-path",
+        join(tempDir, "enc-dir-target"),
+      ]);
+      const body = JSON.parse(r.stdout);
+      expect(body.success).toBe(false);
+      // No status assertion: an unreadable directory bundle is a RETURNED
+      // ErrorResult, which takes the untyped default (2) — the same code as
+      // the refusal. The discriminator is the reason, which only the refusal
+      // carries.
+      expect(body.reason).not.toBe("encrypted-bundle");
+      expect(body.suggestion ?? "").not.toContain("age -d");
+    });
+  });
+
   describe("exit codes", () => {
     /**
      * The classifier itself, exhaustively — one case per class, including the
@@ -2565,6 +2630,13 @@ describe("cli", () => {
         // retryable, but class 3 means retryable UNCHANGED IN A MOMENT and this
         // is a deliberate multi-day hold. Class 3 would invite a caller to loop.
         ["grace-period", { success: false, command: "hub-delete", reason: "grace-period" }, 2],
+        // Refusal, not class 1 (the command ran and diagnosed) and not class 3
+        // (retrying unchanged refuses identically until a human decrypts).
+        [
+          "encrypted-bundle",
+          { success: false, command: "import", reason: "encrypted-bundle" },
+          2,
+        ],
         ["hub-unreachable", { success: false, command: "pull", reason: "hub-unreachable" }, 3],
         ["lock-busy", { success: false, command: "push", reason: "lock-busy" }, 3],
         ["not-yet-synced", { success: false, command: "pull", reason: "not-yet-synced" }, 3],

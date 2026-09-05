@@ -85,6 +85,7 @@ import { readLocalProjectId } from "./identity.js";
 import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
 import { COMPACTION_GRACE_MS, planAck, planRetirement } from "./compact-plan.js";
 import { hubPush } from "./push.js";
+import { errorMessage } from "../errors.js";
 import { discoverSessions } from "../discovery.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { loadOrCreateMachineId } from "../machine.js";
@@ -631,7 +632,7 @@ async function retirePhase(args: {
       try {
         await deleteHubFile(backend, file);
       } catch (e) {
-        failed.push({ file, error: e instanceof Error ? e.message : String(e) });
+        failed.push({ file, error: errorMessage(e) });
       }
     };
     for (const r of doomed) await removeFile(r.file);

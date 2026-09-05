@@ -9,6 +9,7 @@ import {
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type { ExportManifest, SessionManifest, ExportLayer } from "./types.js";
+import { errorMessage } from "./errors.js";
 
 /**
  * The single place a bundle manifest is written, and therefore the single place
@@ -266,7 +267,7 @@ export async function verifyPatchDigest(
   try {
     actual = await computeIntegrityHashFromFile(patchPath);
   } catch (e) {
-    return `the bundle declares a patch digest of ${declared || "(unreadable)"}, but changes.patch could not be read (${(e as Error).message})`;
+    return `the bundle declares a patch digest of ${declared || "(unreadable)"}, but changes.patch could not be read (${errorMessage(e)})`;
   }
   if (actual === declared) return null;
   return `the bundle declares a patch digest of ${declared || "(unreadable)"}, but its changes.patch hashes to ${actual}`;

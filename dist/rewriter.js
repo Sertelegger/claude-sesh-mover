@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import { applyAdapters } from "./version-adapters.js";
 import { detectPlatform, extractUserFromPath, getCurrentUser, samePlatformFamily, translatePath, } from "./platform.js";
+import { errorMessage } from "./errors.js";
 // Characters that terminate a path token embedded in free text.
 // (?<!\/) — a token immediately preceded by "/" is URL-context
 // (http://mnt/..., protocol-relative //tmp/..., file:///mnt/...) and is
@@ -226,7 +227,7 @@ export function transformLine(line, ctx, opts = {}) {
             fieldsChanged: 0,
             adaptationsApplied: [],
             parseFailed: true,
-            parseError: e.message,
+            parseError: errorMessage(e),
         };
     }
     let adaptationsApplied = [];

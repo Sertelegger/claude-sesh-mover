@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { withHubIoTimeout } from "./io-timeout.js";
 import { HUB_JSON, machinePath, type HubJson, type HubMachineJson } from "./layout.js";
+import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { loadOrCreateIdentity } from "../crypto/identity-file.js";
 import { detectPlatform } from "../platform.js";
@@ -110,7 +111,7 @@ export async function hubInit(opts: {
     return {
       success: false,
       command: "hub-init",
-      error: `Cannot create hub directory ${hubPath}: ${(e as Error).message}`,
+      error: `Cannot create hub directory ${hubPath}: ${errorMessage(e)}`,
       suggestion: "Check that the path is writable (network share mounted, sync folder present).",
     };
   }
@@ -126,7 +127,7 @@ export async function hubInit(opts: {
       return {
         success: false,
         command: "hub-init",
-        error: `Existing hub.json is not readable: ${(e as Error).message}`,
+        error: `Existing hub.json is not readable: ${errorMessage(e)}`,
         suggestion: "Point --path at an empty directory or a valid sesh-mover hub.",
       };
     }

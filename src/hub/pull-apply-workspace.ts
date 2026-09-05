@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { type HubBackend } from "./backend.js";
 import { fetchBundleArchive } from "./bundle-io.js";
 import { workspaceDir, type HubBundleRecord } from "./layout.js";
+import { errorMessage } from "../errors.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "../payload/workspace.js";
 import { mergeWorkspaceTrees, type WorkspaceMergeReport } from "./merge.js";
 import { isReadableDir } from "./fs-probe.js";
@@ -127,7 +128,7 @@ async function retrieveWorkspaceTree(
     if (!isReadableDir(tree)) return { dir: null, why: "carries no workspace tree" };
     return { dir: tree };
   } catch (e) {
-    return { dir: null, why: `could not be read back (${(e as Error).message})` };
+    return { dir: null, why: `could not be read back (${errorMessage(e)})` };
   }
 }
 

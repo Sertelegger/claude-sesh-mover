@@ -8,6 +8,7 @@ import {
   adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS,
 } from "./append.js";
 import { recordSharedLayers, type ApplyState } from "./pull-apply-state.js";
+import { errorMessage } from "../errors.js";
 import { applySharedLayers, importSession } from "../importer.js";
 import { computeIntegrityHashFromFile } from "../manifest.js";
 import {
@@ -544,7 +545,7 @@ export async function runApplySessionsStage(
             );
           } catch (e) {
             reasons.push(
-              `Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${(e as Error).message}) — the transcript is complete; those side files are missing.`
+              `Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${errorMessage(e)}) — the transcript is complete; those side files are missing.`
             );
           }
 
@@ -726,7 +727,7 @@ export async function runApplySessionsStage(
                 );
               } catch (e) {
                 reasons.push(
-                  `Your local branch was preserved as session ${preservedSessionId}, but registering it in history.jsonl failed (${(e as Error).message}) — the file is there and \`claude --resume ${preservedSessionId}\` still works; it just won't be listed.`
+                  `Your local branch was preserved as session ${preservedSessionId}, but registering it in history.jsonl failed (${errorMessage(e)}) — the file is there and \`claude --resume ${preservedSessionId}\` still works; it just won't be listed.`
                 );
               }
               // The adopted branch's layer files, onto the base — exactly
@@ -743,7 +744,7 @@ export async function runApplySessionsStage(
                 );
               } catch (e) {
                 reasons.push(
-                  `The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${(e as Error).message}) — the transcript is complete; those side files are missing.`
+                  `The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${errorMessage(e)}) — the transcript is complete; those side files are missing.`
                 );
               }
 

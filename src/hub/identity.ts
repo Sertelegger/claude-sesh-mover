@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { HubBackend } from "./backend.js";
 import { projectJsonPath, assertSafeHubId, type HubProjectJson } from "./layout.js";
+import { errorMessage } from "../errors.js";
 import { localGitRemotes } from "../payload/git-scan.js";
 import { projectJsonFilePath } from "../paths.js";
 
@@ -59,7 +60,7 @@ export function removeLocalProjectIdIfMatches(
     rmSync(localProjectIdPath(projectPath), { force: true });
     return { removed: true, detail: "" };
   } catch (e) {
-    return { removed: false, detail: (e as Error).message };
+    return { removed: false, detail: errorMessage(e) };
   }
 }
 

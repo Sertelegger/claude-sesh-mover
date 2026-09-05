@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { encodeProjectPath } from "./platform.js";
+import { errorMessage } from "./errors.js";
 import type {
   MigrateResult,
   ErrorResult,
@@ -309,7 +310,7 @@ export async function migrateSession(
         directoryRenamed = true;
       } catch (e) {
         imported.warnings.push(
-          `Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${(e as Error).message}. You may need to rename it manually.`
+          `Failed to rename directory ${sourceProjectPath} → ${targetProjectPath}: ${errorMessage(e)}. You may need to rename it manually.`
         );
       }
     }

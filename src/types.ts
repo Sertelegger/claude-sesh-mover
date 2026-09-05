@@ -1088,6 +1088,46 @@ export interface ErrorResult {
   warnings?: string[];
 }
 
+/**
+ * `import --from` was handed an age-ENCRYPTED bundle (`*.age`) — a hub bundle
+ * that left the hub still sealed, or a hand-carried copy of one. A typed
+ * refusal, and deliberately NOT a decrypt (#96 finding 4). Three reasons, each
+ * sufficient on its own:
+ *
+ * - Decryption needs `~/.sesh-mover/identity.age`, this machine's HUB
+ *   identity. `import` is the non-hub transport — its bundles come from
+ *   anywhere, including strangers — and quietly reading the hub identity to
+ *   service one would couple the two transports the design keeps apart.
+ * - `hub/bundle-io.ts` is the one place a bundle crosses the
+ *   plaintext/ciphertext boundary, in both directions. `import` cannot take
+ *   that seam without the non-hub transport importing hub code, and must not
+ *   grow a second seam of its own.
+ * - The recovery is one documented command with the standard `age` tool — the
+ *   whole reason the wire format is age's (`commands/hub-encrypt.md`) — and it
+ *   also works on the machine this refusal matters most for: one holding only
+ *   an escrow file and no plugin identity at all, which a built-in decrypt
+ *   could not serve anyway (the escrow passphrase must never transit a
+ *   session; see `commands/hub-escrow.md`).
+ *
+ * The refusal is actionable or it is useless: `suggestion` carries the exact
+ * command, and `error` says what the file IS — the misdiagnosis this shape
+ * replaces handed the `.age` file to the importer as a DIRECTORY and reported
+ * a nonsense missing-manifest error. The bundle is not damaged; say so.
+ *
+ * Exit class 2 — see `REASON_EXIT_CODE`.
+ */
+export interface EncryptedBundleRefusedResult {
+  success: false;
+  command: "import";
+  reason: "encrypted-bundle";
+  error: string;
+  /** The `.age` file as given on `--from`. */
+  bundlePath: string;
+  /** `bundlePath` minus the `.age` suffix — what the decrypt step should produce. */
+  decryptedPath: string;
+  suggestion: string;
+}
+
 // --- Hub ---
 
 export interface HubInitResult {
@@ -2524,6 +2564,7 @@ export type CliResult =
   | ExportPayloadPlanResult
   | ImportResult
   | DryRunResult
+  | EncryptedBundleRefusedResult
   | MigrateResult
   | BrowseResult
   | ConfigureResult
@@ -2675,6 +2716,15 @@ const REASON_EXIT_CODE: Record<CliResultReason, ExitCode> = {
    * bundle is already on the hub and already what a reader fetches.
    */
   "compaction-pending": EXIT_REFUSED,
+  /**
+   * `import --from <bundle>.tar.gz.age` (#96 finding 4). A refusal, not class
+   * 1: the invocation is well-formed, the command ran, understood exactly what
+   * the file is, declined, and changed nothing — the body says why and names
+   * the remedy. Not class 3 either: retrying unchanged refuses identically
+   * forever, and the remedy is a human running the `age` decrypt in
+   * `suggestion`, not waiting for the machine to catch up.
+   */
+  "encrypted-bundle": EXIT_REFUSED,
   "escrow-verify-failed": EXIT_FAILED,
   // Environment-not-ready: same invocation, retry once the machine catches up.
   "hub-unreachable": EXIT_NOT_READY,

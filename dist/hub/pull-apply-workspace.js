@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fetchBundleArchive } from "./bundle-io.js";
 import { workspaceDir } from "./layout.js";
+import { errorMessage } from "../errors.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "../payload/workspace.js";
 import { mergeWorkspaceTrees } from "./merge.js";
 import { isReadableDir } from "./fs-probe.js";
@@ -73,7 +74,7 @@ async function retrieveWorkspaceTree(backend, file, tempRoot, scratchPrefix) {
         return { dir: tree };
     }
     catch (e) {
-        return { dir: null, why: `could not be read back (${e.message})` };
+        return { dir: null, why: `could not be read back (${errorMessage(e)})` };
     }
 }
 /**

@@ -46,6 +46,7 @@ import { collectHubRecipients, resolveHubEncryption } from "./encryption.js";
 import { registerMachine } from "./init.js";
 import { listMachineIds, readMachineRecord } from "./machines.js";
 import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { compareVersions } from "../version-adapters.js";
 import { readConfigOverrides, writeConfigOverrides, setConfigOverride } from "../config.js";
@@ -263,7 +264,7 @@ export async function hubEncrypt(
       // not nothing either — the preference is what a later `configure --show`
       // will report, so a silent miss leaves the two disagreeing.
       preferenceWarnings.push(
-        `The hub-wide setting was written, but this machine's local hub.encrypt preference could not be recorded (${(e as Error).message}). That affects nothing but what \`configure --show\` reports here.`
+        `The hub-wide setting was written, but this machine's local hub.encrypt preference could not be recorded (${errorMessage(e)}). That affects nothing but what \`configure --show\` reports here.`
       );
     }
   }

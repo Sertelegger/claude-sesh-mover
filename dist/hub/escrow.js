@@ -76,6 +76,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { errorMessage } from "../errors.js";
 import { AGE_SCRYPT_LOG_N, AgeDecryptStream, AgeEncryptStream, AgeError } from "../crypto/age.js";
 import { identityFilePath, readIdentityFile } from "../crypto/identity-file.js";
 import { PROJECT_DIR_NAME, PROJECT_JSON_FILE_NAME, userSeshMoverDir } from "../paths.js";
@@ -550,7 +551,7 @@ export async function hubEscrow(opts) {
             rmSync(escrowRecordPath(), { force: true });
         }
         catch (e) {
-            return refuse("not-enabled", `Could not remove the escrow record: ${e.message}`, "Remove ~/.sesh-mover/escrow.json by hand. It is a pointer, not a key.");
+            return refuse("not-enabled", `Could not remove the escrow record: ${errorMessage(e)}`, "Remove ~/.sesh-mover/escrow.json by hand. It is a pointer, not a key.");
         }
         return {
             success: true,
@@ -635,7 +636,7 @@ export async function hubEscrow(opts) {
             success: false,
             command: "hub-escrow",
             reason: "escrow-verify-failed",
-            error: `The escrow could not be written: ${e.message}`,
+            error: `The escrow could not be written: ${errorMessage(e)}`,
             suggestion: "Nothing usable was left behind. Fix the cause and run it again.",
             limits: [...ESCROW_DESTINATION_LIMITS],
         };
@@ -667,7 +668,7 @@ export async function hubEscrow(opts) {
             success: false,
             command: "hub-escrow",
             reason: "escrow-verify-failed",
-            error: `The escrow was written but did not read back: ${e.message}`,
+            error: `The escrow was written but did not read back: ${errorMessage(e)}`,
             suggestion: "The file was removed. This is the failure mode worth catching now rather than during a " +
                 "recovery: an escrow that does not open reaches you as \"my passphrase doesn't work\", " +
                 "at the one moment there is no other copy of the key.",
@@ -693,7 +694,7 @@ export async function hubEscrow(opts) {
         // The escrow itself is written and valid; only the bookkeeping failed. That
         // must not be reported as a failed escrow — the file the user needs exists.
         warnings.push(`The escrow was written and verified, but the record of it could not be saved ` +
-            `(${e.message}). \`hub escrow\` will report "not enabled" until that is fixed; ` +
+            `(${errorMessage(e)}). \`hub escrow\` will report "not enabled" until that is fixed; ` +
             `the escrow file itself is fine and is at the path reported here.`);
     }
     return {

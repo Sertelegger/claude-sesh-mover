@@ -17,6 +17,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { finished, pipeline } from "node:stream/promises";
+import { errorMessage } from "../errors.js";
 import { isConversationEntry, readLastEntryUuid, MAX_ENTRY_SCAN_BYTES } from "../jsonl.js";
 import { rewriteJsonlStream, buildPathMappings, type RewriteContext } from "../rewriter.js";
 import { detectPlatform } from "../platform.js";
@@ -375,7 +376,7 @@ export async function tryAppendContinuation(a: AppendAttempt): Promise<AppendOut
     // mtime (which is how Claude Code orders /resume). Let the fault surface.
     if (!wroteBytes) throw e;
 
-    const cause = (e as Error).message;
+    const cause = errorMessage(e);
 
     // Rollback is a TRUNCATE, and a truncate is only ours to perform if every
     // byte past `rollbackBytes` is a byte we put there. Nothing upstream can
@@ -394,7 +395,7 @@ export async function tryAppendContinuation(a: AppendAttempt): Promise<AppendOut
       liveSize = statSync(a.basePath).size;
     } catch (statError) {
       throw new Error(
-        `append failed (${cause}) AND the base could not be re-measured, so no rollback was attempted — ${a.basePath} was left exactly as it is: ${(statError as Error).message}`
+        `append failed (${cause}) AND the base could not be re-measured, so no rollback was attempted — ${a.basePath} was left exactly as it is: ${errorMessage(statError)}`
       );
     }
     const oursToUndo = rollbackBytes + appendedBytes;
@@ -408,7 +409,7 @@ export async function tryAppendContinuation(a: AppendAttempt): Promise<AppendOut
       truncateSync(a.basePath, rollbackBytes);
     } catch (rollbackError) {
       throw new Error(
-        `append failed (${cause}) AND rollback failed — ${a.basePath} may be corrupt (expected ${rollbackBytes} bytes): ${(rollbackError as Error).message}`
+        `append failed (${cause}) AND rollback failed — ${a.basePath} may be corrupt (expected ${rollbackBytes} bytes): ${errorMessage(rollbackError)}`
       );
     }
     const restored = readLastEntryUuid(a.basePath);
@@ -649,7 +650,7 @@ export async function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome
       preservedSessionId: input.preservedSessionId,
     };
   } catch (e) {
-    const cause = (e as Error).message;
+    const cause = errorMessage(e);
 
     // `mutatedSize === null` means the fault landed before the truncate — an
     // unreadable delta, a rewrite failure, an IO error during the O(delta)
@@ -687,7 +688,7 @@ export async function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome
         /* best effort — the throw below is the message that matters */
       }
       throw new Error(
-        `adopt failed (${cause}) AND the base could not be re-measured, so no restore was attempted — ${input.basePath} was left exactly as it is, mid-adoption; a complete copy of the session as it was before adoption is at ${backup}: ${(statError as Error).message}`
+        `adopt failed (${cause}) AND the base could not be re-measured, so no restore was attempted — ${input.basePath} was left exactly as it is, mid-adoption; a complete copy of the session as it was before adoption is at ${backup}: ${errorMessage(statError)}`
       );
     }
     if (liveSize !== mutatedSize) {
@@ -711,7 +712,7 @@ export async function adoptHubBranch(input: AdoptHubInput): Promise<AdoptOutcome
     } catch (restoreError) {
       keepWork = true; // the backup is the user's only intact copy — keep it
       throw new Error(
-        `adopt failed (${cause}) AND restoring ${input.basePath} failed — a complete copy of the session as it was is at ${backup}: ${(restoreError as Error).message}`
+        `adopt failed (${cause}) AND restoring ${input.basePath} failed — a complete copy of the session as it was is at ${backup}: ${errorMessage(restoreError)}`
       );
     }
     return { kind: "failed", detail: cause };

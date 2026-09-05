@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS, } from "./append.js";
 import { recordSharedLayers } from "./pull-apply-state.js";
+import { errorMessage } from "../errors.js";
 import { applySharedLayers, importSession } from "../importer.js";
 import { computeIntegrityHashFromFile } from "../manifest.js";
 import { findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
@@ -302,7 +303,7 @@ export async function runApplySessionsStage(input) {
                         await copyLayerDirs(extractDir, record.sessionIdInBundle, targetProjectDir, baseSessionId, configDir, ctx);
                     }
                     catch (e) {
-                        reasons.push(`Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${e.message}) — the transcript is complete; those side files are missing.`);
+                        reasons.push(`Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${errorMessage(e)}) — the transcript is complete; those side files are missing.`);
                     }
                     // The shared layers this bundle carried. Nothing below imports it, so
                     // this is the only place they can land — see `applyBundleSharedLayers`.
@@ -459,7 +460,7 @@ export async function runApplySessionsStage(input) {
                                 }) + "\n", "utf-8");
                             }
                             catch (e) {
-                                reasons.push(`Your local branch was preserved as session ${preservedSessionId}, but registering it in history.jsonl failed (${e.message}) — the file is there and \`claude --resume ${preservedSessionId}\` still works; it just won't be listed.`);
+                                reasons.push(`Your local branch was preserved as session ${preservedSessionId}, but registering it in history.jsonl failed (${errorMessage(e)}) — the file is there and \`claude --resume ${preservedSessionId}\` still works; it just won't be listed.`);
                             }
                             // The adopted branch's layer files, onto the base — exactly
                             // as for a plain append. The PRESERVED session deliberately
@@ -472,7 +473,7 @@ export async function runApplySessionsStage(input) {
                                 await copyLayerDirs(extractDir, record.sessionIdInBundle, targetProjectDir, baseSessionId, configDir, ctx);
                             }
                             catch (e) {
-                                reasons.push(`The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${e.message}) — the transcript is complete; those side files are missing.`);
+                                reasons.push(`The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${errorMessage(e)}) — the transcript is complete; those side files are missing.`);
                             }
                             // As on the plain-append path above, and for the same reason: an
                             // adoption returns before the fragment import, so this is the

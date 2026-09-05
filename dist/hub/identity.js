@@ -2,6 +2,7 @@ import { existsSync, readFileSync, mkdirSync, rmSync, writeFileSync } from "node
 import { basename, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { projectJsonPath, assertSafeHubId } from "./layout.js";
+import { errorMessage } from "../errors.js";
 import { localGitRemotes } from "../payload/git-scan.js";
 import { projectJsonFilePath } from "../paths.js";
 export function localProjectIdPath(projectPath) {
@@ -49,7 +50,7 @@ export function removeLocalProjectIdIfMatches(projectPath, projectId) {
         return { removed: true, detail: "" };
     }
     catch (e) {
-        return { removed: false, detail: e.message };
+        return { removed: false, detail: errorMessage(e) };
     }
 }
 export function writeLocalProjectId(projectPath, id) {

@@ -15,6 +15,7 @@ import { isReadableDir } from "./hub/fs-probe.js";
 import { IGNORE_FILE_NAME, INCLUDE_FILE_NAME, isPluginStateName } from "./paths.js";
 import { MEMORY_INDEX_NAME, appendIndexLines, formatMemoryPointer, memoryIndexTargets, unionMemoryIndex, } from "./memory-index.js";
 import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "./sidecar.js";
+import { errorMessage } from "./errors.js";
 /**
  * QUOTING — every bundle-supplied string echoed into a message in this file is
  * wrapped in `JSON.stringify`, never in a hand-written `"${…}"`.
@@ -565,7 +566,7 @@ function reconcileSharedLayers(opts) {
                             // OS error message in this file whose text demonstrably carries a
                             // bundle-chosen name; the rest name a local path (the config dir,
                             // the project dir, MEMORY.md) and stay unquoted for that reason.
-                            warnings.push(`Could not park the incoming copy of ${JSON.stringify(file)} (${JSON.stringify(e.message)}).`);
+                            warnings.push(`Could not park the incoming copy of ${JSON.stringify(file)} (${JSON.stringify(errorMessage(e))}).`);
                             parkedAs = null;
                         }
                     }
@@ -681,7 +682,7 @@ function reconcileSharedLayers(opts) {
                     });
                 }
                 catch (e) {
-                    warnings.push(`Could not update the memory index (${e.message}) — memories from this bundle are on disk but may not be listed in ${MEMORY_INDEX_NAME}.`);
+                    warnings.push(`Could not update the memory index (${errorMessage(e)}) — memories from this bundle are on disk but may not be listed in ${MEMORY_INDEX_NAME}.`);
                 }
             }
             // A memory file the bundle carried that no index line points at is on
@@ -723,7 +724,7 @@ function reconcileSharedLayers(opts) {
             }
         }
         catch (e) {
-            warnings.push(`Memory files could not be reconciled (${e.message}) — nothing in your memory folder was changed by this import.`);
+            warnings.push(`Memory files could not be reconciled (${errorMessage(e)}) — nothing in your memory folder was changed by this import.`);
         }
     }
     // `plans/` is config-dir-GLOBAL on both ends (the exporter applies no project
@@ -837,7 +838,7 @@ function reconcileSharedLayers(opts) {
             }
         }
         catch (e) {
-            warnings.push(`Plans could not be reconciled (${e.message}) — nothing in your plans folder was changed by this import.`);
+            warnings.push(`Plans could not be reconciled (${errorMessage(e)}) — nothing in your plans folder was changed by this import.`);
         }
     }
     return {
@@ -1061,7 +1062,7 @@ async function reconcilePayloadLayers(opts) {
             // it must NOT become an ErrorResult: the sessions are already on disk by
             // the time this runs, and the failure contract is that no failure of the
             // optional half costs the user a transcript.
-            warnings.push(`The workspace payload could not be applied (${e.message}) — the sessions imported normally and nothing else in this import depends on it.`);
+            warnings.push(`The workspace payload could not be applied (${errorMessage(e)}) — the sessions imported normally and nothing else in this import depends on it.`);
         }
     }
     // --- carry ---
@@ -1253,7 +1254,7 @@ export async function importSession(options) {
         return {
             success: false,
             command: "import",
-            error: `Failed to read manifest: ${e.message}`,
+            error: `Failed to read manifest: ${errorMessage(e)}`,
         };
     }
     // Step 1a: the manifest must be the one the exporter wrote. This runs before
@@ -1784,7 +1785,7 @@ export async function importSession(options) {
         return {
             success: false,
             command: "import",
-            error: `Import write failed: ${writeErr.message}`,
+            error: `Import write failed: ${errorMessage(writeErr)}`,
             details: "Partially written files have been cleaned up. No indexes were modified.",
             suggestion: "Check available disk space or file permissions and retry.",
         };
@@ -1846,7 +1847,7 @@ export async function importSession(options) {
                     // plus the path; a flag named here would be a second thing that can
                     // be wrong, and it would need its own entry and re-run proof in
                     // tests/hub-warning-flags.test.ts.
-                    warnings.push(`Could not write the project identity file into ${targetProjectPath} (${e.message}) — the sessions imported normally. Only this project's hub link is affected; nothing else in the import depends on that file.`);
+                    warnings.push(`Could not write the project identity file into ${targetProjectPath} (${errorMessage(e)}) — the sessions imported normally. Only this project's hub link is affected; nothing else in the import depends on that file.`);
                 }
             }
             else if (existing.projectId !== manifest.projectId) {
@@ -1908,7 +1909,7 @@ export async function importSession(options) {
                 // treats an unregistered prior as re-importable — which would duplicate
                 // them on the next run. Both directions have to be right.
                 registrationFailed.add(session.sessionId);
-                warnings.push(`Session ${JSON.stringify(session.slug)} imported but could not be added to ${historyPath} (${e.message}), so it will not appear in Claude Code's resume list. Its files are in place; nothing was lost.`);
+                warnings.push(`Session ${JSON.stringify(session.slug)} imported but could not be added to ${historyPath} (${errorMessage(e)}), so it will not appear in Claude Code's resume list. Its files are in place; nothing was lost.`);
             }
         }
     }
@@ -2014,7 +2015,7 @@ export async function importSession(options) {
         // out — not an exception that discards a completed import (and, on
         // `migrate`, left the source sessions undeleted beside the copies that
         // already landed).
-        warnings.push(`The sessions imported, but this project's sync-state could not be saved (${e.message}). Importing this same bundle again will NOT be recognized as a duplicate — it would add a second copy of each session. Free space or fix permissions before re-running an import here.`);
+        warnings.push(`The sessions imported, but this project's sync-state could not be saved (${errorMessage(e)}). Importing this same bundle again will NOT be recognized as a duplicate — it would add a second copy of each session. Free space or fix permissions before re-running an import here.`);
     }
     return {
         success: true,

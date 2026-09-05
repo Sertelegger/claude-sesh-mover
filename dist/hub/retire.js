@@ -5,6 +5,7 @@ import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
 import { projectDir, projectJsonPath, tombstoneDirPath, tombstonePath, } from "./layout.js";
 import { formatStamp, graceState, readTombstone, readTombstones, RETIREMENT_GRACE_HOURS, writeTombstone, } from "./tombstone.js";
 import { createMachineNameLookup } from "./whereis.js";
+import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 /**
  * The one place `HubBackend.delete` is called.
@@ -271,7 +272,7 @@ export async function hubDelete(opts) {
                 deletedFiles++;
             }
             catch (e) {
-                failed.push({ path: relPath, error: e.message });
+                failed.push({ path: relPath, error: errorMessage(e) });
             }
         }
         // The local link is removed too, and it is not tidiness: the file is the
