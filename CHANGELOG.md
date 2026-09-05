@@ -59,6 +59,26 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   what each sentence is true of: policy facts travel regardless, past-tense claims about an uploaded
   bundle only past the branch that uploads.
 
+- **`sesh-mover import --from <bundle>.tar.gz.age` is refused with an explanation, instead of failing
+  with a nonsense error about a missing manifest** ([#96]). `.age` was not a recognized archive format,
+  so the encrypted file was handed to the importer as though it were a *directory*. The refusal now
+  names the exact `age -d -i …` command that decrypts it, and says the bundle is not damaged.
+
+  It refuses rather than decrypting, deliberately: decryption needs this machine's **hub** identity,
+  and `import` is the non-hub transport whose bundles come from anywhere. It also could not serve the
+  case that matters most — a rebuilt machine holding only an escrow file has no plugin identity, and an
+  escrow passphrase must never be typed into a session.
+
+  The sibling defect is fixed with it: `extractArchive` treated an unknown format as gzip, and now
+  refuses by name before touching the file.
+
+- **Every unchecked `(e as Error).message` is gone** ([#102]) — 48 sites. Some mattered: in
+  `append.ts`, the module that splices a pulled continuation into a transcript you already own, a
+  `null` rejection turned a handled failure into a thrown one; on the payload-capture path, whose whole
+  job is that no git failure may cost the sessions, the same defect wore a typed parameter instead of a
+  cast. `outputError` — the chokepoint every CLI catch funnels through — now takes `unknown`, so a
+  `throw null` can no longer crash the failure path itself.
+
 ### Internal
 
 - Two stale encryption comments retired, both justifying a correct decision with a premise that had
