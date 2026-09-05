@@ -1759,7 +1759,8 @@ export interface HubNoSuchProjectResult {
 export interface HubUnreachableResult {
   success: false;
   command:
-    | "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-encrypt" | "hub-rekey";
+    | "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-encrypt" | "hub-rekey"
+    | "hub-compact";
   reason: "hub-unreachable";
   /**
    * Which of the two shapes it is — an enum rather than prose, because the
@@ -1851,7 +1852,8 @@ export interface LockStealRecord {
 export interface HubLockBusyResult {
   success: false;
   command:
-    | "push" | "pull" | "hub-unlink" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-rekey";
+    | "push" | "pull" | "hub-unlink" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-rekey"
+    | "hub-compact";
   reason: "lock-busy";
   holderPid: number | null;
   ageSeconds: number | null;
@@ -2436,6 +2438,87 @@ export interface HubRetireFailedResult {
   suggestion: string;
 }
 
+/**
+ * `hub compact` — a run that did something (#92).
+ *
+ * `phase` is which half happened, and it is on the result rather than inferred
+ * from the other fields because the two are genuinely different events for a
+ * user: one uploaded a bundle and deleted nothing, the other deleted files and
+ * uploaded nothing.
+ */
+export interface HubCompactResult {
+  success: true;
+  command: "hub-compact";
+  phase: "consolidated" | "retired";
+  threadId: string;
+  /** The full bundle that replaces the chain. Present in both phases. */
+  consolidatedBundleId: string;
+  /** Phase 2: bundle ids removed from this machine's index and deleted. */
+  retiredBundleIds?: string[];
+  /**
+   * Phase 2: records deliberately kept, each with the reason. Always reported,
+   * including when empty — a compaction that silently kept things looks
+   * identical to one that had nothing to keep, and the difference matters when
+   * the reason is `not-covered` (a parked fork whose only copy is on the hub).
+   */
+  retained?: Array<{ bundleId: string; why: string }>;
+  /**
+   * Phase 2: files this run could not delete. Never fatal — a bundle that
+   * survived is a file that still exists, which is the harmless direction, and
+   * a re-run finishes the job.
+   */
+  failed?: Array<{ file: string; error: string }>;
+  warnings: string[];
+}
+
+/**
+ * `hub compact` declining to retire anything yet.
+ *
+ * A REFUSAL (exit 2), not environment-not-ready (3), for the same reason
+ * `grace-period` is: class 3 is the set worth retrying UNCHANGED in a moment,
+ * and this is a deliberate wait measured in hours or days whose whole point is
+ * that nobody loops on it. The consolidated bundle is already on the hub and
+ * already serving readers, so nothing is broken while this is the answer.
+ */
+export interface HubCompactPendingResult {
+  success: false;
+  command: "hub-compact";
+  reason: "compaction-pending";
+  threadId: string;
+  consolidatedBundleId: string;
+  /**
+   * Machines that have not yet demonstrated they hold the consolidated
+   * content. A CENSUS, never a filtered list — a machine omitted here is
+   * indistinguishable from one that does not exist, and that mistake deletes
+   * data.
+   */
+  outstanding: Array<{
+    machineId: string;
+    machineName: string | null;
+    reason: string;
+    advertisedHead: string;
+  }>;
+  /** When the grace window expires, if that is what is still pending. */
+  eligibleAt?: string;
+  warnings: string[];
+  suggestion: string;
+}
+
+/**
+ * `hub compact` declining before it starts — this directory is linked to no hub
+ * project, so there is no chain of its own to retire. Its own shape rather than
+ * `HubUnlinkedResult` for the reason that one carries `linkCandidates`: those
+ * exist to offer a push or pull somewhere to land, and compaction has nothing
+ * to offer a project it has never published.
+ */
+export interface HubCompactRefusedResult {
+  success: false;
+  command: "hub-compact";
+  reason: "unlinked";
+  error: string;
+  suggestion: string;
+}
+
 export type CliResult =
   | ExportResult
   | ExportPayloadPlanResult
@@ -2456,6 +2539,9 @@ export type CliResult =
   | HubLockBusyResult
   | HubProjectRetiredResult
   | HubRetireResult
+  | HubCompactResult
+  | HubCompactPendingResult
+  | HubCompactRefusedResult
   | HubDeleteResult
   | HubRetireFailedResult
   | HubPullResult
@@ -2581,6 +2667,14 @@ const REASON_EXIT_CODE: Record<CliResultReason, ExitCode> = {
   "encryption-refused": EXIT_REFUSED,
   "stale-machines": EXIT_REFUSED,
   "escrow-refused": EXIT_REFUSED,
+  /**
+   * Compaction declining to delete yet (#92) — waiting on a machine to
+   * acknowledge, or on the grace window. A refusal for `grace-period`'s exact
+   * reason: class 3 invites a caller to loop, and this wait is measured in
+   * hours or days by design. Nothing is broken meanwhile — the consolidated
+   * bundle is already on the hub and already what a reader fetches.
+   */
+  "compaction-pending": EXIT_REFUSED,
   "escrow-verify-failed": EXIT_FAILED,
   // Environment-not-ready: same invocation, retry once the machine catches up.
   "hub-unreachable": EXIT_NOT_READY,

@@ -6,7 +6,13 @@
     "name": "sascha"
   },
   "license": "MIT",
-  "keywords": ["session", "migration", "export", "import", "wsl"],
+  "keywords": [
+    "session",
+    "migration",
+    "export",
+    "import",
+    "wsl"
+  ],
   "commands": [
     "./commands/export.md",
     "./commands/import.md",
@@ -19,6 +25,7 @@
     "./commands/hub-escrow.md",
     "./commands/hub-unlink.md",
     "./commands/hub-retire.md",
+    "./commands/hub-compact.md",
     "./commands/hub-delete.md",
     "./commands/push.md",
     "./commands/pull.md",

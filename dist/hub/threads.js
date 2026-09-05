@@ -142,7 +142,7 @@ export function resolveThreads(indexes) {
  * `assembleChain`'s walk, deliberately as ONE function rather than two inline
  * spellings of the same sentence.
  */
-function isLinkUuid(uuid) {
+export function isLinkUuid(uuid) {
     return typeof uuid === "string" && uuid !== "";
 }
 /**

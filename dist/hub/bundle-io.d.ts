@@ -90,6 +90,13 @@ export type BundleFetchOutcome = {
  * describe them two ways — "this machine is not a recipient" in particular is
  * the same fact whether it was found while reading a bundle or while trying to
  * re-address one.
+ *
+ * **Never throws, for ANY rejection reason.** The two no-throw contracts below
+ * (`fetchBundleArchive`, `rewrapBundleFile`) bottom out here, inside their own
+ * `catch` blocks, so a throw out of this function IS a throw out of them —
+ * with exactly the cost their contracts exist to prevent: exit 1 through the
+ * CLI's outer catch, no `suggestion`, and every disclosure from bundles
+ * already applied in the chain dropped.
  */
 export declare function classifyBundleFailure(e: unknown): BundleFetchFailure;
 /**

@@ -48,6 +48,21 @@ export function tombstonePath(projectId, machineId) {
     assertSafeHubId(machineId, "machineId");
     return `${tombstoneDirPath(projectId)}/${machineId}.json`;
 }
+export function compactionDirPath(projectId) {
+    return `${projectDir(projectId)}/compactions`;
+}
+/**
+ * `compactions/<machineId>.json` — the file machine `<machineId>` owns.
+ *
+ * Same shape as `tombstonePath` and for the same reason: a machine asserts only
+ * about its own removals, so two machines compacting different threads of one
+ * project never contend and no distributed lock is needed. A reader merges
+ * every machine's file the way `readAllIndexes` merges every machine's index.
+ */
+export function compactionPath(projectId, machineId) {
+    assertSafeHubId(machineId, "machineId");
+    return `${compactionDirPath(projectId)}/${machineId}.json`;
+}
 export function bundleDir(projectId, machineId) {
     assertSafeHubId(machineId, "machineId");
     return `${projectDir(projectId)}/bundles/${machineId}`;

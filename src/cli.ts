@@ -1110,6 +1110,60 @@ hub
     }
   });
 
+// `hub compact` (#92) replaces a thread's continuation chain with one full
+// bundle, then removes the chain behind it — but only once every machine has
+// demonstrably got the content, and only this machine's own bundles.
+//
+// TWO PHASES ACROSS INVOCATIONS, never one long run: the wait between them is
+// measured in days and the same-machine lock is stolen from a live holder at 60
+// minutes without telling the victim. A run does the phase it can and stops.
+//
+// NOT ON ANY AUTOMATIC PATH. It is the only verb in this plugin that deletes
+// data a user did not ask to delete by name, so it is never reachable from the
+// SessionEnd auto-push and has no config key — the same rule as `push --full`
+// and `--force-unkeyed`, for the same reason: an unattended caller must not be
+// able to make an irreversible choice.
+hub
+  .command("compact")
+  .description("Consolidate a thread into one full bundle and retire this machine's chain behind it")
+  .option("--thread <id>", "Which thread to compact (required — run whereis to list them)")
+  .option("--project-path <path>", "Override project path (default: cwd)")
+  .option("--source-config-dir <path>", "Override Claude config dir")
+  .action(async (opts) => {
+    try {
+      const configDir = resolveConfigDir(opts.sourceConfigDir);
+      const projectPath = opts.projectPath ?? process.cwd();
+      const config = loadEffectiveConfig(configDir, projectPath);
+      const { resolveHubPath } = await import("./hub/init.js");
+      const hubPath = resolveHubPath(config);
+      if (!hubPath) {
+        outputError("hub-compact", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+        return;
+      }
+      if (!opts.thread) {
+        // The pick-required shape, exactly as `pull` uses it: a `success: true`
+        // result that exits 2, because nothing was compacted and a caller
+        // treating this as "it happened" would be wrong. Compaction deletes, so
+        // it is never implicit about WHICH thread.
+        outputError(
+          "hub-compact",
+          new Error("Which thread? Pass --thread <id>. Run `sesh-mover whereis` to list this project's threads — compaction deletes bundles, so it never guesses.")
+        );
+        return;
+      }
+      const { hubCompact } = await import("./hub/compact.js");
+      output(await hubCompact({
+        configDir,
+        projectPath,
+        hubPath,
+        threadId: opts.thread,
+        claudeVersion: getClaudeVersion(),
+      }));
+    } catch (e) {
+      outputError("hub-compact", e as Error);
+    }
+  });
+
 // `hub escrow` writes a passphrase-wrapped copy of THIS machine's own identity
 // to a path the user names. Default off; a user who never asks never meets it.
 //

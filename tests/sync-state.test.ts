@@ -736,6 +736,44 @@ describe("forgetSentToPeer", () => {
     expect(Object.keys(state.peers["hub:H"].sent)).toEqual(["s-1"]);
   });
 
+  it("scoped AND asked, drops the memory credit too — the compaction case", async () => {
+    const { forgetSentToPeer } = await import("../src/sync-state.js");
+    const state = await seed("/p-forget-one-mem");
+
+    const result = forgetSentToPeer(
+      state, { id: "hub:H" }, { localSessionIds: ["s-2"], memoryDigest: true }
+    );
+
+    // The scoped form still cannot INFER this — `memory/` has no per-session
+    // form — but a caller that is about to delete the bundles carrying the
+    // hub's only copy can know it, and `hub compact` does. Left standing, the
+    // credit makes the consolidated bundle omit `memory/` while the run
+    // removes the one hub copy of it, and a machine bootstrapping from the
+    // consolidated root then never receives it at all.
+    expect(result.forgotten).toEqual(["s-2"]);
+    expect(result.memoryDigest).toBe(true);
+    expect(state.peers["hub:H"].memoryDigest).toBeUndefined();
+    // Still scoped: asking for the memory credit must not widen the session set.
+    expect(Object.keys(state.peers["hub:H"].sent)).toEqual(["s-1"]);
+    // And still peer-scoped, exactly as the unasked form is.
+    expect(state.peers["machine-b"].memoryDigest).toBe("digest-b");
+  });
+
+  it("scoped and asked, reports false when there was no credit to drop", async () => {
+    const { forgetSentToPeer } = await import("../src/sync-state.js");
+    const state = await seed("/p-forget-one-nomem");
+    delete state.peers["hub:H"].memoryDigest;
+
+    const result = forgetSentToPeer(
+      state, { id: "hub:H" }, { localSessionIds: ["s-2"], memoryDigest: true }
+    );
+
+    // `memoryDigest: true` in the RESULT means one was actually dropped, not
+    // that one was requested — the caller discloses it, so a claim to have
+    // re-armed the memory layer must be true.
+    expect(result.memoryDigest).toBe(false);
+  });
+
   it("reports only ids the ledger actually held, and never invents an entry", async () => {
     const { forgetSentToPeer } = await import("../src/sync-state.js");
     const state = await seed("/p-forget-unknown");

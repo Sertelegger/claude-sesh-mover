@@ -142,12 +142,16 @@ export async function hubInit(opts: {
       // source is not a policy a user can check. See `HubJson.encrypt`.
       //
       // **Always `false`, and deliberately NOT seeded from the local
-      // `hub.encrypt` preference.** Nothing in this version can encrypt a
-      // bundle, so a hub created with `encrypt: true` would be one that every
-      // machine — this one included — must refuse to push to. The preference
-      // becomes an input to hub state when there is an enable verb to apply it,
-      // and that verb is the place to check the machine roster's
-      // `pluginVersion` first.
+      // `hub.encrypt` preference.** Bundles can be encrypted now — which is
+      // exactly why this must stay `false`: `hub encrypt --enable` is the
+      // one place this field flips from `false` to `true`, and that
+      // transition (`changed`, below) is what triggers its two disclosure
+      // warnings — that enabling doesn't protect what's already on the hub,
+      // and that its authentication proves the group holds the key, not the
+      // sender. Seed `true` here instead and the hub is born already
+      // "sealed": the transition never happens, so neither warning is ever
+      // shown for it. The preference still reaches `hub.json` — through that
+      // verb, where the warnings travel with the write.
       encrypt: false,
     };
     await backend.writeAtomic(HUB_JSON, JSON.stringify(hub, null, 2) + "\n");

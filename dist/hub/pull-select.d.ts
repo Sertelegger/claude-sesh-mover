@@ -56,6 +56,12 @@ export interface SelectStageInput {
     machineId: string;
     /** Keys the thread mapping this stage may repair. */
     hubId: string;
+    /**
+     * The hub project. Read for exactly one thing — asking the compaction
+     * markers why a needed bundle is absent (#92), so a retired one is not
+     * reported as an unsynced one.
+     */
+    projectId: string;
     threadId?: string;
     latest?: boolean;
     /**

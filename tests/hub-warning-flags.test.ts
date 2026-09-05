@@ -522,6 +522,21 @@ const REGISTRY: FlagUse[] = [
     klass: "future-only",
     why: "Same sentence, push's spelling. The bundle is already written and recorded by the time either caller emits it, so the flag applies to a later push.",
   },
+  // ---- src/hub/compact.ts (#92) --------------------------------------------
+  // Both are refusals taken BEFORE anything is written, so both are honestly
+  // retryable — but they are retryable in different senses and the registry is
+  // where that has to be said rather than assumed.
+  {
+    file: "src/hub/compact.ts",
+    match: "Run push (with --create-project or --project-id) to link and publish this project first.",
+    klass: "retry-works",
+    why: "Compaction refuses on an unlinked project before it reads a byte of the hub, so nothing is half-done. The named flags are push's, and the sentence says `push` for exactly the reason the cross-command check exists: `hub compact` declares neither of them.",
+    provenBy: {
+      test: "hub-compact.test.ts",
+      name: "refuses an unlinked project, and the advised push makes the re-run reach the work",
+      reruns: "hubCompact",
+    },
+  },
   // ---- src/importer.ts -----------------------------------------------------
   // The sharpest gap the widened sweep closed. `importSession` is called by
   // THREE commands (cli.ts's `import`, migrator.ts, pull-apply-sessions.ts),
@@ -924,6 +939,10 @@ const SURFACES: Record<string, string[]> = {
   // at all — the disarm path must not depend on the thing being disarmed.
   "src/hub/io-timeout.ts": ["push", "pull", "init", "reindex", "status", "whereis"],
   "src/hub/merge.ts": ["pull"],
+  // #92. Only its own verb today — but `explainRetiredBundles` is read by
+  // `pull-select.ts`, so the day a message in this file reaches that path it
+  // becomes a pull's message too and this row is where that has to be recorded.
+  "src/hub/compact.ts": ["compact"],
   "src/hub/pull-apply-carry.ts": ["pull"],
   "src/hub/pull-apply-sessions.ts": ["pull"],
   "src/hub/pull-apply-workspace.ts": ["pull"],

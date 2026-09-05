@@ -72,14 +72,48 @@ async function absorbLateError(s) {
     await finished(s).catch(() => { });
 }
 /**
+ * The reason's text, extracted without trusting the reason to be an Error — or
+ * an object at all. A rejection reason is whatever the failing code passed to
+ * `reject` or `throw`, and `throw null`, `reject("boom")` and an Error whose
+ * `message` was reassigned to a number are all legal; `(e as Error).message`
+ * turned the first into a TypeError thrown from the one function documented as
+ * never throwing (#96, finding 5).
+ *
+ * The duck-type on `message` rather than `instanceof Error` is deliberate: a
+ * cross-realm Error fails `instanceof` and its `message` is still the diagnosis
+ * worth keeping whole (the same "kept WHOLE" rule `BundleFetchFailure.message`
+ * states). The outer catch is the part no shape check can replace — a property
+ * read and `String()` both run code the reason's author controls (a getter, a
+ * `toString`), so promising "never throws" means not trusting the extraction
+ * itself either. What the fallback cannot do is diagnose: a reason that will
+ * not even render says nothing about WHY the bundle failed, and only the kind
+ * still carries a remedy.
+ */
+function failureMessage(e) {
+    try {
+        const m = e?.message;
+        return typeof m === "string" ? m : String(e);
+    }
+    catch {
+        return "(rejection reason could not be rendered)";
+    }
+}
+/**
  * One exception, one of the four kinds. **Shared by both directions**, which is
  * the point: a re-wrap and a fetch fail for the same four reasons and must not
  * describe them two ways — "this machine is not a recipient" in particular is
  * the same fact whether it was found while reading a bundle or while trying to
  * re-address one.
+ *
+ * **Never throws, for ANY rejection reason.** The two no-throw contracts below
+ * (`fetchBundleArchive`, `rewrapBundleFile`) bottom out here, inside their own
+ * `catch` blocks, so a throw out of this function IS a throw out of them —
+ * with exactly the cost their contracts exist to prevent: exit 1 through the
+ * CLI's outer catch, no `suggestion`, and every disclosure from bundles
+ * already applied in the chain dropped.
  */
 export function classifyBundleFailure(e) {
-    const message = e.message;
+    const message = failureMessage(e);
     if (!(e instanceof AgeError))
         return { kind: "transfer", message };
     switch (e.code) {

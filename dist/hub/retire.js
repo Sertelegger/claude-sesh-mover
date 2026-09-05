@@ -12,8 +12,13 @@ import { loadOrCreateMachineId } from "../machine.js";
  * A named funnel rather than three call sites, so "physical removal happens
  * here and nowhere else" is a property of the code and not of a convention. It
  * swallows nothing: the caller records every failure into `HubDeleteResult.failed`.
+ *
+ * Exported for `hub compact`, which is the other operation the slice-4 spec
+ * gave physical removal to. It swallows nothing there either — compaction
+ * records its failures and keeps going, because a bundle it could not delete is
+ * a file that still exists, which is the harmless direction.
  */
-async function deleteHubFile(backend, relPath) {
+export async function deleteHubFile(backend, relPath) {
     await backend.delete(relPath);
 }
 /**

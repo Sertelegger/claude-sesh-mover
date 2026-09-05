@@ -2,6 +2,74 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [Unreleased]
+
+### Added
+
+- **`sesh-mover hub compact` (`/sesh-mover:hub-compact`) — consolidate a thread, retire the chain behind
+  it ([#92]).** A thread pushed for months is one root bundle plus a long tail of continuations, every
+  one of which a fresh machine has to fetch and apply in order. This replaces the tail with a single
+  full bundle and then deletes the tail.
+
+  > **It runs in two phases, on two separate invocations, usually days apart — and the first deletes
+  > nothing.** The second deletes, and only once every machine has demonstrably received the content
+  > *and* a grace window has passed. A run reporting `consolidated` has removed nothing and is not
+  > half way through anything dangerous.
+
+  Only **this machine's** bundles are ever retired. A thread's chain can span machines and bundle files
+  live in per-machine directories, so retiring all of it would mean deleting another machine's files —
+  which per-machine ownership forbids for everything except `hub delete`'s owner-only, two-phase,
+  whole-project path. Each machine reclaims its own share, and the result says so rather than
+  presenting a partial job as a complete one.
+
+  **What "acknowledged" means is not what the design originally assumed.** A machine that only ever
+  *pulls* a thread never lists any bundle id — a pull writes its own index with no bundle records — so
+  waiting for every index to name the consolidated bundle would wait forever. What is checked instead
+  is whether each machine's advertised head, or the anchor of a record it pushed, is reachable from the
+  consolidated bundle's head: evidence of *content*, not of a file name.
+
+  A bundle is retired only when the consolidated transcript demonstrably **contains** its head, never
+  merely because it sits on the same chain. A parked fork chains perfectly and holds entries no full
+  export of the surviving branch will ever have, and after consolidation the hub may hold the only copy
+  of that work — so those are kept, and reported in `retained` with a reason.
+
+  It is deliberately not on any automatic path: no config key, unreachable from the session-end
+  auto-push, and no default thread. It is the only verb here that deletes data you did not name a file
+  for, so it never guesses which thread you meant.
+
+- **A `pull` that meets a bundle another machine retired now says so**, instead of reporting
+  "the hub folder has not finished syncing — retry in a moment" for a file that is never coming back.
+  The retry does work — a compaction removes its index records before deleting, so this is only visible
+  while a synced copy of that index is still the old one — but the *reason* was wrong, and the message
+  now names the consolidated bundle that replaced it.
+
+### Fixed
+
+- **`classifyBundleFailure` could throw from the one function whose contract is that it does not**
+  ([#96]). A rejection reason of `null` or `undefined` made `(e as Error).message` a TypeError, and the
+  pull's whole abort contract rests on that function: an uncaught throw there exits through the CLI's
+  outer catch and drops the suggestion *plus* every disclosure from bundles already applied. The same
+  shape appears at ~45 other sites, several on contracts where a throw is not cosmetic; tracked in
+  [#102].
+
+- **A push that uploaded nothing no longer claims a bundle went out in plaintext** ([#96]). Encryption
+  warnings were minted before the export and carried out on the "already up to date" early return, so
+  an unattended session-end push could report that "this bundle went to the hub as PLAINTEXT and
+  nothing can change that after the fact" about a bundle that does not exist. Warnings are now split by
+  what each sentence is true of: policy facts travel regardless, past-tense claims about an uploaded
+  bundle only past the branch that uploads.
+
+### Internal
+
+- Two stale encryption comments retired, both justifying a correct decision with a premise that had
+  become false ([#96]) — and the streaming constraint in `crypto/age.ts` is now pinned by a test.
+  Rewriting the encryptor to accumulate and emit at the end produces byte-identical output and the
+  entire existing crypto suite passes against it; only the new emit-before-end assertion notices.
+
+[#92]: https://github.com/Sertelegger/claude-sesh-mover/issues/92
+[#96]: https://github.com/Sertelegger/claude-sesh-mover/issues/96
+[#102]: https://github.com/Sertelegger/claude-sesh-mover/issues/102
+
 ## [0.10.0] — 2026-08-31
 
 ### Added
