@@ -13,6 +13,10 @@ import {
 } from "./index-file.js";
 import { errorMessage } from "../errors.js";
 import { extractArchive } from "../archiver.js";
+import { digestFile, signStatement, type BundleSignature } from "./signature.js";
+import { loadOrCreateSigningKey } from "../crypto/signing-key.js";
+import { workspaceDir, bundleFileName, isEncryptedBundleFile } from "./layout.js";
+import type { HubBackend } from "./backend.js";
 import { discoverSessions } from "../discovery.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { readManifest } from "../manifest.js";
@@ -245,6 +249,34 @@ export async function hubReindex(
       }
       const hasWorkspace = !!manifest.workspace;
 
+      // RE-SIGN WHAT WE REBUILD (#86), and the reason it is allowed here at all
+      // is worth stating: an index is supposed to be DERIVABLE from the bundles
+      // plus local sync-state, and a signature plainly is not — it is an
+      // assertion, like a tombstone. What makes this not a violation is WHO is
+      // doing it. Only the machine that owns this index may write it, and that
+      // machine holds the signing key, so the assertion is re-derivable by
+      // exactly the one party entitled to make it. A rebuild is not forging
+      // anything; it is re-stating what this machine already said about its own
+      // bundles.
+      //
+      // The alternative — carrying no signature on rebuilt records — is worse
+      // than it sounds. Every peer that has already seen a signed bundle from
+      // this machine would read the rebuilt ones as a DOWNGRADE, so repairing
+      // a lost index would look, from every other machine, exactly like the
+      // tamper it is designed to detect.
+      //
+      // The digest is of `tarPath`, the PLAINTEXT archive `fetchBundleArchive`
+      // just produced — the same bytes the original signature covered, which is
+      // what makes a re-signature equal to the original rather than merely
+      // similar. A bundle whose signature cannot be rebuilt (no key, or a
+      // workspace artifact that is gone) is left unsigned rather than signed
+      // with a statement that is not true.
+      const signature = await rebuildSignature({
+        backend, hubId: probe.hub?.hubId ?? "", projectId: local.projectId, machineId: machine.id,
+        bundleId: parsed.bundleId, pushedAt: parsed.pushedAt, file, tarPath,
+        hasWorkspace, warnings,
+      });
+
       for (const s of manifest.sessions) {
         // Same mapping as push's index-projection step: a continuation
         // bundles under the LOCAL session id it continues, not its own
@@ -279,6 +311,7 @@ export async function hubReindex(
             messageCount: s.messageCount,
             pushedAt: parsed.pushedAt,
             hasWorkspace,
+            ...(signature ? { signature } : {}),
           },
         });
         threadMeta.set(threadId, {
@@ -391,3 +424,79 @@ export async function hubReindex(
     lock.release();
   }
 }
+/**
+ * Rebuild the signature for one of THIS machine's own bundles.
+ *
+ * Returns `null` — leaving the record unsigned — for every case it cannot
+ * state truthfully, and each of those is a real one rather than defensive
+ * padding: no signing key on this machine (nothing to sign with), or a
+ * workspace artifact the manifest declares that is no longer on the hub
+ * (`workspaceDigest` would have to be invented). An unsigned record is honest;
+ * a signed one carrying a digest nobody can reproduce is worse than none,
+ * because it fails verification later and looks like tampering.
+ *
+ * Never throws. A rebuild that cannot re-sign must still rebuild — the command
+ * exists to end a lost-index condition, and refusing over a key would leave
+ * the user with no index at all.
+ */
+async function rebuildSignature(args: {
+  backend: HubBackend;
+  hubId: string;
+  projectId: string;
+  machineId: string;
+  bundleId: string;
+  pushedAt: string;
+  file: string;
+  tarPath: string;
+  hasWorkspace: boolean;
+  warnings: string[];
+}): Promise<BundleSignature | null> {
+  try {
+    const key = loadOrCreateSigningKey();
+    if (!key.ok) {
+      args.warnings.push(
+        `this machine's signing key could not be read (${key.detail}), so rebuilt records carry no signature. Every other machine will read them as unsigned until this machine pushes again with a working key.`
+      );
+      return null;
+    }
+    let workspaceFile: string | undefined;
+    let workspaceDigest: string | undefined;
+    if (args.hasWorkspace) {
+      const candidate = `${workspaceDir(args.projectId, args.machineId)}/${bundleFileName(args.pushedAt, args.bundleId, { encrypted: isEncryptedBundleFile(args.file) })}`;
+      if (!(await args.backend.exists(candidate))) {
+        // A PRE-#91 bundle carried its tree INSIDE the archive, so `hasWorkspace`
+        // is true and no separate artifact was ever written. Indistinguishable
+        // here from a split artifact that has been deleted, and the same answer
+        // serves both: say nothing about a workspace file rather than name one
+        // that is not there.
+        return null;
+      }
+      const tmp = `${args.tarPath}.ws`;
+      const got = await fetchBundleArchive({ backend: args.backend, file: candidate, destPath: tmp });
+      if (!got.ok) return null;
+      workspaceFile = candidate;
+      workspaceDigest = await digestFile(tmp);
+      rmSync(tmp, { force: true });
+    }
+    return signStatement(
+      key.privateKey,
+      {
+        domain: "sesh-mover/bundle-sig/1",
+        hubId: args.hubId,
+        projectId: args.projectId,
+        machineId: args.machineId,
+        bundleId: args.bundleId,
+        pushedAt: args.pushedAt,
+        bundleFile: args.file,
+        bundleDigest: await digestFile(args.tarPath),
+        ...(workspaceFile ? { workspaceFile, workspaceDigest } : {}),
+      },
+      key.publicKey
+    );
+  } catch (e) {
+    args.warnings.push(`a rebuilt record could not be re-signed (${errorMessage(e)}); it is left unsigned.`);
+    return null;
+  }
+}
+
+

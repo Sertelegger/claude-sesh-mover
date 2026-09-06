@@ -522,6 +522,18 @@ const REGISTRY: FlagUse[] = [
     klass: "future-only",
     why: "Same sentence, push's spelling. The bundle is already written and recorded by the time either caller emits it, so the flag applies to a later push.",
   },
+  // ---- src/hub/trust.ts (#86) ----------------------------------------------
+  {
+    file: "src/hub/trust.ts",
+    match: "Then re-run with --fingerprint.",
+    klass: "retry-works",
+    why: "The refusal wrote nothing — no pin, no hub file — and the SAME invocation plus the fingerprint read off the other machine confirms the key. The flag is `hub trust`'s own, so the cross-command check is satisfied without naming a command. Note what the retry deliberately does NOT do: it never succeeds by supplying a fingerprint read off the hub, because the value being compared has to come from a channel the hub does not control. A `future-only` classification would be wrong — the remedy is this same command, now.",
+    provenBy: {
+      test: "hub-trust.test.ts",
+      name: "confirms when the fingerprint matches, and the pin becomes confirmed",
+      reruns: "hubTrust",
+    },
+  },
   // ---- src/hub/compact.ts (#92) --------------------------------------------
   // Both are refusals taken BEFORE anything is written, so both are honestly
   // retryable — but they are retryable in different senses and the registry is
@@ -943,6 +955,9 @@ const SURFACES: Record<string, string[]> = {
   // `pull-select.ts`, so the day a message in this file reaches that path it
   // becomes a pull's message too and this row is where that has to be recorded.
   "src/hub/compact.ts": ["compact"],
+  // #86. Its own verb only: nothing else surfaces these messages, and the one
+  // flag they name is this command's own.
+  "src/hub/trust.ts": ["trust"],
   "src/hub/pull-apply-carry.ts": ["pull"],
   "src/hub/pull-apply-sessions.ts": ["pull"],
   "src/hub/pull-apply-workspace.ts": ["pull"],

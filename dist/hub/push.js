@@ -912,6 +912,11 @@ export async function hubPush(opts) {
                         anchorEntryUuid: s.type === "continuation" ? s.continuation?.anchorEntryUuid : null,
                         headEntryUuid: readLastEntryUuid(join(bundleStaging, "sessions", `${s.sessionId}.jsonl`)) ?? "",
                         messageCount: s.messageCount, pushedAt, hasWorkspace,
+                        // Spread, not `signature: bundleSignature` — an explicit-undefined
+                        // key would survive into the in-memory record, and "absent means
+                        // pre-signing" (layout.ts) is a statement about the KEY, which an
+                        // unsigned push must genuinely not have.
+                        ...(bundleSignature ? { signature: bundleSignature } : {}),
                     },
                 });
                 pushedSessions.push({ threadId, sessionId: s.sessionId, type: s.type === "continuation" ? "continuation" : "full" });
