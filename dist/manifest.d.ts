@@ -192,6 +192,19 @@ export type HashedLayer = (typeof HASHED_LAYERS)[number];
  */
 export declare function computeLayerDigest(dir: string): Promise<string | null>;
 /**
+ * EXPORTED for #86's signed statement, which needs the same property for the
+ * same reason and must not grow a second spelling of it: a signature over a
+ * differently-ordered serialization of identical content verifies as a
+ * mismatch, which is the most confusing possible failure.
+ *
+ * Recursively key-sorted projection of a value, so two structurally equal
+ * objects serialize identically regardless of key insertion order. `undefined`
+ * properties are dropped, which is what `JSON.stringify` does when the manifest
+ * is written — so the digest computed over the in-memory manifest at export
+ * matches the one computed over the parsed manifest at import.
+ */
+export declare function canonicalize(value: unknown): unknown;
+/**
  * Bundle-level digest over the manifest's own session inventory: the count,
  * then every declared session record verbatim (session id, per-session
  * `integrityHash`, `layerDigests`, message count, continuation linkage, …).
