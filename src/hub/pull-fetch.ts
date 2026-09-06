@@ -4,8 +4,16 @@ import type { HubBackend } from "./backend.js";
 import { fetchBundleArchive, type BundleFetchFailure } from "./bundle-io.js";
 import type { HubBundleRecord } from "./layout.js";
 import type { ApplyState } from "./pull-apply-state.js";
+import { findPin, readPins, recordPin } from "./pins.js";
+import {
+  digestFile,
+  verifyStatement,
+  type BundleSignature,
+  type SignatureFailure,
+} from "./signature.js";
 import { stageAbort, stageOk, type StageOutcome } from "./pull-stages.js";
 import { errorMessage } from "../errors.js";
+import { keyFingerprint } from "../crypto/signing-key.js";
 import { extractArchive } from "../archiver.js";
 import { readManifest, verifySessionsDigest } from "../manifest.js";
 import type { ExportManifest, ProgressEvent } from "../types.js";
@@ -13,6 +21,22 @@ import type { ExportManifest, ProgressEvent } from "../types.js";
 export interface FetchStageInput {
   backend: HubBackend;
   record: HubBundleRecord;
+  /**
+   * The hub this pull is reading (#86). Two consumers, both signature-side:
+   * the statement context a signed record is checked against, and the pin
+   * store's key — a pin is per `(hubId, machineId)` because the same machine
+   * id on two hubs is two different trust decisions.
+   */
+  hubId: string;
+  /** The statement context's project half — the project this pull resolved. */
+  projectId: string;
+  /**
+   * The pull's single "now", captured once by `pull.ts`. Passed rather than
+   * read: `hub-pull-invariants.test.ts` enforces that no pull stage reads the
+   * wall clock, so a pull's recorded times cannot disagree with each other by
+   * however long the transfer took, and a test can pin one.
+   */
+  nowIso: string;
   /**
    * The machine whose index listed THIS record (`SourcedBundle.machineId`), not
    * the machine the pull resolved to. It is stamped onto the workspace
@@ -58,6 +82,15 @@ export interface FetchStageInput {
  * `bundleSession.integrityHash` is therefore NOT redundant with anything here;
  * treating it as redundant welds a corrupt delta into a transcript the user
  * already owns.
+ *
+ * A record carrying a `signature` (#86) adds ONE more true thing on return:
+ * the archive's plaintext bytes hash to what a holder of the signing key said
+ * they should, for this exact hub slot. It adds it only for signed records —
+ * unsigned is the permanent normal, exactly like plaintext beside ciphertext —
+ * and it says nothing about the split workspace artifact: the statement
+ * carries a `workspaceDigest`, but that file is retrieved by
+ * `pull-apply-workspace.ts`, which does not check it yet. A named gap, not an
+ * oversight.
  */
 export interface FetchStageResult {
   /** Where the bundle was unpacked — `manifest.json`, `sessions/`, and friends sit directly under it. */
@@ -83,13 +116,14 @@ export interface FetchStageResult {
  *   `if (manifest.carry)` guard stays welded to the assignment in here so that
  *   shape is not available to write.
  *
- * FIVE `aborted` outcomes — one per untrusted-input call, in the order they
- * run: the retrieval, the unpack, the manifest parse, the manifest's own digest,
- * and the transcript that manifest declares. The count is worth stating because
- * it only moves in one direction: every call in this stage is handed bytes off
- * the hub, so a new one without a `try` is a new way for the stage to leave
- * `hubPull` as a throw — which is exactly what the download and the unpack were
- * until now.
+ * SIX `aborted` outcomes — one per untrusted-input call, in the order they
+ * run: the retrieval, the signature check (#86), the unpack, the manifest
+ * parse, the manifest's own digest, and the transcript that manifest declares.
+ * The count is worth stating because it only moves in one direction — it was
+ * five until the signature check, and every call in this stage is handed bytes
+ * off the hub, so a new one without a `try` is a new way for the stage to
+ * leave `hubPull` as a throw — which is exactly what the download and the
+ * unpack were until they were typed.
  *
  * The retrieval is one abort with FOUR diagnoses, because decryption lives
  * inside it (`fetchBundleArchive`) and its failures are not the transfer's. Two
@@ -132,10 +166,253 @@ function retrievalSuggestion(failure: BundleFetchFailure): string {
   }
 }
 
+/**
+ * One abort per way a signature can be present and wrong, because the remedies
+ * share nothing (#86). The switch is exhaustive over `SignatureFailure` on
+ * purpose: a new arm there fails to compile until someone words it here, which
+ * is the same trick `exitCodeForResult` plays and for the same reason — a
+ * failure class nobody assigned a message to must not fall into a default.
+ */
+function signatureFailureAbort(
+  record: HubBundleRecord,
+  machineId: string,
+  failure: SignatureFailure
+): StageOutcome<FetchStageResult> {
+  switch (failure.kind) {
+    case "bad-signature":
+      // The tag does not say damage or tampering, so neither do we — and a
+      // partially synced index file is far likelier than an attacker.
+      return stageAbort({
+        success: false,
+        command: "pull",
+        error: `Bundle ${record.bundleId} carries a signature that does not verify (${record.file}).`,
+        suggestion:
+          "Nothing from this bundle was applied. The signed statement does not match its signature under the key it names. That is damage or tampering, and the check cannot say which — so it accuses nobody: a partially written or partially synced index file is by far the likelier cause. If the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again. The bundles applied before it in this chain are recorded and will not be refetched.",
+      });
+    case "context-mismatch":
+      // The loudest arm, deliberately: everything cryptographic checks out,
+      // which is exactly what damage cannot produce. A valid signature does
+      // not drift onto a different record by accident.
+      return stageAbort({
+        success: false,
+        command: "pull",
+        error: `Bundle ${record.bundleId} carries a valid signature for a DIFFERENT location (${record.file}): the statement's ${failure.field} is "${failure.found}", but this record's is "${failure.expected}".`,
+        suggestion:
+          "Nothing from this bundle was applied. This signature is cryptographically valid — a real statement, really signed — just not about the hub slot it arrived in. Damage does not move a valid signature between records, so a statement lifted off one bundle and re-filed on another is the strongest evidence of deliberate tampering this check can produce. Do not simply retry: look at who can write to the hub, and compare notes with the machine the statement names. The bundles applied before it in this chain are recorded and will not be refetched.",
+      });
+    case "digest-mismatch":
+      return stageAbort({
+        success: false,
+        command: "pull",
+        error: `Bundle ${record.bundleId} is not the archive its signature vouches for (${record.file}): the content digest does not match the signed one.`,
+        suggestion:
+          "Nothing from this bundle was applied. The signature and its statement are valid and belong to this exact record — the archive beside them is what differs, so the file changed after it was signed. Substitution and damage look identical from here, and a partially synced file is the likeliest damage: if the hub is a synced folder, give it a moment and retry; otherwise ask the machine that pushed it to push again — and if this repeats on an intact share, treat the file as having been replaced. The bundles applied before it in this chain are recorded and will not be refetched.",
+      });
+    case "unpinned-key":
+      // NOT necessarily an attack, and nothing automatic will ever resolve it:
+      // a machine that lost its signing key and re-minted looks exactly like a
+      // substitution from here. The remedy is a human and `hub trust`.
+      return stageAbort({
+        success: false,
+        command: "pull",
+        error: `Bundle ${record.bundleId} is signed with a key that is not the one pinned for machine ${machineId} (${record.file}).`,
+        suggestion: `Nothing from this bundle was applied. Pinned key: ${keyFingerprint(failure.pinned)}. This bundle's key: ${keyFingerprint(failure.found)}. A changed key is NOT necessarily an attack — a machine that lost its signing key and minted a fresh one looks exactly like this, and nothing on this machine can tell the two apart, which is why nothing automatic happens here. Confirm the new key out of band — read its fingerprint off that machine itself, not off the hub — and accept it with \`sesh-mover hub trust\`; if that machine never re-minted a key, stop pulling and treat the hub as compromised. The bundles applied before it in this chain are recorded and will not be refetched.`,
+      });
+  }
+}
+
+interface SignatureGateInput {
+  record: HubBundleRecord;
+  /** The machine whose index listed the record — the claimed signer. */
+  machineId: string;
+  hubId: string;
+  projectId: string;
+  /**
+   * The pull's single "now", captured once by `pull.ts` for the whole
+   * operation. Passed rather than read here: `tests/hub-pull-invariants.ts`
+   * enforces that no pull stage reads the wall clock, so that a pull's
+   * recorded times cannot disagree with each other by however long the
+   * transfer took — and so a test can pin one.
+   */
+  nowIso: string;
+  /** The local PLAINTEXT archive — already decrypted if the hub copy was sealed. */
+  tarPath: string;
+  /** The stage's applied-outcome sentences. The gate appends, never replaces. */
+  reasons: string[];
+}
+
+/**
+ * Attribution for one bundle: `null` means carry on, anything else is the
+ * abort to return. Extracted so the six-abort accounting in `runFetchStage`
+ * stays readable, not because the policy is reusable — it is pull policy.
+ *
+ * An ABSENT signature applies exactly as before #86, permanently — that is
+ * every bundle already on every hub, and the mixed state is structural, the
+ * same way plaintext bundles sit beside ciphertext ones. The branch is the
+ * absent field on this record, never a hub-wide or config switch, for the
+ * suffix rule's reason: a policy bit fails in both directions, invisibly to
+ * the machine that flipped it. What keeps "absent" from being the tamperer's
+ * free pass is the DOWNGRADE check: once this machine holds a pin for the
+ * signer, an unsigned bundle from it is worth a sentence — a warning rather
+ * than a refusal, because the push side legitimately falls back to unsigned
+ * when its key is unreadable (owner ruling), and refusing here would strand
+ * every machine that does.
+ */
+async function runSignatureGate(
+  input: SignatureGateInput
+): Promise<StageOutcome<FetchStageResult> | null> {
+  const { record, machineId, hubId, projectId, nowIso, tarPath, reasons } = input;
+
+  // Read STRUCTURALLY rather than off the declared type: `HubBundleRecord`
+  // grows `signature` from the push side in this same slice, and this reader
+  // must be correct for records that carry it and records that never will.
+  // Runtime shape is NOT trusted either way — the record came out of another
+  // machine's index file, which is exactly the file the pin store distrusts.
+  const signature = (record as HubBundleRecord & { signature?: BundleSignature | null }).signature;
+
+  // One pin read serves both branches. `readPins` never throws (an unreadable
+  // store is EMPTY by its own documented rule), and the pin is per
+  // (hubId, machineId) because the same machine id on two hubs is two trust
+  // decisions.
+  const pin = findPin(readPins(), hubId, machineId);
+
+  if (signature == null) {
+    if (pin !== null) {
+      // The downgrade ratchet. The pin store records no "has sent signed
+      // bundles" fact separately from the pin itself, and does not need to: a
+      // `tofu` pin is only ever written after a signed bundle from this
+      // machine VERIFIED here, so its existence is that fact. A `confirmed`
+      // pin is a human's out-of-band vouch for the key — a stronger statement,
+      // warned on the same way, since an unsigned bundle bypasses exactly what
+      // the human confirmed.
+      reasons.push(
+        `Bundle ${record.bundleId} from machine ${machineId} is unsigned, and that machine's signing key (${keyFingerprint(pin.publicKey)}) is pinned here — so this is a downgrade, not the permanent unsigned normal. The likeliest cause is benign: a machine whose signing key becomes unreadable warns locally and pushes unsigned. A tamperer stripping signature fields looks identical from here, which is why this is said out loud. The bundle was applied — refusing would strand every machine that legitimately stops signing.`
+      );
+    }
+    return null;
+  }
+
+  /**
+   * Statement first, digest second, and the order is diagnosis quality: a
+   * forged or mislocated statement makes its own digest claim uninteresting,
+   * so hashing the archive before knowing the claim is real would spend the
+   * expensive step to compare against a number nobody vouched for — and on a
+   * doubly-wrong bundle it would report the less specific of two true things.
+   *
+   * The `try` is not decoration. `verifyStatement` itself never lets a bad
+   * key or bad signature bytes throw (`verifyBytes` guarantees that), but the
+   * STATEMENT is attacker-shaped: one signed self-consistently over `null`
+   * verifies its own bytes and then trips the verifier's context walk. That
+   * throw would leave `hubPull` through the CLI's outer catch — exit 1, no
+   * suggestion, every prior disclosure dropped — the exact loss this module
+   * exists to prevent.
+   */
+  let verdict: ReturnType<typeof verifyStatement>;
+  try {
+    verdict = verifyStatement({
+      signature,
+      // The REAL context — this record, as this pull resolved it — never
+      // anything echoed from the statement, or the check would ask the
+      // attacker whether they are lying.
+      context: {
+        hubId,
+        projectId,
+        machineId,
+        bundleId: record.bundleId,
+        bundleFile: record.file,
+      },
+      pinnedKey: pin?.publicKey ?? null,
+    });
+  } catch (e) {
+    return stageAbort({
+      success: false,
+      command: "pull",
+      error: `Bundle ${record.bundleId} carries a signature this machine could not even evaluate (${record.file}): ${errorMessage(e)}`,
+      suggestion:
+        "Nothing from this bundle was applied. The signature field on this bundle's index record is shaped so badly the verifier tripped walking it — no record sesh-mover writes looks like that, so the index is damaged or was edited. Ask the machine that pushed it to push again (a push rewrites its own index record); the bundles applied before it in this chain are recorded and will not be refetched.",
+    });
+  }
+  if (!verdict.ok) return signatureFailureAbort(record, machineId, verdict.failure);
+
+  // The digest comparison is the CALLER's half, deliberately: `verifyStatement`
+  // authenticates the statement, and only this stage holds the file the
+  // statement is about. `digestFile` reads a local file this stage just wrote,
+  // so a throw out of it is this machine's disk, not the bundle — but the
+  // contract is the contract: nothing in this stage may throw.
+  let actualDigest: string;
+  try {
+    actualDigest = await digestFile(tarPath);
+  } catch (e) {
+    return stageAbort({
+      success: false,
+      command: "pull",
+      error: `Bundle ${record.bundleId} downloaded but could not be re-read to check its signature: ${errorMessage(e)}`,
+      suggestion:
+        "Nothing from this bundle was applied. The archive arrived — and was decrypted if it needed to be — and then hashing the local temporary copy failed, which is a fact about this machine's disk or temp directory rather than about the bundle. Retry the pull. The bundles applied before it in this chain are recorded and will not be refetched.",
+    });
+  }
+  if (actualDigest !== signature.statement.bundleDigest) {
+    return signatureFailureAbort(record, machineId, { kind: "digest-mismatch", file: record.file });
+  }
+
+  // Note what is NOT checked here: the statement's `workspaceDigest`. The
+  // split workspace artifact (#91) is retrieved by `pull-apply-workspace.ts`,
+  // which does not consult the statement yet — a named gap, not an oversight.
+
+  if (pin === null) {
+    // Trust on first use — AFTER the digest matched, so a bundle that fails
+    // its own statement can never be the thing that installs a pin. This is
+    // the once-per-machine hub trust TOFU cannot avoid; the disclosure below
+    // and `hub trust` are what convert it into a human-confirmed pin.
+    const outcome = recordPin({
+      hubId,
+      machineId,
+      publicKey: signature.publicKey,
+      origin: "tofu",
+      nowIso,
+    });
+    switch (outcome.kind) {
+      case "pinned":
+        reasons.push(
+          `Machine ${machineId}'s signing key ${keyFingerprint(signature.publicKey)} was pinned on first use. That trusted the hub's word for it, once — the pin is what makes every later change loud. To upgrade it to an out-of-band confirmation, compare fingerprints and run \`sesh-mover hub trust\`.`
+        );
+        break;
+      case "failed":
+        // A local file problem must not stop a verified bundle applying — but
+        // silence here would make every future pull re-TOFU, which is the
+        // exact thing pinning exists to stop, so it is said out loud.
+        reasons.push(
+          `Bundle ${record.bundleId} verified, but pinning machine ${machineId}'s signing key failed (${outcome.detail}). The bundle was applied — a local file problem must not undo a verified pull — but until the pin store is writable again, every pull trusts the hub afresh for this machine.`
+        );
+        break;
+      case "conflict":
+        // Only reachable through a race: this gate saw no pin, and by the
+        // write another process had recorded a DIFFERENT key. recordPin wrote
+        // nothing, which is its load-bearing refusal — two keys claiming one
+        // machine is a human's question.
+        reasons.push(
+          `Bundle ${record.bundleId} verified with no pin for machine ${machineId}, but by the time its key was recorded, another process had pinned a different one (${keyFingerprint(outcome.pinned.publicKey)} vs ${keyFingerprint(outcome.found)}). Nothing was overwritten. Compare fingerprints out of band and settle it with \`sesh-mover hub trust\`.`
+        );
+        break;
+      case "unchanged":
+        // A race that agreed: another process pinned this same key first.
+        break;
+    }
+  }
+  return null;
+}
+
 export async function runFetchStage(
   input: FetchStageInput
 ): Promise<StageOutcome<FetchStageResult>> {
-  const { backend, record, machineId, bundleIndex: i, chainLength, tempRoot, state: st } = input;
+  const { backend, record, machineId, hubId, projectId, nowIso, bundleIndex: i, chainLength, tempRoot, state: st } = input;
+
+  // User-facing sentences this stage wants surfaced WITHOUT stopping the pull
+  // — the signature gate's downgrade warning and pin disclosures land here.
+  // They ride the stage contract's `reasons` on the applied outcome; an abort
+  // later in the stage discards them, which is right, because the terminal
+  // message is then the only story worth telling.
+  const reasons: string[] = [];
 
   // Bundles COMPLETED over bundles total, emitted as this one starts: bundle 0
   // reports 0%, and the chain's last bundle reports (n-1)/n rather than 100 —
@@ -198,6 +475,27 @@ export async function runFetchStage(
       suggestion: retrievalSuggestion(got.failure),
     });
   }
+
+  /**
+   * The SIGNATURE check (#86) — the sixth untrusted-input abort, and its
+   * position is the point: AFTER retrieval, so the plaintext archive exists
+   * locally to hash, and BEFORE the unpack, so on a signed bundle node-tar
+   * never parses a byte that failed attribution. Every check below the unpack
+   * asks "is this bundle intact"; this one asks "who wrote it", and an answer
+   * of "not who the record claims" makes the intact-ness question moot.
+   *
+   * The whole gate lives in a helper that returns rather than throws, because
+   * every input it touches is attacker-writable: the `signature` field was
+   * read out of another machine's index file, and the pin store's job is
+   * precisely to distrust that file. Where it cannot even classify a failure
+   * (a statement shaped so the verifier trips walking it), the catch turns the
+   * throw into a typed abort — the module contract, not politeness.
+   */
+  const sigOutcome = await runSignatureGate({
+    record, machineId, hubId, projectId, nowIso, tarPath, reasons,
+  });
+  if (sigOutcome !== null) return sigOutcome;
+
   const extractDir = join(tempRoot, record.bundleId);
   mkdirSync(extractDir, { recursive: true });
   /**
@@ -369,5 +667,5 @@ export async function runFetchStage(
     };
   }
 
-  return stageOk({ extractDir, manifest: bundleManifest });
+  return stageOk({ extractDir, manifest: bundleManifest }, reasons);
 }

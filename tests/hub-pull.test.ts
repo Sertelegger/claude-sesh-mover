@@ -17,6 +17,9 @@ import {
 import { flushThreadMapping } from "../src/hub/pull-record.js";
 import { hubWhereis } from "../src/hub/whereis.js";
 import { createFsBackend } from "../src/hub/backend.js";
+import type { HubIndexJson } from "../src/hub/layout.js";
+import { loadOrCreateSigningKey } from "../src/crypto/signing-key.js";
+import { digestFile, signStatement } from "../src/hub/signature.js";
 import { readAllIndexes, writeMachineIndex } from "../src/hub/index-file.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
 import { machinePath } from "../src/hub/layout.js";
@@ -1506,6 +1509,49 @@ async function arrangeContinuation(
   }
 }
 
+
+/**
+ * Re-sign a bundle a fixture just rewrote (#86).
+ *
+ * Every caller here rewrites a hub bundle to exercise a guard FURTHER DOWN —
+ * the manifest integrity hash, the sessions digest, the carry floor, the
+ * unpacker. Since signing landed, the index record's signature vouches for the
+ * bytes that were there BEFORE the rewrite, so the signature gate aborts first
+ * and none of those tests reach what they are about.
+ *
+ * **Re-signing rather than stripping the signature is the faithful choice.**
+ * Stripping would exercise the unsigned path — a different, permanently
+ * supported shape — while re-signing reproduces what these tests actually
+ * describe: a bundle genuinely from the machine it claims, whose CONTENT is
+ * nevertheless wrong. That is a sender-side defect, and the downstream guards
+ * are exactly what must still catch it. It also keeps the suite honest about
+ * what a signature proves — authorship, never that the contents are correct.
+ */
+async function resignBundleOnHub(
+  backend: ReturnType<typeof createFsBackend>,
+  indexes: HubIndexJson[],
+  bundleId: string,
+  archivePath: string
+): Promise<void> {
+  const key = loadOrCreateSigningKey();
+  for (const index of indexes) {
+    let touched = false;
+    for (const thread of Object.values(index.threads)) {
+      for (const r of thread.bundles) {
+        if (r.bundleId !== bundleId || !r.signature) continue;
+        if (!key.ok) throw new Error("fixture cannot re-sign: no signing key on this machine");
+        r.signature = signStatement(
+          key.privateKey,
+          { ...r.signature.statement, bundleDigest: await digestFile(archivePath) },
+          key.publicKey
+        );
+        touched = true;
+      }
+    }
+    if (touched) await writeMachineIndex(backend, index);
+  }
+}
+
 /**
  * Unpack the most recently pushed continuation bundle on the hub, hand its
  * directory to `mutate`, and put it back under the same hub path.
@@ -1540,6 +1586,8 @@ async function mutateContinuationBundle(
     const outPath = join(stage, "out.tar.gz");
     await createArchive(dir, outPath, "gzip");
     await backend.writeAtomic(record.file, readFileSync(outPath));
+
+    await resignBundleOnHub(backend, indexes, record.bundleId, outPath);
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
@@ -1613,6 +1661,7 @@ async function reanchorBundleEntry(
           const outPath = join(stage, `${record.bundleId}-out.tar.gz`);
           await createArchive(dir, outPath, "gzip");
           await backend.writeAtomic(record.file, readFileSync(outPath));
+          await resignBundleOnHub(backend, indexes, record.bundleId, outPath);
 
           record.fromEntryUuid = newParentUuid;
           await writeMachineIndex(backend, index);
@@ -3175,7 +3224,14 @@ async function patchBundleManifest(
 async function roundTripHubArchive(
   hubPath: string,
   file: string,
-  mutate: (root: string) => void
+  mutate: (root: string) => void,
+  /**
+   * The project whose indexes hold the record to re-sign (#86). Optional only
+   * because a couple of callers round-trip an artifact no index signs; when it
+   * is given, the rewritten archive is re-signed — see `resignBundleOnHub` for
+   * why re-signing rather than stripping is the faithful choice.
+   */
+  projectId?: string
 ): Promise<void> {
   const backend = createFsBackend(hubPath);
   const work = mkdtempSync(join(tmpdir(), "sesh-ws-patch-"));
@@ -3189,6 +3245,18 @@ async function roundTripHubArchive(
     const out = join(work, "out.tar.gz");
     await createArchive(dir, out, "gzip");
     await backend.writeAtomic(file, readFileSync(out));
+    if (projectId !== undefined) {
+      const { indexes } = await readAllIndexes(backend, projectId);
+      for (const index of indexes) {
+        for (const thread of Object.values(index.threads)) {
+          for (const r of thread.bundles) {
+            if (r.file === file) {
+              await resignBundleOnHub(backend, indexes, r.bundleId, out);
+            }
+          }
+        }
+      }
+    }
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
@@ -3219,7 +3287,7 @@ async function mutateBundleTree(
   bundleId: string,
   mutate: (bundleDir: string) => void
 ): Promise<void> {
-  await roundTripHubArchive(hubPath, await bundleHubFile(hubPath, projectId, bundleId), mutate);
+  await roundTripHubArchive(hubPath, await bundleHubFile(hubPath, projectId, bundleId), mutate, projectId);
 }
 
 /**
@@ -4909,6 +4977,7 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
       const outPath = join(stage, "out.tar.gz");
       await createArchive(dir, outPath, "gzip");
       await backend.writeAtomic(record.file, readFileSync(outPath));
+      await resignBundleOnHub(backend, indexes, record.bundleId, outPath);
     } finally {
       rmSync(stage, { recursive: true, force: true });
     }
@@ -4982,17 +5051,32 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
       "an archive that cannot be unpacked",
       "unpack",
       /could not be unpacked/,
-      (hub: string, file: string) => {
+      // Truncate, then RE-SIGN the truncation (#86). Without the re-sign the
+      // signature gate catches a half archive first — correctly, and that is
+      // the feature working — but this case is about the UNPACKER, which must
+      // still refuse rather than throw for the bundle that reaches it: an
+      // unsigned one, or a signed one whose sender archived badly. Re-signing
+      // is what puts the truncated bytes in front of the guard under test.
+      async (hub: string, file: string, projectId: string) => {
         const abs = join(hub, file);
         const bytes = readFileSync(abs);
         writeFileSync(abs, bytes.subarray(0, Math.floor(bytes.length / 2)));
+        const backend = createFsBackend(hub);
+        const { indexes } = await readAllIndexes(backend, projectId);
+        for (const index of indexes) {
+          for (const t of Object.values(index.threads)) {
+            for (const r of t.bundles) {
+              if (r.file === file) await resignBundleOnHub(backend, indexes, r.bundleId, abs);
+            }
+          }
+        }
       },
     ],
     [
       "a hub path that exists but cannot be read as a file",
       "download",
       /could not be read from the hub/,
-      (hub: string, file: string) => {
+      async (hub: string, file: string) => {
         const abs = join(hub, file);
         rmSync(abs, { force: true });
         mkdirSync(abs, { recursive: true });
@@ -5001,7 +5085,7 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
   ])("refuses, rather than throwing, on %s", async (_label, tag, matcher, damage) => {
     const f = await twoMachines(`sesh-pull-fetch-${tag}`);
     try {
-      damage(f.hub, await firstBundleFile(f.hub, f.projectId));
+      await damage(f.hub, await firstBundleFile(f.hub, f.projectId), f.projectId);
 
       const result = await f.pull();
 
@@ -5033,12 +5117,24 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
    * proves is the single helper, not the sentence.
    */
   it.each([
-    ["unpack", /could not be unpacked/, (hub: string, file: string) => {
+    // Re-signs the truncation for the same reason the table above does: without
+    // it the signature gate answers first, and this case is about the UNPACK
+    // abort's disclosure handling.
+    ["unpack", /could not be unpacked/, async (hub: string, file: string, projectId: string) => {
       const abs = join(hub, file);
       const bytes = readFileSync(abs);
       writeFileSync(abs, bytes.subarray(0, Math.floor(bytes.length / 2)));
+      const backend = createFsBackend(hub);
+      const { indexes } = await readAllIndexes(backend, projectId);
+      for (const index of indexes) {
+        for (const t of Object.values(index.threads)) {
+          for (const r of t.bundles) {
+            if (r.file === file) await resignBundleOnHub(backend, indexes, r.bundleId, abs);
+          }
+        }
+      }
     }],
-    ["download", /could not be read from the hub/, (hub: string, file: string) => {
+    ["download", /could not be read from the hub/, async (hub: string, file: string) => {
       const abs = join(hub, file);
       rmSync(abs, { force: true });
       mkdirSync(abs, { recursive: true });
@@ -5046,7 +5142,7 @@ describe("hub pull — bundle integrity and interrupted-pull repair", () => {
   ])("keeps the disclosures collected before a %s abort", async (label, matcher, damage) => {
     const f = await twoMachines(`sesh-pull-fetchwarn-${label}`);
     try {
-      damage(f.hub, await firstBundleFile(f.hub, f.projectId));
+      await damage(f.hub, await firstBundleFile(f.hub, f.projectId), f.projectId);
 
       // A lock left behind by a crashed operation, old enough to steal. The
       // steal is disclosed as a warning before the first bundle is fetched.

@@ -444,6 +444,11 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
       const fetched = await runFetchStage({
         backend, record, machineId: bundleMachineId, bundleIndex: i, tempRoot, state: st,
         chainLength: needed.length, onProgress: opts.onProgress,
+        // The signature statement's context (#86) — what the verifier compares
+        // against, rather than the statement's own claims about itself.
+        hubId: hub.hubId,
+        projectId: local.projectId,
+        nowIso: new Date(opNowMs).toISOString(),
       });
       // The only correct handling of a fetch abort. `break` would fall through
       // to the carry gate, the thread mapping, `writeSyncState` and
@@ -452,6 +457,11 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
       // (bundle N+1 is anchored on N's head) and fragment-import AND record the
       // next bundle, foreclosing the remedy the message names.
       if (fetched.status === "aborted") return withPriorWarnings(fetched.terminal!, warnings);
+      // This stage produced no reasons until the signature gate arrived, which
+      // is why the spread was missing. Dropping them would lose the downgrade
+      // warning and a failed pin write — the second silently re-trusts the hub
+      // on every later pull.
+      warnings.push(...fetched.reasons);
       const { extractDir, manifest: bundleManifest } = fetched.value!;
 
       // Merge, unpack, or decline the chain's workspace payload. Self-gating:

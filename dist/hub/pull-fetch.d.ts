@@ -16,6 +16,13 @@ export interface FetchStageInput {
     /** The statement context's project half — the project this pull resolved. */
     projectId: string;
     /**
+     * The pull's single "now", captured once by `pull.ts`. Passed rather than
+     * read: `hub-pull-invariants.test.ts` enforces that no pull stage reads the
+     * wall clock, so a pull's recorded times cannot disagree with each other by
+     * however long the transfer took, and a test can pin one.
+     */
+    nowIso: string;
+    /**
      * The machine whose index listed THIS record (`SourcedBundle.machineId`), not
      * the machine the pull resolved to. It is stamped onto the workspace
      * generation this stage records, and the merge-ancestor rule is only sound

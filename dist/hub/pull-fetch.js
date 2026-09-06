@@ -139,7 +139,7 @@ function signatureFailureAbort(record, machineId, failure) {
  * every machine that does.
  */
 async function runSignatureGate(input) {
-    const { record, machineId, hubId, projectId, tarPath, reasons } = input;
+    const { record, machineId, hubId, projectId, nowIso, tarPath, reasons } = input;
     // Read STRUCTURALLY rather than off the declared type: `HubBundleRecord`
     // grows `signature` from the push side in this same slice, and this reader
     // must be correct for records that carry it and records that never will.
@@ -239,7 +239,7 @@ async function runSignatureGate(input) {
             machineId,
             publicKey: signature.publicKey,
             origin: "tofu",
-            nowIso: new Date().toISOString(),
+            nowIso,
         });
         switch (outcome.kind) {
             case "pinned":
@@ -266,7 +266,7 @@ async function runSignatureGate(input) {
     return null;
 }
 export async function runFetchStage(input) {
-    const { backend, record, machineId, hubId, projectId, bundleIndex: i, chainLength, tempRoot, state: st } = input;
+    const { backend, record, machineId, hubId, projectId, nowIso, bundleIndex: i, chainLength, tempRoot, state: st } = input;
     // User-facing sentences this stage wants surfaced WITHOUT stopping the pull
     // — the signature gate's downgrade warning and pin disclosures land here.
     // They ride the stage contract's `reasons` on the applied outcome; an abort
@@ -348,7 +348,7 @@ export async function runFetchStage(input) {
      * throw into a typed abort — the module contract, not politeness.
      */
     const sigOutcome = await runSignatureGate({
-        record, machineId, hubId, projectId, tarPath, reasons,
+        record, machineId, hubId, projectId, nowIso, tarPath, reasons,
     });
     if (sigOutcome !== null)
         return sigOutcome;
