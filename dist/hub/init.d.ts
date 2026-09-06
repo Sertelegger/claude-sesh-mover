@@ -23,6 +23,11 @@ export declare function resolveHubPath(config: SeshMoverConfig): string | null;
  * platform and timestamp it already published. A public key is not a secret, and
  * generating one is 32 bytes of `randomBytes`.
  *
+ * The SIGNING key (#86) is published on the same unconditional schedule for the
+ * parallel reason: the key has to be on the hub before the first bundle signed
+ * with it is pulled, or the puller has nothing to pin. Same cost, same
+ * non-secret, one more mint on first check-in.
+ *
  * ### It never fails a push over a key
  *
  * `loadOrCreateIdentity` returns a result and does not throw, and this function
@@ -31,7 +36,12 @@ export declare function resolveHubPath(config: SeshMoverConfig): string | null;
  * file is unreadable. The hard failure rule belongs at the ENCRYPTING call site,
  * where "no key" actually means "no confidentiality".
  *
- * ### A recipient it cannot prove is carried forward, never retracted
+ * The signing key (#86) rides the same rule, with a stronger owner ruling
+ * behind it: even the SIGNING call site in push.ts warns and pushes unsigned
+ * rather than refusing, so a fortiori a broken key file must not stop the
+ * check-in that merely publishes its public half.
+ *
+ * ### A key it cannot prove is carried forward, never retracted
  *
  * If the identity cannot be read this run, the previously published
  * `ageRecipient` on this machine's own record is preserved instead of being
@@ -43,6 +53,14 @@ export declare function resolveHubPath(config: SeshMoverConfig): string | null;
  * a key nobody holds costs 100 bytes, and being dropped costs the ability to
  * read anything ever again. Reading this machine's own record before writing it
  * is squarely inside per-machine ownership.
+ *
+ * `signingPublicKey` gets the identical carry-forward, and the safe direction
+ * is the same one for a different reason: the published key is what `hub
+ * trust` fingerprints and what a first-contact pin records, so a transient
+ * read failure that retracted it would hand the next machine to pull an empty
+ * slot where the pinnable key was — while a stale-but-real key costs nothing,
+ * because verification reads the key off the signed statement and checks it
+ * against the PIN, never against this record.
  */
 export declare function registerMachine(hubPath: string): Promise<HubMachineJson>;
 export declare function hubInit(opts: {

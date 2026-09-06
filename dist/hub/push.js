@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import { createFsBackend } from "./backend.js";
 import { bundleDir, bundleFileName, workspaceDir, } from "./layout.js";
 import { bundleEncryptStream } from "./bundle-io.js";
+import { digestFile, signStatement, SIGNATURE_DOMAIN } from "./signature.js";
+import { loadOrCreateSigningKey } from "../crypto/signing-key.js";
 import { collectHubRecipients, planBundleEncryption, resolveHubEncryption } from "./encryption.js";
 import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { resolveProjectIdentity, mintHubProject, readHubProjectAsLocal, writeLocalProjectId, readLocalProjectId, removeLocalProjectIdIfMatches, } from "./identity.js";
@@ -140,6 +142,28 @@ function failedAfterLink(projectPath, commits, error) {
                 `run \`sesh-mover hub unlink\` (or delete .sesh-mover-project.json) to unlink it.${orphanBundle}`,
         suggestion: relinkSuggestion,
     };
+}
+/**
+ * The disclosure for a push that went up unsigned because this machine's
+ * signing key could not be read (#86).
+ *
+ * ONE spelling for both producers (the unreadable-key branch and the
+ * should-be-unreachable signer-throw branch), because the sentence carries the
+ * cost of the degradation and two copies of it would drift. It names the file
+ * and no flag or config key, deliberately: warn-and-push-unsigned is an owner
+ * ruling, not a policy with a switch, so there is nothing to advise passing.
+ *
+ * What it must say, per that ruling: what happened, and what it costs — the
+ * bundle applies fine on a peer that has never seen this machine sign, but one
+ * that HAS treats the unsigned bundle as a downgrade, because from there it is
+ * indistinguishable from a tamperer stripping the signature.
+ */
+function unsignedPushWarning(detail) {
+    return (`This machine's signing key could not be used (${detail}), so this bundle was pushed UNSIGNED. ` +
+        `It still applies everywhere, but a machine that has already verified a signed bundle from this one ` +
+        `treats an unsigned push as a downgrade — the same thing a tamperer stripping signatures looks like. ` +
+        `Restore ~/.sesh-mover/signing.key, or remove it to mint a replacement; a replacement key surfaces ` +
+        `on peers as a key change to confirm out of band.`);
 }
 /**
  * `onProgress`'s contract, which is invisible from any single call site — the
@@ -688,9 +712,18 @@ export async function hubPush(opts) {
              * Shared rather than written twice, because the thing that must not drift
              * between the two is the encryption branch: a second copy is precisely how
              * a workspace artifact ends up as plaintext on a hub the user sealed.
+             *
+             * Returns the sha256 of the PLAINTEXT archive, computed here — after
+             * `createArchive`, before the stream that may encrypt — because this is
+             * the one moment both callers provably hold the plaintext bytes. The
+             * signature below signs this digest and not the uploaded bytes: `hub
+             * rekey` rewrites a bundle's header in place under the same name, so a
+             * ciphertext digest dies at every rekey, while over plaintext a rekey is
+             * a non-event (signature.ts has the full argument).
              */
             const uploadArchive = async (sourceDir, tmpArchive, hubPath) => {
                 await createArchive(sourceDir, tmpArchive, "gzip");
+                const plaintextDigest = await digestFile(tmpArchive);
                 const w = await backend.writeStreamAtomic(hubPath);
                 try {
                     // Streaming, deliberately: `AgeEncryptStream` goes INTO the existing
@@ -720,6 +753,7 @@ export async function hubPush(opts) {
                     await w.abort();
                     throw e;
                 }
+                return plaintextDigest;
             };
             const hubFile = `${bundleDir(local.projectId, machine.id)}/${bundleFileName(pushedAt, bundleId, { encrypted: encryption.kind === "encrypt" })}`;
             // WORKSPACE ARTIFACT FIRST, BUNDLE SECOND, and the order is the failure
@@ -735,10 +769,11 @@ export async function hubPush(opts) {
             //   hard way, one download at a time.
             //
             // Same principle as #92's "a failed run leaves the LARGER state".
+            let workspaceDigest;
             if (workspaceUpload) {
-                await uploadArchive(workspaceUpload.staging, join(staging, "workspace.tar.gz"), workspaceUpload.hubFile);
+                workspaceDigest = await uploadArchive(workspaceUpload.staging, join(staging, "workspace.tar.gz"), workspaceUpload.hubFile);
             }
-            await uploadArchive(bundleStaging, join(staging, "bundle.tar.gz"), hubFile);
+            const bundleDigest = await uploadArchive(bundleStaging, join(staging, "bundle.tar.gz"), hubFile);
             commits.bundleCommitted = true;
             // The bundle is on the hub, so this push has delivered: link the project.
             // Deferred all the way to here (rather than to just after the export) so
@@ -748,6 +783,60 @@ export async function hubPush(opts) {
             // auto-push unarmed. Past this line there IS a link, and a later failure
             // rolls it back and says so.
             commitLocalLink();
+            /**
+             * SIGN (#86) — one statement per push, stamped on every index record this
+             * push mints below. One and not per-record, because the statement binds
+             * the BUNDLE's context (id, hub path, digests) and every record of one
+             * push shares all of it; a per-record signature would sign nine copies of
+             * the same sentence.
+             *
+             * `bundleFile` is `hubFile` — the exact string each record's `file` gets —
+             * because the verifier compares the two and a mismatch here is a
+             * self-inflicted verification failure indistinguishable from a bundle
+             * moved by an attacker.
+             *
+             * **An unreadable key warns and pushes unsigned — owner ruling, and not a
+             * policy choice a flag or config key may reopen.** It matches
+             * `registerMachine`'s "never fail a push over a key": this includes the
+             * unattended SessionEnd auto-push, which would otherwise refuse at every
+             * session end over a transient file problem. The cost is stated in the
+             * warning rather than discovered on a peer: a machine that has signed
+             * before and stops looks, from the receiving side, exactly like a
+             * tamperer stripping signatures.
+             */
+            let bundleSignature;
+            const signingKey = loadOrCreateSigningKey();
+            if (signingKey.ok) {
+                try {
+                    bundleSignature = signStatement(signingKey.privateKey, {
+                        domain: SIGNATURE_DOMAIN,
+                        hubId: hub.hubId,
+                        projectId: local.projectId,
+                        machineId: machine.id,
+                        bundleId,
+                        pushedAt,
+                        bundleFile: hubFile,
+                        bundleDigest,
+                        // Absent together when no workspace artifact went up — absent,
+                        // not empty: `canonicalize` drops undefined, so the two shapes
+                        // sign differently and a verifier cannot be talked into reading
+                        // a missing artifact as a matching one (signature.ts).
+                        ...(workspaceUpload && workspaceDigest !== undefined
+                            ? { workspaceFile: workspaceUpload.hubFile, workspaceDigest }
+                            : {}),
+                    }, signingKey.publicKey);
+                }
+                catch (e) {
+                    // Should be unreachable — the key was validated as Ed25519 by the
+                    // read above and Ed25519 signing takes no options to get wrong — but
+                    // the ruling is categorical, so a throw from the signer degrades the
+                    // same way an unreadable key does rather than failing the push.
+                    warnings.push(unsignedPushWarning(errorMessage(e)));
+                }
+            }
+            else {
+                warnings.push(unsignedPushWarning(signingKey.detail));
+            }
             // Peer bookkeeping from the staged bundle (snapshot, never live files)
             recordSentFromBundle(opts.projectPath, { id: hubPeerId, name: "hub" }, bundleStaging);
             // The workspace generation this machine's tree now shares with the hub —
