@@ -1519,13 +1519,22 @@ async function arrangeContinuation(
  * bytes that were there BEFORE the rewrite, so the signature gate aborts first
  * and none of those tests reach what they are about.
  *
- * **Re-signing rather than stripping the signature is the faithful choice.**
- * Stripping would exercise the unsigned path — a different, permanently
- * supported shape — while re-signing reproduces what these tests actually
- * describe: a bundle genuinely from the machine it claims, whose CONTENT is
- * nevertheless wrong. That is a sender-side defect, and the downstream guards
- * are exactly what must still catch it. It also keeps the suite honest about
- * what a signature proves — authorship, never that the contents are correct.
+ * **Re-signing rather than stripping is the faithful choice — but ONLY for a
+ * bundle this machine owns.** Re-signing reproduces what these tests describe:
+ * a bundle genuinely from the machine it claims, whose CONTENT is wrong. That
+ * is a sender-side defect and the downstream guards must still catch it.
+ *
+ * **For another machine's bundle it is not merely unfaithful, it is the attack.**
+ * This helper holds only the CURRENT home's key. Signing a peer's record with
+ * it produces a statement claiming that peer, signed by someone else — which
+ * is exactly what the pin exists to reject, and rejecting it is the feature
+ * working. An earlier version of this helper did that unconditionally and made
+ * six multi-machine tests fail with `unpinned-key`; the gate was right and the
+ * fixture was forging.
+ *
+ * So a foreign record has its signature STRIPPED instead. That is honest and
+ * costs nothing: an absent signature is a pre-signing bundle, a shape supported
+ * permanently, and the downstream guard under test is reached either way.
  */
 async function resignBundleOnHub(
   backend: ReturnType<typeof createFsBackend>,
@@ -1534,17 +1543,23 @@ async function resignBundleOnHub(
   archivePath: string
 ): Promise<void> {
   const key = loadOrCreateSigningKey();
+  const me = loadOrCreateMachineId().id;
   for (const index of indexes) {
     let touched = false;
     for (const thread of Object.values(index.threads)) {
       for (const r of thread.bundles) {
         if (r.bundleId !== bundleId || !r.signature) continue;
-        if (!key.ok) throw new Error("fixture cannot re-sign: no signing key on this machine");
-        r.signature = signStatement(
-          key.privateKey,
-          { ...r.signature.statement, bundleDigest: await digestFile(archivePath) },
-          key.publicKey
-        );
+        if (index.machineId === me) {
+          if (!key.ok) throw new Error("fixture cannot re-sign: no signing key on this machine");
+          r.signature = signStatement(
+            key.privateKey,
+            { ...r.signature.statement, bundleDigest: await digestFile(archivePath) },
+            key.publicKey
+          );
+        } else {
+          // Not ours to sign. See the header: forging it is the attack.
+          delete r.signature;
+        }
         touched = true;
       }
     }
