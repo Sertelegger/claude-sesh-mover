@@ -1,4 +1,5 @@
 import { isSafeSessionId } from "../manifest.js";
+import type { BundleSignature } from "./signature.js";
 
 // ---- Hub file schema types (Slice 1, schemaVersion 1 everywhere) ----
 
@@ -89,6 +90,26 @@ export interface HubMachineJson {
    * carries.
    */
   ageRecipient?: string;
+  /**
+   * This machine's Ed25519 signing key (#86) — the PUBLIC half of
+   * `~/.sesh-mover/signing.key`, as base64url raw bytes. The private half is
+   * never transported, exactly as with `ageRecipient` above.
+   *
+   * Published so a peer can verify this machine's bundle signatures and pin the
+   * key on first contact — the pin, not this field, is what supplies the trust
+   * (see `pins.ts`: whoever can write this file can substitute the key, so a
+   * hub-published key detects only a tamperer who declines to re-sign).
+   *
+   * **Optional, permanently.** A machine on an older version, or one whose key
+   * file was unreadable when it last checked in, has none. Such a machine
+   * pushes unsigned bundles, which apply exactly as every pre-signing bundle
+   * does — the receive-side downgrade ratchet, not this field's absence, is
+   * what surfaces a machine that used to sign and stopped.
+   *
+   * A public key discloses nothing — it sits beside the same already-public
+   * facts `ageRecipient` does.
+   */
+  signingPublicKey?: string;
 }
 export interface HubProjectJson {
   schemaVersion: 1;
@@ -133,6 +154,29 @@ export interface HubBundleRecord {
   messageCount: number;
   pushedAt: string;
   hasWorkspace: boolean;
+  /**
+   * The pushing machine's signed statement about this bundle (#86) — Ed25519
+   * over sha256 digests of the PLAINTEXT archives plus the context that locates
+   * them (see `signature.ts` for why plaintext: a ciphertext signature dies at
+   * every `hub rekey`).
+   *
+   * **Absent means a pre-signing bundle, permanently** — exactly as an absent
+   * `.age` suffix means plaintext. That is every bundle in existence, and the
+   * mixed state is structural, not transitional. The branch is per-RECORD data,
+   * never local config, never `hub.json`, never a version check: a hub-wide
+   * "signatures required" switch would strand every earlier bundle the moment
+   * it flipped, invisibly to the machine that flipped it. What stops a
+   * tamperer simply stripping this field is the receive-side downgrade
+   * ratchet, not anything recorded here.
+   *
+   * It lives on the index record rather than in its own hub file because it is
+   * already in hand at the verification point (zero extra hub reads) and the
+   * index is the signer's own file, so per-machine ownership holds trivially.
+   * The index stays derivable in the only sense that invariant demands: the
+   * one machine allowed to write it holds the signing key, so `hub reindex`
+   * can re-mint what it cannot re-read.
+   */
+  signature?: BundleSignature;
 }
 export interface HubThreadEntry {
   localSessionId: string;

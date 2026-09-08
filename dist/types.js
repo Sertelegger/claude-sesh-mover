@@ -91,6 +91,14 @@ const REASON_EXIT_CODE = {
     "stale-machines": EXIT_REFUSED,
     "escrow-refused": EXIT_REFUSED,
     /**
+     * `hub trust` declining to confirm a key (#86). A refusal: it ran, decided,
+     * and wrote nothing. Deliberately not class 3 — retrying the same invocation
+     * refuses identically until a human supplies a matching fingerprint, and a
+     * caller that looped on it would be looping on a step whose entire value is
+     * that a person performed it.
+     */
+    "trust-refused": EXIT_REFUSED,
+    /**
      * Compaction declining to delete yet (#92) — waiting on a machine to
      * acknowledge, or on the grace window. A refusal for `grace-period`'s exact
      * reason: class 3 invites a caller to loop, and this wait is measured in

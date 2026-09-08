@@ -1161,6 +1161,48 @@ hub
     }
   });
 
+// `hub trust` (#86) prints each machine's signing-key fingerprint and lets a
+// user CONFIRM one out of band.
+//
+// It exists because trust-on-first-use trusts the hub once per machine, and on
+// a shared-directory hub anyone who can tamper with a bundle can also rewrite
+// the victim's `machines/<id>.json` and publish a key of their own. Comparing a
+// fingerprint over a channel that is not the hub is the only step in signing
+// that does not depend on trusting the hub.
+//
+// Optional by owner ruling — a single-owner fleet may decline the ceremony and
+// still get pinning. Takes no lock and writes nothing on the hub: it reads the
+// machine roster and writes only this machine's own local pin file.
+hub
+  .command("trust")
+  .description("Show each machine's signing-key fingerprint, and confirm one out of band")
+  .option("--machine <id>", "Confirm this machine's key (requires --fingerprint)")
+  .option("--fingerprint <fp>", "The fingerprint read from that machine, over a channel that is not the hub")
+  .option("--project-path <path>", "Override project path (default: cwd)")
+  .option("--source-config-dir <path>", "Override Claude config dir")
+  .action(async (opts) => {
+    try {
+      const configDir = resolveConfigDir(opts.sourceConfigDir);
+      const projectPath = opts.projectPath ?? process.cwd();
+      const config = loadEffectiveConfig(configDir, projectPath);
+      const { resolveHubPath } = await import("./hub/init.js");
+      const hubPath = resolveHubPath(config);
+      if (!hubPath) {
+        outputError("hub-trust", new Error("No hub configured. Run: sesh-mover hub init --path <dir>"));
+        return;
+      }
+      const { hubTrust } = await import("./hub/trust.js");
+      output(await hubTrust({
+        projectPath,
+        hubPath,
+        machineId: opts.machine,
+        fingerprint: opts.fingerprint,
+      }));
+    } catch (e) {
+      outputError("hub-trust", e);
+    }
+  });
+
 // `hub compact` (#92) replaces a thread's continuation chain with one full
 // bundle, then removes the chain behind it — but only once every machine has
 // demonstrably got the content, and only this machine's own bundles.

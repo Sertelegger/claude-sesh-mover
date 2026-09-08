@@ -7,6 +7,22 @@ export interface FetchStageInput {
     backend: HubBackend;
     record: HubBundleRecord;
     /**
+     * The hub this pull is reading (#86). Two consumers, both signature-side:
+     * the statement context a signed record is checked against, and the pin
+     * store's key — a pin is per `(hubId, machineId)` because the same machine
+     * id on two hubs is two different trust decisions.
+     */
+    hubId: string;
+    /** The statement context's project half — the project this pull resolved. */
+    projectId: string;
+    /**
+     * The pull's single "now", captured once by `pull.ts`. Passed rather than
+     * read: `hub-pull-invariants.test.ts` enforces that no pull stage reads the
+     * wall clock, so a pull's recorded times cannot disagree with each other by
+     * however long the transfer took, and a test can pin one.
+     */
+    nowIso: string;
+    /**
      * The machine whose index listed THIS record (`SourcedBundle.machineId`), not
      * the machine the pull resolved to. It is stamped onto the workspace
      * generation this stage records, and the merge-ancestor rule is only sound
@@ -50,6 +66,15 @@ export interface FetchStageInput {
  * `bundleSession.integrityHash` is therefore NOT redundant with anything here;
  * treating it as redundant welds a corrupt delta into a transcript the user
  * already owns.
+ *
+ * A record carrying a `signature` (#86) adds ONE more true thing on return:
+ * the archive's plaintext bytes hash to what a holder of the signing key said
+ * they should, for this exact hub slot. It adds it only for signed records —
+ * unsigned is the permanent normal, exactly like plaintext beside ciphertext —
+ * and it says nothing about the split workspace artifact: the statement
+ * carries a `workspaceDigest`, but that file is retrieved by
+ * `pull-apply-workspace.ts`, which does not check it yet. A named gap, not an
+ * oversight.
  */
 export interface FetchStageResult {
     /** Where the bundle was unpacked — `manifest.json`, `sessions/`, and friends sit directly under it. */

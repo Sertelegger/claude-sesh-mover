@@ -46,14 +46,33 @@ import type { HubPullResult } from "../src/types.js";
  * The bundle records inside keep pointing at `bundles/<the real id>/…`, which
  * is a hub-relative path the backend validates on its own, so the payload is
  * still fetchable and only the IDENTITY the pull books it under moves.
+ *
+ * **Signatures are stripped, and that is the point of this comment.** Since #86
+ * a record carries a statement naming the machine that signed it, so moving one
+ * under a spoofed identity is exactly the context mismatch the signature gate
+ * refuses — measured: with them intact the pull aborts before it ever reaches
+ * the peer ledger, and this file's whole subject (a prototype name used as a
+ * ledger KEY) goes untested while looking green.
+ *
+ * That refusal is the stronger outcome and it is covered on its own in
+ * `hub-signing-verify.test.ts`. What must not be lost is THIS hazard, which is
+ * orthogonal to signing and survives it: an unsigned peer index is a
+ * permanently supported shape, so stripping the signatures is what keeps the
+ * pull walking all the way into the code that books a receipt under the id.
  */
 function republishPeerIndexAs(hub: string, projectId: string, localMachineId: string, spoofed: string): void {
   const dir = join(hub, "projects", projectId, "index");
   const names = readdirSync(dir).filter((n) => n.endsWith(".json") && n !== `${localMachineId}.json`);
   expect(names, "the peer must have published exactly one index file").toHaveLength(1);
   const p = join(dir, names[0]);
-  const parsed = JSON.parse(readFileSync(p, "utf-8")) as { machineId: string };
+  const parsed = JSON.parse(readFileSync(p, "utf-8")) as {
+    machineId: string;
+    threads: Record<string, { bundles: Array<{ signature?: unknown }> }>;
+  };
   parsed.machineId = spoofed;
+  for (const thread of Object.values(parsed.threads)) {
+    for (const record of thread.bundles) delete record.signature;
+  }
   writeFileSync(join(dir, `${spoofed}.json`), JSON.stringify(parsed, null, 2) + "\n", "utf-8");
   rmSync(p);
 }

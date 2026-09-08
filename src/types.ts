@@ -1800,7 +1800,7 @@ export interface HubUnreachableResult {
   success: false;
   command:
     | "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-encrypt" | "hub-rekey"
-    | "hub-compact";
+    | "hub-compact" | "hub-trust";
   reason: "hub-unreachable";
   /**
    * Which of the two shapes it is — an enum rather than prose, because the
@@ -1893,7 +1893,7 @@ export interface HubLockBusyResult {
   success: false;
   command:
     | "push" | "pull" | "hub-unlink" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-rekey"
-    | "hub-compact";
+    | "hub-compact" | "hub-trust";
   reason: "lock-busy";
   holderPid: number | null;
   ageSeconds: number | null;
@@ -2559,6 +2559,47 @@ export interface HubCompactRefusedResult {
   suggestion: string;
 }
 
+/**
+ * `hub trust` (#86) — the machine roster with each signing key's pin state.
+ *
+ * `pinned` is three-valued and each value is a different fact: `confirmed`
+ * means a human compared a fingerprint out of band; `tofu` means this machine
+ * trusted the hub once; `null` means no key has been seen from that machine at
+ * all. Only the first is independent of the hub, which is the whole point of
+ * reporting them apart rather than as a boolean.
+ */
+export interface HubTrustResultShape {
+  success: true;
+  command: "hub-trust";
+  hubId: string;
+  machines: Array<{
+    machineId: string;
+    machineName: string | null;
+    signingPublicKey: string | null;
+    fingerprint: string | null;
+    pinned: "tofu" | "confirmed" | null;
+    conflict: boolean;
+  }>;
+  confirmed?: { machineId: string; fingerprint: string };
+  warnings: string[];
+}
+
+/**
+ * `hub trust` declining. A refusal (exit 2): it ran, understood, and wrote
+ * nothing. `fingerprint-mismatch` is the load-bearing one — confirming without
+ * a matching fingerprint would be the user typing yes to whatever the hub
+ * published, which is trust-on-first-use with extra steps.
+ */
+export interface HubTrustRefusedResultShape {
+  success: false;
+  command: "hub-trust";
+  reason: "trust-refused";
+  refusal: "no-such-machine" | "no-key-published" | "fingerprint-mismatch" | "pin-write-failed";
+  error: string;
+  suggestion: string;
+  warnings: string[];
+}
+
 export type CliResult =
   | ExportResult
   | ExportPayloadPlanResult
@@ -2582,6 +2623,8 @@ export type CliResult =
   | HubRetireResult
   | HubCompactResult
   | HubCompactPendingResult
+  | HubTrustResultShape
+  | HubTrustRefusedResultShape
   | HubCompactRefusedResult
   | HubDeleteResult
   | HubRetireFailedResult
@@ -2708,6 +2751,14 @@ const REASON_EXIT_CODE: Record<CliResultReason, ExitCode> = {
   "encryption-refused": EXIT_REFUSED,
   "stale-machines": EXIT_REFUSED,
   "escrow-refused": EXIT_REFUSED,
+  /**
+   * `hub trust` declining to confirm a key (#86). A refusal: it ran, decided,
+   * and wrote nothing. Deliberately not class 3 — retrying the same invocation
+   * refuses identically until a human supplies a matching fingerprint, and a
+   * caller that looped on it would be looping on a step whose entire value is
+   * that a person performed it.
+   */
+  "trust-refused": EXIT_REFUSED,
   /**
    * Compaction declining to delete yet (#92) — waiting on a machine to
    * acknowledge, or on the grace window. A refusal for `grace-period`'s exact

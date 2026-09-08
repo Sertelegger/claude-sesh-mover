@@ -314,13 +314,18 @@ export async function computeLayerDigest(dir) {
     return `sha256:${hash.digest("hex")}`;
 }
 /**
+ * EXPORTED for #86's signed statement, which needs the same property for the
+ * same reason and must not grow a second spelling of it: a signature over a
+ * differently-ordered serialization of identical content verifies as a
+ * mismatch, which is the most confusing possible failure.
+ *
  * Recursively key-sorted projection of a value, so two structurally equal
  * objects serialize identically regardless of key insertion order. `undefined`
  * properties are dropped, which is what `JSON.stringify` does when the manifest
  * is written — so the digest computed over the in-memory manifest at export
  * matches the one computed over the parsed manifest at import.
  */
-function canonicalize(value) {
+export function canonicalize(value) {
     if (Array.isArray(value))
         return value.map(canonicalize);
     if (value !== null && typeof value === "object") {

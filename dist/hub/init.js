@@ -7,6 +7,7 @@ import { HUB_JSON, machinePath } from "./layout.js";
 import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { loadOrCreateIdentity } from "../crypto/identity-file.js";
+import { loadOrCreateSigningKey } from "../crypto/signing-key.js";
 import { detectPlatform } from "../platform.js";
 import { PLUGIN_VERSION } from "../version.js";
 import { readConfigOverrides, writeConfigOverrides, setConfigOverride } from "../config.js";
@@ -36,6 +37,11 @@ export function resolveHubPath(config) {
  * platform and timestamp it already published. A public key is not a secret, and
  * generating one is 32 bytes of `randomBytes`.
  *
+ * The SIGNING key (#86) is published on the same unconditional schedule for the
+ * parallel reason: the key has to be on the hub before the first bundle signed
+ * with it is pulled, or the puller has nothing to pin. Same cost, same
+ * non-secret, one more mint on first check-in.
+ *
  * ### It never fails a push over a key
  *
  * `loadOrCreateIdentity` returns a result and does not throw, and this function
@@ -44,7 +50,12 @@ export function resolveHubPath(config) {
  * file is unreadable. The hard failure rule belongs at the ENCRYPTING call site,
  * where "no key" actually means "no confidentiality".
  *
- * ### A recipient it cannot prove is carried forward, never retracted
+ * The signing key (#86) rides the same rule, with a stronger owner ruling
+ * behind it: even the SIGNING call site in push.ts warns and pushes unsigned
+ * rather than refusing, so a fortiori a broken key file must not stop the
+ * check-in that merely publishes its public half.
+ *
+ * ### A key it cannot prove is carried forward, never retracted
  *
  * If the identity cannot be read this run, the previously published
  * `ageRecipient` on this machine's own record is preserved instead of being
@@ -56,17 +67,32 @@ export function resolveHubPath(config) {
  * a key nobody holds costs 100 bytes, and being dropped costs the ability to
  * read anything ever again. Reading this machine's own record before writing it
  * is squarely inside per-machine ownership.
+ *
+ * `signingPublicKey` gets the identical carry-forward, and the safe direction
+ * is the same one for a different reason: the published key is what `hub
+ * trust` fingerprints and what a first-contact pin records, so a transient
+ * read failure that retracted it would hand the next machine to pull an empty
+ * slot where the pinnable key was — while a stale-but-real key costs nothing,
+ * because verification reads the key off the signed statement and checks it
+ * against the PIN, never against this record.
  */
 export async function registerMachine(hubPath) {
     const backend = createFsBackend(hubPath);
     const identity = loadOrCreateMachineId();
     const key = loadOrCreateIdentity();
     let ageRecipient = key.ok ? key.recipient : undefined;
-    if (ageRecipient === undefined) {
+    const signing = loadOrCreateSigningKey();
+    let signingPublicKey = signing.ok ? signing.publicKey : undefined;
+    if (ageRecipient === undefined || signingPublicKey === undefined) {
         try {
             const prior = JSON.parse((await backend.read(machinePath(identity.id))).toString());
-            if (typeof prior.ageRecipient === "string" && prior.ageRecipient.length > 0) {
+            if (ageRecipient === undefined && typeof prior.ageRecipient === "string" && prior.ageRecipient.length > 0) {
                 ageRecipient = prior.ageRecipient;
+            }
+            if (signingPublicKey === undefined &&
+                typeof prior.signingPublicKey === "string" &&
+                prior.signingPublicKey.length > 0) {
+                signingPublicKey = prior.signingPublicKey;
             }
         }
         catch {
@@ -81,6 +107,7 @@ export async function registerMachine(hubPath) {
         lastSeenAt: new Date().toISOString(),
         pluginVersion: PLUGIN_VERSION,
         ...(ageRecipient === undefined ? {} : { ageRecipient }),
+        ...(signingPublicKey === undefined ? {} : { signingPublicKey }),
     };
     await backend.writeAtomic(machinePath(identity.id), JSON.stringify(record, null, 2) + "\n");
     return record;

@@ -23,6 +23,7 @@
     "./commands/hub-encrypt.md",
     "./commands/hub-rekey.md",
     "./commands/hub-escrow.md",
+    "./commands/hub-trust.md",
     "./commands/hub-unlink.md",
     "./commands/hub-retire.md",
     "./commands/hub-compact.md",

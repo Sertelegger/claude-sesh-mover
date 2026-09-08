@@ -245,6 +245,17 @@ function appendEntry(path: string, entry: Record<string, unknown>): void {
  *   `lastCarry`, which is carry's. A cross-stage fact belongs to the
  *   sequencer.
  *
+ * RAISED 346 -> 358 by per-machine signing (#86). The change added two things
+ * to this function and both are sequencing rather than work: three fields
+ * passed into `runFetchStage` (the statement's context, plus the pull's single
+ * clock reading), and a `warnings.push(...fetched.reasons)` that every OTHER
+ * stage call already had — the fetch stage simply produced no reasons until
+ * the signature gate arrived, which is exactly why the line was missing and
+ * why its absence would have silently dropped the downgrade warning.
+ *
+ * The new WORK is `runSignatureGate` in `pull-fetch.ts`, which is where the
+ * ratchet wants it. Raised rather than contorted, per the rule above.
+ *
  * RAISED 340 -> 346 by the workspace split (#91). The change added two
  * arguments to an existing stage call and nothing else: `workspaceFile` (where
  * this bundle's tree is, straight off its own manifest) and `projectId` (our
@@ -261,7 +272,7 @@ describe("hubPull is sequencing", () => {
     expect(
       lines,
       "hubPull grew — extract the new work into a stage, or raise this ratchet in the same commit and say why"
-    ).toBeLessThan(346);
+    ).toBeLessThan(358);
   });
 
   it("spreads each in-loop stage's reasons inside the loop, not after it", () => {
