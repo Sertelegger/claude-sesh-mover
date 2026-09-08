@@ -627,6 +627,123 @@ describe("rewriter", () => {
     });
   });
 
+  /**
+   * #108 — stage 1 had NO leading guard at all, and that is a different defect
+   * from the stage-2 one the block below pins.
+   *
+   * Stage 2 matches a SHAPE (`/seg/seg`) and a character class can guard it.
+   * Stage 1 substitutes a known LITERAL wherever it appears, so no class can
+   * express the rule — the guard has to look at what precedes the match. The
+   * consequence was that a mapped project path inside a URL was rewritten, and
+   * crucially **this was not gated on a cross-platform move**: every
+   * export/import/push/pull runs stage 1, so a same-family Linux→Linux
+   * migration corrupted URLs in captured tool output too.
+   *
+   * The existing `file://` pin below passes for an unrelated reason — its path
+   * is outside every mapping, so it never reaches stage 1 at all.
+   */
+  describe("URL guard (#108): a MAPPED path inside a URL is left alone", () => {
+    /** Same family, so nothing here depends on cross-platform translation. */
+    function sameFamilyCtx() {
+      return {
+        mappings: [{ from: "/home/sascha/proj", to: "/home/dev/app", description: "project" }],
+        sourcePlatform: "linux" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "sascha",
+        targetUser: "dev",
+      };
+    }
+
+    it("leaves a mapped path inside an https URL alone, same family", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = sameFamilyCtx();
+      // The dangerous shape: the result would still be a well-formed URL,
+      // pointing somewhere else. Nothing about it looks corrupted.
+      expect(rewriteString("https://example.com/home/sascha/proj/x", ctx)).toBe(
+        "https://example.com/home/sascha/proj/x"
+      );
+      expect(rewriteString("http://localhost:5173/home/sascha/proj/index.html", ctx)).toBe(
+        "http://localhost:5173/home/sascha/proj/index.html"
+      );
+    });
+
+    it("still translates the same mapped path when it is NOT in a URL", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = sameFamilyCtx();
+      // The control that makes the test above mean something: a guard that
+      // simply stopped stage 1 working would pass the URL cases and fail here.
+      expect(rewriteString("see /home/sascha/proj/src/a.ts for details", ctx)).toBe(
+        "see /home/dev/app/src/a.ts for details"
+      );
+    });
+
+    it("leaves a mapped path inside a URL alone cross-family, where it mangled outright", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = {
+        mappings: [{ from: "/home/sascha/proj", to: "E:\\proj", description: "project" }],
+        sourcePlatform: "linux" as const,
+        targetPlatform: "win32" as const,
+        sourceUser: "sascha",
+        targetUser: "sascha",
+      };
+      // Measured before the fix: "http://localhost:5173E:\\proj/index.html".
+      expect(rewriteString("http://localhost:5173/home/sascha/proj/index.html", ctx)).toBe(
+        "http://localhost:5173/home/sascha/proj/index.html"
+      );
+    });
+
+    it("guards any scheme, not a hardcoded http/https list", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = sameFamilyCtx();
+      for (const url of [
+        "file:///home/sascha/proj/x",
+        "ws://host/home/sascha/proj/sock",
+        "vscode-remote://ssh/home/sascha/proj/f.ts",
+      ]) {
+        expect(rewriteString(url, ctx), url).toBe(url);
+      }
+    });
+  });
+
+  /**
+   * #16's guard/token asymmetry: `_ @ ~ +` were legal INSIDE a stage-2 token
+   * and invisible in FRONT of one, so a token could start immediately after a
+   * character it was allowed to contain. Both classes now derive from one
+   * constant — except `+`, carved out by owner ruling because `+/path` is a
+   * unified-diff added line and this codebase's own domain is carry patches.
+   */
+  describe("guard/token symmetry (#16)", () => {
+    it("does not start a token after a character a token may contain", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      // Measured before the fix: "cd ~C:\\Users\\sascha\\AppData\\Local\\Temp\\build"
+      // and "~E:\\x". A tilde is not a domain character, so no URL rule was
+      // protecting these — the asymmetry alone was the bug.
+      for (const input of ["cd ~/tmp/build", "~/mnt/e/x", "~/a@/tmp/x", "foo_/tmp/x"]) {
+        expect(rewriteString(input, ctx), input).toBe(input);
+      }
+    });
+
+    it("KEEPS translating a `+`-prefixed path — the deliberate exception", async () => {
+      const { rewriteString } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      // A unified-diff added line. Full symmetry would leave the SOURCE
+      // machine's path in the transcript, which is wrong in a way a reader
+      // cannot see is wrong. Pinned so "finishing" the symmetry fails here.
+      //
+      // **The path must be one STAGE 2 translates, not a mapped one.** The
+      // first version of this test used `+/mnt/e/GitHub/proj/...`, which is a
+      // stage-1 mapping match — and stage 1 never consulted the guard class,
+      // so the test passed with the carve-out REMOVED. Caught by mutation, and
+      // it is exactly this file's own recurring defect: a guard that passes for
+      // a reason unrelated to what it claims.
+      expect(rewriteString("+/tmp/scratch", ctx)).toBe(
+        "+C:\\Users\\sascha\\AppData\\Local\\Temp\\scratch"
+      );
+      expect(rewriteString("+/mnt/e/other/x", ctx)).toBe("+E:\\other\\x");
+    });
+  });
+
   describe("URL guard (#8): tokens preceded by / are not translated", () => {
     it("leaves http URLs with unix-root hosts untouched", async () => {
       const { rewriteString } = await import("../src/rewriter.js");

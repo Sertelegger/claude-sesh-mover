@@ -6,16 +6,78 @@ import { finished } from "node:stream/promises";
 import { applyAdapters } from "./version-adapters.js";
 import { detectPlatform, extractUserFromPath, getCurrentUser, samePlatformFamily, translatePath, } from "./platform.js";
 import { errorMessage } from "./errors.js";
+/**
+ * The characters that may appear INSIDE a path token, and — with one stated
+ * exception — the characters that block a token from starting.
+ *
+ * **One constant, because two lists drifted.** The guard used to be
+ * `[A-Za-z0-9.-]` while the token class was `[A-Za-z0-9._@+~-]`, so `_ @ ~ +`
+ * were legal inside a token and invisible in front of one. Measured against
+ * the shipped build, that mangled ordinary shell output:
+ *
+ *     "cd ~/tmp/build"   ->  "cd ~C:\Users\…\Temp\build"
+ *     "~/mnt/e/x"        ->  "~E:\x"
+ *
+ * A tilde is not a domain character, so no URL rule was protecting it; the
+ * asymmetry alone was the bug. Deriving both from one constant is what stops
+ * the two lists disagreeing again — the class is the thing, not the two
+ * spellings of it.
+ */
+const TOKEN_CHARS = "A-Za-z0-9._@+~-";
+/**
+ * The guard class, which is `TOKEN_CHARS` MINUS `+`.
+ *
+ * **`+` is carved out deliberately, by owner ruling, and the reason is this
+ * repo's own subject matter.** A line beginning `+/home/user/src/app.ts` is a
+ * unified-diff added line, and `rewriteString` runs on captured shell output —
+ * where `git diff` output is ordinary and where a project whose whole domain is
+ * carry patches will meet it. Under full symmetry those paths would stop being
+ * translated and a transcript would show the SOURCE machine's path, which is
+ * wrong in a way a reader cannot see is wrong.
+ *
+ * The carve-out is the kind of exception that invites someone to "finish" the
+ * symmetry later, so it is spelled here with the reason attached rather than
+ * left as a difference between two character classes. `tests/rewriter.test.ts`
+ * pins both halves: `+`-prefixed paths still translate, and `~`/`_`/`@` no
+ * longer do.
+ */
+const GUARD_CHARS = TOKEN_CHARS.replace("+", "");
 // Characters that terminate a path token embedded in free text.
 // (?<!\/) — a token immediately preceded by "/" is URL-context
 // (http://mnt/..., protocol-relative //tmp/..., file:///mnt/...) and is
-// never translated. (?<![A-Za-z0-9.-]) protects paths following domain names
-// (https://example.com/mnt/...). Together these prevent URL corruption while
-// still translating bare filesystem paths. Leaving text unchanged is the
-// preferred failure mode.
-const UNIX_TOKEN = /(?<![A-Za-z0-9.-])(?<!\/)(?:\/[A-Za-z0-9._@+~-]+)+\/?/g;
-const WIN_TOKEN = /(?<![A-Za-z0-9.-])(?<!\/)[A-Za-z]:\\[^\s"'`)\]}>,;]*/g;
+// never translated. The `GUARD_CHARS` lookbehind protects paths following
+// domain names (https://example.com/mnt/...) and, since the two classes were
+// unified, anything else a token may contain. Together these prevent URL
+// corruption while still translating bare filesystem paths. Leaving text
+// unchanged is the preferred failure mode.
+const UNIX_TOKEN = new RegExp(`(?<![${GUARD_CHARS}])(?<!\\/)(?:\\/[${TOKEN_CHARS}]+)+\\/?`, "g");
+const WIN_TOKEN = new RegExp(`(?<![${GUARD_CHARS}])(?<!\\/)[A-Za-z]:\\\\[^\\s"'\`)\\]}>,;]*`, "g");
 const TAIL = /[^\s"'`)\]}>,;:]*/;
+/**
+ * A scheme prefix immediately before the position a stage-1 match starts at
+ * (#108).
+ *
+ * **Stage 1 had no leading guard at all**, and that is a different bug from the
+ * one above rather than a variant of it. Stage 2 matches a SHAPE (`/seg/seg`)
+ * and can be guarded by a character class; stage 1 substitutes a known LITERAL
+ * wherever it appears, including inside a URL — so a character class cannot
+ * express the rule. Measured, and NOT gated on a cross-platform move:
+ *
+ *     "https://example.com/home/me/proj/x"          ->  ".../home/dev/app/x"
+ *     "http://localhost:5173/home/me/proj/index.html"
+ *                                    (cross-family) ->  "http://localhost:5173E:\proj/index.html"
+ *
+ * The first is the dangerous one: still a well-formed URL, now pointing
+ * somewhere else. Every export/import/push/pull runs stage 1, so this fired on
+ * same-machine moves too.
+ *
+ * Matched against the text BEFORE the candidate rather than as a lookbehind,
+ * because the mapping is interpolated into the pattern and a variable-length
+ * lookbehind in front of it would be both unreadable and easy to get wrong. It
+ * is deliberately narrow — a scheme and authority, not "any URL-ish thing" —
+ * so a path that merely follows a colon still translates.
+ */
+const URL_PREFIX = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'`)\]}>,;]*$/;
 function escapeRegex(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -35,7 +97,15 @@ export function rewriteString(input, ctx) {
         // next char is a separator, or the match ends at a token terminator / EOS.
         // Prevents `/home/me/app` from rewriting inside `/home/me/app-backup`.
         const re = new RegExp(escapeRegex(mapping.from) + "(?![^\\s\"'`)\\]}>,;:/\\\\])" + "(" + TAIL.source + ")", "g");
-        result = result.replace(re, (_m, tail) => mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail));
+        result = result.replace(re, (m, tail, offset, whole) => {
+            // #108: leave a mapped path alone when it sits inside a URL. Checked on
+            // the text BEFORE this match rather than in the pattern — see
+            // `URL_PREFIX`. Returning the match verbatim is the no-op, and "leave
+            // text unchanged" is this function's stated preferred failure mode.
+            if (URL_PREFIX.test(whole.slice(0, offset)))
+                return m;
+            return mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail);
+        });
     }
     // Stage 2 (cross-family only): translate remaining path-like tokens through
     // the platform engine (/mnt/<drive>, /tmp, /home, /Users, drive letters).
