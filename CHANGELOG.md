@@ -68,6 +68,25 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   same way plaintext and encrypted bundles coexist. An unreadable signing key warns and pushes
   unsigned rather than failing the push.
 
+- **A project path inside a URL is no longer rewritten** ([#108]). The path-rewriter runs two stages;
+  the second guards against mistaking a URL's path for a filesystem path, and the first had no such
+  guard at all — so a mapped project path was substituted wherever it appeared, including inside an
+  `http(s)://` or `file://` URL. `https://example.com/<your project path>/x` came back pointing
+  somewhere else, still looking like a valid URL.
+
+  > **This was never limited to cross-platform moves.** Every export, import, push and pull runs that
+  > stage, so a same-machine migration between two directories corrupted URLs in captured tool output
+  > too. Cross-platform it mangled them outright.
+
+  It applies only to captured tool output — user and assistant text are never rewritten — but a dev
+  server URL, a source-mapped stack trace or a docs link containing the project path all qualify.
+
+- **`~/…` and `_`-adjacent paths are no longer mangled** ([#16]). The rewriter's two character classes
+  disagreed: `_ @ ~ +` were legal inside a path token and invisible in front of one, so a token could
+  start immediately after a character it was allowed to contain. `cd ~/tmp/build` became
+  `cd ~C:\Users\…\Temp\build`. Both classes now derive from one constant, with `+` deliberately
+  excluded so a unified-diff line like `+/home/you/src/app.ts` keeps translating.
+
 ### Fixed
 
 - **`classifyBundleFailure` could throw from the one function whose contract is that it does not**
@@ -115,6 +134,8 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
 [#96]: https://github.com/Sertelegger/claude-sesh-mover/issues/96
 [#86]: https://github.com/Sertelegger/claude-sesh-mover/issues/86
 [#102]: https://github.com/Sertelegger/claude-sesh-mover/issues/102
+[#108]: https://github.com/Sertelegger/claude-sesh-mover/issues/108
+[#16]: https://github.com/Sertelegger/claude-sesh-mover/issues/16
 
 ## [0.10.0] — 2026-08-31
 
