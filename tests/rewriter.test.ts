@@ -980,6 +980,75 @@ describe("rewriter", () => {
       ).rejects.toThrow();
     });
 
+    /**
+     * #16 asked for a post-open input-error pin, and the reason it gave is
+     * right: the test above never reaches the readline path. It passes a path
+     * that does not exist, so it dies at `statSync(inputPath)` (src/rewriter.ts
+     * :492) before a byte is read — which pins the PRE-open failure and nothing
+     * else.
+     *
+     * A directory is the cheapest input that gets past that line: `statSync`
+     * succeeds on one, so the failure arrives from the read stream itself,
+     * inside the `for await`, which is the path with no coverage.
+     */
+    it("rejects on an input error raised AFTER the stat succeeds", async () => {
+      const { rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const dir = mkdtempSync(join(tmpdir(), "sesh-stream-postopen-"));
+      try {
+        // The input IS the directory: stattable, not readable as a file.
+        await expect(rewriteJsonlStream(dir, join(dir, "out.jsonl"), ctx, {})).rejects.toThrow();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * #16 also asked for a drain-race pin "with an input large enough to force
+     * `write() === false`", saying the existing error test never backpressures.
+     *
+     * **The premise needed retargeting and the measurement is why.** A probe of
+     * the write half showed the existing small fixture DOES reach the drain
+     * branch — but only 39 times in 40, with the fall-through landing on the
+     * `finished(out)` race instead. So the bullet was not wrong, it was FLAKY:
+     * a pin built on the small input would pass almost always and fail roughly
+     * once in forty runs, which is worse than no pin.
+     *
+     * One line larger than the stream's 64 KiB high-water mark makes entry
+     * deterministic (40/40 measured), which is what a pin needs. This asserts
+     * the content survives the backpressure round trip — the failure it guards
+     * against is a dropped or truncated chunk after an awaited drain, not a
+     * throw.
+     */
+    it("round-trips a line larger than the write high-water mark, through the drain path", async () => {
+      const { rewriteJsonlStream } = await import("../src/rewriter.js");
+      const ctx = await wslToWinCtx();
+      const dir = mkdtempSync(join(tmpdir(), "sesh-stream-drain-"));
+      try {
+        const input = join(dir, "in.jsonl");
+        const output = join(dir, "out.jsonl");
+        // ~70 KiB of payload in ONE line, comfortably past the 64 KiB default,
+        // so `out.write()` returns false and the await is entered every run.
+        const big = "x".repeat(70 * 1024);
+        writeFileSync(
+          input,
+          JSON.stringify({ uuid: "u1", type: "user", cwd: "/mnt/e/GitHub/proj", pad: big }) + "\n",
+          "utf-8"
+        );
+        await rewriteJsonlStream(input, output, ctx, {});
+
+        const written = readFileSync(output, "utf-8");
+        const parsed = JSON.parse(written.trim());
+        // The payload survived intact...
+        expect(parsed.pad).toHaveLength(big.length);
+        // ...and the rewrite still happened on the same line, so the drain
+        // round trip did not cost the transformation.
+        expect(parsed.cwd).toBe("E:\\GitHub\\proj");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     // Pins the error-latch (outErrored promise raced at every await point):
     // without it, an output-stream open failure either crashes the process
     // (unhandled 'error' event) or hangs forever (once(out, "drain") misses
