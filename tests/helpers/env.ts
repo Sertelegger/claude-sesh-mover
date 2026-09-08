@@ -147,6 +147,32 @@ export function overridePath(dir: string): PathOverrideHandle {
 }
 
 /**
+ * In-process twin of `prependPath`: put `dir` in FRONT of this process's
+ * executable search path, keeping the rest, and return a handle that restores
+ * the original. Built on `overridePath`, so the original comes back under its
+ * own casing, and a PATH that was unset is deleted again rather than written
+ * back as the string "undefined" — which is what a bare
+ * `process.env.PATH = saved` does when `saved` is undefined.
+ *
+ * The joiner is `node:path`'s `delimiter` (`;` on Windows, `:` elsewhere), and
+ * that is the whole reason this helper exists rather than a one-liner at each
+ * call site. A hand-rolled `${dir}:${process.env.PATH}` is wrong on Windows in
+ * the quietest possible way: the result is still a valid PATH there, just one
+ * whose first entry is `<dir>:C` — a directory that does not exist — so the
+ * code under test walks straight past the stub and finds the real binary, and
+ * every assertion passes against it (#16). Nothing fails; the test simply
+ * stops testing what it says.
+ *
+ * Like `overridePath`, this mutates process-wide state for the duration of one
+ * test; always `.restore()` in a `finally` or `afterEach`.
+ */
+export function prependPathInProcess(dir: string): PathOverrideHandle {
+  const key = Object.keys(process.env).find((k) => k.toUpperCase() === "PATH");
+  const current = key === undefined ? undefined : process.env[key];
+  return overridePath(current ? `${dir}${delimiter}${current}` : dir);
+}
+
+/**
  * Build an env object with `dir` prepended to PATH, safe to pass as a child
  * process's `env` option.
  *

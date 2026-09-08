@@ -14,8 +14,44 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import * as tar from "tar";
-import { overrideTmp, type TmpOverrideHandle } from "./helpers/env.js";
+import {
+  overrideTmp,
+  overridePath,
+  prependPathInProcess,
+  type PathOverrideHandle,
+  type TmpOverrideHandle,
+} from "./helpers/env.js";
+
+const isWindows = process.platform === "win32";
+
+/**
+ * Is a real `zstd` on the PATH this file was collected with? Decided once, at
+ * collection time and before any test prepends a shim, so the real-binary
+ * block below is skipped VISIBLY on a runner without one instead of passing
+ * for want of it. Same probe as archiver.ts's `isZstdAvailable`, made
+ * synchronous because `describe.skipIf` needs its answer now.
+ */
+const realZstdOnPath = ((): boolean => {
+  try {
+    execFileSync("zstd", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+interface ZstdShim {
+  /** Prepend this to PATH to put the shim in front of any real zstd. */
+  binDir: string;
+  /**
+   * Every invocation the shim answered, argv joined by single spaces, in call
+   * order. Empty after an operation means a REAL zstd answered instead — the
+   * silent inertness this log exists to make loud.
+   */
+  calls(): string[];
+}
 
 /**
  * Install a fake `zstd` on PATH that implements the exact invocations the
@@ -27,12 +63,41 @@ import { overrideTmp, type TmpOverrideHandle } from "./helpers/env.js";
  * (`--stdout`) rather than the older file-to-file `-d <in> -o <out>`, because
  * a size bound that only gets to look at the result is a bound that has
  * already paid for it — see the decompression-limit tests below.
+ *
+ * Every invocation is also recorded in `calls()`, because a shim that is on
+ * PATH and never runs is worse than no shim: the tests pass against whatever
+ * real zstd the machine has and prove nothing about the shape they claim to
+ * pin. That is exactly what happened on Windows CI (#16), and the log is what
+ * turns it from invisible into a failure — assert the log, never just the
+ * outcome.
+ *
+ * POSIX only, and the reason is narrower than "Windows cannot run a shebang
+ * script". archiver.ts spawns `zstd` by bare name with no shell, and on
+ * Windows that lookup is libuv's `search_path` (deps/uv/src/win/process.c),
+ * whose contract is explicit: it follows cmd.exe's rules "with this exception
+ * that PATHEXT environment variable isn't used. Since CreateProcess can start
+ * only .com and .exe files, only those extensions are tried." So a
+ * `zstd.cmd`/`zstd.bat` beside this script would never be a candidate either,
+ * and the lookup walks past the shim directory to the runner's real
+ * `zstd.exe` (windows-latest ships one at C:\tools\zstd) — which is what kept
+ * the old, unguarded block green there while it exercised nothing it named.
+ * Node's own post-CVE-2024-27980 refusal to spawn a batch file without a
+ * shell (src/process_wrap.cc, `IsWindowsBatchFile(options.file)`) is a
+ * second, independent barrier, and it only applies to a caller that names the
+ * `.cmd` literally, which archiver.ts never does. The one artefact libuv would
+ * accept is a `zstd.exe`, and minting a PE binary inside a vitest run means a
+ * hex blob nobody can audit or a runtime compiler dependency — neither
+ * provable from the platform this file is written on. So the block that uses
+ * this shim is skipped on Windows, and the real-binary block beside it keeps
+ * the coverage the Windows job was in fact providing.
  */
-function installZstdShim(tempDir: string): string {
+function installZstdShim(tempDir: string): ZstdShim {
   const binDir = join(tempDir, "shim-bin");
   mkdirSyncFs(binDir, { recursive: true });
+  const callLog = join(binDir, "calls.log");
   const script = [
     "#!/bin/sh",
+    `printf '%s\\n' "$*" >> "${callLog}"`,
     'if [ "$1" = "--version" ]; then echo "zstd 1.5.5-fake"; exit 0; fi',
     'if [ "$1" = "-f" ]; then cp "$2" "$4"; exit 0; fi',
     'if [ "$1" = "-d" ] && [ "$2" = "--stdout" ]; then cat "$3"; exit 0; fi',
@@ -42,7 +107,13 @@ function installZstdShim(tempDir: string): string {
   const shimPath = join(binDir, "zstd");
   writeFileSync(shimPath, script);
   chmodSync(shimPath, 0o755);
-  return binDir;
+  return {
+    binDir,
+    calls: () =>
+      existsSync(callLog)
+        ? readFileSync(callLog, "utf-8").split("\n").filter((line) => line !== "")
+        : [],
+  };
 }
 
 describe("archiver", () => {
@@ -169,18 +240,16 @@ describe("archiver", () => {
     });
   });
 
-  describe("zstd via shim", () => {
-    let savedPath: string | undefined;
-
-    beforeEach(() => {
-      savedPath = process.env.PATH;
-      process.env.PATH = `${installZstdShim(tempDir)}:${process.env.PATH}`;
-    });
-
-    afterEach(() => {
-      process.env.PATH = savedPath;
-    });
-
+  /**
+   * The container properties every zstd backend must satisfy. Registered
+   * twice below: once against the shim, where each run is proved to have
+   * reached it, and once against the real binary, where the run is proved to
+   * have produced a real frame. Neither alone is the coverage — the shim run
+   * is deterministic and available on a machine with no zstd, the real run is
+   * what a user's export actually goes through, and until #16 the second was
+   * only ever happening by accident, under the first one's name.
+   */
+  function zstdContainerProperties(): void {
     it("round-trips a directory through tar.zst", async () => {
       const { createArchive, extractArchive } = await import("../src/archiver.js");
       const archivePath = join(tempDir, "test-export.tar.zst");
@@ -217,6 +286,73 @@ describe("archiver", () => {
       writeFileSync(preciousPath, "precious");
       await createArchive(sourceDir, join(tempDir, "created.tar.zst"), "zstd");
       expect(readFileSync(preciousPath, "utf-8")).toBe("precious");
+    });
+  }
+
+  // Skipped on Windows for the reason documented on installZstdShim; the
+  // real-binary block below is what runs there.
+  describe.skipIf(isWindows)("zstd via shim", () => {
+    let shim: ZstdShim;
+    let pathHandle: PathOverrideHandle;
+
+    beforeEach(() => {
+      shim = installZstdShim(tempDir);
+      pathHandle = prependPathInProcess(shim.binDir);
+    });
+
+    afterEach(() => {
+      // Restore BEFORE asserting, so a failure here cannot leave the shim on
+      // PATH for the real-binary block that follows.
+      pathHandle.restore();
+      // Every test in this block shells out to zstd at least once. An empty
+      // log means a real zstd answered and the shim was decoration — the
+      // silent inertness the Windows guard exists for, caught here on every
+      // platform the block does run on.
+      expect(shim.calls(), "no zstd invocation reached the shim").not.toEqual([]);
+    });
+
+    zstdContainerProperties();
+
+    it("is what answered, for every invocation shape the archiver uses", async () => {
+      const { createArchive, extractArchive, isZstdAvailable, zstdFrameHasContentChecksum } =
+        await import("../src/archiver.js");
+      expect(await isZstdAvailable()).toBe(true);
+      const archivePath = join(tempDir, "who-answered.tar.zst");
+      await createArchive(sourceDir, archivePath, "zstd");
+      const extractDir = join(tempDir, "who-answered-out");
+      mkdirSync(extractDir);
+      await extractArchive(archivePath, extractDir);
+
+      // Pinned as the exact argv sequence, not "non-empty": these three shapes
+      // are the archiver's whole contract with the binary, and a fourth one
+      // appearing here (or one of these changing) is a change the shim has to
+      // learn about before it can keep faking it.
+      const calls = shim.calls();
+      expect(calls).toHaveLength(3);
+      expect(calls[0]).toBe("--version");
+      expect(calls[1]).toMatch(/^-f .+ -o /);
+      expect(calls[1].endsWith(` -o ${archivePath}`)).toBe(true);
+      expect(calls[2]).toBe(`-d --stdout ${archivePath}`);
+      // And the artefact says the same from the other side: the shim's -f is
+      // a plain copy, so what it "compressed" is a bare tar, not a zstd frame.
+      expect(zstdFrameHasContentChecksum(archivePath)).toBeNull();
+    });
+  });
+
+  /**
+   * The same properties against whatever real `zstd` this machine has. This
+   * is the coverage the Windows job was providing under the shim block's name
+   * before #16 — kept deliberately, now on every OS with the binary, and
+   * skipped visibly where none is on PATH rather than passing for want of one.
+   */
+  describe.skipIf(!realZstdOnPath)("zstd via the real binary on PATH", () => {
+    zstdContainerProperties();
+
+    it("writes a real zstd frame, so a leaked shim could not satisfy this block", async () => {
+      const { createArchive, zstdFrameHasContentChecksum } = await import("../src/archiver.js");
+      const archivePath = join(tempDir, "real.tar.zst");
+      await createArchive(sourceDir, archivePath, "zstd");
+      expect(zstdFrameHasContentChecksum(archivePath)).toBe(true);
     });
   });
 
@@ -329,20 +465,17 @@ describe("archiver", () => {
       expect(zstdFrameHasContentChecksum(on)).toBe(true);
     });
 
-    it("refuses to hand back a .tar.zst that carries no frame checksum", async () => {
+    // POSIX only, for the reason documented on installZstdShim: a shell-less
+    // spawn on Windows resolves only .com/.exe, so this shim is never a
+    // candidate there and the runner's real zstd.exe answers — which would
+    // make this test assert the opposite of its name. Skipped visibly rather
+    // than returned from, so the report says so. `zstdFrameHasContentChecksum`,
+    // the part that is genuinely platform-dependent, is covered on every OS by
+    // the test above.
+    it.skipIf(isWindows)("refuses to hand back a .tar.zst that carries no frame checksum", async () => {
       // A zstd whose build/version default leaves the checksum out. Shimmed
       // rather than waited for: the archive would decompress fine and corrupt
       // silently, which is precisely what must never ship as a bundle.
-      //
-      // POSIX only, and not because the production code is: `execFileSync`
-      // goes through CreateProcess on Windows, which cannot run an
-      // extension-less `#!/bin/sh` file at all. PATHEXT resolution therefore
-      // walks straight past the shim directory to the runner's REAL zstd.exe —
-      // which is exactly why the shim block above passes on Windows CI, and
-      // exactly what would make this test assert the opposite of its name
-      // there. `zstdFrameHasContentChecksum`, the part that is genuinely
-      // platform-dependent, is covered on every OS by the test above.
-      if (process.platform === "win32") return;
       const { createArchive, ZstdNoContentChecksumError } = await import("../src/archiver.js");
       const binDir = join(tempDir, "nocheck-bin");
       mkdirSyncFs(binDir, { recursive: true });
@@ -359,8 +492,7 @@ describe("archiver", () => {
         ].join("\n")
       );
       chmodSync(shim, 0o755);
-      const savedPath = process.env.PATH;
-      process.env.PATH = `${binDir}:${savedPath}`;
+      const pathHandle = prependPathInProcess(binDir);
       try {
         const out = join(tempDir, "nocheck-export.tar.zst");
         await expect(createArchive(sourceDir, out, "zstd")).rejects.toBeInstanceOf(
@@ -369,7 +501,7 @@ describe("archiver", () => {
         // And it leaves nothing behind for a caller to mistake for a bundle.
         expect(existsSync(out)).toBe(false);
       } finally {
-        process.env.PATH = savedPath;
+        pathHandle.restore();
       }
     });
 
@@ -382,7 +514,6 @@ describe("archiver", () => {
       // by some other tool, or by a zstd predating our create-side guard. The
       // content is separately covered by the manifest's own hashes, so the
       // right answer is to say so, not to stand between a user and their data.
-      const { execFileSync } = await import("node:child_process");
       const staging = join(tempDir, "nc-src");
       mkdirSync(join(staging, "sessions"), { recursive: true });
       writeFileSync(join(staging, "manifest.json"), '{"version":1,"plugin":"sesh-mover"}');
@@ -944,11 +1075,10 @@ describe("archiver", () => {
     it("reports no-zstd for a .tar.zst when zstd is off PATH", async () => {
       const { readManifestFromArchive } = await import("../src/archiver.js");
       const dir = mkdtempSync(join(tmpdir(), "sesh-rma-"));
-      const savedPath = process.env.PATH;
+      // Deterministic coverage of the no-zstd branch even on machines that
+      // do have zstd installed.
+      const pathHandle = overridePath(join(dir, "no-such-bin"));
       try {
-        // Deterministic coverage of the no-zstd branch even on machines that
-        // do have zstd installed.
-        process.env.PATH = join(dir, "no-such-bin");
         const archive = join(dir, "z-export.tar.zst");
         writeFileSync(archive, "opaque zstd bytes");
         const r = await readManifestFromArchive(archive);
@@ -958,7 +1088,7 @@ describe("archiver", () => {
           expect(r.detail).toMatch(/zstd/i);
         }
       } finally {
-        process.env.PATH = savedPath;
+        pathHandle.restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });

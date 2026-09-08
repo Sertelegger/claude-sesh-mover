@@ -8,9 +8,25 @@ on:
   schedule:
     - cron: "31 6 * * 1"
 
+# Same shape as ci.yml, for the same reasons, and the workflow name is what
+# keeps the two apart — without it a CodeQL run and a CI run for the same PR
+# push would cancel each other. A scheduled scan resolves to the SHA of main
+# at the moment it fires, so it can only collide with a push scan of that
+# exact commit, where the two results are the same result; a scan of any
+# other commit always runs to completion. Neither a weekly scan nor a merged
+# commit's scan is ever pre-empted by the other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    # Measured 1.4–2.2 min today; sized for what it becomes rather than what it
+    # is. The CodeQL bundle download and the database build both grow with the
+    # codebase and the runner's network, and a false timeout here drops a
+    # security scan. Still an order of magnitude under the six-hour default.
+    timeout-minutes: 30
     permissions:
       security-events: write
       contents: read

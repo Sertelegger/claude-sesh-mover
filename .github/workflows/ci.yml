@@ -5,6 +5,19 @@ on:
     branches: [main]
   pull_request:
 
+# One group per open PR: a push while the previous run is still going cancels
+# it, because only the newest head can be reviewed and a PR that iterates
+# stacks a three-OS matrix per push. A push to main has no PR number and falls
+# through to the SHA, so main runs never share a group and every merged commit
+# keeps its own verdict (a ref-keyed group would drop one: by default GitHub
+# holds one pending run per group, even with cancel-in-progress off). That fallback
+# is what makes the unconditional cancel below safe — never copy the flag
+# without the group. The workflow name keeps CI and CodeQL from cancelling
+# each other on the same push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
@@ -97,6 +110,9 @@ jobs:
   windows-smoke:
     runs-on: windows-latest
     needs: test
+    # Measured 0.5–0.7 min end to end. npm ci on a cold Windows runner is the
+    # only step that can plausibly stall, and the default is six hours.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
