@@ -43,6 +43,31 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   while a synced copy of that index is still the old one — but the *reason* was wrong, and the message
   now names the consolidated bundle that replaced it.
 
+- **Per-machine bundle signing ([#86]).** Every push now signs a statement naming the bundle it wrote —
+  hub, project, machine, bundle id, file path, and a sha256 of the plaintext archive (plus the
+  workspace artifact's, since #91 moved the project tree into a file of its own that no existing digest
+  reached). A pull verifies it before unpacking, so on a signed bundle nothing ever parses bytes that
+  failed attribution.
+
+  > **The pin is the part that carries the security property, not the signature.** A signature checked
+  > against a key the hub publishes detects only a tamperer who declines to re-sign — anyone who can
+  > write a bundle can also rewrite that machine's published key. So the first key seen for a machine
+  > is pinned locally, and a change refuses the pull.
+
+  `sesh-mover hub trust` (`/sesh-mover:hub-trust`) closes the remaining gap: it prints a short
+  fingerprint you compare against the same fingerprint on the other machine, **over a channel that is
+  not the hub**, and records the result as confirmed. That is the only step that does not depend on
+  trusting the hub, and it is optional — pinning happens either way.
+
+  What this does **not** buy, and must not be read as buying: a signature proves which machine wrote a
+  bundle, never that its contents are safe. A valid signature from a machine that has been compromised
+  authenticates hostile content perfectly, so the consent gates around importing project files are
+  unchanged.
+
+  Nothing migrates. Unsigned bundles — every bundle that exists today — keep working permanently, the
+  same way plaintext and encrypted bundles coexist. An unreadable signing key warns and pushes
+  unsigned rather than failing the push.
+
 ### Fixed
 
 - **`classifyBundleFailure` could throw from the one function whose contract is that it does not**
@@ -88,6 +113,7 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
 
 [#92]: https://github.com/Sertelegger/claude-sesh-mover/issues/92
 [#96]: https://github.com/Sertelegger/claude-sesh-mover/issues/96
+[#86]: https://github.com/Sertelegger/claude-sesh-mover/issues/86
 [#102]: https://github.com/Sertelegger/claude-sesh-mover/issues/102
 
 ## [0.10.0] — 2026-08-31
