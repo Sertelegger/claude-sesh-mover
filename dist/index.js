@@ -15,6 +15,7 @@ export * from "./rewriter.js";
 export * from "./archiver.js";
 export * from "./version-adapters.js";
 export * from "./progress.js";
+export * from "./latched-write.js";
 export * from "./sidecar.js";
 export * from "./memory-index.js";
 export * from "./exporter.js";

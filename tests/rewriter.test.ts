@@ -1049,12 +1049,17 @@ describe("rewriter", () => {
       }
     });
 
-    // Pins the error-latch (outErrored promise raced at every await point):
-    // without it, an output-stream open failure either crashes the process
-    // (unhandled 'error' event) or hangs forever (once(out, "drain") misses
-    // an 'error' that fired before the wait began). Collapsing the
-    // Promise.race wrappers or dropping outErrored?.catch(() => {}) must
-    // turn this test red.
+    // Pins the error latch END TO END, through this verb. The latch itself now
+    // lives in `src/latched-write.ts` and is pinned directly there — which is
+    // the stronger test, because this one asserts only that the call rejects
+    // and so cannot see WHICH error survived or whether a healthy stream ever
+    // finishes. Measured: a last-error-wins latch and a `finish()` that forgets
+    // `end()` both leave this test green.
+    //
+    // What it still earns is the half a unit test cannot reach — that this
+    // verb's real stream, opened on a real path, is actually wired to the
+    // latch. Without it, an output-stream open failure either crashes the
+    // process on an unhandled 'error' or hangs forever on a missed 'drain'.
     it("rejects (does not crash or hang) when the output stream errors", async () => {
       const { rewriteJsonlStream } = await import("../src/rewriter.js");
       const ctx = await wslToWinCtx();

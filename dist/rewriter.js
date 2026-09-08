@@ -1,11 +1,10 @@
 import { createReadStream, createWriteStream, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
-import { finished } from "node:stream/promises";
 import { applyAdapters } from "./version-adapters.js";
 import { detectPlatform, extractUserFromPath, getCurrentUser, samePlatformFamily, translatePath, } from "./platform.js";
 import { errorMessage } from "./errors.js";
+import { latchedWriteStream } from "./latched-write.js";
 /**
  * The characters that may appear INSIDE a path token, and — with one stated
  * exception — the characters that block a token from starting.
@@ -364,28 +363,14 @@ export async function rewriteJsonlStream(inputPath, outputPath, ctx, opts = {}) 
     const hash = opts.computeHash && outputPath ? createHash("sha256") : null;
     const input = createReadStream(inputPath, { encoding: "utf-8" });
     const rl = createInterface({ input, crlfDelay: Infinity });
-    const out = outputPath ? createWriteStream(outputPath, { encoding: "utf-8" }) : null;
-    // A write-stream failure (bad output dir, disk full, EACCES) needs three
-    // guards, or it either crashes the process or hangs forever:
-    // (1) With zero 'error' listeners it's an "unhandled error event" that
-    //     crashes the process outright — out.once("error", reject) below
-    //     doubles as that listener.
-    // (2) once(out, "drain") only reacts to an 'error' that fires *after* we
-    //     start waiting on it — if the stream already errored (and destroyed
-    //     itself, e.g. on open failure) before we reach that await, the wait
-    //     hangs forever. Latching the first 'error' into a promise and racing
-    //     it at every await point fixes this: once rejected, it stays
-    //     rejected, so racing it after the fact still wins instantly.
-    // (3) The promise from (2) is only "consumed" once raced below, which
-    //     can't happen before the input stream yields its first line. If the
-    //     output errors first, Node sees a rejected promise with no handler
-    //     yet and crashes with an unhandled-rejection error. The no-op catch
-    //     marks it handled immediately without swallowing the rejection for
-    //     the real race later.
-    const outErrored = out
-        ? new Promise((_, reject) => out.once("error", reject))
+    // The output sits on the write-side error latch (latched-write.ts holds
+    // the three guards it exists for, once). Its two await points below are
+    // where a write failure surfaces; the destroy() in the catch is for OUR
+    // failures — a read error, a thrown transform — which the stream would
+    // otherwise never learn about.
+    const out = outputPath
+        ? latchedWriteStream(createWriteStream(outputPath, { encoding: "utf-8" }))
         : null;
-    outErrored?.catch(() => { });
     try {
         for await (const line of rl) {
             // readline strips the terminator; count it back for progress (LF assumed).
@@ -412,15 +397,12 @@ export async function rewriteJsonlStream(inputPath, outputPath, ctx, opts = {}) 
             }
             const chunk = outLine + "\n";
             hash?.update(chunk);
-            if (out && !out.write(chunk)) {
-                await Promise.race([once(out, "drain"), outErrored]);
-            }
+            if (out && !out.write(chunk))
+                await out.drain();
             opts.onProgress?.(Math.min(bytesProcessed, bytesTotal), bytesTotal);
         }
-        if (out) {
-            out.end();
-            await Promise.race([finished(out), outErrored]);
-        }
+        if (out)
+            await out.finish();
     }
     catch (e) {
         out?.destroy();
