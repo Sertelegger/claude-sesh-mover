@@ -67,8 +67,10 @@ See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
   git's patch-header parser in the carry apply path and ask git instead) and the
   disclosure-side half of #35.
 - **Slice 4 — self-hosted service + web UI.** A service the owner runs (a NAS to begin
-  with) that machines push to and pull from over HTTP, plus a browsable UI. Design pass
-  done: `docs/superpowers/specs/2026-08-15-hub-slice4-service-and-ui-design.md`. The
+  with) that machines push to and pull from over HTTP, plus a browsable UI. Tracked by
+  [#111](https://github.com/Sertelegger/claude-sesh-mover/issues/111), which decomposes 4a
+  into five issues and carries 4b and 4c as undecomposed phases. Design pass done:
+  `docs/superpowers/specs/2026-08-15-hub-slice4-service-and-ui-design.md`. The
   service stays **dumb storage** — every mutation goes through the existing `HubBackend`
   contract expressed over HTTP and the server interprets nothing on the write path — and
   derives exactly one read-only projection for the UI, by importing the same
@@ -98,13 +100,14 @@ See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
   moves from housekeeping to a 4b prerequisite** — and because the server computes the
   view, index files must stay readable to it, so the split is: encrypt bundle payloads,
   leave indexes plaintext. What that exposes is **more than metadata, and saying otherwise
-  would be a false assurance**: `HubThreadEntry.slug` is Claude Code's
-  conversation-derived title, and `hub reindex` additionally writes a real
-  `extractSummaryFromFile` result — up to 100 characters of the first user message —
-  where `hub push` writes only the slug (`reindex.ts:156` vs `push.ts:730`, a
-  disagreement between two writers of the same file that is worth closing on its own
-  merits). So a plaintext index leaks session *titles* today and message *excerpts* after
-  any reindex. Transcript bodies stay sealed; the index does not. **Neither the server nor a
+  would be a false assurance**: `HubThreadEntry.slug` is Claude Code's own
+  conversation-derived session title, so a plaintext index leaks session *titles*, along
+  with thread structure, the project's filesystem path, machine names, ids and timestamps.
+  Transcript bodies stay sealed; the index does not. (An earlier version of this paragraph
+  also warned that `hub reindex` wrote a real `extractSummaryFromFile` excerpt where `hub
+  push` wrote only the slug. **That is fixed** — `summary` is written in exactly one place,
+  `buildIndexFile`, derived from `slug`, and `PriorThreadEntry = Omit<HubThreadEntry,
+  "summary">` exists so no caller can supply one. Do not re-file it.) **Neither the server nor a
   browser can answer "is this thread current *here*?"** — that depends on the requesting
   machine's local sync-state and session files, which the hub has never seen — so machines
   report a local-state summary (ids and timestamps only, never content), and every
