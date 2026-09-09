@@ -1,13 +1,13 @@
 import { appendFileSync, closeSync, copyFileSync, createReadStream, createWriteStream, existsSync, mkdtempSync, openSync, readSync, rmSync, statSync, truncateSync, } from "node:fs";
 import { createInterface } from "node:readline";
-import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { finished, pipeline } from "node:stream/promises";
+import { pipeline } from "node:stream/promises";
 import { errorMessage } from "../errors.js";
 import { isConversationEntry, readLastEntryUuid, MAX_ENTRY_SCAN_BYTES } from "../jsonl.js";
 import { rewriteJsonlStream, buildPathMappings } from "../rewriter.js";
 import { detectPlatform } from "../platform.js";
+import { latchedWriteStream } from "../latched-write.js";
 /**
  * How recently a base session must have been written for the append to be
  * treated as "a live Claude Code session is probably still appending to it".
@@ -591,13 +591,10 @@ function isLineBoundary(path, offset) {
 async function stripHeader(src, dest, headerPresent) {
     const input = createReadStream(src, { encoding: "utf-8" });
     const rl = createInterface({ input, crlfDelay: Infinity });
-    const out = createWriteStream(dest, { encoding: "utf-8" });
-    // Same three-part write-stream error protocol as rewriter.ts's
-    // rewriteJsonlStream (see the comment there): latch the first 'error' so a
-    // failed open can't hang the drain await, and mark it handled immediately so
-    // an early rejection isn't an unhandled rejection.
-    const outErrored = new Promise((_, reject) => out.once("error", reject));
-    outErrored.catch(() => { });
+    // The output sits on the write-side error latch (latched-write.ts).
+    // Module-private, like exporter.ts's copyFileWithHash, and pinned only
+    // through the latch's own test.
+    const out = latchedWriteStream(createWriteStream(dest, { encoding: "utf-8" }));
     let skipped = !headerPresent;
     let count = 0;
     try {
@@ -608,13 +605,11 @@ async function stripHeader(src, dest, headerPresent) {
                 skipped = true;
                 continue;
             }
-            if (!out.write(line + "\n")) {
-                await Promise.race([once(out, "drain"), outErrored]);
-            }
+            if (!out.write(line + "\n"))
+                await out.drain();
             count++;
         }
-        out.end();
-        await Promise.race([finished(out), outErrored]);
+        await out.finish();
     }
     catch (e) {
         out.destroy();

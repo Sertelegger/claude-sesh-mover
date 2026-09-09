@@ -75,6 +75,7 @@ import type {
   ErrorResult,
   ConfigureResult,
   OnDivergenceMode,
+  ProgressEvent,
 } from "./types.js";
 import { PROJECT_DIR_NAME, projectSeshMoverDir, userSeshMoverDir } from "./paths.js";
 
@@ -136,10 +137,7 @@ program
   .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
     try {
-      const onProgress = opts.progress
-        ? (ev: import("./types.js").ProgressEvent) =>
-            process.stderr.write(JSON.stringify(ev) + "\n")
-        : undefined;
+      const onProgress = progressWriter(opts.progress);
       const configDir = resolveConfigDir(opts.sourceConfigDir);
       const config = loadEffectiveConfig(configDir, process.cwd());
       // `!!`, never `!== false`: absence has to coerce to "do not capture" at
@@ -323,10 +321,7 @@ program
   .action(async (opts) => {
     let tempExtractDir: string | undefined;
     try {
-      const onProgress = opts.progress
-        ? (ev: import("./types.js").ProgressEvent) =>
-            process.stderr.write(JSON.stringify(ev) + "\n")
-        : undefined;
+      const onProgress = progressWriter(opts.progress);
       let fromPath = opts.from;
 
       // If archive, extract first
@@ -454,10 +449,7 @@ program
   .option("--progress", "Emit NDJSON progress events on stderr")
   .action(async (opts) => {
     try {
-      const onProgress = opts.progress
-        ? (ev: import("./types.js").ProgressEvent) =>
-            process.stderr.write(JSON.stringify(ev) + "\n")
-        : undefined;
+      const onProgress = progressWriter(opts.progress);
       const sourceConfigDir = resolveConfigDir(opts.sourceConfigDir);
       const targetConfigDir = resolveConfigDir(opts.targetConfigDir);
       const claudeVersion = getClaudeVersion();
@@ -1543,9 +1535,7 @@ program
         return;
       }
       const { hubPush } = await import("./hub/push.js");
-      const onProgress = opts.progress
-        ? (ev: import("./types.js").ProgressEvent) => process.stderr.write(JSON.stringify(ev) + "\n")
-        : undefined;
+      const onProgress = progressWriter(opts.progress);
       output(await hubPush({
         configDir, projectPath, hubPath,
         sessionIds: opts.sessionId,
@@ -1649,9 +1639,7 @@ program
         return;
       }
       const { hubPull } = await import("./hub/pull.js");
-      const onProgress = opts.progress
-        ? (ev: import("./types.js").ProgressEvent) => process.stderr.write(JSON.stringify(ev) + "\n")
-        : undefined;
+      const onProgress = progressWriter(opts.progress);
       output(await hubPull({
         configDir, projectPath, hubPath,
         threadId: opts.thread,
@@ -2246,6 +2234,36 @@ async function readStdin(timeoutMs = HOOK_STDIN_TIMEOUT_MS): Promise<string> {
   });
 }
 
+/**
+ * The `--progress` sink: one compact JSON `ProgressEvent` per line on STDERR,
+ * or `undefined` when the flag is off so every orchestrator's `onProgress?.()`
+ * stays a no-op. One copy of what export/import/migrate/push/pull each spelled
+ * inline until #16.
+ *
+ * NOT a third output chokepoint, and the two properties a chokepoint has are
+ * exactly the two this lacks: it never writes to stdout, and it never touches
+ * `process.exitCode`. The result contract is "one JSON object on stdout whose
+ * SHAPE picks the exit code"; a progress line says nothing about how the
+ * command ended — the hub phases' terminal `percent: 100` fires on every
+ * outcome, refusal and throw included (see `ProgressEvent` in types.ts), so a
+ * consumer could not read an outcome off this stream if it tried. Stderr is
+ * the stream precisely so a caller parsing stdout never sees a byte of it;
+ * `tests/cli.test.ts` pins "stdout stays one JSON object" with the flag on.
+ *
+ * Compact serialization, unlike `output()`'s indented form, because here the
+ * LINE is the record and the reader splits on "\n". The write's backpressure
+ * boolean is dropped: every emitter types the callback `=> void`, and honoring
+ * it would mean every emitter awaiting stderr — which the five inline copies
+ * this replaced did not do either. A stalled stderr reader therefore buffers
+ * in-process rather than slowing the operation, same as before.
+ */
+function progressWriter(enabled: boolean): ((ev: ProgressEvent) => void) | undefined {
+  if (!enabled) return undefined;
+  return (ev) => {
+    process.stderr.write(JSON.stringify(ev) + "\n");
+  };
+}
+
 // --- Output chokepoints ---
 //
 // EXACTLY TWO of them, and the difference between them is the stated rule
@@ -2275,6 +2293,12 @@ async function readStdin(timeoutMs = HOOK_STDIN_TIMEOUT_MS): Promise<string> {
 //
 // The hook endpoints call NEITHER helper. That is what keeps their "always exit
 // 0" protocol requirement structurally out of reach of this scheme.
+//
+// Nor is anything that writes to STDERR a candidate. `progressWriter` (just
+// above) and `writeHookDiagnostic` are side-channels: neither carries a result
+// and neither sets a code, so counting `process.stderr.write` sites says
+// nothing about whether this rule holds. The property to check is who assigns
+// `process.exitCode`, and only the two helpers below do.
 
 // The two are ordered, and the order is the contract: set the code first, then
 // escalate. On every ordinary run the escalation is a no-op and the code is what

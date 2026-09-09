@@ -1,8 +1,6 @@
 import { createReadStream, createWriteStream, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
-import { finished } from "node:stream/promises";
 import { applyAdapters } from "./version-adapters.js";
 import type {
   ExportManifest,
@@ -19,6 +17,7 @@ import {
   translatePath,
 } from "./platform.js";
 import { errorMessage } from "./errors.js";
+import { latchedWriteStream } from "./latched-write.js";
 
 export interface RewriteContext {
   mappings: PathMapping[];
@@ -28,16 +27,81 @@ export interface RewriteContext {
   targetUser: string;
 }
 
+/**
+ * The characters that may appear INSIDE a path token, and — with one stated
+ * exception — the characters that block a token from starting.
+ *
+ * **One constant, because two lists drifted.** The guard used to be
+ * `[A-Za-z0-9.-]` while the token class was `[A-Za-z0-9._@+~-]`, so `_ @ ~ +`
+ * were legal inside a token and invisible in front of one. Measured against
+ * the shipped build, that mangled ordinary shell output:
+ *
+ *     "cd ~/tmp/build"   ->  "cd ~C:\Users\…\Temp\build"
+ *     "~/mnt/e/x"        ->  "~E:\x"
+ *
+ * A tilde is not a domain character, so no URL rule was protecting it; the
+ * asymmetry alone was the bug. Deriving both from one constant is what stops
+ * the two lists disagreeing again — the class is the thing, not the two
+ * spellings of it.
+ */
+const TOKEN_CHARS = "A-Za-z0-9._@+~-";
+
+/**
+ * The guard class, which is `TOKEN_CHARS` MINUS `+`.
+ *
+ * **`+` is carved out deliberately, by owner ruling, and the reason is this
+ * repo's own subject matter.** A line beginning `+/home/user/src/app.ts` is a
+ * unified-diff added line, and `rewriteString` runs on captured shell output —
+ * where `git diff` output is ordinary and where a project whose whole domain is
+ * carry patches will meet it. Under full symmetry those paths would stop being
+ * translated and a transcript would show the SOURCE machine's path, which is
+ * wrong in a way a reader cannot see is wrong.
+ *
+ * The carve-out is the kind of exception that invites someone to "finish" the
+ * symmetry later, so it is spelled here with the reason attached rather than
+ * left as a difference between two character classes. `tests/rewriter.test.ts`
+ * pins both halves: `+`-prefixed paths still translate, and `~`/`_`/`@` no
+ * longer do.
+ */
+const GUARD_CHARS = TOKEN_CHARS.replace("+", "");
+
 // Characters that terminate a path token embedded in free text.
 // (?<!\/) — a token immediately preceded by "/" is URL-context
 // (http://mnt/..., protocol-relative //tmp/..., file:///mnt/...) and is
-// never translated. (?<![A-Za-z0-9.-]) protects paths following domain names
-// (https://example.com/mnt/...). Together these prevent URL corruption while
-// still translating bare filesystem paths. Leaving text unchanged is the
-// preferred failure mode.
-const UNIX_TOKEN = /(?<![A-Za-z0-9.-])(?<!\/)(?:\/[A-Za-z0-9._@+~-]+)+\/?/g;
-const WIN_TOKEN = /(?<![A-Za-z0-9.-])(?<!\/)[A-Za-z]:\\[^\s"'`)\]}>,;]*/g;
+// never translated. The `GUARD_CHARS` lookbehind protects paths following
+// domain names (https://example.com/mnt/...) and, since the two classes were
+// unified, anything else a token may contain. Together these prevent URL
+// corruption while still translating bare filesystem paths. Leaving text
+// unchanged is the preferred failure mode.
+const UNIX_TOKEN = new RegExp(`(?<![${GUARD_CHARS}])(?<!\\/)(?:\\/[${TOKEN_CHARS}]+)+\\/?`, "g");
+const WIN_TOKEN = new RegExp(`(?<![${GUARD_CHARS}])(?<!\\/)[A-Za-z]:\\\\[^\\s"'\`)\\]}>,;]*`, "g");
 const TAIL = /[^\s"'`)\]}>,;:]*/;
+
+/**
+ * A scheme prefix immediately before the position a stage-1 match starts at
+ * (#108).
+ *
+ * **Stage 1 had no leading guard at all**, and that is a different bug from the
+ * one above rather than a variant of it. Stage 2 matches a SHAPE (`/seg/seg`)
+ * and can be guarded by a character class; stage 1 substitutes a known LITERAL
+ * wherever it appears, including inside a URL — so a character class cannot
+ * express the rule. Measured, and NOT gated on a cross-platform move:
+ *
+ *     "https://example.com/home/me/proj/x"          ->  ".../home/dev/app/x"
+ *     "http://localhost:5173/home/me/proj/index.html"
+ *                                    (cross-family) ->  "http://localhost:5173E:\proj/index.html"
+ *
+ * The first is the dangerous one: still a well-formed URL, now pointing
+ * somewhere else. Every export/import/push/pull runs stage 1, so this fired on
+ * same-machine moves too.
+ *
+ * Matched against the text BEFORE the candidate rather than as a lookbehind,
+ * because the mapping is interpolated into the pattern and a variable-length
+ * lookbehind in front of it would be both unreadable and easy to get wrong. It
+ * is deliberately narrow — a scheme and authority, not "any URL-ish thing" —
+ * so a path that merely follows a colon still translates.
+ */
+const URL_PREFIX = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'`)\]}>,;]*$/;
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -64,9 +128,14 @@ export function rewriteString(input: string, ctx: RewriteContext): string {
       escapeRegex(mapping.from) + "(?![^\\s\"'`)\\]}>,;:/\\\\])" + "(" + TAIL.source + ")",
       "g"
     );
-    result = result.replace(re, (_m, tail: string) =>
-      mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail)
-    );
+    result = result.replace(re, (m: string, tail: string, offset: number, whole: string) => {
+      // #108: leave a mapped path alone when it sits inside a URL. Checked on
+      // the text BEFORE this match rather than in the pattern — see
+      // `URL_PREFIX`. Returning the match verbatim is the no-op, and "leave
+      // text unchanged" is this function's stated preferred failure mode.
+      if (URL_PREFIX.test(whole.slice(0, offset))) return m;
+      return mapping.to + (crossFamily ? normalizeSeparators(tail, ctx.targetPlatform) : tail);
+    });
   }
 
   // Stage 2 (cross-family only): translate remaining path-like tokens through
@@ -430,28 +499,14 @@ export async function rewriteJsonlStream(
 
   const input = createReadStream(inputPath, { encoding: "utf-8" });
   const rl = createInterface({ input, crlfDelay: Infinity });
-  const out = outputPath ? createWriteStream(outputPath, { encoding: "utf-8" }) : null;
-  // A write-stream failure (bad output dir, disk full, EACCES) needs three
-  // guards, or it either crashes the process or hangs forever:
-  // (1) With zero 'error' listeners it's an "unhandled error event" that
-  //     crashes the process outright — out.once("error", reject) below
-  //     doubles as that listener.
-  // (2) once(out, "drain") only reacts to an 'error' that fires *after* we
-  //     start waiting on it — if the stream already errored (and destroyed
-  //     itself, e.g. on open failure) before we reach that await, the wait
-  //     hangs forever. Latching the first 'error' into a promise and racing
-  //     it at every await point fixes this: once rejected, it stays
-  //     rejected, so racing it after the fact still wins instantly.
-  // (3) The promise from (2) is only "consumed" once raced below, which
-  //     can't happen before the input stream yields its first line. If the
-  //     output errors first, Node sees a rejected promise with no handler
-  //     yet and crashes with an unhandled-rejection error. The no-op catch
-  //     marks it handled immediately without swallowing the rejection for
-  //     the real race later.
-  const outErrored: Promise<never> | null = out
-    ? new Promise<never>((_, reject) => out.once("error", reject))
+  // The output sits on the write-side error latch (latched-write.ts holds
+  // the three guards it exists for, once). Its two await points below are
+  // where a write failure surfaces; the destroy() in the catch is for OUR
+  // failures — a read error, a thrown transform — which the stream would
+  // otherwise never learn about.
+  const out = outputPath
+    ? latchedWriteStream(createWriteStream(outputPath, { encoding: "utf-8" }))
     : null;
-  outErrored?.catch(() => {});
 
   try {
     for await (const line of rl) {
@@ -479,16 +534,11 @@ export async function rewriteJsonlStream(
 
       const chunk = outLine + "\n";
       hash?.update(chunk);
-      if (out && !out.write(chunk)) {
-        await Promise.race([once(out, "drain"), outErrored as Promise<never>]);
-      }
+      if (out && !out.write(chunk)) await out.drain();
       opts.onProgress?.(Math.min(bytesProcessed, bytesTotal), bytesTotal);
     }
 
-    if (out) {
-      out.end();
-      await Promise.race([finished(out), outErrored as Promise<never>]);
-    }
+    if (out) await out.finish();
   } catch (e) {
     out?.destroy();
     throw e;

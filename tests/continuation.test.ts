@@ -197,9 +197,12 @@ describe("continuation", () => {
       }
     });
 
-    // Pins the error-latch pattern shared with rewriteJsonlStream and
-    // copyFileWithHash: an output-stream open failure must reject, not crash
-    // the process (unhandled 'error' event) or hang on a missed 'drain'.
+    // Pins the error latch through this verb. The pattern itself is now one
+    // copy in `src/latched-write.ts`, with its own direct tests; this asserts
+    // the wiring — that a real stream on a real path reaches it — which is the
+    // part a unit test of the helper cannot cover. An output-stream open
+    // failure must reject, not crash the process on an unhandled 'error' or
+    // hang on a missed 'drain'.
     it("rejects (does not crash or hang) when the output stream errors", async () => {
       const { buildContinuationStream } = await import("../src/continuation.js");
       const dir = mkdtempSync(join(tmpdir(), "sesh-cont-"));

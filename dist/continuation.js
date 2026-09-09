@@ -1,8 +1,7 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { createHash, randomUUID } from "node:crypto";
-import { once } from "node:events";
-import { finished } from "node:stream/promises";
+import { latchedWriteStream } from "./latched-write.js";
 /**
  * The uuid at a slice boundary, in the SAME representation `readEntryUuids`
  * uses — the empty string for "this line carries no uuid".
@@ -107,38 +106,19 @@ export async function buildContinuationStream(input) {
     const header = buildContinuationHeader(input, fromEntryIndex, newCount);
     // Pass 2: write header + tail
     const hash = createHash("sha256");
-    const out = createWriteStream(outputPath, { encoding: "utf-8" });
+    // The output sits on the write-side error latch (latched-write.ts). Three
+    // await points here rather than two: the header write is a write like any
+    // other and can be the one that backpressures.
+    const out = latchedWriteStream(createWriteStream(outputPath, { encoding: "utf-8" }));
     const src = createReadStream(sourceJsonlPath, { encoding: "utf-8" });
     const rl = createInterface({ input: src, crlfDelay: Infinity });
     let index = 0;
     let entryCount = 0;
-    // A write-stream failure (bad output dir, disk full, EACCES) needs three
-    // guards, or it either crashes the process or hangs forever — mirrors
-    // rewriter.ts's rewriteJsonlStream (see the comment there for the full
-    // rationale):
-    // (1) With zero 'error' listeners it's an "unhandled error event" that
-    //     crashes the process outright — out.once("error", reject) below
-    //     doubles as that listener.
-    // (2) once(out, "drain") only reacts to an 'error' that fires *after* we
-    //     start waiting on it — if the stream already errored (and destroyed
-    //     itself, e.g. on open failure) before we reach that await, the wait
-    //     hangs forever. Latching the first 'error' into a promise and racing
-    //     it at every await point fixes this: once rejected, it stays
-    //     rejected, so racing it after the fact still wins instantly.
-    // (3) The promise from (2) is only "consumed" once raced below, which
-    //     can't happen before the first tail line (or the header write) is
-    //     reached. If the output errors first, Node sees a rejected promise
-    //     with no handler yet and crashes with an unhandled-rejection error.
-    //     The no-op catch marks it handled immediately without swallowing the
-    //     rejection for the real race later.
-    const outErrored = new Promise((_, reject) => out.once("error", reject));
-    outErrored.catch(() => { });
     try {
         const headerLine = JSON.stringify(header) + "\n";
         hash.update(headerLine);
-        if (!out.write(headerLine)) {
-            await Promise.race([once(out, "drain"), outErrored]);
-        }
+        if (!out.write(headerLine))
+            await out.drain();
         entryCount++;
         for await (const line of rl) {
             if (!line)
@@ -151,15 +131,13 @@ export async function buildContinuationStream(input) {
             if (index >= fromEntryIndex) {
                 const chunk = line + "\n";
                 hash.update(chunk);
-                if (!out.write(chunk)) {
-                    await Promise.race([once(out, "drain"), outErrored]);
-                }
+                if (!out.write(chunk))
+                    await out.drain();
                 entryCount++;
             }
             index++;
         }
-        out.end();
-        await Promise.race([finished(out), outErrored]);
+        await out.finish();
     }
     catch (e) {
         out.destroy();

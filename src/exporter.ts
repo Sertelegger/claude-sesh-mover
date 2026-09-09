@@ -9,8 +9,6 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
-import { once } from "node:events";
-import { finished } from "node:stream/promises";
 import { writeManifest, computeLayerDigest } from "./manifest.js";
 import { discoverSessions } from "./discovery.js";
 import { detectPlatform } from "./platform.js";
@@ -34,6 +32,7 @@ import type {
   SyncStateSessionSent,
   ProgressEvent,
 } from "./types.js";
+import { latchedWriteStream } from "./latched-write.js";
 
 /**
  * Digest every auxiliary layer directory this session actually landed in the
@@ -90,30 +89,21 @@ async function copyFileWithHash(
 ): Promise<string> {
   const hash = createHash("sha256");
   const input = createReadStream(src);
-  const output = createWriteStream(dest);
+  // The output sits on the write-side error latch (latched-write.ts). This
+  // function is module-private, so the latch's own test is the only thing
+  // that pins its error handling — which is the reason the latch is shared
+  // rather than inlined here.
+  const output = latchedWriteStream(createWriteStream(dest));
   let bytes = 0;
-  // Same error-latch hardening as rewriter.ts's rewriteJsonlStream and
-  // continuation.ts's buildContinuationStream: without racing a latched
-  // 'error' promise at both await points, a write failure (bad dest dir,
-  // disk full, EACCES) either crashes the process (unhandled 'error' event)
-  // or hangs forever (once(output, "drain") missing an 'error' that fired
-  // before the wait began).
-  const outputErrored: Promise<never> = new Promise<never>((_, reject) =>
-    output.once("error", reject)
-  );
-  outputErrored.catch(() => {});
   try {
     for await (const chunk of input) {
       const buf = chunk as Buffer;
       hash.update(buf);
       bytes += buf.length;
-      if (!output.write(buf)) {
-        await Promise.race([once(output, "drain"), outputErrored]);
-      }
+      if (!output.write(buf)) await output.drain();
       onBytes?.(bytes);
     }
-    output.end();
-    await Promise.race([finished(output), outputErrored]);
+    await output.finish();
   } catch (e) {
     output.destroy();
     throw e;

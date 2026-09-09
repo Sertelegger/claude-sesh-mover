@@ -4,9 +4,19 @@ on:
   push:
     tags: ["v*"]
 
+# Deliberately NO concurrency block here, and not cancel-in-progress: false
+# either. A tag is unique, so a group keyed on the ref would never collapse
+# anything; a group keyed on the workflow would cancel a PENDING release
+# whenever a third tag arrived, because by default GitHub holds one pending run
+# per group regardless of the flag. A release run cancelled mid-publish is
+# the one failure a concurrency group must not be allowed to create.
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Measured 0.1–0.2 min. The one thing that can hang is the release API
+    # call, and the default is six hours.
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
