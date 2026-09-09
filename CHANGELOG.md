@@ -2,7 +2,7 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
-## [Unreleased]
+## [0.11.0] — 2026-09-08
 
 ### Added
 
@@ -11,10 +11,11 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   one of which a fresh machine has to fetch and apply in order. This replaces the tail with a single
   full bundle and then deletes the tail.
 
-  > **It runs in two phases, on two separate invocations, usually days apart — and the first deletes
-  > nothing.** The second deletes, and only once every machine has demonstrably received the content
-  > *and* a grace window has passed. A run reporting `consolidated` has removed nothing and is not
-  > half way through anything dangerous.
+  > **It runs in two phases, on two separate invocations — and the first deletes nothing.** The second
+  > deletes, and only once every machine has demonstrably received the content *and* a grace window
+  > has passed. That window is six hours; in practice the wait is however long every machine takes to
+  > pull, since the acknowledgement gate is the slower of the two. A run reporting `consolidated` has
+  > removed nothing and is not half way through anything dangerous.
 
   Only **this machine's** bundles are ever retired. A thread's chain can span machines and bundle files
   live in per-machine directories, so retiring all of it would mean deleting another machine's files —
@@ -44,10 +45,19 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   now names the consolidated bundle that replaced it.
 
 - **Per-machine bundle signing ([#86]).** Every push now signs a statement naming the bundle it wrote —
-  hub, project, machine, bundle id, file path, and a sha256 of the plaintext archive (plus the
-  workspace artifact's, since #91 moved the project tree into a file of its own that no existing digest
-  reached). A pull verifies it before unpacking, so on a signed bundle nothing ever parses bytes that
-  failed attribution.
+  hub, project, machine, bundle id, file path, and a sha256 of the plaintext archive. A pull verifies
+  that before unpacking, so on a signed bundle nothing ever parses transcript bytes that failed
+  attribution.
+
+  > **The project tree is a separate matter, and this release does not close it.** Since 0.10.0 the
+  > workspace payload travels as its own hub file. The signed statement *carries* a digest of it, but
+  > the pull does **not** check that digest — the artifact is fetched by a different stage, and the code
+  > says so at the site. So the transcripts are attested on the read side and the file payload is not.
+
+  Signing also mints a **second** key, `~/.sesh-mover/signing.key`, on the next hub operation. It is
+  deliberately **not** covered by `hub escrow`, which wraps the encryption identity only: losing the
+  signing key costs a re-mint and one `hub trust` round with each peer, where losing the encryption
+  identity is permanent. Worth knowing if you read 0.10.0's escrow notes as covering every key.
 
   > **The pin is the part that carries the security property, not the signature.** A signature checked
   > against a key the hub publishes detects only a tamperer who declines to re-sign — anyone who can
@@ -68,6 +78,8 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   same way plaintext and encrypted bundles coexist. An unreadable signing key warns and pushes
   unsigned rather than failing the push.
 
+### Fixed
+
 - **A project path inside a URL is no longer rewritten** ([#108]). The path-rewriter runs two stages;
   the second guards against mistaking a URL's path for a filesystem path, and the first had no such
   guard at all — so a mapped project path was substituted wherever it appeared, including inside an
@@ -86,8 +98,6 @@ Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./
   start immediately after a character it was allowed to contain. `cd ~/tmp/build` became
   `cd ~C:\Users\…\Temp\build`. Both classes now derive from one constant, with `+` deliberately
   excluded so a unified-diff line like `+/home/you/src/app.ts` keeps translating.
-
-### Fixed
 
 - **`classifyBundleFailure` could throw from the one function whose contract is that it does not**
   ([#96]). A rejection reason of `null` or `undefined` made `(e as Error).message` a TypeError, and the

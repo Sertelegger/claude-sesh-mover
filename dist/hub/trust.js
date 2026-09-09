@@ -36,7 +36,8 @@
  *
  * ## What it deliberately will not do
  *
- * It will not confirm a key it has not been shown. `--confirm` takes the
+ * It will not confirm a key it has not been shown. `--machine` names the key and
+ * `--fingerprint` takes the
  * fingerprint the user read off the other machine and refuses if it does not
  * match what the hub is currently publishing — otherwise the "ceremony" would
  * be the user typing yes to whatever the hub said, which is TOFU with extra

@@ -36,13 +36,14 @@
  *
  * ## What it deliberately will not do
  *
- * It will not confirm a key it has not been shown. `--confirm` takes the
+ * It will not confirm a key it has not been shown. `--machine` names the key and
+ * `--fingerprint` takes the
  * fingerprint the user read off the other machine and refuses if it does not
  * match what the hub is currently publishing — otherwise the "ceremony" would
  * be the user typing yes to whatever the hub said, which is TOFU with extra
  * steps and a false sense of having checked.
  */
-import type { HubLockBusyResult, HubUnreachableResult } from "../types.js";
+import type { HubUnreachableResult } from "../types.js";
 export interface TrustedMachine {
     machineId: string;
     machineName: string | null;
@@ -63,7 +64,7 @@ export interface HubTrustResult {
     command: "hub-trust";
     hubId: string;
     machines: TrustedMachine[];
-    /** Set when `--confirm` was given and a pin was written. */
+    /** Set when `--machine` + `--fingerprint` matched and a pin was written. */
     confirmed?: {
         machineId: string;
         fingerprint: string;
@@ -79,7 +80,15 @@ export interface HubTrustRefusedResult {
     suggestion: string;
     warnings: string[];
 }
-export type HubTrustOutcome = HubTrustResult | HubTrustRefusedResult | HubUnreachableResult | HubLockBusyResult;
+/**
+ * NO `HubLockBusyResult` — this verb takes no project lock, so it cannot
+ * return one. It was in this union until an audit noticed the verb has no
+ * `acquireProjectLock` call at all, and a union member a function cannot
+ * produce is worse than noise: it tells every caller to write a branch that
+ * can never run, and tells the next reader this verb contends with pushes.
+ * It writes only this machine's own local pin file (see `hubTrust`).
+ */
+export type HubTrustOutcome = HubTrustResult | HubTrustRefusedResult | HubUnreachableResult;
 export interface HubTrustOptions {
     projectPath: string;
     hubPath: string;

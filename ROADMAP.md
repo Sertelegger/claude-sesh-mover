@@ -56,8 +56,12 @@ See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
   zero new dependencies, nothing to be missing, and `age -d -i` still works as the
   recovery path. It closes the plaintext-at-rest gap **going forward only**: existing
   bundles are never rewritten, because that would be one machine rewriting another's
-  files. Per-machine *signing* is a separate step and is not in it;
-  compaction of superseded bundles so a long-lived hub directory doesn't grow unbounded.
+  files. Per-machine *signing* is a separate mechanism and shipped after it, in **0.11.0**
+  ([#86](https://github.com/Sertelegger/claude-sesh-mover/issues/86)) — with the pin store
+  that makes it mean anything, since a signature checked against a key the hub publishes
+  detects only a tamperer who declines to re-sign. Also here: compaction of superseded
+  bundles so a long-lived hub directory doesn't grow unbounded
+  ([#92](https://github.com/Sertelegger/claude-sesh-mover/issues/92), shipped in 0.11.0).
   Two hardening items belong to the same pass because Slice 2 made them reachable:
   [#38](https://github.com/Sertelegger/claude-sesh-mover/issues/38) (stop re-implementing
   git's patch-header parser in the carry apply path and ask git instead) and the
