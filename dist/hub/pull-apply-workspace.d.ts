@@ -3,6 +3,7 @@ import { type HubBundleRecord } from "./layout.js";
 import { type WorkspaceMergeReport } from "./merge.js";
 import { type StageOutcome } from "./pull-stages.js";
 import type { ChainWorkspaceBase } from "./pull-apply-state.js";
+import type { WorkspaceAttestation } from "./signature.js";
 export interface ApplyWorkspaceStageInput {
     backend: HubBackend;
     extractDir: string;
@@ -39,6 +40,19 @@ export interface ApplyWorkspaceStageInput {
      * stage's own outcomes; see the containment check in `runApplyWorkspaceStage`.
      */
     workspaceFile?: string;
+    /**
+     * What this bundle's VERIFIED signature says about the artifact
+     * `workspaceFile` points at (#110), or absent when no signature was present.
+     *
+     * OPTIONAL on purpose. `tsconfig.json` excludes `tests`, so a REQUIRED field
+     * added here would produce zero compile errors and simply arrive `undefined`
+     * at runtime in every existing test — two call sites in
+     * `tests/hub-pull-stages.test.ts` already omit the required `projectId` with
+     * the suite green. Absent is read as `{ kind: "unsigned" }`, the permanent
+     * normal, and the guard is proved end-to-end through `hubPull`, where the
+     * wiring is real, rather than here where a caller can forget it.
+     */
+    workspaceAttestation?: WorkspaceAttestation;
     tempRoot: string;
 }
 export interface WorkspaceStageValue {
@@ -49,6 +63,14 @@ export interface WorkspaceStageValue {
     merge?: WorkspaceMergeReport;
     refused?: string[];
     declaredMissing?: true;
+    /**
+     * The artifact was retrieved and is NOT the one its bundle's signature
+     * vouches for (#110). Disjoint from `declaredMissing`, whose remedy is the
+     * opposite: `declaredMissing` means "nothing to fetch, wait for the next
+     * push", this means "the bytes on the hub are not the bytes that were
+     * signed".
+     */
+    unverified?: true;
 }
 /**
  * Apply the chain's workspace payload — by merging it, unpacking it, or
@@ -62,8 +84,10 @@ export interface WorkspaceStageValue {
  * here mid-accumulation, and an earlier bundle's integrity abort has to be able
  * to stop the pull before this ever runs.
  *
- * Five outcomes, and the difference between the last two is the whole reason
- * this returns an outcome rather than a value:
+ * EIGHT rows and three outcome kinds, and the difference between `skipped` and
+ * `aborted` is the whole reason this returns an outcome rather than a value.
+ * (The count said "five" over seven rows for two releases; it is spelled out
+ * here so the next row makes it wrong again loudly rather than quietly.)
  *
  * | situation | outcome |
  * |---|---|
@@ -71,6 +95,7 @@ export interface WorkspaceStageValue {
  * | manifest declares one the bundle lacks | `skipped`, one reason, `declaredMissing` |
  * | manifest points its snapshot outside the pushing machine's own hub directory | `skipped`, one reason, `declaredMissing` |
  * | split snapshot that could not be fetched | `skipped`, one reason, `declaredMissing` |
+ * | split snapshot fetched, but not the one its signature vouches for (#110) | `skipped`, one reason, `unverified` |
  * | merged, or unpacked | `applied`, `unpacked` plus `merge`/`refused` |
  * | no generation common to both trees | `skipped`, the ancestor reasons PLUS the no-common-point sentence |
  * | explicit --target-path, not empty, no force | `aborted` — see below |
@@ -82,6 +107,14 @@ export interface WorkspaceStageValue {
  * common — a tree that was never in the bundle is gone for good, an artifact
  * still syncing is a retry, and a pointer outside the pushing machine's own
  * directory is a bundle nobody should trust.
+ *
+ * **`unverified` is a FOURTH field rather than a fourth `declaredMissing`
+ * sentence, because the advice inverts.** Those three all mean "nothing could
+ * be fetched, wait for the next push". This one means the file IS there and is
+ * not what was signed — so the skill layer must not route it to "probably still
+ * syncing", and `commands/pull.md` gives it its own bullet. It is also the one
+ * row where `--force-workspace` is refused rather than merely useless: the
+ * payload never reaches an unpack.
  *
  * **The abort is not a refusal.** `WorkspaceTargetNotEmptyError` returns an
  * `ErrorResult` the caller must return VERBATIM, stopping the pull before this

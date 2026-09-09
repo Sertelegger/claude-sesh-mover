@@ -176,6 +176,18 @@ const REGISTRY: FlagUse[] = [
   },
   {
     file: "src/hub/pull-apply-workspace.ts",
+    match: "and its contents are NOT what machine",
+    klass: "future-only",
+    why: "The split artifact (#91) was fetched and does not match the digest its bundle's signed statement vouches for (#110). --force-workspace is named only to FORECLOSE it, and that is the point: the payload is refused before anything is unpacked, so the flag cannot reach it — someone who read 'refused' and reached for the override would otherwise find the one flag that usually answers a workspace skip doing nothing. Not re-runnable either, for the reason the entry below gives: this pull recorded its bundles. The remedy is a fresh push from the named machine, which mints a NEW artifact under a new name; a re-index is deliberately never offered, because `hub reindex` on the pushing machine re-signs whatever is on the hub and would launder the substitution.",
+  },
+  {
+    file: "src/hub/pull-apply-workspace.ts",
+    match: "--force-workspace is not the remedy: it overwrites rather than merges",
+    klass: "descriptive",
+    why: "The merge ANCESTOR did not match the digest this machine recorded when it applied that generation (#110), so no base was used and nothing was merged. Nothing is asked of the user here and the flag is named to steer them away from it: --force-workspace does not supply a merge base, it skips merging altogether and overwrites — which is the exact loss the ancestor check exists to prevent, so following it would complete the attack the refusal just stopped. The message deliberately names damage beside substitution rather than accusing: a hub is often a synced folder and a half-written archive lands on this branch as an ordinary state.",
+  },
+  {
+    file: "src/hub/pull-apply-workspace.ts",
     match: "no 3-way merge was attempted even though this machine has workspace generations",
     klass: "descriptive",
     why: "Restates what --force-workspace just did. Nothing is being asked of the user.",

@@ -370,7 +370,7 @@ export async function hubPull(opts) {
             // warning and a failed pin write — the second silently re-trusts the hub
             // on every later pull.
             warnings.push(...fetched.reasons);
-            const { extractDir, manifest: bundleManifest } = fetched.value;
+            const { extractDir, manifest: bundleManifest, workspaceAttestation } = fetched.value;
             // Merge, unpack, or decline the chain's workspace payload. Self-gating:
             // called on every bundle, does its work only on the newest one carrying a
             // generation. It stays INSIDE the loop for two reasons — the generation
@@ -391,6 +391,12 @@ export async function hubPull(opts) {
                 // RAW: the stage contains it against `projectId`/`machineId`, so a bad
                 // pointer is one of its outcomes rather than a throw from here.
                 workspaceFile: bundleManifest.workspace?.file,
+                // What this bundle's own VERIFIED statement says about the artifact
+                // that pointer names (#110). Minted in the fetch stage after
+                // `verifyStatement` and the bundle-digest match; never re-derived here
+                // and never read off `record.signature`, which is the raw field out of
+                // another machine's index file.
+                workspaceAttestation,
                 chainWorkspaceBases: st.chainWorkspaceBases,
                 // This bundle's own machine, like the sessions stage's ledger below:
                 // when this stage acts, this IS the machine whose workspace payload is
@@ -411,6 +417,7 @@ export async function hubPull(opts) {
                 st.workspaceMerge = ws.value.merge;
                 st.workspaceRefused = ws.value.refused;
                 st.workspaceDeclaredMissing = ws.value.declaredMissing;
+                st.workspaceUnverified = ws.value.unverified;
             }
             // Spread HERE, inside the loop, at the position the moved code occupied:
             // these interleave with the session warnings of the same and earlier
@@ -543,6 +550,7 @@ export async function hubPull(opts) {
             workspaceMerge: st.workspaceMerge,
             workspaceRefused: st.workspaceRefused,
             workspaceDeclaredMissing: st.workspaceDeclaredMissing,
+            workspaceUnverified: st.workspaceUnverified,
             carryAvailable,
             carryApplied,
             appended: st.appended.length > 0 ? st.appended : undefined,

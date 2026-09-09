@@ -2148,6 +2148,18 @@ export interface HubPullResult extends HubPullFindings, SharedLayerFindings {
    */
   workspaceDeclaredMissing?: boolean;
   /**
+   * The bundle's workspace snapshot was fetched and is NOT the one its
+   * signature vouches for (#110), so nothing was written and no generation was
+   * recorded. A SEPARATE field from `workspaceDeclaredMissing` because the
+   * advice inverts: that one says wait for the next push, this one says do not
+   * trust the file that IS there. The pull still succeeds and exits 0 — the
+   * sessions are attested and applied; only the optional tree was declined.
+   *
+   * Hub-only. It is deliberately NOT on `PayloadFindings`, which is shared with
+   * `import`, where no hub statement exists to check anything against.
+   */
+  workspaceUnverified?: boolean;
+  /**
    * The uncommitted work this pull's bundle chain carried (design §6.2), as the
    * SENDING machine described it. Present whenever a bundle declared a carry,
    * whether or not it was applied — `carryApplied` says what happened to it.
@@ -3006,12 +3018,37 @@ export interface SyncStateImported {
  */
 export interface WorkspaceGenerationRef {
   bundleId: string;
-  /** Hub-relative path of the bundle carrying this generation. */
+  /**
+   * Hub-relative path of the file carrying this generation's tree — the
+   * separate workspace ARTIFACT since #91, the bundle for a generation
+   * recorded before that split. `fetchAncestorWorkspace` opens exactly this,
+   * so recording the bundle path instead degrades every future merge to
+   * no-ancestor: safe, silent and permanently wrong.
+   */
   file: string;
   /** When this machine pushed or applied it (this machine's clock). */
   syncedAt: string;
   /** When the bundle was published (the PUSHING machine's clock). Diagnostic only. */
   pushedAt?: string;
+  /**
+   * sha256 of the PLAINTEXT archive whose tree this machine's directory
+   * reflects, as THIS machine computed it when it pushed or applied the
+   * generation (#110).
+   *
+   * A SELF-attestation, not a signature. It is never read off the hub and needs
+   * no peer to sign anything, which is why it holds on a fleet that has never
+   * signed a bundle. What it detects is the hub file changing under a
+   * generation this machine already used — an attacker-chosen 3-way merge base,
+   * which scores every local file as unchanged and overwrites the local copy
+   * with no sidecar and no backup, reported as a clean merge.
+   *
+   * Absent means NO CHECK, permanently — the same rule an absent `.age` suffix
+   * and an absent `signature` get. Every ref written before #110 has none, and
+   * so does every inline (pre-#91) generation, whose `file` names a bundle no
+   * pull ever hashed. `MAX_WORKSPACE_GENERATIONS` is 50, so unattested refs
+   * persist for a long time: coverage grows, it is never total.
+   */
+  digest?: string;
 }
 
 export interface SyncState {

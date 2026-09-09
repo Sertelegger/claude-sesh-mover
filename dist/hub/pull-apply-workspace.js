@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fetchBundleArchive } from "./bundle-io.js";
+import { digestFile } from "./signature.js";
 import { workspaceDir } from "./layout.js";
 import { errorMessage } from "../errors.js";
 import { unpackWorkspace, WorkspaceTargetNotEmptyError } from "../payload/workspace.js";
@@ -43,24 +44,55 @@ import { isPluginStateName } from "../paths.js";
  * older generation predates workspace payloads, the archive is unreadable, this
  * machine is not a recipient. None of them is a reason to fail a pull whose
  * sessions are perfectly fine, and both callers fail toward writing nothing.
+ * #110 adds a fourth failure of the same character — the bytes are not the ones
+ * that were attested — and it degrades the same way.
+ *
+ * **The archive is hashed on EVERY retrieval, not only when an expectation
+ * exists.** The digest is what a generation records for its own future ancestor
+ * check, and that check has to work on a hub that has never signed a bundle: a
+ * pull that hashed only signed payloads would leave the majority of fleets with
+ * no ancestor attestation at all. It costs one sha256 of a local file the next
+ * line is about to read anyway.
+ *
+ * The two expectation sources are deliberately different in kind, and neither
+ * is read off the hub. The ancestor caller passes one only when the generation
+ * it is opening recorded one — this machine's own note about a tree it applied.
+ * The incoming caller passes one only when a VERIFIED statement named this
+ * exact file. `undefined` means no comparison runs, which is the permanent
+ * normal on both sides.
  *
  * Each attempt gets its OWN scratch directory: `chooseMergeAncestor` can call
  * this twice, and a failed extraction may already have written part of a tree.
  * Sharing one would silently hand back a blend of two generations.
  */
-async function retrieveWorkspaceTree(backend, file, tempRoot, scratchPrefix) {
+async function retrieveWorkspaceTree(backend, file, tempRoot, scratchPrefix, 
+/**
+ * The sha256 this tree's PLAINTEXT archive must have, or `undefined` for no
+ * check. See the header for where each caller's expectation comes from.
+ */
+expectedDigest) {
     try {
         if (!(await backend.exists(file))) {
             return {
                 dir: null,
+                kind: "unavailable",
                 why: "is no longer on the hub (pruned, or not yet synced to this machine)",
             };
         }
         const work = mkdtempSync(join(tempRoot, scratchPrefix));
         const tarPath = join(work, "payload.tar.gz");
         const got = await fetchBundleArchive({ backend, file, destPath: tarPath });
-        if (!got.ok)
-            return { dir: null, why: `could not be read back (${got.failure.message})` };
+        if (!got.ok) {
+            return { dir: null, kind: "unavailable", why: `could not be read back (${got.failure.message})` };
+        }
+        // Hashed unconditionally — see the header. BEFORE the unpack, for exactly
+        // the reason the bundle's own signature gate gives at the same position in
+        // `pull-fetch.ts`: on an attested artifact node-tar never parses a byte
+        // that failed attribution.
+        const digest = await digestFile(tarPath);
+        if (expectedDigest !== undefined && digest !== expectedDigest) {
+            return { dir: null, kind: "digest-mismatch", expected: expectedDigest, found: digest };
+        }
         const unpacked = join(work, "unpacked");
         mkdirSync(unpacked, { recursive: true });
         await extractArchive(tarPath, unpacked);
@@ -69,12 +101,16 @@ async function retrieveWorkspaceTree(backend, file, tempRoot, scratchPrefix) {
         // states: an archive whose `workspace` entry is a FILE otherwise passes here
         // and throws ENOTDIR out of the merge, which is the terminal shape this
         // whole function exists to avoid.
-        if (!isReadableDir(tree))
-            return { dir: null, why: "carries no workspace tree" };
-        return { dir: tree };
+        if (!isReadableDir(tree)) {
+            return { dir: null, kind: "unavailable", why: "carries no workspace tree" };
+        }
+        return { dir: tree, digest };
     }
     catch (e) {
-        return { dir: null, why: `could not be read back (${errorMessage(e)})` };
+        // `digestFile` throwing lands here too. That is a fact about this machine's
+        // disk rather than about the artifact, and it degrades to `unavailable`
+        // like every other local failure — never to a mismatch, which would accuse.
+        return { dir: null, kind: "unavailable", why: `could not be read back (${errorMessage(e)})` };
     }
 }
 /**
@@ -91,9 +127,31 @@ async function retrieveWorkspaceTree(backend, file, tempRoot, scratchPrefix) {
  * absolute/traversing/symlink tar entries before anything is written).
  */
 async function fetchAncestorWorkspace(backend, ref, tempRoot) {
-    const got = await retrieveWorkspaceTree(backend, ref.file, tempRoot, "ancestor-");
+    // `typeof`, not `?? undefined`: the hub block is the one part of the
+    // sync-state file `parseSyncState` does not shape-check, so `digest` can be
+    // any JSON value — the same reason `knownWorkspaceGenerations` uses
+    // `Array.isArray` rather than a coalesce. A non-string reads as "no check".
+    const expected = typeof ref.digest === "string" ? ref.digest : undefined;
+    const got = await retrieveWorkspaceTree(backend, ref.file, tempRoot, "ancestor-", expected);
     if (got.dir !== null)
         return { dir: got.dir };
+    if (got.kind === "digest-mismatch") {
+        return {
+            dir: null,
+            warning: `The workspace generation ${ref.bundleId}, which this pull would have merged against, ` +
+                `is on the hub but is not the copy this machine recorded when it applied that ` +
+                `generation — so it was NOT used as a merge base and nothing was merged against it. ` +
+                `Two causes, and this cannot tell them apart: the file may be damaged or still ` +
+                `arriving, since a hub is often a synced folder and a half-written archive lands ` +
+                `exactly here; or it may have been replaced after that machine wrote it. Declining it ` +
+                `costs nothing either way. A 3-way merge trusts its base to decide which side ` +
+                `changed, so merging against a base that is not the one this machine held can score ` +
+                `your own edits as unchanged and overwrite them silently, with no sidecar. ` +
+                `--force-workspace is not the remedy: it overwrites rather than merges. Ask the ` +
+                `machine that pushed that generation to push a fresh snapshot, which mints a new ` +
+                `artifact under a new name.`,
+        };
+    }
     return {
         dir: null,
         warning: `The workspace generation ${ref.bundleId}, which this pull would have merged against, ` +
@@ -304,8 +362,10 @@ function describeWorkspaceMerge(r) {
  * here mid-accumulation, and an earlier bundle's integrity abort has to be able
  * to stop the pull before this ever runs.
  *
- * Five outcomes, and the difference between the last two is the whole reason
- * this returns an outcome rather than a value:
+ * EIGHT rows and three outcome kinds, and the difference between `skipped` and
+ * `aborted` is the whole reason this returns an outcome rather than a value.
+ * (The count said "five" over seven rows for two releases; it is spelled out
+ * here so the next row makes it wrong again loudly rather than quietly.)
  *
  * | situation | outcome |
  * |---|---|
@@ -313,6 +373,7 @@ function describeWorkspaceMerge(r) {
  * | manifest declares one the bundle lacks | `skipped`, one reason, `declaredMissing` |
  * | manifest points its snapshot outside the pushing machine's own hub directory | `skipped`, one reason, `declaredMissing` |
  * | split snapshot that could not be fetched | `skipped`, one reason, `declaredMissing` |
+ * | split snapshot fetched, but not the one its signature vouches for (#110) | `skipped`, one reason, `unverified` |
  * | merged, or unpacked | `applied`, `unpacked` plus `merge`/`refused` |
  * | no generation common to both trees | `skipped`, the ancestor reasons PLUS the no-common-point sentence |
  * | explicit --target-path, not empty, no force | `aborted` — see below |
@@ -324,6 +385,14 @@ function describeWorkspaceMerge(r) {
  * common — a tree that was never in the bundle is gone for good, an artifact
  * still syncing is a retry, and a pointer outside the pushing machine's own
  * directory is a bundle nobody should trust.
+ *
+ * **`unverified` is a FOURTH field rather than a fourth `declaredMissing`
+ * sentence, because the advice inverts.** Those three all mean "nothing could
+ * be fetched, wait for the next push". This one means the file IS there and is
+ * not what was signed — so the skill layer must not route it to "probably still
+ * syncing", and `commands/pull.md` gives it its own bullet. It is also the one
+ * row where `--force-workspace` is refused rather than merely useless: the
+ * payload never reaches an unpack.
  *
  * **The abort is not a refusal.** `WorkspaceTargetNotEmptyError` returns an
  * `ErrorResult` the caller must return VERBATIM, stopping the pull before this
@@ -486,9 +555,116 @@ export async function runApplyWorkspaceStage(input) {
         const materializeIncoming = async () => {
             if (incoming.kind === "inline")
                 return { dir: inlineDir };
-            const got = await retrieveWorkspaceTree(backend, incoming.file, tempRoot, "incoming-ws-");
+            /**
+             * ATTRIBUTION FOR THE TREE (#110). The bundle's own signature covers the
+             * ARCHIVE; since #91 the tree is a separate hub file the archive cannot
+             * reach, so the statement carries a second digest for it and this is the
+             * only reader of it.
+             *
+             * Absent, or `unsigned`, is NOT a refusal and never becomes one: that is
+             * every pre-#86 bundle on every hub. The branch is the absent field on
+             * THIS record, never local config, never `hub.json`, never a version —
+             * the `.age` suffix rule, for the same reason: a policy bit fails in both
+             * directions, invisibly to the machine that set it.
+             *
+             * The two anomaly arms below WARN AND APPLY rather than refuse. Both are
+             * unreachable by anyone who cannot sign: the manifest pointer lives
+             * inside the archive `bundleDigest` already covered, the statement cannot
+             * be edited without the key, and a lifted older statement of the same
+             * machine trips `context-mismatch` on `bundleId`/`bundleFile`. `push.ts`
+             * writes the statement pair iff it wrote the manifest pointer, and
+             * `reindex.ts` returns an UNSIGNED record rather than one it cannot make
+             * true. So the only producer is a signer contradicting itself — exactly
+             * the residue #86 concedes it cannot detect — and refusing raises no
+             * attacker's cost while silently losing every workspace payload from a
+             * future writer we have not written yet.
+             *
+             * SKIP, not abort, on a mismatch, and the strongest reason is not the
+             * obvious one.
+             *
+             * (1) An abort here is a NEW ROUTE INTO A DOCUMENTED HAZARD. `pull.ts`
+             *     returns a workspace abort terminally while the bundles before it
+             *     are already applied AND CREDITED — the peer ledger is written
+             *     inside the loop and `runRecordStage` runs after it. `pull-record.ts`
+             *     names a workspace abort as one of exactly three hard returns that
+             *     reach that state, and spells out the cost: the next push mints a new
+             *     thread and ships only a delta, leaving a continuation chain on the
+             *     hub with no base bundle to anchor it. Adding a route into it on an
+             *     input an ATTACKER CHOOSES is the wrong direction.
+             * (2) An abort hands a hub-writing attacker a transcript denial of
+             *     service: rewriting one artifact would block the thread's sessions on
+             *     every retry, indefinitely. Under skip the same attacker denies the
+             *     tree and nothing else, so the "stricter" option is strictly worse
+             *     for availability and buys nothing for integrity.
+             * (3) A benign trigger exists and this function already names it: the
+             *     artifact is not covered by `pull-select.ts`'s `not-yet-synced`
+             *     sweep, so a synced folder that delivered the bundle and not the
+             *     whole artifact lands here routinely. Because the digest runs BEFORE
+             *     the unpack, a partial artifact that used to surface as gzip damage
+             *     surfaces as a mismatch instead — which is why the sentence names the
+             *     sync cause beside the substitution cause and does not accuse.
+             * (4) The skip already defeats the attack completely: nothing is written,
+             *     no generation is recorded, the sessions import, and a typed field
+             *     plus a sentence disclose it. Abort adds loudness, not safety.
+             *
+             * The cost, stated rather than discovered: this returns success and exit
+             * 0, so `sesh-mover hub pull || handle_failure` learns nothing about a
+             * detected substitution. That is #107's to change, and when it is built it
+             * must be a LOCAL receiver policy and never a `hub.json` field.
+             *
+             * NO OVERRIDE FLAG, and neither existing force flag is a precedent.
+             * `--force-unkeyed` exists because nothing ever deletes a
+             * `machines/<id>.json`, so one decommissioned machine would block every
+             * encrypted push forever with no other remedy. `--force-append` overrides
+             * only the liveness heuristic, never the chain guard. Here nothing is
+             * permanently blocked — a fresh push from that machine is ordinary
+             * operation — and "I know that artifact was replaced and it is fine" is
+             * not knowledge anyone can hold, because the entire content is what failed
+             * attestation. A flag would also sit one keystroke from --force-workspace.
+             *
+             * WHAT THIS DOES NOT CLOSE.
+             *
+             * - STRIPPING the signature. An index file carries no integrity of its
+             *   own (`index-file.ts` writes plain JSON), and on the filesystem backend
+             *   "can write the artifact" and "can write the index record" are the same
+             *   capability. An attacker deletes `signature` from the record AND
+             *   substitutes the artifact; the gate takes the unsigned branch, no
+             *   expectation exists, and the tree applies. All that is left is the
+             *   downgrade warning, and only once this machine holds a pin. That is
+             *   mandated — an unsigned bundle must apply exactly as it always has —
+             *   and closing it is #107's strict mode.
+             * - `hub reindex` LAUNDERS a substitution. `rebuildSignature` fetches
+             *   whatever is at the derived artifact path and signs its digest with
+             *   this machine's real key, so the machine that pushed can, by running
+             *   the documented repair tool in response to a peer's mismatch report,
+             *   sign the attacker's bytes. That feedback loop is why the sentence
+             *   below never offers a reindex.
+             * - A key holder signs anything. #86's limit (3): a valid signature from a
+             *   compromised machine authenticates hostile content perfectly, so #36's
+             *   consent gate around applying project files is unchanged.
+             * - REPLAY rather than substitution. `verifyStatement`'s context walk does
+             *   not compare `pushedAt`, so an old, authentic, signed record of the
+             *   same machine re-filed into another thread slot still verifies — and
+             *   its artifact genuinely IS what was signed, so this check passes.
+             */
+            const att = input.workspaceAttestation ?? { kind: "unsigned" };
+            let expected;
+            if (att.kind === "signed-no-artifact") {
+                reasons.push(`Bundle ${record.bundleId} from machine ${machineId} is signed and its signature verified, but the signed statement says nothing about the workspace snapshot the bundle points at (${incoming.file}) — so that snapshot is attested by nothing and was applied on the strength of the transcripts alone. Every sesh-mover that signs also signs its snapshot, so this came from a build that does not, and a tamperer holding that machine's key would look identical from here.`);
+            }
+            else if (att.kind === "attested" && att.file !== incoming.file) {
+                reasons.push(`Bundle ${record.bundleId}'s signed statement names a different workspace snapshot (${att.file}) from the one its manifest points at (${incoming.file}). Both travelled inside the same signed push, so they cannot disagree unless the machine that signed them produced the disagreement. The snapshot at the manifest's path was applied unattested.`);
+            }
+            else if (att.kind === "attested") {
+                expected = att.digest;
+            }
+            const got = await retrieveWorkspaceTree(backend, incoming.file, tempRoot, "incoming-ws-", expected);
             if (got.dir !== null)
-                return { dir: got.dir };
+                return { dir: got.dir, digest: got.digest };
+            if (got.kind === "digest-mismatch") {
+                reasons.push(`The bundle's workspace snapshot is a separate file on the hub (${incoming.file}) and its contents are NOT what machine ${machineId} signed for it. Nothing was written to this project's directory, no workspace generation was recorded, and the sessions imported normally — the bundle archive itself verified; only the snapshot did not. A snapshot is written once under a name no later push reuses, so this is not a stale copy: either a syncing folder has delivered it incompletely, or the file was replaced after that machine wrote it. THIS PULL CANNOT BE RE-RUN TO GET IT: its bundles are recorded now, so an immediate repeat answers "already up to date". --force-workspace will not help either — the payload is refused before anything is unpacked. The only thing that can deliver these files is a fresh push from that machine, which mints a new snapshot under a new name; do not ask for the existing one to be re-indexed. If it keeps happening, compare that machine's signing fingerprint out of band with \`sesh-mover hub trust\` before trusting anything it holds.`);
+                return { dir: null, unverified: true };
+            }
             reasons.push(`The bundle's workspace snapshot travels as its own file on the hub (${incoming.file}) and that file ${got.why}, so there was nothing to apply and this project's files were left untouched. The sessions imported normally. The snapshot and the bundle are separate hub files and can go missing independently — pruned, or a synced folder that has delivered one and not yet the other. THIS PULL CANNOT BE RE-RUN TO GET IT: its bundles are recorded now, so an immediate repeat answers "already up to date" without ever reaching the files. No generation was recorded either — recording one for files that were never written is what makes a later merge read the whole payload as deleted — so the next snapshot that machine pushes is what can deliver them, and if this directory has content by then that payload needs --force-workspace for the same reason a skipped one does.`);
             return { dir: null };
         };
@@ -503,6 +679,10 @@ export async function runApplyWorkspaceStage(input) {
          * IDENTITY is `record.bundleId` either way: the split moved where the tree
          * lives, not what names it.
          */
+        // The DIGEST recorded beside it belongs to the ARTIFACT. An inline (pre-#91)
+        // generation's `file` is the BUNDLE, which this stage never hashed, so it
+        // records none — and absent means no check, exactly like every ref written
+        // before #110.
         const generationFile = incoming.kind === "artifact" ? incoming.file : record.file;
         const entries = existsSync(effectiveProjectPath) ? readdirSync(effectiveProjectPath) : [];
         const hasRealContent = entries.some((n) => !isPluginStateName(n));
@@ -532,7 +712,12 @@ export async function runApplyWorkspaceStage(input) {
             // describeWorkspaceMerge says so.
             const inc = await materializeIncoming();
             if (inc.dir === null) {
-                return stageSkip(reasons, { unpacked: null, declaredMissing: true });
+                // Two disjoint outcomes, never both: `declaredMissing` says nothing
+                // could be fetched and the remedy is the next push; `unverified` says
+                // the file IS there and is not what was signed. `commands/pull.md`
+                // routes them to opposite advice, so folding them would send a
+                // substitution report to "wait, it is probably still syncing".
+                return stageSkip(reasons, inc.unverified ? { unpacked: null, unverified: true } : { unpacked: null, declaredMissing: true });
             }
             const report = await mergeWorkspaceTrees({
                 ancestorDir,
@@ -552,6 +737,7 @@ export async function runApplyWorkspaceStage(input) {
             const stateWs = readSyncState(effectiveProjectPath);
             setLastWorkspace(stateWs, hubId, {
                 bundleId: record.bundleId, file: generationFile, pushedAt: record.pushedAt,
+                ...(inc.digest !== undefined ? { digest: inc.digest } : {}),
             });
             writeSyncState(stateWs);
             reasons.push(...describeWorkspaceMerge(report));
@@ -585,7 +771,12 @@ export async function runApplyWorkspaceStage(input) {
         else {
             const inc = await materializeIncoming();
             if (inc.dir === null) {
-                return stageSkip(reasons, { unpacked: null, declaredMissing: true });
+                // Two disjoint outcomes, never both: `declaredMissing` says nothing
+                // could be fetched and the remedy is the next push; `unverified` says
+                // the file IS there and is not what was signed. `commands/pull.md`
+                // routes them to opposite advice, so folding them would send a
+                // substitution report to "wait, it is probably still syncing".
+                return stageSkip(reasons, inc.unverified ? { unpacked: null, unverified: true } : { unpacked: null, declaredMissing: true });
             }
             try {
                 const ws = await unpackWorkspace(inc.dir, effectiveProjectPath, { force: forceWorkspace || !hasRealContent });
@@ -618,6 +809,7 @@ export async function runApplyWorkspaceStage(input) {
                 const stateWs = readSyncState(effectiveProjectPath);
                 setLastWorkspace(stateWs, hubId, {
                     bundleId: record.bundleId, file: generationFile, pushedAt: record.pushedAt,
+                    ...(inc.digest !== undefined ? { digest: inc.digest } : {}),
                 });
                 writeSyncState(stateWs);
                 return stageOk({ unpacked, refused }, reasons);
