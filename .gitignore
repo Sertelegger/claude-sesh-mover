@@ -8,7 +8,7 @@ node_modules/
 # replaces.
 .sesh-mover/
 .envrc
-docs/
+docs
 .worktrees/
 graphify-out/
 .claude/settings.local.json
