@@ -2,19 +2,25 @@
 # excludes would drop them. Committed on purpose: it means the same thing on
 # every clone and every machine.
 #
-# These two hold the project's WORKING MEMORY, and neither is in git:
+# `.superpowers/` is the SDD ledger — per-task findings and the carried
+# constraints ("never order across machines by pushedAt", "never floor
+# mtimeMs", "never probe a binary with --help"), each with the measurement
+# behind it. It is not in git, so losing it on a machine move means re-deriving
+# all of it. GitHub issues carry what to do next; this carries what NOT to do
+# and why we know, which is what stops a fixed defect being reintroduced.
 #
-#   docs/         — design specs and implementation plans (gitignored)
-#   .superpowers/ — the SDD ledger: per-task findings and the carried
-#                   constraints ("never order across machines by pushedAt",
-#                   "never floor mtimeMs", "never probe a binary with --help"),
-#                   each with the measurement behind it.
+# `docs/` WAS LISTED HERE and deliberately is not any more. This project's
+# design specs moved into a separate private repo, and `docs/` is now a symlink
+# into it — so they reach another machine by being cloned there, not by riding
+# along in a bundle. The line would not work even if it stayed: `captureCarry`
+# refuses a symlink on purpose, because a stat-based check follows it and would
+# put the LINK TARGET's bytes in the payload. Removing it is bookkeeping, not a
+# policy change.
 #
-# GitHub issues carry what to do next. These carry what NOT to do and why we
-# know — which is what stops a fixed defect being reintroduced. Losing them on
-# a machine move means re-deriving all of it, so they travel with the sessions.
+# **If you do not have a docs repo, list your own `docs/` here.** An ordinary
+# gitignored docs directory travelling beside the sessions is exactly what this
+# file is for, and it is the case the design was built around.
 #
 # A pattern with a `/` anywhere in it is rooted at the project; a bare pattern
 # matches that name at any depth. See README's include-list section.
-docs/
 .superpowers/
