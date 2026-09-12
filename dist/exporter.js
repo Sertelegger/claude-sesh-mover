@@ -1,7 +1,7 @@
 import { mkdirSync, copyFileSync, readdirSync, existsSync, createReadStream, createWriteStream, statSync, } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
-import { writeManifest, computeLayerDigest } from "./manifest.js";
+import { writeManifest, computeLayerDigest, layerFiles, layerFilePath } from "./manifest.js";
 import { discoverSessions } from "./discovery.js";
 import { detectPlatform } from "./platform.js";
 import { extractSummaryFromFile } from "./summary.js";
@@ -49,8 +49,29 @@ function copyDirIfExists(srcDir, destDir) {
     if (!existsSync(srcDir))
         return false;
     mkdirSync(destDir, { recursive: true });
-    for (const file of readdirSync(srcDir)) {
-        copyFileSync(join(srcDir, file), join(destDir, file));
+    // RECURSIVE, through the same `layerFiles` the digest walks (#121). Claude
+    // Code writes `subagents/workflows/<wf_id>/` for any session that has run a
+    // Workflow, and a flat `readdirSync` + `copyFileSync` met that directory as a
+    // file. What it did then depended on the filesystem, which is why it took so
+    // long to be reported as one bug: `copyFileSync` sizes its copy loop from
+    // `st_size`, so a NON-EMPTY directory threw (EISDIR on Linux, ENOTSUP on
+    // macOS, whose `copyfile(3)` reports any non-regular file as "not supported
+    // on socket" and sent the first reporter looking for a socket that was not
+    // there) while an EMPTY one on a filesystem that reports `st_size` 0 for
+    // directories — btrfs, measured — threw nothing and wrote a ZERO-BYTE FILE
+    // named `workflows` into the bundle. The loud half blocked export, and
+    // therefore push, for any session that had run a workflow; the quiet half
+    // produced a bundle that passed its own integrity check.
+    //
+    // Not `fs.cpSync(..., { recursive: true })`, which is the obvious fix and is
+    // wrong here: measured on Node 22.23.2 it preserves a symlink AS a symlink
+    // even under `dereference: true`, and `archiver.ts`'s `assertSafeEntries`
+    // refuses a `SymbolicLink` tar entry — so it would trade a broken export for
+    // a bundle this plugin cannot import.
+    for (const rel of layerFiles(srcDir)) {
+        const dest = join(destDir, ...rel.split("/"));
+        mkdirSync(dirname(dest), { recursive: true });
+        copyFileSync(layerFilePath(srcDir, rel), dest);
     }
     return true;
 }
