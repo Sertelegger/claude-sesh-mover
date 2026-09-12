@@ -125,6 +125,12 @@ export interface ApplyState {
      * the declaration comment in `initApplyState`.
      */
     workspaceDeclaredMissing: boolean | undefined;
+    /**
+     * Set when a split workspace artifact was retrieved and did NOT match the
+     * digest its bundle's verified signature vouches for (#110). DISJOINT from
+     * `workspaceDeclaredMissing`: that one means nothing could be fetched at all.
+     */
+    workspaceUnverified: boolean | undefined;
     /** Which bundle in this chain carries the workspace generation to apply. */
     readonly workspaceBundleIndex: number;
     readonly chainWorkspaceBases: Array<ChainWorkspaceBase>;

@@ -828,7 +828,16 @@ describe("hub pull", () => {
         mkdirSync(join(ws, ".git"), { recursive: true });
         writeFileSync(join(ws, ".sesh-mover-include"), "*\n");
         writeFileSync(join(ws, ".git", "config"), "[remote]\n");
-      });
+      // `resign: true` because this bundle IS signed and HOME is still machine
+      // A's here, so the record is ours to re-stamp honestly (#110). Without it
+      // the artifact attestation refuses the payload before the floor is ever
+      // consulted, and this test would pass for the wrong reason — proving the
+      // digest check works rather than the thing it names. What it must keep
+      // exercising is the faithful case: a payload genuinely from the machine
+      // it claims, whose CONTENT is hostile. Do NOT repair it by stripping the
+      // signature; that silently deletes signature coverage from the one
+      // workspace test that has it.
+      }, { resign: true });
 
       restore.restore();
       restore = overrideHome(homeB);
@@ -1535,6 +1544,12 @@ async function arrangeContinuation(
  * So a foreign record has its signature STRIPPED instead. That is honest and
  * costs nothing: an absent signature is a pre-signing bundle, a shape supported
  * permanently, and the downstream guard under test is reached either way.
+ */
+/**
+ * NOTE (#110): this reuses `{ ...r.signature.statement }` wholesale, so a stale
+ * `workspaceDigest` survives every re-sign. Harmless, because it only ever
+ * round-trips BUNDLES and never touches an artifact — but never reach for it to
+ * repair an artifact rewrite; `resignWorkspaceDigestOnHub` is that one.
  */
 async function resignBundleOnHub(
   backend: ReturnType<typeof createFsBackend>,
@@ -3343,7 +3358,18 @@ async function mutateWorkspaceArtifact(
   hubPath: string,
   projectId: string,
   bundleId: string,
-  mutate: (root: string) => void
+  mutate: (root: string) => void,
+  /**
+   * `resign: true` re-stamps the signed statement's `workspaceDigest` so the
+   * rewritten artifact is the one the signature vouches for — an HONEST edit by
+   * the machine that owns the record, which is what a fixture wants when it is
+   * exercising something OTHER than #110's attestation.
+   *
+   * Default false, so an attack fixture gets the attack: the artifact changes
+   * and the statement does not, which is exactly the substitution the pull now
+   * refuses.
+   */
+  opts: { resign?: boolean } = {}
 ): Promise<void> {
   const manifest = await readHubBundleManifest(hubPath, projectId, bundleId);
   const file = manifest.workspace?.file;
@@ -3351,6 +3377,58 @@ async function mutateWorkspaceArtifact(
     throw new Error(`mutateWorkspaceArtifact: bundle ${bundleId} declares no workspace artifact`);
   }
   await roundTripHubArchive(hubPath, file, mutate);
+  if (opts.resign) await resignWorkspaceDigestOnHub(hubPath, projectId, bundleId);
+}
+
+/**
+ * Re-stamp `workspaceDigest` on every index record for `bundleId`, from the
+ * artifact now on the hub (#110).
+ *
+ * **A separate helper from `resignBundleOnHub`, and it has to be.** That one
+ * re-stamps `bundleDigest` from a BUNDLE archive — the wrong digest and the
+ * wrong file. And passing `projectId` to `roundTripHubArchive` in the hope it
+ * re-signs is a silent no-op: its re-sign block gates on `r.file === file`, and
+ * an artifact lives under `workspaces/<machine>/` while every index record's
+ * `file` is under `bundles/<machine>/`. So the artifact round trip never
+ * matches a record and nothing is re-signed.
+ *
+ * Same owned/foreign split as `resignBundleOnHub`, for the same reason: a
+ * record this machine owns is re-signed honestly, and a peer's is stripped
+ * rather than forged. Forging a foreign signature is the attack, and a fixture
+ * that does it tests nothing — it is the defect that made six signing tests
+ * fail for the wrong reason once already.
+ */
+async function resignWorkspaceDigestOnHub(
+  hubPath: string,
+  projectId: string,
+  bundleId: string
+): Promise<void> {
+  const backend = createFsBackend(hubPath);
+  const key = loadOrCreateSigningKey();
+  const me = loadOrCreateMachineId().id;
+  const { indexes } = await readAllIndexes(backend, projectId);
+  for (const index of indexes) {
+    let touched = false;
+    for (const thread of Object.values(index.threads)) {
+      for (const r of thread.bundles) {
+        if (r.bundleId !== bundleId || !r.signature) continue;
+        const wsFile = r.signature.statement.workspaceFile;
+        if (typeof wsFile !== "string") continue;
+        if (index.machineId === me) {
+          if (!key.ok) throw new Error("fixture cannot re-sign: no signing key on this machine");
+          r.signature = signStatement(
+            key.privateKey,
+            { ...r.signature.statement, workspaceDigest: await digestFile(join(hubPath, wsFile)) },
+            key.publicKey
+          );
+        } else {
+          delete r.signature;
+        }
+        touched = true;
+      }
+    }
+    if (touched) await writeMachineIndex(backend, index);
+  }
 }
 
 describe("hub pull — workspace 3-way merge", () => {
@@ -3800,6 +3878,16 @@ describe("hub pull — workspace 3-way merge", () => {
     }
   });
 
+  /**
+   * The GUARDED behaviour here is "degrade to no-ancestor, never fail the
+   * pull", and it is unchanged. What #110 changed is WHICH arm reports it: the
+   * generation now carries the digest this machine recorded when it applied
+   * that tree, and the comparison happens before the gunzip, so a corrupted
+   * archive is caught as a mismatch rather than as an unreadable one. The
+   * message must therefore name damage BESIDE substitution and must not accuse
+   * — a hub is often a synced folder and a half-written archive lands here as
+   * an ordinary state, which is exactly what this fixture writes.
+   */
   it("an unreadable ancestor archive degrades to no-ancestor mode, never a failed pull", async () => {
     const w = await arrangeWorkspacePair();
     try {
@@ -3822,7 +3910,47 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(p.workspaceUnpacked).toBeNull();
       expect(p.importedSessions.length + (p.appended?.length ?? 0)).toBeGreaterThan(0);
       expect(readFileSync(join(w.projectB, "shared.txt"), "utf-8")).toBe(wsLines({ 8: "B-EDIT" }));
-      expect(p.warnings.join(" ")).toContain("could not be read back");
+      const w1 = p.warnings.join(" ");
+      expect(w1).toContain("was NOT used as a merge base");
+      // Names BOTH causes and picks neither. A message that accused would be
+      // wrong on this very fixture.
+      expect(w1).toMatch(/damaged or still arriving/);
+      expect(w1).toMatch(/replaced after that machine wrote it/);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  /**
+   * #110, and the invariant is that the pull SUCCEEDS IN MERGING against an
+   * ancestor nobody attested. Absent means no check, permanently — every
+   * generation recorded before #110 has no digest, `MAX_WORKSPACE_GENERATIONS`
+   * is 50, so that backlog is around for a long time, and turning an absent
+   * digest into a refusal would break every one of those merges at once.
+   */
+  it("an ancestor generation recorded before #110 carries no digest and is merged against unchecked", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      // Age B's recorded generation back to the pre-#110 shape.
+      const st = readSyncState(w.projectB);
+      delete (st.hub!.lastWorkspace as { digest?: string }).digest;
+      for (const g of st.hub!.workspaceGenerations ?? []) delete (g as { digest?: string }).digest;
+      writeSyncState(st);
+      expect(readSyncState(w.projectB).hub?.lastWorkspace?.digest).toBeUndefined();
+
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      // The merge ran: an unattested ancestor is still a legal ancestor.
+      expect(p.workspaceMerge).toBeDefined();
+      expect(p.warnings.join(" ")).not.toContain("was NOT used as a merge base");
     } finally {
       w.cleanup();
     }
@@ -5858,6 +5986,195 @@ describe("hub pull — the shared layers as typed result fields", () => {
       expect(readTextLf(join(f.memDirB, "test_memory.md"))).toContain(A_MEMORY_V1);
     } finally {
       f.cleanup();
+    }
+  });
+});
+
+/**
+ * # The workspace artifact's attestation (#110)
+ *
+ * `hub push` signs a statement carrying `workspaceDigest` over the plaintext
+ * workspace artifact; until #110 nothing compared it, so the transcripts were
+ * attested on the read side and the project tree was not. Since #91 the tree is
+ * a SEPARATE hub file, which is why the bundle's own signature cannot reach it:
+ * an attacker with hub write access replaces the artifact, the bundle's
+ * signature still verifies over the archive, and the tree applies.
+ *
+ * Two of these tests assert that an attack SUCCEEDS, and that is the invariant
+ * rather than an oversight — an unsigned bundle is the permanent normal and
+ * must apply exactly as it always has. They are named so nobody "fixes" them.
+ *
+ * Every guard here is a comparison over bytes, so its proof lives on Linux;
+ * there is no platform-specific behaviour to chase on the Windows job.
+ */
+describe("hub pull — workspace artifact attestation (#110)", () => {
+  /** The one bundle A has pushed so far, as this machine's index records it. */
+  async function onlyBundle(hubPath: string, projectId: string): Promise<{ bundleId: string; file: string }> {
+    const { indexes } = await readAllIndexes(createFsBackend(hubPath), projectId);
+    const bundles = Object.values(indexes[0].threads).flatMap((t) => t.bundles);
+    return { bundleId: bundles[bundles.length - 1].bundleId, file: bundles[bundles.length - 1].file };
+  }
+
+  /** Delete every `signature` on the hub, leaving the bundles otherwise intact. */
+  async function stripSignatures(hubPath: string, projectId: string): Promise<void> {
+    const backend = createFsBackend(hubPath);
+    const { indexes } = await readAllIndexes(backend, projectId);
+    for (const index of indexes) {
+      for (const thread of Object.values(index.threads)) {
+        for (const r of thread.bundles) delete r.signature;
+      }
+      await writeMachineIndex(backend, index);
+    }
+  }
+
+  it("refuses a substituted artifact on the BOOTSTRAP path, and still imports the sessions", async () => {
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    try {
+      const first = await onlyBundle(w.hub, w.projectId);
+      await mutateWorkspaceArtifact(w.hub, w.projectId, first.bundleId, (dir) => {
+        writeFileSync(join(dir, "workspace", "shared.txt"), "ATTACKER\n");
+      });
+
+      w.useB();
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      // The transcripts are the point of a pull and they are attested, so they land.
+      expect(p.importedSessions.length + (p.appended?.length ?? 0)).toBeGreaterThan(0);
+      // The tree does not.
+      expect(p.workspaceUnpacked).toBeNull();
+      expect(p.workspaceUnverified).toBe(true);
+      // Disjoint from "could not be fetched" — the advice inverts.
+      expect(p.workspaceDeclaredMissing).toBeUndefined();
+      expect(existsSync(join(w.projectB, "shared.txt"))).toBe(false);
+      // No generation recorded: recording one for files never written is what
+      // makes the NEXT merge read the whole payload as a deletion.
+      expect(readSyncState(w.projectB).hub?.lastWorkspace).toBeUndefined();
+
+      const warned = p.warnings.join(" ");
+      expect(warned).toContain("are NOT what machine");
+      // It must not offer a remedy that forecloses itself. A re-pull answers
+      // "already up to date", --force-workspace is refused before the unpack,
+      // and `hub reindex` on the pushing machine re-signs whatever is on the
+      // hub — which would launder the substitution.
+      expect(warned).not.toMatch(/pull again|re-run this pull/i);
+      expect(warned).toMatch(/fresh push/i);
+      expect(warned).not.toMatch(/do not ask for the existing one to be re-indexed[\s\S]*run .?sesh-mover hub reindex/i);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("refuses a substituted artifact on the MERGE path, leaving local work untouched", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      // From the push itself, not from the indexes: B has pulled by now, so B
+      // has an index file of its own and "the first index" is not A's.
+      const gen2 = await w.pushFromA();
+      w.useB();
+      const genBefore = readSyncState(w.projectB).hub?.lastWorkspace?.bundleId;
+      expect(genBefore).toBeDefined();
+
+      await mutateWorkspaceArtifact(w.hub, w.projectId, gen2.bundleId, (dir) => {
+        writeFileSync(join(dir, "workspace", "shared.txt"), "ATTACKER\n");
+      });
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      expect(p.workspaceUnverified).toBe(true);
+      expect(p.workspaceMerge).toBeUndefined();
+      // B's own edit survives, unmerged and unoverwritten.
+      expect(readTextLf(join(w.projectB, "shared.txt"))).toBe(wsLines({ 8: "B-EDIT" }));
+      // And the generation did not advance to the one that failed attestation.
+      expect(readSyncState(w.projectB).hub?.lastWorkspace?.bundleId).toBe(genBefore);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  /**
+   * THE ATTACK SUCCEEDING IS THE INVARIANT. An unsigned bundle is every bundle
+   * that existed before #86 and every bundle from a machine whose signing key
+   * became unreadable — the push side falls back to unsigned by owner ruling.
+   * Refusing here would strand all of them. Closing this is #107's strict mode,
+   * which must be a LOCAL receiver policy and never a `hub.json` field.
+   *
+   * It also records the residue honestly: stripping the signature is itself
+   * within reach of anyone who can rewrite the artifact, because an index file
+   * carries no integrity of its own.
+   */
+  it("APPLIES a substituted artifact when the bundle is unsigned — the permanent normal, not a bug", async () => {
+    const w = await arrangeWorkspacePair({ bootstrapB: false });
+    try {
+      const first = await onlyBundle(w.hub, w.projectId);
+      await mutateWorkspaceArtifact(w.hub, w.projectId, first.bundleId, (dir) => {
+        writeFileSync(join(dir, "workspace", "shared.txt"), "ATTACKER\n");
+      });
+      await stripSignatures(w.hub, w.projectId);
+
+      w.useB();
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      expect(p.workspaceUnverified).toBeUndefined();
+      expect(p.workspaceUnpacked).not.toBeNull();
+      expect(readTextLf(join(w.projectB, "shared.txt"))).toBe("ATTACKER\n");
+      // And it must not be described as something it is not. Found by mutation:
+      // returning `signed-no-artifact` for an unsigned record leaves every
+      // assertion above green while telling the user this bundle "is signed and
+      // its signature verified" — a sentence that is false about every bundle
+      // written before #86. The three attestation arms are three different
+      // facts precisely so this one keeps its own wording.
+      const warned = p.warnings.join(" ");
+      expect(warned).not.toContain("is signed and its signature verified");
+      expect(warned).not.toContain("attested by nothing");
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  it("declines a SUBSTITUTED merge ancestor rather than merging against an attacker's base", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      // B recorded gen-1 as its ancestor when it bootstrapped. Replace that
+      // artifact with a well-formed archive holding different bytes — a valid
+      // tarball, so nothing but the digest can tell.
+      w.useB();
+      const ancestor = readSyncState(w.projectB).hub?.lastWorkspace;
+      expect(ancestor?.digest).toBeDefined();
+      await roundTripHubArchive(w.hub, ancestor!.file, (dir) => {
+        writeFileSync(join(dir, "workspace", "shared.txt"), wsLines({ 2: "POISONED", 8: "POISONED" }));
+      });
+
+      w.useA();
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+
+      // No ancestor -> no merge. B's edit is untouched rather than scored as
+      // unchanged against a base it never held and silently overwritten.
+      expect(p.workspaceMerge).toBeUndefined();
+      expect(readTextLf(join(w.projectB, "shared.txt"))).toBe(wsLines({ 8: "B-EDIT" }));
+      expect(p.warnings.join(" ")).toContain("was NOT used as a merge base");
+    } finally {
+      w.cleanup();
     }
   });
 });

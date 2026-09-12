@@ -1,6 +1,7 @@
 import type { HubBackend } from "./backend.js";
 import type { HubBundleRecord } from "./layout.js";
 import type { ApplyState } from "./pull-apply-state.js";
+import { type WorkspaceAttestation } from "./signature.js";
 import { type StageOutcome } from "./pull-stages.js";
 import type { ExportManifest, ProgressEvent } from "../types.js";
 export interface FetchStageInput {
@@ -67,19 +68,26 @@ export interface FetchStageInput {
  * treating it as redundant welds a corrupt delta into a transcript the user
  * already owns.
  *
- * A record carrying a `signature` (#86) adds ONE more true thing on return:
- * the archive's plaintext bytes hash to what a holder of the signing key said
- * they should, for this exact hub slot. It adds it only for signed records —
- * unsigned is the permanent normal, exactly like plaintext beside ciphertext —
- * and it says nothing about the split workspace artifact: the statement
- * carries a `workspaceDigest`, but that file is retrieved by
- * `pull-apply-workspace.ts`, which does not check it yet. A named gap, not an
- * oversight.
+ * A record carrying a `signature` (#86) adds TWO more true things on return,
+ * and only for signed records — unsigned is the permanent normal, exactly like
+ * plaintext beside ciphertext. First: the archive's plaintext bytes hash to
+ * what a holder of the signing key said they should, for this exact hub slot.
+ * Second (#110): `workspaceAttestation` carries what that same verified
+ * statement said about the SPLIT workspace artifact (#91) — a second hub file
+ * the archive's own digest cannot reach. This stage does not fetch that file;
+ * `pull-apply-workspace.ts` does, and compares.
  */
 export interface FetchStageResult {
     /** Where the bundle was unpacked — `manifest.json`, `sessions/`, and friends sit directly under it. */
     extractDir: string;
     manifest: ExportManifest;
+    /**
+     * What this bundle's signature says about the split workspace artifact its
+     * manifest points at (#110). Minted in the signature gate because that is the
+     * only place in a pull where a statement is proved; `pull-apply-workspace.ts`
+     * is the consumer.
+     */
+    workspaceAttestation: WorkspaceAttestation;
 }
 export declare function runFetchStage(input: FetchStageInput): Promise<StageOutcome<FetchStageResult>>;
 //# sourceMappingURL=pull-fetch.d.ts.map

@@ -33,7 +33,8 @@ import { readManifest, verifySessionsDigest } from "../manifest.js";
  * five until the signature check, and every call in this stage is handed bytes
  * off the hub, so a new one without a `try` is a new way for the stage to
  * leave `hubPull` as a throw — which is exactly what the download and the
- * unpack were until they were typed.
+ * unpack were until they were typed. #110 publishes the verified statement's
+ * workspace pair on the result and adds no call, so the count is unchanged.
  *
  * The retrieval is one abort with FOUR diagnoses, because decryption lives
  * inside it (`fetchBundleArchive`) and its failures are not the transfer's. Two
@@ -121,23 +122,6 @@ function signatureFailureAbort(record, machineId, failure) {
             });
     }
 }
-/**
- * Attribution for one bundle: `null` means carry on, anything else is the
- * abort to return. Extracted so the six-abort accounting in `runFetchStage`
- * stays readable, not because the policy is reusable — it is pull policy.
- *
- * An ABSENT signature applies exactly as before #86, permanently — that is
- * every bundle already on every hub, and the mixed state is structural, the
- * same way plaintext bundles sit beside ciphertext ones. The branch is the
- * absent field on this record, never a hub-wide or config switch, for the
- * suffix rule's reason: a policy bit fails in both directions, invisibly to
- * the machine that flipped it. What keeps "absent" from being the tamperer's
- * free pass is the DOWNGRADE check: once this machine holds a pin for the
- * signer, an unsigned bundle from it is worth a sentence — a warning rather
- * than a refusal, because the push side legitimately falls back to unsigned
- * when its key is unreadable (owner ruling), and refusing here would strand
- * every machine that does.
- */
 async function runSignatureGate(input) {
     const { record, machineId, hubId, projectId, nowIso, tarPath, reasons } = input;
     // Read STRUCTURALLY rather than off the declared type: `HubBundleRecord`
@@ -162,7 +146,7 @@ async function runSignatureGate(input) {
             // the human confirmed.
             reasons.push(`Bundle ${record.bundleId} from machine ${machineId} is unsigned, and that machine's signing key (${keyFingerprint(pin.publicKey)}) is pinned here — so this is a downgrade, not the permanent unsigned normal. The likeliest cause is benign: a machine whose signing key becomes unreadable warns locally and pushes unsigned. A tamperer stripping signature fields looks identical from here, which is why this is said out loud. The bundle was applied — refusing would strand every machine that legitimately stops signing.`);
         }
-        return null;
+        return { aborted: null, attestation: { kind: "unsigned" } };
     }
     /**
      * Statement first, digest second, and the order is diagnosis quality: a
@@ -197,15 +181,15 @@ async function runSignatureGate(input) {
         });
     }
     catch (e) {
-        return stageAbort({
-            success: false,
-            command: "pull",
-            error: `Bundle ${record.bundleId} carries a signature this machine could not even evaluate (${record.file}): ${errorMessage(e)}`,
-            suggestion: "Nothing from this bundle was applied. The signature field on this bundle's index record is shaped so badly the verifier tripped walking it — no record sesh-mover writes looks like that, so the index is damaged or was edited. Ask the machine that pushed it to push again (a push rewrites its own index record); the bundles applied before it in this chain are recorded and will not be refetched.",
-        });
+        return { aborted: stageAbort({
+                success: false,
+                command: "pull",
+                error: `Bundle ${record.bundleId} carries a signature this machine could not even evaluate (${record.file}): ${errorMessage(e)}`,
+                suggestion: "Nothing from this bundle was applied. The signature field on this bundle's index record is shaped so badly the verifier tripped walking it — no record sesh-mover writes looks like that, so the index is damaged or was edited. Ask the machine that pushed it to push again (a push rewrites its own index record); the bundles applied before it in this chain are recorded and will not be refetched.",
+            }) };
     }
     if (!verdict.ok)
-        return signatureFailureAbort(record, machineId, verdict.failure);
+        return { aborted: signatureFailureAbort(record, machineId, verdict.failure) };
     // The digest comparison is the CALLER's half, deliberately: `verifyStatement`
     // authenticates the statement, and only this stage holds the file the
     // statement is about. `digestFile` reads a local file this stage just wrote,
@@ -216,19 +200,33 @@ async function runSignatureGate(input) {
         actualDigest = await digestFile(tarPath);
     }
     catch (e) {
-        return stageAbort({
-            success: false,
-            command: "pull",
-            error: `Bundle ${record.bundleId} downloaded but could not be re-read to check its signature: ${errorMessage(e)}`,
-            suggestion: "Nothing from this bundle was applied. The archive arrived — and was decrypted if it needed to be — and then hashing the local temporary copy failed, which is a fact about this machine's disk or temp directory rather than about the bundle. Retry the pull. The bundles applied before it in this chain are recorded and will not be refetched.",
-        });
+        return { aborted: stageAbort({
+                success: false,
+                command: "pull",
+                error: `Bundle ${record.bundleId} downloaded but could not be re-read to check its signature: ${errorMessage(e)}`,
+                suggestion: "Nothing from this bundle was applied. The archive arrived — and was decrypted if it needed to be — and then hashing the local temporary copy failed, which is a fact about this machine's disk or temp directory rather than about the bundle. Retry the pull. The bundles applied before it in this chain are recorded and will not be refetched.",
+            }) };
     }
     if (actualDigest !== signature.statement.bundleDigest) {
-        return signatureFailureAbort(record, machineId, { kind: "digest-mismatch", file: record.file });
+        return { aborted: signatureFailureAbort(record, machineId, { kind: "digest-mismatch", file: record.file }) };
     }
-    // Note what is NOT checked here: the statement's `workspaceDigest`. The
-    // split workspace artifact (#91) is retrieved by `pull-apply-workspace.ts`,
-    // which does not consult the statement yet — a named gap, not an oversight.
+    // What the statement says about the SPLIT workspace artifact (#91), minted
+    // here and nowhere else (#110). Only now: the statement verified
+    // cryptographically, its context matched the record this pull resolved, and
+    // the archive's own digest matched — so what it says about a SECOND file is
+    // worth carrying. `pull-apply-workspace.ts` downloads that file and compares.
+    //
+    // BOTH fields or NEITHER. `push.ts` writes them together and `canonicalize`
+    // drops `undefined`, so a statement missing one is a DIFFERENT signed
+    // statement rather than a partial one — reading them independently is how a
+    // digest ends up checked against the wrong file. `typeof`-guarded because the
+    // statement's field TYPES are validated nowhere: a buggy or hostile signer
+    // signs `workspaceFile: {}` perfectly well, and a non-string must degrade to
+    // "no attestation" rather than reach a path comparison.
+    const st = signature.statement;
+    const attestation = typeof st.workspaceFile === "string" && typeof st.workspaceDigest === "string"
+        ? { kind: "attested", file: st.workspaceFile, digest: st.workspaceDigest }
+        : { kind: "signed-no-artifact" };
     if (pin === null) {
         // Trust on first use — AFTER the digest matched, so a bundle that fails
         // its own statement can never be the thing that installs a pin. This is
@@ -263,7 +261,7 @@ async function runSignatureGate(input) {
                 break;
         }
     }
-    return null;
+    return { aborted: null, attestation };
 }
 export async function runFetchStage(input) {
     const { backend, record, machineId, hubId, projectId, nowIso, bundleIndex: i, chainLength, tempRoot, state: st } = input;
@@ -350,8 +348,8 @@ export async function runFetchStage(input) {
     const sigOutcome = await runSignatureGate({
         record, machineId, hubId, projectId, nowIso, tarPath, reasons,
     });
-    if (sigOutcome !== null)
-        return sigOutcome;
+    if (sigOutcome.aborted !== null)
+        return sigOutcome.aborted;
     const extractDir = join(tempRoot, record.bundleId);
     mkdirSync(extractDir, { recursive: true });
     /**
@@ -517,6 +515,6 @@ export async function runFetchStage(input) {
             bundleIndex: i,
         };
     }
-    return stageOk({ extractDir, manifest: bundleManifest }, reasons);
+    return stageOk({ extractDir, manifest: bundleManifest, workspaceAttestation: sigOutcome.attestation }, reasons);
 }
 //# sourceMappingURL=pull-fetch.js.map

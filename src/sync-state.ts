@@ -492,6 +492,14 @@ export const MAX_WORKSPACE_GENERATIONS = 50;
  *   pushing machine's wall clock — the hub is a passive filesystem and stamps
  *   nothing — so it must never be compared with another machine's stamp to
  *   order two generations.
+ * - **`generation.digest` describes the HUB ARCHIVE this tree came out of,
+ *   never the tree afterwards** (#110). A merge writes files, so hashing the
+ *   directory later would answer a different question and would not match what
+ *   the next `fetchAncestorWorkspace` downloads. It is absent for an inline
+ *   (pre-#91) generation, whose `file` names a bundle no pull ever hashed, and
+ *   absent means NO CHECK — the same rule as an absent `.age` suffix. Never
+ *   backfill it from whatever the hub holds today: that would pin an
+ *   attacker-supplied value as the trusted one.
  *
  * Same v1/v2 discipline as `setThreadId`: the hub block (and with it
  * schemaVersion 2) appears only once hub data is first written.
@@ -499,7 +507,7 @@ export const MAX_WORKSPACE_GENERATIONS = 50;
 export function setLastWorkspace(
   state: SyncState,
   hubId: string,
-  generation: { bundleId: string; file: string; pushedAt: string }
+  generation: { bundleId: string; file: string; pushedAt: string; digest?: string }
 ): void {
   if (!state.hub) {
     state.hub = { hubId, threadByLocalSession: {} };
@@ -510,6 +518,7 @@ export function setLastWorkspace(
     file: generation.file,
     pushedAt: generation.pushedAt,
     syncedAt: new Date().toISOString(),
+    ...(generation.digest !== undefined ? { digest: generation.digest } : {}),
   };
   const rest = knownWorkspaceGenerations(state).filter((g) => g.bundleId !== ref.bundleId);
   state.hub.lastWorkspace = ref;

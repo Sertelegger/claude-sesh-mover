@@ -81,6 +81,32 @@ export interface BundleStatement {
   workspaceDigest?: string;
 }
 
+/**
+ * What a bundle's signature says about its split workspace artifact (#91),
+ * AFTER `verifyStatement` and the `bundleDigest` comparison have both passed —
+ * minted only in `pull-fetch.ts`'s signature gate, which is the one place in a
+ * pull where a statement is proved.
+ *
+ * THREE values rather than `{file,digest} | null`, and the third arm is the
+ * point: "no signature at all" and "a verified signature that named no
+ * artifact" are different facts with different handling. The first is the
+ * permanent normal — every pre-#86 bundle on every hub — and must apply exactly
+ * as it always has. Same reason `pins.ts` keeps `tofu`/`confirmed`/`null` as
+ * three facts rather than a boolean.
+ *
+ * Narrow ON PURPOSE. A consumer must never be handed `record.signature`: that
+ * field is raw out of another machine's index file, which is the exact file the
+ * pin store exists to distrust, and handing it over invites a second
+ * `verifyStatement`, a second pin read and a second policy.
+ */
+export type WorkspaceAttestation =
+  /** No signature on this record. Permanent normal; no check runs. */
+  | { kind: "unsigned" }
+  /** Signed and verified; the statement named no workspace artifact. */
+  | { kind: "signed-no-artifact" }
+  /** Signed and verified. This is what the signer said about the artifact. */
+  | { kind: "attested"; file: string; digest: string };
+
 /** What lands on `HubBundleRecord.signature`. */
 export interface BundleSignature {
   statement: BundleStatement;

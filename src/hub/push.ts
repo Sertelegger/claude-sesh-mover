@@ -1131,8 +1131,15 @@ export async function hubPush(opts: HubPushOptions): Promise<HubPushOutcome> {
           // it at the bundle would leave every ancestor fetch degrading to
           // "carries no workspace tree" and every merge falling back to
           // no-ancestor: safe, silent and permanently wrong.
+          // The digest is the one `uploadArchive` computed over the PLAINTEXT
+          // artifact — the same number the signed statement carries (#110), and
+          // recorded here so a future pull on this machine can tell whether the
+          // artifact it is about to merge against is still the copy this
+          // machine actually pushed. Absent when the push could not compute one,
+          // and absent means no check.
           setLastWorkspace(stateWs, hub.hubId, {
             bundleId, file: workspaceUpload.hubFile, pushedAt,
+            ...(workspaceDigest !== undefined ? { digest: workspaceDigest } : {}),
           });
         }
         if (manifest.memoryDigest) {

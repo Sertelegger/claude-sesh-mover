@@ -197,6 +197,7 @@ export function initApplyState(input) {
         // and the two want opposite advice (that skip's remedies cannot deliver a
         // payload that was never in the bundle).
         workspaceDeclaredMissing: undefined,
+        workspaceUnverified: undefined,
         workspaceBundleIndex,
         chainWorkspaceBases,
         importedSessions,

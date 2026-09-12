@@ -245,6 +245,17 @@ function appendEntry(path: string, entry: Record<string, unknown>): void {
  *   `lastCarry`, which is carry's. A cross-stage fact belongs to the
  *   sequencer.
  *
+ * RAISED 358 -> 366 by the workspace-artifact attestation (#110). Measured at
+ * 362 when the change landed. What arrived here is wiring in the same shape #91
+ * used for `workspaceFile`: one more value destructured from the fetch result,
+ * one more argument forwarded to the workspace stage, one line copying the new
+ * outcome field onto the result — plus the comment saying why the attestation
+ * is FORWARDED rather than read off `record.signature`, which is the raw field
+ * out of another machine's index file and the exact thing the pin store exists
+ * to distrust. That comment is the part worth its lines: it is what stops the
+ * next reader reaching for the record. All of the new WORK is in
+ * `pull-apply-workspace.ts` and `pull-fetch.ts`.
+ *
  * RAISED 346 -> 358 by per-machine signing (#86). The change added two things
  * to this function and both are sequencing rather than work: three fields
  * passed into `runFetchStage` (the statement's context, plus the pull's single
@@ -272,7 +283,7 @@ describe("hubPull is sequencing", () => {
     expect(
       lines,
       "hubPull grew — extract the new work into a stage, or raise this ratchet in the same commit and say why"
-    ).toBeLessThan(358);
+    ).toBeLessThan(366);
   });
 
   it("spreads each in-loop stage's reasons inside the loop, not after it", () => {
