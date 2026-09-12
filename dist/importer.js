@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendFileSync, lstatSync, rmSync, statSync, writeFileSync, } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, } from "./manifest.js";
+import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, layerFiles, layerFilePath, isAgentTranscript, } from "./manifest.js";
 import { rewriteJsonlStream, buildImportRewriteContext } from "./rewriter.js";
 import { encodeProjectPath } from "./platform.js";
 import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
@@ -1744,13 +1744,18 @@ export async function importSession(options) {
             if (existsSync(subagentsDir) && layerOk("subagents")) {
                 const targetSubDir = join(targetProjectDir, newSessionId, "subagents");
                 mkdirSync(targetSubDir, { recursive: true });
-                for (const file of readdirSync(subagentsDir)) {
-                    if (file.endsWith(".jsonl")) {
+                // `layerFiles` — the same walk the digest and the export copy use, so
+                // this applies exactly what the bundle carries (#121). Recursive since
+                // Claude Code writes `subagents/workflows/<wf_id>/`.
+                for (const rel of layerFiles(subagentsDir)) {
+                    const dest = join(targetSubDir, ...rel.split("/"));
+                    mkdirSync(dirname(dest), { recursive: true });
+                    if (isAgentTranscript(rel)) {
                         // Rewrite subagent JSONL too (never applies version adapters).
-                        await rewriteJsonlStream(join(subagentsDir, file), join(targetSubDir, file), ctx, { newSessionId });
+                        await rewriteJsonlStream(layerFilePath(subagentsDir, rel), dest, ctx, { newSessionId });
                     }
                     else {
-                        copyFileSync(join(subagentsDir, file), join(targetSubDir, file));
+                        copyFileSync(layerFilePath(subagentsDir, rel), dest);
                     }
                 }
             }
@@ -1759,8 +1764,10 @@ export async function importSession(options) {
             if (existsSync(toolResultsDir) && layerOk("tool-results")) {
                 const targetTrDir = join(targetProjectDir, newSessionId, "tool-results");
                 mkdirSync(targetTrDir, { recursive: true });
-                for (const file of readdirSync(toolResultsDir)) {
-                    copyFileSync(join(toolResultsDir, file), join(targetTrDir, file));
+                for (const rel of layerFiles(toolResultsDir)) {
+                    const dest = join(targetTrDir, ...rel.split("/"));
+                    mkdirSync(dirname(dest), { recursive: true });
+                    copyFileSync(layerFilePath(toolResultsDir, rel), dest);
                 }
             }
             // Copy file history
@@ -1768,8 +1775,10 @@ export async function importSession(options) {
             if (existsSync(fileHistoryDir) && layerOk("file-history")) {
                 const targetFhDir = join(targetConfigDir, "file-history", newSessionId);
                 mkdirSync(targetFhDir, { recursive: true });
-                for (const file of readdirSync(fileHistoryDir)) {
-                    copyFileSync(join(fileHistoryDir, file), join(targetFhDir, file));
+                for (const rel of layerFiles(fileHistoryDir)) {
+                    const dest = join(targetFhDir, ...rel.split("/"));
+                    mkdirSync(dirname(dest), { recursive: true });
+                    copyFileSync(layerFilePath(fileHistoryDir, rel), dest);
                 }
             }
         }

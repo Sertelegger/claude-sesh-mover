@@ -1,11 +1,11 @@
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, statSync, } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, statSync, } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_WINDOW_MS, } from "./append.js";
 import { recordSharedLayers } from "./pull-apply-state.js";
 import { errorMessage } from "../errors.js";
 import { applySharedLayers, importSession } from "../importer.js";
-import { computeIntegrityHashFromFile } from "../manifest.js";
+import { computeIntegrityHashFromFile, isAgentTranscript, layerFilePath, layerFiles, } from "../manifest.js";
 import { findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
@@ -142,17 +142,25 @@ async function copyLayerDirs(extractDir, bundleSessionId, targetProjectDir, base
         if (!existsSync(from))
             continue;
         mkdirSync(to, { recursive: true });
-        for (const f of readdirSync(from)) {
-            const dest = join(to, f);
+        // `layerFiles` — the ONE walk the digest, the export copy and the importer
+        // share (#121), so this applies exactly what the bundle carries. Recursive
+        // because Claude Code writes `subagents/workflows/<wf_id>/`; before the
+        // shared walk each of the four sites did its own flat `readdirSync` and a
+        // directory entry reached `copyFileSync`.
+        for (const rel of layerFiles(from)) {
+            const dest = join(to, ...rel.split("/"));
             if (existsSync(dest))
                 continue;
-            if (rewriteJsonl && f.endsWith(".jsonl")) {
+            mkdirSync(dirname(dest), { recursive: true });
+            if (rewriteJsonl && isAgentTranscript(rel)) {
                 // Path rewrite + the base's session id, never version adapters —
-                // the same rule importer.ts follows for subagents.
-                await rewriteJsonlStream(join(from, f), dest, ctx, { newSessionId: baseSessionId });
+                // the same rule importer.ts follows for subagents. `isAgentTranscript`
+                // rather than `.jsonl`: a nested `workflows/<id>/journal.jsonl` is not a
+                // transcript and the rewrite would stamp a `sessionId` into it.
+                await rewriteJsonlStream(layerFilePath(from, rel), dest, ctx, { newSessionId: baseSessionId });
             }
             else {
-                copyFileSync(join(from, f), dest);
+                copyFileSync(layerFilePath(from, rel), dest);
             }
         }
     }
