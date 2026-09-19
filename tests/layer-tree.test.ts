@@ -28,7 +28,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFixtureTree } from "./fixtures/create-fixtures.js";
@@ -149,6 +152,89 @@ describe("nested layer directories (#121)", () => {
     // Edit a NESTED file: before #121 this changed nothing the manifest knew about.
     writeFileSync(join(layerDir, "workflows", "wf_abc123", "agent-anested01.meta.json"), "{}");
     expect(await computeLayerDigest(layerDir)).not.toBe(declared);
+  });
+
+  /**
+   * #125 — the apply side refuses a symlink, and the DIGEST IS NOT THE GUARD.
+   *
+   * Tampering with an honest bundle is caught by `layerDigests` and the layer
+   * is dropped with an integrity warning. That is accident detection, not a
+   * security control: an attacker ASSEMBLING a bundle computes the digest over
+   * what is there, because `computeLayerDigest` resolves links. So this test
+   * restamps the manifest the way such a bundle would already have been built,
+   * which is what makes it a test of the guard rather than of the digest.
+   *
+   * Measured before the fix: `success: true`, `warnings: []`, and the host
+   * file's content sitting in the target session directory.
+   *
+   * Proof lives on Linux — this is `Dirent`/`lstat` semantics, not the Windows
+   * `COPYFILE_EXCL` class.
+   */
+  it("refuses a SYMLINK in a bundle layer and does not copy the host file it points at", async () => {
+    addWorkflowTree();
+    const exported = await exportTo("symlink-attack");
+    expect(exported.success).toBe(true);
+    if (!exported.success || !("exportPath" in exported)) return;
+
+    // A file on the importing machine that the bundle must not be able to read.
+    const outside = mkdtempSync(join(tmpdir(), "sm-host-"));
+    writeFileSync(join(outside, "stolen.txt"), "HOST-ONLY-CONTENT\n");
+
+    const layerDir = join(exported.exportPath, "sessions", sessionId, "subagents");
+    const planted = join(layerDir, "agent-sub1.meta.json");
+    unlinkSync(planted);
+    symlinkSync(join(outside, "stolen.txt"), planted);
+
+    // Restamp exactly as an assembling attacker would — see the block above.
+    const { computeLayerDigest, readManifest, writeManifest } = await import("../src/manifest.js");
+    const manifest = readManifest(exported.exportPath);
+    manifest.sessions[0].layerDigests!.subagents = (await computeLayerDigest(layerDir))!;
+    writeManifest(exported.exportPath, manifest);
+
+    const targetBase = mkdtempSync(join(tmpdir(), "sm-symtarget-"));
+    const targetConfig = join(targetBase, ".claude");
+    mkdirSync(targetConfig, { recursive: true });
+    const targetProject = "/home/other/work/testproject";
+
+    const { importSession } = await import("../src/importer.js");
+    const imported = await importSession({
+      exportPath: exported.exportPath,
+      targetConfigDir: targetConfig,
+      targetProjectPath: targetProject,
+      targetClaudeVersion: "2.1.81",
+      noRegister: true,
+    });
+    expect(imported.success).toBe(true);
+    if (!imported.success || !("importedSessions" in imported)) return;
+    const newId = imported.importedSessions[0].newId;
+
+    const { encodeProjectPath } = await import("../src/platform.js");
+    const landedDir = join(targetConfig, "projects", encodeProjectPath(targetProject), newId, "subagents");
+
+    // 1. The link target's content is nowhere in the target config dir.
+    expect(existsSync(join(landedDir, "agent-sub1.meta.json"))).toBe(false);
+    const swept: string[] = [];
+    const sweep = (d: string): void => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) sweep(p);
+        else if (e.isFile()) swept.push(readFileSync(p, "utf-8"));
+      }
+    };
+    sweep(targetConfig);
+    expect(swept.some((c) => c.includes("HOST-ONLY-CONTENT"))).toBe(false);
+
+    // 2. The user is TOLD, and not by an integrity warning that would
+    //    mis-describe a hand-built bundle as damage.
+    const warned = (imported.warnings ?? []).join(" ");
+    expect(warned).toContain("agent-sub1.meta.json");
+    expect(warned).toMatch(/symlink/i);
+
+    // 3. The rest of the layer still applied — the refusal is per entry.
+    expect(existsSync(join(landedDir, "agent-sub1.jsonl"))).toBe(true);
+
+    rmSync(targetBase, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   });
 
   it("round-trips through import: nested transcripts are PATH-REWRITTEN, the journal is not", async () => {

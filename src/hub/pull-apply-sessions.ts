@@ -15,6 +15,7 @@ import {
   isAgentTranscript,
   layerFilePath,
   layerFiles,
+  walkLayer,
 } from "../manifest.js";
 import {
   findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid,
@@ -166,7 +167,8 @@ async function copyLayerDirs(
   baseSessionId: string,
   targetConfigDir: string,
   ctx: RewriteContext
-): Promise<void> {
+): Promise<string[]> {
+  const refusals: string[] = [];
   const pairs: Array<{ from: string; to: string; rewriteJsonl: boolean }> = [
     {
       from: join(extractDir, "sessions", bundleSessionId, "subagents"),
@@ -192,7 +194,17 @@ async function copyLayerDirs(
     // because Claude Code writes `subagents/workflows/<wf_id>/`; before the
     // shared walk each of the four sites did its own flat `readdirSync` and a
     // directory entry reached `copyFileSync`.
-    for (const rel of layerFiles(from)) {
+    // `rejectSymlinks` — a hub bundle is untrusted in exactly the way an
+    // imported one is (#125), and `fetchBundleArchive` hands back a directory
+    // this stage walks, so `archiver.ts`'s tar-entry refusal is not in play for
+    // a tree that arrived any other way.
+    const walked = walkLayer(from, { rejectSymlinks: true });
+    for (const rel of walked.refusedSymlinks) {
+      refusals.push(
+        `A bundle layer file (${rel}) arrived as a SYMLINK rather than a file and was not applied. No push sesh-mover makes produces one, so this bundle was assembled or edited by hand; following it would have copied whatever it points at on this machine into the session, which the next push would upload.`
+      );
+    }
+    for (const rel of walked.files) {
       const dest = join(to, ...rel.split("/"));
       if (existsSync(dest)) continue;
       mkdirSync(dirname(dest), { recursive: true });
@@ -207,6 +219,7 @@ async function copyLayerDirs(
       }
     }
   }
+  return refusals;
 }
 
 /**
@@ -552,9 +565,11 @@ export async function runApplySessionsStage(
           // integrity — and the splice above is already committed, so a
           // throw here would be strictly worse than a warning.
           try {
-            await copyLayerDirs(
-              extractDir, record.sessionIdInBundle,
-              targetProjectDir, baseSessionId, configDir, ctx
+            reasons.push(
+              ...(await copyLayerDirs(
+                extractDir, record.sessionIdInBundle,
+                targetProjectDir, baseSessionId, configDir, ctx
+              ))
             );
           } catch (e) {
             reasons.push(
@@ -751,9 +766,11 @@ export async function runApplySessionsStage(
               // give a second session the same auxiliary detail is a poor
               // trade; the preserved transcript is complete without them.
               try {
-                await copyLayerDirs(
-                  extractDir, record.sessionIdInBundle,
-                  targetProjectDir, baseSessionId, configDir, ctx
+                reasons.push(
+                  ...(await copyLayerDirs(
+                    extractDir, record.sessionIdInBundle,
+                    targetProjectDir, baseSessionId, configDir, ctx
+                  ))
                 );
               } catch (e) {
                 reasons.push(

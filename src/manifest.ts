@@ -347,8 +347,41 @@ void _hashedLayersAreExportLayers;
  * Separators are normalised to `/` so a bundle written on Windows and read on
  * POSIX hashes identically; `join` would emit `workflows\\wf1\\x` there.
  */
-export function layerFiles(dir: string): string[] {
-  const out: string[] = [];
+export interface LayerWalk {
+  /** Relative POSIX paths of the files this layer carries, sorted. */
+  files: string[];
+  /**
+   * Entries refused for being a symlink rather than a regular file — populated
+   * only under `rejectSymlinks` (#125). Always empty on the read side.
+   */
+  refusedSymlinks: string[];
+}
+
+/**
+ * The walk itself. `layerFiles` is the read-side accessor; the APPLY side calls
+ * this with `rejectSymlinks` (#125).
+ *
+ * **Two leaf predicates, and which one is correct depends on who wrote the
+ * tree.** On the read side (the digest, and the export copy reading this
+ * machine's own config dir) a leaf is `statSync(...).isFile()`, which RESOLVES
+ * links: that is what this did before #121, it keeps a flat directory's digest
+ * byte-identical, and dereferencing a link the user placed in their own config
+ * dir is existing, intended behaviour.
+ *
+ * On the APPLY side the tree came out of a bundle that may have been assembled
+ * by someone else, and a symlink there is not something this plugin ever
+ * writes — export dereferences, so every layer entry it produces is a regular
+ * file. Following one copies arbitrary host content into the target session
+ * directory, which the default-on session-end auto-push can then upload. So the
+ * apply side uses `lstatSync` and refuses the entry, naming it.
+ *
+ * `archiver.ts` already refuses `SymbolicLink` tar entries, but only inside
+ * `extractArchive` — a `--format dir` bundle never passes through it, which is
+ * exactly the hole this closes.
+ */
+export function walkLayer(dir: string, opts: { rejectSymlinks?: boolean } = {}): LayerWalk {
+  const files: string[] = [];
+  const refusedSymlinks: string[] = [];
   const walk = (abs: string, prefix: string): void => {
     let entries;
     try {
@@ -362,8 +395,16 @@ export function layerFiles(dir: string): string[] {
         walk(join(abs, e.name), rel);
         continue;
       }
+      if (opts.rejectSymlinks) {
+        // `Dirent` already answered this without a syscall: a symlink reports
+        // neither `isFile()` nor `isDirectory()`. `lstat` is not needed and
+        // would only add a race between the readdir and the check.
+        if (e.isFile()) files.push(rel);
+        else if (e.isSymbolicLink()) refusedSymlinks.push(rel);
+        continue;
+      }
       try {
-        if (statSync(join(abs, e.name)).isFile()) out.push(rel);
+        if (statSync(join(abs, e.name)).isFile()) files.push(rel);
       } catch {
         // Dangling symlink, or a race with a file being removed. Not carried,
         // not hashed — the two stay in agreement, which is the point.
@@ -373,8 +414,13 @@ export function layerFiles(dir: string): string[] {
   walk(dir, "");
   // Explicit comparator: UTF-16 code-unit order, identical on every platform,
   // never the host locale's collation.
-  out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  return out;
+  files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  refusedSymlinks.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return { files, refusedSymlinks };
+}
+
+export function layerFiles(dir: string): string[] {
+  return walkLayer(dir).files;
 }
 
 /**

@@ -5,7 +5,7 @@ import {
 } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { overrideHome, overridePath } from "./helpers/env.js";
 import { copyTreeSync } from "./helpers/copy-tree.js";
 import { readBytesLf, readTextLf } from "./helpers/eol.js";
@@ -106,6 +106,61 @@ describe("captureCarry", () => {
       expect(meta.patchBytes).toBe(readFileSync(join(dest, "changes.patch")).length);
     } finally {
       cleanup(repo, dest);
+    }
+  });
+
+  /**
+   * #119 — the refusal is right, the silence was not.
+   *
+   * A symlink must never be carried: `git ls-files --others` lists one like any
+   * other entry and a `stat`-based check follows it, so a link pointing at
+   * `~/.ssh/id_rsa` would put the TARGET's bytes in the bundle. What this pins
+   * is that a path the user NAMED and did not get is said out loud — one line
+   * below a `catch` whose own comment calls a silent omission the thing it
+   * exists to prevent.
+   *
+   * Found for real: this repo symlinked its own `docs/` into a separate
+   * documentation repo, and the `.sesh-mover-include` line naming it went from
+   * carrying 28 files to carrying nothing, with `reIncludedCount` unchanged and
+   * no diagnostic anywhere in the result.
+   */
+  it("says so when a re-included path is a symlink, instead of dropping it silently", async () => {
+    const repo = gitRepo();
+    const dest = tempDest();
+    try {
+      const outside = mkdtempSync(join(tmpdir(), "sesh-outside-"));
+      writeFileSync(join(outside, "real.md"), "# elsewhere\n");
+      writeFileSync(join(repo, ".gitignore"), "docs\n");
+      symlinkSync(outside, join(repo, "docs"));
+      writeCarryRules(repo, "include", "docs\n");
+      git(repo, ["add", "-A"]);
+      git(repo, ["commit", "-q", "-m", "link"]);
+      // Something real to carry. Without it `captureCarry` returns
+      // `{captured:false, reason:"clean"}` before it ever walks the candidates,
+      // and the test would pass against a completely unfixed build.
+      writeFileSync(join(repo, "work.txt"), "in progress\n");
+
+      // `diagnostics` is an INJECTED channel, not a return field: the result is
+      // `{captured, meta}`, and `capturePayload` is what turns these into user
+      // warnings. Asserting on `r.diagnostics` silently reads `undefined`.
+      const diagnostics: string[] = [];
+      const r = await captureCarry(repo, dest, { diagnostics });
+      expect(r.captured).toBe(true);
+      if (!r.captured) return;
+
+      // Still not carried — the guard is unchanged and must stay.
+      expect(existsSync(join(dest, "untracked", "docs"))).toBe(false);
+      expect(r.meta.reIncluded).toEqual([]);
+      // But the user is told, by name and by reason.
+      const said = diagnostics.join(" ");
+      expect(said).toContain("docs");
+      expect(said).toMatch(/symlink/i);
+      expect(said).toMatch(/\.sesh-mover-include/);
+
+      rmSync(outside, { recursive: true, force: true });
+    } finally {
+      rmSync(dirname(dest), { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
     }
   });
 

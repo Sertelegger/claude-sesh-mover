@@ -685,6 +685,15 @@ interface CarriedFile {
  *   directory shape — `vendor/lib/`, an untracked nested repository — and
  *   counting it as a file makes `untrackedCount` a lie.
  */
+/** What an entry is, when it is not a regular file — for the #119 disclosure. */
+function describeNonFile(st: { isSymbolicLink(): boolean; isDirectory(): boolean; isFIFO(): boolean; isSocket(): boolean }): string {
+  if (st.isSymbolicLink()) return "symlink";
+  if (st.isDirectory()) return "directory";
+  if (st.isFIFO()) return "named pipe";
+  if (st.isSocket()) return "socket";
+  return "special file";
+}
+
 function collectFiles(
   projectPath: string,
   rels: Iterable<{ rel: string; reIncluded: boolean }>,
@@ -707,7 +716,29 @@ function collectFiles(
       );
       continue;
     }
-    if (!st.isFile()) continue; // symlink, directory (nested repo), socket, FIFO
+    if (!st.isFile()) {
+      // A path the user NAMED in `.sesh-mover-include` and did not get (#119).
+      // The refusal itself is correct and must not change — `git ls-files
+      // --others` lists a symlink like any other entry and a `stat`-based check
+      // follows it, so a `key -> ~/.ssh/id_rsa` link would put the TARGET's
+      // bytes in the bundle. What was wrong is the silence, one line below a
+      // `catch` whose comment says "a silent omission is what this exists to
+      // prevent".
+      //
+      // Only for a RE-INCLUDED path, deliberately. An untracked nested
+      // repository arrives here as `vendor/lib/` on every single push and
+      // nobody asked for it by name; warning about that is noise. A
+      // re-inclusion is a line in a committed file whose whole purpose is
+      // naming things that would otherwise be dropped, so its absence from
+      // `reIncluded` reads as "nothing to say" when the truth is "asked for,
+      // refused".
+      if (reIncluded) {
+        diagnostics.push(
+          `${JSON.stringify(rel)} is named by .sesh-mover-include but is a ${describeNonFile(st)}, not a file, so it was NOT carried. Contents are never followed through a link — that would put the link target's bytes in the bundle. If you meant to carry what it points at, name that path instead.`
+        );
+      }
+      continue; // symlink, directory (nested repo), socket, FIFO
+    }
     files.push({ rel, size: st.size, reIncluded });
   }
   return files;

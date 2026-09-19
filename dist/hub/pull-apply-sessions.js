@@ -5,7 +5,7 @@ import { adoptHubBranch, readDeltaChainInfo, tryAppendContinuation, APPEND_LIVE_
 import { recordSharedLayers } from "./pull-apply-state.js";
 import { errorMessage } from "../errors.js";
 import { applySharedLayers, importSession } from "../importer.js";
-import { computeIntegrityHashFromFile, isAgentTranscript, layerFilePath, layerFiles, } from "../manifest.js";
+import { computeIntegrityHashFromFile, isAgentTranscript, layerFilePath, walkLayer, } from "../manifest.js";
 import { findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
 import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
@@ -121,6 +121,7 @@ function threadBaseCandidates(state, threadId, pendingSessionId, targetProjectDi
  * uuid-named, so a collision means the same artifact already arrived.
  */
 async function copyLayerDirs(extractDir, bundleSessionId, targetProjectDir, baseSessionId, targetConfigDir, ctx) {
+    const refusals = [];
     const pairs = [
         {
             from: join(extractDir, "sessions", bundleSessionId, "subagents"),
@@ -147,7 +148,15 @@ async function copyLayerDirs(extractDir, bundleSessionId, targetProjectDir, base
         // because Claude Code writes `subagents/workflows/<wf_id>/`; before the
         // shared walk each of the four sites did its own flat `readdirSync` and a
         // directory entry reached `copyFileSync`.
-        for (const rel of layerFiles(from)) {
+        // `rejectSymlinks` — a hub bundle is untrusted in exactly the way an
+        // imported one is (#125), and `fetchBundleArchive` hands back a directory
+        // this stage walks, so `archiver.ts`'s tar-entry refusal is not in play for
+        // a tree that arrived any other way.
+        const walked = walkLayer(from, { rejectSymlinks: true });
+        for (const rel of walked.refusedSymlinks) {
+            refusals.push(`A bundle layer file (${rel}) arrived as a SYMLINK rather than a file and was not applied. No push sesh-mover makes produces one, so this bundle was assembled or edited by hand; following it would have copied whatever it points at on this machine into the session, which the next push would upload.`);
+        }
+        for (const rel of walked.files) {
             const dest = join(to, ...rel.split("/"));
             if (existsSync(dest))
                 continue;
@@ -164,6 +173,7 @@ async function copyLayerDirs(extractDir, bundleSessionId, targetProjectDir, base
             }
         }
     }
+    return refusals;
 }
 /**
  * Land ONE bundle's session content: splice it onto an existing transcript,
@@ -308,7 +318,7 @@ export async function runApplySessionsStage(input) {
                     // integrity — and the splice above is already committed, so a
                     // throw here would be strictly worse than a warning.
                     try {
-                        await copyLayerDirs(extractDir, record.sessionIdInBundle, targetProjectDir, baseSessionId, configDir, ctx);
+                        reasons.push(...(await copyLayerDirs(extractDir, record.sessionIdInBundle, targetProjectDir, baseSessionId, configDir, ctx)));
                     }
                     catch (e) {
                         reasons.push(`Continuation was appended to session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${errorMessage(e)}) — the transcript is complete; those side files are missing.`);
@@ -478,7 +488,7 @@ export async function runApplySessionsStage(input) {
                             // give a second session the same auxiliary detail is a poor
                             // trade; the preserved transcript is complete without them.
                             try {
-                                await copyLayerDirs(extractDir, record.sessionIdInBundle, targetProjectDir, baseSessionId, configDir, ctx);
+                                reasons.push(...(await copyLayerDirs(extractDir, record.sessionIdInBundle, targetProjectDir, baseSessionId, configDir, ctx)));
                             }
                             catch (e) {
                                 reasons.push(`The hub branch was adopted into session ${baseSessionId}, but copying its subagent/tool-result/file-history files failed (${errorMessage(e)}) — the transcript is complete; those side files are missing.`);
