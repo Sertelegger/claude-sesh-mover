@@ -238,7 +238,7 @@ describe("platform detection", () => {
      * entries' `cwd` and encodes to a different name. Skips cleanly when there
      * is no config dir to read, so it is a no-op in CI containers.
      */
-    it("reproduces the directory names Claude Code actually created on this machine", async () => {
+    it("reproduces the directory names Claude Code actually created on this machine", async (ctx) => {
       const { encodeProjectPath } = await import("../src/platform.js");
       const { readdirSync, readFileSync, existsSync } = await import("node:fs");
       const { join } = await import("node:path");
@@ -247,7 +247,16 @@ describe("platform detection", () => {
       const roots = [".claude", ".claude-nv", ".claude-nfg"]
         .map((d) => join(homedir(), d, "projects"))
         .filter((d) => existsSync(d));
-      if (roots.length === 0) return; // nothing to check here
+      if (roots.length === 0) {
+        // SKIP, not silently pass. A CI runner has no Claude config dir, so an
+        // early `return` here made this the most important assertion in the
+        // file report green without checking anything — and on the Windows job
+        // that is the ONLY thing that could settle whether the encoder sees a
+        // native path. A vacuous pass reading as a verification is exactly the
+        // failure this repo's "a green suite is not evidence" rule names.
+        ctx.skip();
+        return;
+      }
 
       let checked = 0;
       const mismatches: string[] = [];
