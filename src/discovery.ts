@@ -1,6 +1,6 @@
 import { readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { encodeProjectPath } from "./platform.js";
+import { encodeProjectPath, legacyEncodeProjectPath } from "./platform.js";
 import {
   readFirstJsonlLine,
   readFirstConversationEntry,
@@ -14,28 +14,45 @@ export function discoverSessions(
   projectPath: string
 ): DiscoveredSession[] {
   const encoded = encodeProjectPath(projectPath);
-  const projectDir = join(configDir, "projects", encoded);
+  // ALSO scan the pre-0.12.0 directory name when it differs (#126). That
+  // directory is where a pre-0.12.0 `import` put transcripts for any path
+  // containing a `.`, a `_`, a space — or, on Windows, any path at all — and
+  // Claude Code has never read it. Including those sessions here is the only
+  // way a user can still SEE them and migrate them into place; leaving them out
+  // would make the fix look like it deleted their history.
+  //
+  // A READ widening only. Nothing in this module chooses a write destination,
+  // and nothing downstream may: an import must land where Claude Code reads.
+  const legacy = legacyEncodeProjectPath(projectPath);
+  const dirs = [encoded, ...(legacy !== encoded ? [legacy] : [])]
+    .map((e) => ({ encoded: e, dir: join(configDir, "projects", e) }))
+    .filter((d) => existsSync(d.dir));
 
-  if (!existsSync(projectDir)) {
+  if (dirs.length === 0) {
     return [];
   }
 
   const sessions: DiscoveredSession[] = [];
 
-  const files = readdirSync(projectDir).filter((f) => f.endsWith(".jsonl"));
+  for (const { encoded: encodedDir, dir: projectDir } of dirs) {
+    const files = readdirSync(projectDir).filter((f) => f.endsWith(".jsonl"));
 
-  for (const file of files) {
-    const sessionId = file.replace(".jsonl", "");
-    const jsonlPath = join(projectDir, file);
-    const session = parseSessionJsonl(
-      jsonlPath,
-      sessionId,
-      projectPath,
-      encoded,
-      configDir
-    );
-    if (session) {
-      sessions.push(session);
+    for (const file of files) {
+      const sessionId = file.replace(".jsonl", "");
+      const jsonlPath = join(projectDir, file);
+      // Each directory passes its OWN encoded name: the session's layer dirs
+      // and file-history live beside it, under the name it is actually stored
+      // as, not under the name it should have been stored as.
+      const session = parseSessionJsonl(
+        jsonlPath,
+        sessionId,
+        projectPath,
+        encodedDir,
+        configDir
+      );
+      if (session) {
+        sessions.push(session);
+      }
     }
   }
 
