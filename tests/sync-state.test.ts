@@ -353,6 +353,67 @@ describe("sync-state", () => {
   });
 });
 
+/**
+ * #126 — the sync-state file is NAMED with the project-path encoding, so
+ * changing the encoder orphans every existing one. The loss is silent and
+ * four-fold (dedup registry, thread map, workspace generations, per-peer sent
+ * ledger), so the path helper renames forward exactly once.
+ */
+describe("sync-state — the #126 encoder rename", () => {
+  let home: string;
+  let restore: { restore(): void };
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { overrideHome } = await import("./helpers/env.js");
+    home = mkdtempSync(join(tmpdir(), "sesh-syncmig-"));
+    restore = overrideHome(home);
+  });
+  afterEach(async () => {
+    restore.restore();
+    const { rmSync } = await import("node:fs");
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("renames a pre-0.12.0 state file forward, once, preserving its contents", async () => {
+    const { syncStatePath, readSyncState } = await import("../src/sync-state.js");
+    const { encodeProjectPath, legacyEncodeProjectPath } = await import("../src/platform.js");
+    const { mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+    const { userSeshMoverDir } = await import("../src/paths.js");
+
+    const project = "/Users/testuser/Projects/my_app.v2";
+    expect(legacyEncodeProjectPath(project)).not.toBe(encodeProjectPath(project));
+
+    const dir = join(userSeshMoverDir(), "sync-state");
+    mkdirSync(dir, { recursive: true });
+    const legacyFile = join(dir, `${legacyEncodeProjectPath(project)}.json`);
+    writeFileSync(legacyFile, JSON.stringify({ projectPath: project, schemaVersion: 1, peers: {}, lineage: {}, imported: { "hash-abc": { localSessionId: "sess-1", importedAt: "2026-04-10T12:00:00Z", registered: true } } }));
+
+    const resolved = syncStatePath(project);
+    expect(resolved.endsWith(`${encodeProjectPath(project)}.json`)).toBe(true);
+    expect(existsSync(legacyFile)).toBe(false); // moved, not copied
+    // The contents survived — this is the registry whose loss silently
+    // un-dedupes every future import.
+    expect(readSyncState(project).imported["hash-abc"]?.localSessionId).toBe("sess-1");
+  });
+
+  it("never overwrites a file already at the new name", async () => {
+    const { syncStatePath, readSyncState } = await import("../src/sync-state.js");
+    const { encodeProjectPath, legacyEncodeProjectPath } = await import("../src/platform.js");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { userSeshMoverDir } = await import("../src/paths.js");
+
+    const project = "/Users/testuser/Projects/my_app.v2";
+    const dir = join(userSeshMoverDir(), "sync-state");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${legacyEncodeProjectPath(project)}.json`), JSON.stringify({ projectPath: project, schemaVersion: 1, peers: {}, lineage: {}, imported: { old: { localSessionId: "x", importedAt: "2026-04-10T12:00:00Z", registered: true } } }));
+    writeFileSync(join(dir, `${encodeProjectPath(project)}.json`), JSON.stringify({ projectPath: project, schemaVersion: 1, peers: {}, lineage: {}, imported: { current: { localSessionId: "y", importedAt: "2026-04-10T12:00:00Z", registered: true } } }));
+
+    syncStatePath(project);
+    expect(Object.keys(readSyncState(project).imported)).toEqual(["current"]);
+  });
+});
+
 describe("sync-state v2 (hub)", () => {
   let tempHome: string;
   let homeOverride: HomeOverrideHandle;

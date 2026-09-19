@@ -149,32 +149,140 @@ describe("platform detection", () => {
     });
   });
 
+  /**
+   * #126 — these pin sesh-mover's encoder against CLAUDE CODE's, not against
+   * itself. The four cases that lived here until 0.12.0 were all paths where
+   * the old rule and Claude Code's agree, which is exactly why a divergence
+   * affecting every path containing `.`, `_` or a space shipped and stayed.
+   * Keep at least one case per character class below, and keep the live check.
+   */
   describe("encodeProjectPath", () => {
-    it("encodes Unix path to directory name", async () => {
+    it("encodes a plain Unix path", async () => {
       const { encodeProjectPath } = await import("../src/platform.js");
-      expect(encodeProjectPath("/Users/sascha/Projects/foo")).toBe(
-        "-Users-sascha-Projects-foo"
-      );
-    });
-
-    it("encodes root path", async () => {
-      const { encodeProjectPath } = await import("../src/platform.js");
+      expect(encodeProjectPath("/Users/sascha/Projects/foo")).toBe("-Users-sascha-Projects-foo");
       expect(encodeProjectPath("/Users/sascha")).toBe("-Users-sascha");
     });
 
-    it("encodes Windows path with drive letter", async () => {
+    /**
+     * The class the old encoder got wrong. Each of these produced a directory
+     * Claude Code never reads, while `import` reported success.
+     */
+    it("replaces EVERY non-alphanumeric, not just the separator", async () => {
+      const { encodeProjectPath } = await import("../src/platform.js");
+      // A dot — the case found on disk: `/home/dev/.claude-mem/observer-sessions`
+      // really does live under a DOUBLE dash.
+      expect(encodeProjectPath("/home/dev/.claude-mem/observer-sessions")).toBe(
+        "-home-dev--claude-mem-observer-sessions"
+      );
+      expect(encodeProjectPath("/home/dev/repos/my_project")).toBe("-home-dev-repos-my-project");
+      expect(encodeProjectPath("/home/dev/repos/site.com")).toBe("-home-dev-repos-site-com");
+      expect(encodeProjectPath("/home/dev/repos/my project")).toBe("-home-dev-repos-my-project");
+      expect(encodeProjectPath("/home/dev/repos/v1.2.3")).toBe("-home-dev-repos-v1-2-3");
+    });
+
+    /**
+     * BOTH the drive colon and the separator become dashes — `C--Users-…`, not
+     * `C-Users-…`. The rule is read verbatim out of the linux-x64 embedded JS;
+     * what string reaches the encoder on win32 is not directly observable from
+     * here, which is what the live check below is for.
+     */
+    it("encodes a Windows drive path with both the colon and the separator", async () => {
       const { encodeProjectPath } = await import("../src/platform.js");
       expect(encodeProjectPath("C:\\Users\\sascha\\Projects\\foo")).toBe(
-        "C-Users-sascha-Projects-foo"
+        "C--Users-sascha-Projects-foo"
       );
     });
 
-    it("encodes paths with hyphens (one-way, lossy)", async () => {
+    it("is one-way: a hyphen in a component is indistinguishable from a separator", async () => {
       const { encodeProjectPath } = await import("../src/platform.js");
-      // This is intentionally lossy — hyphens in path components merge with separators
       expect(encodeProjectPath("/Users/sascha/Projects/tzun-sdk")).toBe(
         "-Users-sascha-Projects-tzun-sdk"
       );
+    });
+
+    /**
+     * Over 200 characters, Claude Code truncates and appends a base36 hash OF
+     * THE RAW PATH. Three ways to get this subtly wrong, each pinned here.
+     */
+    it("caps at 200 characters and appends the hash of the RAW path", async () => {
+      const { encodeProjectPath } = await import("../src/platform.js");
+      const long = "/home/dev/repos/" + "a".repeat(200) + "/deep";
+      const out = encodeProjectPath(long);
+      expect(out.length).toBe(207); // 200 + "-" + 6-char suffix
+      expect(out.slice(0, 200)).toBe(long.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 200));
+      // Hashing the SANITIZED string instead of the raw one is the natural
+      // mistake and silently changes the suffix on every capped path.
+      expect(out.endsWith("-cleylq")).toBe(true);
+    });
+
+    /**
+     * The hash can land on exactly INT32_MIN, whose `Math.abs` leaves int32.
+     * Re-coercing with `| 0` hands back the negative and the name grows a stray
+     * dash — `-zik0zk` instead of `zik0zk`. Reachable, not theoretical.
+     */
+    it("does not re-coerce Math.abs, so an INT32_MIN hash has no stray dash", async () => {
+      const { encodeProjectPath } = await import("../src/platform.js");
+      const v = "/home/dev/repos/" + "deep/".repeat(40) + "begaknul";
+      const out = encodeProjectPath(v);
+      expect(out.endsWith("-zik0zk")).toBe(true);
+      expect(out.endsWith("--zik0zk")).toBe(false);
+    });
+
+    /**
+     * THE CHECK THAT WOULD HAVE CAUGHT US. Everything above is sesh-mover
+     * agreeing with a rule someone read out of a bundle; this is sesh-mover
+     * agreeing with directories Claude Code actually created.
+     *
+     * Keyed on the FIRST conversation entry's `cwd`, because that is what
+     * Claude Code keys the directory on — a mid-session `cd` changes later
+     * entries' `cwd` and encodes to a different name. Skips cleanly when there
+     * is no config dir to read, so it is a no-op in CI containers.
+     */
+    it("reproduces the directory names Claude Code actually created on this machine", async (ctx) => {
+      const { encodeProjectPath } = await import("../src/platform.js");
+      const { readdirSync, readFileSync, existsSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const { homedir } = await import("node:os");
+
+      const roots = [".claude", ".claude-nv", ".claude-nfg"]
+        .map((d) => join(homedir(), d, "projects"))
+        .filter((d) => existsSync(d));
+      if (roots.length === 0) {
+        // SKIP, not silently pass. A CI runner has no Claude config dir, so an
+        // early `return` here made this the most important assertion in the
+        // file report green without checking anything — and on the Windows job
+        // that is the ONLY thing that could settle whether the encoder sees a
+        // native path. A vacuous pass reading as a verification is exactly the
+        // failure this repo's "a green suite is not evidence" rule names.
+        ctx.skip();
+        return;
+      }
+
+      let checked = 0;
+      const mismatches: string[] = [];
+      for (const root of roots) {
+        for (const dir of readdirSync(root)) {
+          const files = readdirSync(join(root, dir)).filter((f) => f.endsWith(".jsonl"));
+          if (files.length === 0) continue;
+          let cwd: string | null = null;
+          for (const line of readFileSync(join(root, dir, files[0]), "utf-8").split("\n").slice(0, 60)) {
+            if (!line.trim()) continue;
+            try {
+              const o = JSON.parse(line) as { cwd?: unknown; uuid?: unknown };
+              if (typeof o.uuid === "string" && o.uuid !== "" && typeof o.cwd === "string") {
+                cwd = o.cwd;
+                break;
+              }
+            } catch {
+              /* a torn or non-JSON line proves nothing about the encoder */
+            }
+          }
+          if (cwd === null) continue;
+          checked++;
+          if (encodeProjectPath(cwd) !== dir) mismatches.push(`${cwd} -> ${encodeProjectPath(cwd)} (on disk: ${dir})`);
+        }
+      }
+      expect(mismatches, `checked ${checked} real project directories`).toEqual([]);
     });
   });
 

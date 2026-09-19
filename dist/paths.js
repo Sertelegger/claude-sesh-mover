@@ -96,6 +96,25 @@ export function includeFilePath(projectPath) {
 export function ignoreFilePath(projectPath) {
     return join(projectPath, IGNORE_FILE_NAME);
 }
+/**
+ * The children of `<configDir>/projects/<encoded>/<sessionId>/` that an export
+ * CARRIES — and therefore the only ones `migrate` may delete (#124).
+ *
+ * **These are Claude Code's names, not this plugin's**, which is why they are
+ * not on `PLUGIN_STATE_NAMES`. They live here anyway because the property that
+ * matters is the same one that list exists for: exactly one copy, so the
+ * exporter and the migrator's cleanup cannot disagree about what travelled.
+ *
+ * The list is deliberately a CLOSED set that the code treats as incomplete.
+ * Claude Code adds directories to a session on its own schedule and has done so
+ * twice already — `workflows/` (run records and scripts) and
+ * `auto-mode-classifier-error.txt` — neither of which any version of this
+ * plugin carries. Both were found by accident, after a real migration, by
+ * diffing 6,382 files. So the rule is not "delete everything except these", it
+ * is "delete ONLY these, keep anything unrecognised, and say so" — which is
+ * safe against the next name without anyone having to learn it first.
+ */
+export const EXPORTED_SESSION_DIR_NAMES = ["subagents", "tool-results"];
 /** `<projectPath>/.sesh-mover-project.json`. */
 export function projectJsonFilePath(projectPath) {
     return join(projectPath, PROJECT_JSON_FILE_NAME);

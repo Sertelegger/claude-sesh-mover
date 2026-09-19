@@ -254,73 +254,30 @@ export const HASHED_LAYERS = ["subagents", "tool-results", "file-history"];
 const _hashedLayersAreExportLayers = HASHED_LAYERS;
 void _hashedLayersAreExportLayers;
 /**
- * Aggregate digest over ONE auxiliary layer directory of a bundle
- * (`sessions/<id>/subagents`, `sessions/<id>/tool-results`,
- * `file-history/<id>`). `null` when the directory is absent — a bundle that
- * never carried that layer declares no digest for it.
+ * The walk itself. `layerFiles` is the read-side accessor; the APPLY side calls
+ * this with `rejectSymlinks` (#125).
  *
- * ## Why one digest per layer and not one per file
+ * **Two leaf predicates, and which one is correct depends on who wrote the
+ * tree.** On the read side (the digest, and the export copy reading this
+ * machine's own config dir) a leaf is `statSync(...).isFile()`, which RESOLVES
+ * links: that is what this did before #121, it keeps a flat directory's digest
+ * byte-identical, and dereferencing a link the user placed in their own config
+ * dir is existing, intended behaviour.
  *
- * Detection power is identical: the digest is taken over the sorted
- * `(name, sha256-of-content)` pairs plus the file count, so ANY bit flip,
- * truncation, rename, addition or removal inside the directory changes it. Only
- * *localisation* differs — an aggregate says "this session's file-history is not
- * what the exporter hashed", a per-file map says which file. Localisation buys
- * nothing here because the response is the same either way (the layer is not
- * copied; see importer.ts), and the manifest cost is not hypothetical: measured
- * on a real `~/.claude`, one session's `file-history` held 106 files, so a
- * per-file map is ~10 KB of manifest for ONE session and hundreds of KB for a
- * `--scope all` export of a busy project. Three keys per session is O(1).
+ * On the APPLY side the tree came out of a bundle that may have been assembled
+ * by someone else, and a symlink there is not something this plugin ever
+ * writes — export dereferences, so every layer entry it produces is a regular
+ * file. Following one copies arbitrary host content into the target session
+ * directory, which the default-on session-end auto-push can then upload. So the
+ * apply side uses `lstatSync` and refuses the entry, naming it.
  *
- * The listing comes from `layerFiles` below, and that sharing IS the invariant:
- * it is exactly the set `copyDirIfExists` in exporter.ts copies, that
- * `copyLayerDirs` in hub/pull-apply-sessions.ts copies, and that importer.ts
- * applies — so the digest can never cover a file the bundle does not actually
- * carry, or miss one it does. It used to say this while all four sites
- * *separately* did a flat `readdirSync`, which held only while the tree was
- * flat; #121 made it false (Claude Code writes `subagents/workflows/<id>/`)
- * and the coupling is a shared function now rather than a shared habit.
- *
- * Names are hashed alongside contents. In principle a filesystem that
- * re-normalises Unicode filenames on extraction could turn that into a false
- * mismatch; in practice every name Claude Code writes here is ASCII (subagent
- * and tool-result files are uuid-named, file-history entries are
- * `<hex>@v<n>`), and the failure direction is a warning plus a skipped
- * auxiliary layer, never lost transcript data.
+ * `archiver.ts` already refuses `SymbolicLink` tar entries, but only inside
+ * `extractArchive` — a `--format dir` bundle never passes through it, which is
+ * exactly the hole this closes.
  */
-/**
- * Every file a layer directory carries, as POSIX-separated paths relative to
- * it, sorted — **the ONE walk the digest and all three copy paths share** (#121).
- *
- * Recursive, because Claude Code writes `subagents/workflows/<wf_id>/` for any
- * session that has run a Workflow. Before #121 every one of those four sites
- * did its own flat `readdirSync`, which agreed only by accident of the tree
- * being flat; when it stopped being flat the copies threw and the digest went
- * silently blind to the subtree, in the same release.
- *
- * Two predicates, and they are deliberately NOT the same one:
- *
- * - **Recurse on `dirent.isDirectory()`.** A `Dirent` reports the entry's own
- *   type, so a symlink-to-directory answers `false` and is never walked. That
- *   is the safe default and it matches `payload/workspace.ts`'s walk.
- * - **Take a leaf on `statSync(...).isFile()`**, which RESOLVES symlinks. That
- *   is what this function did before #121, and keeping it is what makes the
- *   output byte-identical for a flat directory — including one holding a
- *   symlink to a file. Compatibility is the whole reason: every bundle in
- *   existence has a flat layer tree (a nested one could not be exported, see
- *   #121), so identical-on-flat means no existing bundle's recorded digest
- *   changes meaning. A `Dirent.isFile()` leaf test would have been tidier and
- *   would have silently re-hashed every such directory.
- *
- * Anything that is neither — a socket, a FIFO, a dangling link — is skipped,
- * and must be: `computeIntegrityHashFromFile` opens a read stream, so a FIFO
- * would hang rather than throw.
- *
- * Separators are normalised to `/` so a bundle written on Windows and read on
- * POSIX hashes identically; `join` would emit `workflows\\wf1\\x` there.
- */
-export function layerFiles(dir) {
-    const out = [];
+export function walkLayer(dir, opts = {}) {
+    const files = [];
+    const refusedSymlinks = [];
     const walk = (abs, prefix) => {
         let entries;
         try {
@@ -335,9 +292,19 @@ export function layerFiles(dir) {
                 walk(join(abs, e.name), rel);
                 continue;
             }
+            if (opts.rejectSymlinks) {
+                // `Dirent` already answered this without a syscall: a symlink reports
+                // neither `isFile()` nor `isDirectory()`. `lstat` is not needed and
+                // would only add a race between the readdir and the check.
+                if (e.isFile())
+                    files.push(rel);
+                else if (e.isSymbolicLink())
+                    refusedSymlinks.push(rel);
+                continue;
+            }
             try {
                 if (statSync(join(abs, e.name)).isFile())
-                    out.push(rel);
+                    files.push(rel);
             }
             catch {
                 // Dangling symlink, or a race with a file being removed. Not carried,
@@ -348,8 +315,12 @@ export function layerFiles(dir) {
     walk(dir, "");
     // Explicit comparator: UTF-16 code-unit order, identical on every platform,
     // never the host locale's collation.
-    out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    return out;
+    files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    refusedSymlinks.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return { files, refusedSymlinks };
+}
+export function layerFiles(dir) {
+    return walkLayer(dir).files;
 }
 /**
  * Is this layer entry an AGENT TRANSCRIPT — i.e. a file the apply side must

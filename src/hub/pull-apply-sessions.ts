@@ -15,6 +15,7 @@ import {
   isAgentTranscript,
   layerFilePath,
   layerFiles,
+  walkLayer,
 } from "../manifest.js";
 import {
   findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid,
@@ -166,7 +167,8 @@ async function copyLayerDirs(
   baseSessionId: string,
   targetConfigDir: string,
   ctx: RewriteContext
-): Promise<void> {
+): Promise<string[]> {
+  const refusals: string[] = [];
   const pairs: Array<{ from: string; to: string; rewriteJsonl: boolean }> = [
     {
       from: join(extractDir, "sessions", bundleSessionId, "subagents"),
@@ -192,7 +194,17 @@ async function copyLayerDirs(
     // because Claude Code writes `subagents/workflows/<wf_id>/`; before the
     // shared walk each of the four sites did its own flat `readdirSync` and a
     // directory entry reached `copyFileSync`.
-    for (const rel of layerFiles(from)) {
+    // `rejectSymlinks` — a hub bundle is untrusted in exactly the way an
+    // imported one is (#125), and `fetchBundleArchive` hands back a directory
+    // this stage walks, so `archiver.ts`'s tar-entry refusal is not in play for
+    // a tree that arrived any other way.
+    const walked = walkLayer(from, { rejectSymlinks: true });
+    for (const rel of walked.refusedSymlinks) {
+      refusals.push(
+        `A bundle layer file (${rel}) arrived as a SYMLINK rather than a file and was not applied. No push sesh-mover makes produces one, so this bundle was assembled or edited by hand; following it would have copied whatever it points at on this machine into the session, which the next push would upload.`
+      );
+    }
+    for (const rel of walked.files) {
       const dest = join(to, ...rel.split("/"));
       if (existsSync(dest)) continue;
       mkdirSync(dirname(dest), { recursive: true });
@@ -207,6 +219,7 @@ async function copyLayerDirs(
       }
     }
   }
+  return refusals;
 }
 
 /**
@@ -519,6 +532,14 @@ export async function runApplySessionsStage(
         // Identical derivation to importSession's — same manifest, same
         // target — so a spliced continuation and an imported fragment
         // carry byte-identical rewrites.
+        // Deliberately NO sessionIdMap (#127). A pulled continuation is
+        // spliced into a transcript the user ALREADY OWNS, so an unmapped
+        // `session_id` leaves one file carrying two run namespaces — the same
+        // defect as on import, on a worse file. `pull.ts` does hold the
+        // peer-session -> local-base-session pair in sync-state's
+        // `hub.threadByLocalSession`, so a one-entry map is buildable; it is
+        // out of 0.12.0 because it needs its own cross-machine proof. Decided,
+        // not overlooked.
         const ctx = buildImportRewriteContext(
           bundleManifest,
           projectPath,
@@ -552,9 +573,11 @@ export async function runApplySessionsStage(
           // integrity — and the splice above is already committed, so a
           // throw here would be strictly worse than a warning.
           try {
-            await copyLayerDirs(
-              extractDir, record.sessionIdInBundle,
-              targetProjectDir, baseSessionId, configDir, ctx
+            reasons.push(
+              ...(await copyLayerDirs(
+                extractDir, record.sessionIdInBundle,
+                targetProjectDir, baseSessionId, configDir, ctx
+              ))
             );
           } catch (e) {
             reasons.push(
@@ -751,9 +774,11 @@ export async function runApplySessionsStage(
               // give a second session the same auxiliary detail is a poor
               // trade; the preserved transcript is complete without them.
               try {
-                await copyLayerDirs(
-                  extractDir, record.sessionIdInBundle,
-                  targetProjectDir, baseSessionId, configDir, ctx
+                reasons.push(
+                  ...(await copyLayerDirs(
+                    extractDir, record.sessionIdInBundle,
+                    targetProjectDir, baseSessionId, configDir, ctx
+                  ))
                 );
               } catch (e) {
                 reasons.push(
@@ -820,6 +845,20 @@ export async function runApplySessionsStage(
               `Thread ${threadId} could not be continued locally: ${forkSummary}. The hub's branch was imported as a separate session and nothing local was touched — adopt-hub cannot help here.`
             );
           }
+          // fall through to the fragment import
+        } else if (outcome.reason === "compacted") {
+          // #129. NOT an error and not damage: the sending machine's session
+          // was compacted, Claude Code severs the parentUuid chain at that
+          // boundary by design, and the entries themselves arrived in full.
+          //
+          // NAMES NO FLAG, deliberately. None helps — `--force-append` skips
+          // only the liveness guard, two returns further down in `append.ts`,
+          // so it cannot reach this decline. Naming one would also owe
+          // `tests/hub-warning-flags.test.ts` a `retry-works` proof that no
+          // re-run could satisfy.
+          reasons.push(
+            `Thread ${threadId} was compacted on the machine that pushed it, so this continuation could not be spliced onto the local transcript: Claude Code severs the entry chain at a compaction boundary by design, and there is nothing for the splice to attach to. This is not an error and nothing was lost — the entries arrived in full and were imported as a separate session, nothing local was touched, and the thread continues normally from the next continuation.`
+          );
           // fall through to the fragment import
         } else {
           // THIS bundle is foreclosed — the fragment import below records

@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendFileSync, lstatSync, rmSync, statSync, writeFileSync, } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, layerFiles, layerFilePath, isAgentTranscript, } from "./manifest.js";
+import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, layerFilePath, isAgentTranscript, walkLayer, } from "./manifest.js";
 import { rewriteJsonlStream, buildImportRewriteContext } from "./rewriter.js";
 import { encodeProjectPath } from "./platform.js";
 import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
@@ -1513,9 +1513,19 @@ export async function importSession(options) {
         // bare: quoting it would imply a distrust that is not there.
         warnings.push(`Export from newer Claude Code (${JSON.stringify(manifest.sourceClaudeVersion)}) than target (${targetClaudeVersion}). Unknown entry types will be preserved.`);
     }
+    // Generate new session IDs. Built HERE, above the rewrite context, because
+    // the context carries it (#127): a `session_id` or `continuedInSessionId`
+    // naming a session that travels in THIS bundle is mapped to the id we are
+    // about to mint for it, and one that does not is left byte-identical.
+    // `targetSessions` is final by this point — the filters above are its last
+    // mutation.
+    const sessionIdMap = new Map();
+    for (const session of targetSessions) {
+        sessionIdMap.set(session.sessionId, randomUUID());
+    }
     // Step 2: Build path mappings (shared with hub/pull.ts's append path — see
     // buildImportRewriteContext for why this must not be re-derived locally)
-    const ctx = buildImportRewriteContext(manifest, targetProjectPath, targetConfigDir);
+    const ctx = buildImportRewriteContext(manifest, targetProjectPath, targetConfigDir, sessionIdMap);
     // Step 3: Verify per-session integrity (before any rewriting)
     const integrityFailedSessions = new Set();
     /** `<sessionId>\0<layer>` for every layer directory that failed its digest. */
@@ -1612,11 +1622,6 @@ export async function importSession(options) {
     // acts on it without a human reading it. Then the check belongs right here,
     // beside the loop above, and `manifest.memoryDigest` is what it compares
     // against `computeLayerDigest(join(exportPath, "memory"))`.
-    // Generate new session IDs
-    const sessionIdMap = new Map();
-    for (const session of targetSessions) {
-        sessionIdMap.set(session.sessionId, randomUUID());
-    }
     const importedSessions = targetSessions.map((session) => ({
         originalId: session.sessionId,
         newId: sessionIdMap.get(session.sessionId),
@@ -1747,7 +1752,12 @@ export async function importSession(options) {
                 // `layerFiles` — the same walk the digest and the export copy use, so
                 // this applies exactly what the bundle carries (#121). Recursive since
                 // Claude Code writes `subagents/workflows/<wf_id>/`.
-                for (const rel of layerFiles(subagentsDir)) {
+                // `rejectSymlinks` — the bundle is untrusted here (#125). See `walkLayer`.
+                const walked = walkLayer(subagentsDir, { rejectSymlinks: true });
+                for (const rel of walked.refusedSymlinks) {
+                    warnings.push(`the bundle's "subagents" files for session ${session.sessionId} contain ${JSON.stringify(rel)}, which is a SYMLINK rather than a file. It was not applied. No bundle sesh-mover writes contains one — an export copies file contents, so every layer entry it produces is a regular file — which means this bundle was assembled or edited by hand. Following it would have copied whatever it points at on THIS machine into the imported session, where a linked project's session-end auto-push could then upload it.`);
+                }
+                for (const rel of walked.files) {
                     const dest = join(targetSubDir, ...rel.split("/"));
                     mkdirSync(dirname(dest), { recursive: true });
                     if (isAgentTranscript(rel)) {
@@ -1764,7 +1774,11 @@ export async function importSession(options) {
             if (existsSync(toolResultsDir) && layerOk("tool-results")) {
                 const targetTrDir = join(targetProjectDir, newSessionId, "tool-results");
                 mkdirSync(targetTrDir, { recursive: true });
-                for (const rel of layerFiles(toolResultsDir)) {
+                const walkedTr = walkLayer(toolResultsDir, { rejectSymlinks: true });
+                for (const rel of walkedTr.refusedSymlinks) {
+                    warnings.push(`the bundle's "tool-results" files for session ${session.sessionId} contain ${JSON.stringify(rel)}, which is a SYMLINK rather than a file. It was not applied. No bundle sesh-mover writes contains one — an export copies file contents, so every layer entry it produces is a regular file — which means this bundle was assembled or edited by hand. Following it would have copied whatever it points at on THIS machine into the imported session, where a linked project's session-end auto-push could then upload it.`);
+                }
+                for (const rel of walkedTr.files) {
                     const dest = join(targetTrDir, ...rel.split("/"));
                     mkdirSync(dirname(dest), { recursive: true });
                     copyFileSync(layerFilePath(toolResultsDir, rel), dest);
@@ -1775,7 +1789,11 @@ export async function importSession(options) {
             if (existsSync(fileHistoryDir) && layerOk("file-history")) {
                 const targetFhDir = join(targetConfigDir, "file-history", newSessionId);
                 mkdirSync(targetFhDir, { recursive: true });
-                for (const rel of layerFiles(fileHistoryDir)) {
+                const walkedFh = walkLayer(fileHistoryDir, { rejectSymlinks: true });
+                for (const rel of walkedFh.refusedSymlinks) {
+                    warnings.push(`the bundle's "file-history" files for session ${session.sessionId} contain ${JSON.stringify(rel)}, which is a SYMLINK rather than a file. It was not applied. No bundle sesh-mover writes contains one — an export copies file contents, so every layer entry it produces is a regular file — which means this bundle was assembled or edited by hand. Following it would have copied whatever it points at on THIS machine into the imported session, where a linked project's session-end auto-push could then upload it.`);
+                }
+                for (const rel of walkedFh.files) {
                     const dest = join(targetFhDir, ...rel.split("/"));
                     mkdirSync(dirname(dest), { recursive: true });
                     copyFileSync(layerFilePath(fileHistoryDir, rel), dest);

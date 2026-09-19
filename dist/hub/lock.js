@@ -82,6 +82,13 @@ export class LockBusyError extends Error {
     }
 }
 function lockPath(projectPath) {
+    // Deliberately NOT migrated the way `sync-state.ts` is (#126). A lock file is
+    // ephemeral state about a process running NOW; renaming a pre-0.12.0 one
+    // forward would hand this run a stale holder record to reason about, and the
+    // liveness probe would then have to answer `unknown` for a pid that has been
+    // gone for weeks — which this module treats as ALIVE, so the cost would be a
+    // 60-minute wait for a lock nobody holds. A file left at the old name is
+    // inert clutter, which is the correct outcome.
     return join(userSeshMoverDir(), "locks", `${encodeProjectPath(projectPath)}.lock`);
 }
 /** Where a steal is written down. Beside the lock, never inside it: the lock file is deleted by the steal. */

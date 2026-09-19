@@ -21,6 +21,50 @@ describe("discovery", () => {
   });
 
   describe("discoverSessions", () => {
+    /**
+     * #126 — a pre-0.12.0 `import` wrote transcripts under the OLD encoding for
+     * any path containing a `.`, a `_` or a space, and Claude Code has never
+     * read that directory. Discovery scans both names so those sessions are
+     * still visible and can be migrated into place; a fix that only corrected
+     * the encoder would have looked, to that user, like it deleted their
+     * history.
+     *
+     * This is a READ widening only — nothing here picks a write destination.
+     */
+    it("also finds sessions left under the pre-0.12.0 directory name", async () => {
+      const { discoverSessions } = await import("../src/discovery.js");
+      const { encodeProjectPath, legacyEncodeProjectPath } = await import("../src/platform.js");
+      const { mkdirSync, writeFileSync, renameSync } = await import("node:fs");
+
+      // A path where the two encoders disagree — the whole class #126 is about.
+      const project = "/Users/testuser/Projects/my_app.v2";
+      expect(legacyEncodeProjectPath(project)).not.toBe(encodeProjectPath(project));
+
+      const legacyDir = join(configDir, "projects", legacyEncodeProjectPath(project));
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(
+        join(legacyDir, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"),
+        JSON.stringify({
+          uuid: "e1", timestamp: "2026-04-10T12:00:00Z",
+          sessionId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+          cwd: project, version: "2.1.81", type: "user",
+          message: { role: "user", content: "stranded by the old encoder" },
+        }) + "\n"
+      );
+
+      const found = discoverSessions(configDir, project);
+      expect(found).toHaveLength(1);
+      expect(found[0].sessionId).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    });
+
+    it("does not scan a second directory when both encoders agree", async () => {
+      // The common case, and worth pinning: a plain path must not cause two
+      // readdirs of the same directory, nor report its sessions twice.
+      const { discoverSessions } = await import("../src/discovery.js");
+      const sessions = discoverSessions(configDir, "/Users/testuser/Projects/testproject");
+      expect(sessions).toHaveLength(1);
+    });
+
     it("finds sessions for a project path", async () => {
       const { discoverSessions } = await import("../src/discovery.js");
       const sessions = discoverSessions(

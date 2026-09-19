@@ -34,6 +34,58 @@ describe("migrator", () => {
   });
 
   describe("migrateSession", () => {
+    /**
+     * #124 — migrate must not delete what no bundle carried.
+     *
+     * Cleanup used to be `rmSync(<sessionDir>, { recursive: true })`, which
+     * removed the whole session folder including anything Claude Code had put
+     * there that no version of this plugin knows how to export. That is
+     * migrate's own documented hazard (`--exclude` drops a layer from the
+     * bundle while cleanup still deletes the source) applied to a name nobody
+     * registered as a layer, and it has already cost two in the wild:
+     * `workflows/` run records and `auto-mode-classifier-error.txt`, found only
+     * by hand-diffing a real 190-session migration.
+     *
+     * The fixture uses a name the plugin has never heard of ON PURPOSE. Naming
+     * `workflows/` here would pin today's known-unknown and pass just as well
+     * against a fix that only special-cases that one string — which is the fix
+     * this issue exists to reject.
+     */
+    it("keeps session-folder entries no export carried, and says which", async () => {
+      const { migrateSession } = await import("../src/migrator.js");
+      const sourceEncoded = "-Users-testuser-Projects-testproject";
+      const sessionDir = join(configDir, "projects", sourceEncoded, sessionId);
+      mkdirSync(join(sessionDir, "some-future-feature"), { recursive: true });
+      writeFileSync(join(sessionDir, "some-future-feature", "state.json"), "{}\n");
+      writeFileSync(join(sessionDir, "stray-diagnostic.txt"), "boom\n");
+
+      const result = await migrateSession({
+        sourceConfigDir: configDir,
+        targetConfigDir: configDir,
+        sourceProjectPath: "/Users/testuser/Projects/testproject",
+        targetProjectPath: "/Users/testuser/Projects/newproject",
+        scope: "current",
+        sessionId,
+        excludeLayers: [],
+        claudeVersion: "2.1.81",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // The uncarried entries survive, exactly where they were.
+      expect(existsSync(join(sessionDir, "some-future-feature", "state.json"))).toBe(true);
+      expect(existsSync(join(sessionDir, "stray-diagnostic.txt"))).toBe(true);
+      // What WAS carried is gone, so migrate still did its job.
+      expect(existsSync(join(sessionDir, "subagents"))).toBe(false);
+      expect(existsSync(join(sessionDir, "tool-results"))).toBe(false);
+
+      // And the user is told, by name — silence is what made this cost two
+      // directories before anyone noticed.
+      const said = result.warnings.join(" ");
+      expect(said).toContain("some-future-feature");
+      expect(said).toContain("stray-diagnostic.txt");
+    });
+
     it("moves a session to a new project path on same config dir", async () => {
       const { migrateSession } = await import("../src/migrator.js");
       const result = await migrateSession({

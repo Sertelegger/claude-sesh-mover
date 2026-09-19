@@ -1080,3 +1080,322 @@ describe("rewriter", () => {
     });
   });
 });
+
+/**
+ * # The fields Claude Code 2.1.27x writes that the rewriter used to miss (#127)
+ *
+ * Every fixture below is the real on-disk shape, keys taken verbatim from live
+ * transcripts, values redacted. None of these had a test before, because the
+ * rewriter never wrote them — so "the suite is green" said nothing here.
+ *
+ * The rule these encode: **a field is rewritten if its value is a LOCATION and
+ * left verbatim if it is CONTENT**, with the tie-breaker "does a second copy of
+ * these bytes travel in this bundle?".
+ *
+ * Linux-provable: string mapping only, no platform-specific behaviour.
+ */
+describe("rewriter — 2.1.27x path fields (#127)", () => {
+  const ctxFor = async (): Promise<import("../src/rewriter.js").RewriteContext> => {
+    const { buildPathMappings, encodeProjectPathForTest } = await import("../src/rewriter.js").then(
+      async (m) => ({ ...m, encodeProjectPathForTest: (await import("../src/platform.js")).encodeProjectPath })
+    );
+    const src = "/home/dev/repos/proj";
+    const tgt = "/tgt/proj";
+    return {
+      mappings: buildPathMappings("linux", "linux", src, tgt, "/home/dev/.claude", "/tgt/cfg", "dev", "tgtuser"),
+      sourcePlatform: "linux",
+      targetPlatform: "linux",
+      sourceUser: "dev",
+      targetUser: "tgtuser",
+      sessionIdMap: new Map([["old-session", "new-session"]]),
+      encodedProject: [encodeProjectPathForTest(src), encodeProjectPathForTest(tgt)] as const,
+    };
+  };
+
+  /**
+   * `attachment` is about a third of all lines and roughly half of all
+   * CONVERSATION entries, and had no branch at all. `snapshot.workingDirectory`
+   * is a second, parallel cwd — the top-level one was rewritten while this was
+   * not, so a resumed session was told it sits somewhere that does not exist.
+   */
+  it("rewrites an attachment's environment snapshot, including the rendered reminder", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "attachment",
+        uuid: "a1",
+        cwd: "/home/dev/repos/proj",
+        attachment: {
+          type: "environment",
+          snapshot: {
+            workingDirectory: "/home/dev/repos/proj",
+            additionalWorkingDirectories: ["/home/dev/repos/proj/sub"],
+            scratchpadDirectory: "/tmp/claude-1000/-home-dev-repos-proj/old-session/scratchpad",
+          },
+          changes: [{ field: "workingDirectory", from: "/home/dev/repos/proj", to: "/home/dev/repos/proj/x" }],
+          filename: "/home/dev/repos/proj/tests/a.test.ts",
+          files: [{ path: "/home/dev/.claude/CLAUDE.md" }],
+        },
+        rendered: [{ content: "- Primary working directory: /home/dev/repos/proj\n" }],
+      },
+      ctx,
+      "new-session"
+    );
+    const att = out.attachment as Record<string, Record<string, unknown>>;
+    expect(att.snapshot.workingDirectory).toBe("/tgt/proj");
+    expect(att.snapshot.additionalWorkingDirectories).toEqual(["/tgt/proj/sub"]);
+    // The scratchpad embeds BOTH the encoded project name and the session id,
+    // mid-path, where no prefix mapping reaches.
+    expect(att.snapshot.scratchpadDirectory).toBe("/tmp/claude-1000/-tgt-proj/new-session/scratchpad");
+    expect((att.changes as Array<Record<string, string>>)[0].from).toBe("/tgt/proj");
+    expect(att.filename).toBe("/tgt/proj/tests/a.test.ts");
+    expect((att.files as Array<Record<string, string>>)[0].path).toBe("/tgt/cfg/CLAUDE.md");
+    expect((out.rendered as Array<Record<string, string>>)[0].content).toContain("/tgt/proj");
+  });
+
+  /**
+   * The key and its own value are the same fact. Before #127 only the key moved,
+   * so one object named the target machine in its key and the source machine in
+   * `realParentDir` — the field a `/rewind` restore consults to re-create a
+   * parent directory, which makes it the highest write-side risk in the set.
+   */
+  it("rewrites file-history backup VALUES, not only their keys", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "file-history-snapshot",
+        snapshot: {
+          trackedFileBackups: {
+            "/home/dev/repos/proj/a.md": {
+              backupFileName: "df0f7abe@v2",
+              realParentDir: "/home/dev/repos/proj",
+            },
+          },
+        },
+      },
+      ctx
+    );
+    const backups = (out.snapshot as Record<string, Record<string, Record<string, unknown>>>).trackedFileBackups;
+    expect(Object.keys(backups)).toEqual(["/tgt/proj/a.md"]);
+    expect(backups["/tgt/proj/a.md"].realParentDir).toBe("/tgt/proj");
+  });
+
+  it("rewrites the file-history-delta entry type, which had no branch at all", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "file-history-delta",
+        trackingPath: "/home/dev/repos/proj/a.md",
+        backup: { backupFileName: "x@v1", realParentDir: "/home/dev/repos/proj" },
+      },
+      ctx
+    );
+    expect(out.trackingPath).toBe("/tgt/proj/a.md");
+    expect((out.backup as Record<string, unknown>).realParentDir).toBe("/tgt/proj");
+  });
+
+  /**
+   * We carry the `tool-results` layer AND rename its directory to the new
+   * session id, then left the pointer naming the source machine. The cleanest
+   * "moved the data, broke the link" case in the corpus.
+   */
+  it("rewrites toolUseResult pointers, including the string-valued form", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "user",
+        uuid: "u1",
+        message: { role: "user", content: "x" },
+        toolUseResult: {
+          persistedOutputPath: "/home/dev/.claude/projects/-home-dev-repos-proj/old-session/tool-results/b5.txt",
+          filePath: "/home/dev/repos/proj/a.ts",
+          file: { filePath: "/home/dev/repos/proj/b.ts" },
+          bashEditDiff: { changedFiles: ["/home/dev/repos/proj/c.rs"], files: [{ filePath: "/home/dev/repos/proj/d.rs" }] },
+          backgroundCwdHint: "Session cwd remains /home/dev/repos/proj; ...",
+          // CONTENT despite the name — measured file bytes, left verbatim.
+          originalFile: "#!/usr/bin/env bash\ncd /home/dev/repos/proj\n",
+        },
+      },
+      ctx,
+      "new-session"
+    );
+    const tr = out.toolUseResult as Record<string, Record<string, unknown>>;
+    expect(tr.persistedOutputPath).toBe("/tgt/cfg/projects/-tgt-proj/new-session/tool-results/b5.txt");
+    expect(tr.filePath).toBe("/tgt/proj/a.ts");
+    expect(tr.file.filePath).toBe("/tgt/proj/b.ts");
+    expect(tr.bashEditDiff.changedFiles).toEqual(["/tgt/proj/c.rs"]);
+    expect((tr.bashEditDiff.files as Array<Record<string, string>>)[0].filePath).toBe("/tgt/proj/d.rs");
+    expect(tr.backgroundCwdHint).toContain("/tgt/proj");
+    expect(tr.originalFile).toContain("/home/dev/repos/proj");
+
+    const asString = rewriteEntry(
+      { type: "user", uuid: "u2", message: { role: "user", content: "x" }, toolUseResult: "wrote /home/dev/repos/proj/e.ts" },
+      ctx
+    );
+    expect(asString.toolUseResult).toBe("wrote /tgt/proj/e.ts");
+  });
+
+  /**
+   * There was no `assistant` branch, which is the structural reason every tool
+   * INPUT survived a move. The wire triple is bound by an equation Claude Code
+   * re-checks on resume — rewriting one leg is strictly worse than doing
+   * nothing, so `command` is RE-DERIVED rather than rewritten in place.
+   */
+  it("rewrites tool inputs and keeps the wire equation intact", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "assistant",
+        uuid: "a2",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/home/dev/repos/proj/a.ts" } },
+            { type: "tool_use", id: "t2", name: "Bash", input: { command: "ls /home/dev/repos/proj" } },
+            // CONTENT: a script body, not a location, despite the key's name.
+            { type: "tool_use", id: "t3", name: "Workflow", input: { script: "const p='/home/dev/repos/proj'" } },
+          ],
+        },
+        wireIngestContext: { t2: { cwd: "/home/dev/repos/proj" } },
+        wireToolInputs: { t2: { command: "cd /home/dev/repos/proj && ls /home/dev/repos/proj" } },
+      },
+      ctx
+    );
+    const blocks = (out.message as Record<string, Array<Record<string, Record<string, unknown>>>>).content;
+    expect(blocks[0].input.file_path).toBe("/tgt/proj/a.ts");
+    expect(blocks[1].input.command).toBe("ls /tgt/proj");
+    expect(blocks[2].input.script).toBe("const p='/home/dev/repos/proj'"); // untouched
+    const wic = out.wireIngestContext as Record<string, Record<string, string>>;
+    const wti = out.wireToolInputs as Record<string, Record<string, string>>;
+    expect(wic.t2.cwd).toBe("/tgt/proj");
+    // THE EQUATION: wire === "cd " + wic.cwd + " && " + input.command
+    expect(wti.t2.command).toBe(`cd ${wic.t2.cwd} && ${blocks[1].input.command as string}`);
+  });
+
+  /**
+   * The OTHER wire shape. The fixture above uses the `cd <cwd> && <cmd>` form;
+   * this one is `wire === input` verbatim, which is the majority case measured
+   * (134 of 135 pairs in one real transcript). Found by mutation: disabling the
+   * plain branch left every test green, because nothing exercised it.
+   */
+  it("re-derives the wire command in its plain form too", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "assistant",
+        uuid: "a3",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "t9", name: "Bash", input: { command: "cat /home/dev/repos/proj/a.ts" } }],
+        },
+        wireToolInputs: { t9: { command: "cat /home/dev/repos/proj/a.ts" } },
+      },
+      ctx
+    );
+    const blocks = (out.message as Record<string, Array<Record<string, Record<string, unknown>>>>).content;
+    const wti = out.wireToolInputs as Record<string, Record<string, string>>;
+    expect(blocks[0].input.command).toBe("cat /tgt/proj/a.ts");
+    expect(wti.t9.command).toBe(blocks[0].input.command);
+  });
+
+  /**
+   * A wire form whose relation did NOT hold before the rewrite is left exactly
+   * as it was — Claude Code's own check already fails for it, so reproducing
+   * that is correct and manufacturing agreement would not be.
+   */
+  it("leaves a wire command alone when the relation never held", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "assistant",
+        uuid: "a4",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tX", name: "Bash", input: { command: "ls /home/dev/repos/proj" } }],
+        },
+        wireToolInputs: { tX: { command: "something else entirely" } },
+      },
+      ctx
+    );
+    expect((out.wireToolInputs as Record<string, Record<string, string>>).tX.command).toBe("something else entirely");
+  });
+
+  /**
+   * The encoded project name inside FREE TEXT — which `rewritePathValue`'s
+   * interior segment pass never sees, because that only runs on whole-path
+   * fields. This is what the mapping added to `buildPathMappings` is for, and
+   * without it a rewritten stdout line comes out half target and half source.
+   * Found by mutation: deleting that mapping left every test green.
+   */
+  it("rewrites the encoded project name inside free text", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const out = rewriteEntry(
+      {
+        type: "user",
+        uuid: "u9",
+        message: { role: "user", content: "x" },
+        toolUseResult: {
+          stdout: "wrote /tgt/cfg/projects/-home-dev-repos-proj/old-session/tool-results/z.txt",
+        },
+      },
+      ctx
+    );
+    const stdout = (out.toolUseResult as Record<string, string>).stdout;
+    // The half-rewritten shape is the bug: target config dir, source project.
+    expect(stdout).not.toContain("-home-dev-repos-proj");
+    expect(stdout).toContain("-tgt-proj");
+  });
+
+  /**
+   * `session_id` is WHO WROTE the entry, not which file it is in. It is mapped
+   * when the referent travels in this bundle and left byte-identical when it
+   * does not — never assigned, because a measured ~24% of them name a run with
+   * no transcript at all, and stamping the new id over those fabricates
+   * authorship.
+   */
+  it("MAPS session_id when the referent travels, and leaves it alone when it does not", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const mapped = rewriteEntry(
+      { type: "user", uuid: "u3", session_id: "old-session", message: { role: "user", content: "x" } },
+      ctx,
+      "new-session"
+    );
+    expect(mapped.sessionId).toBe("new-session"); // the file
+    expect(mapped.session_id).toBe("new-session"); // the run, mapped
+
+    const stranger = rewriteEntry(
+      { type: "user", uuid: "u4", session_id: "a-run-not-in-this-bundle", message: { role: "user", content: "x" } },
+      ctx,
+      "new-session"
+    );
+    expect(stranger.sessionId).toBe("new-session");
+    expect(stranger.session_id).toBe("a-run-not-in-this-bundle");
+  });
+
+  it("leaves every session reference byte-identical when no map was supplied", async () => {
+    const { rewriteEntry, buildPathMappings } = await import("../src/rewriter.js");
+    const ctx = {
+      mappings: buildPathMappings("linux", "linux", "/a", "/b", "/c", "/d", "u", "v"),
+      sourcePlatform: "linux" as const,
+      targetPlatform: "linux" as const,
+      sourceUser: "u",
+      targetUser: "v",
+    };
+    const out = rewriteEntry(
+      { type: "user", uuid: "u5", session_id: "old-session", continuedInSessionId: "old-session", message: { role: "user", content: "x" } },
+      ctx,
+      "new-session"
+    );
+    expect(out.session_id).toBe("old-session");
+    expect(out.continuedInSessionId).toBe("old-session");
+  });
+});

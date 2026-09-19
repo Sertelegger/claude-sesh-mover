@@ -4,7 +4,7 @@ import type { BundleFetchFailureKind } from "./hub/bundle-io.js";
 import type { EscrowRefusal, UnsafeOutRule } from "./hub/escrow.js";
 import type { ApplyResult, CarryMeta } from "./payload/carry.js";
 export type Platform = "darwin" | "linux" | "wsl1" | "wsl2" | "win32";
-export type JsonlEntryType = "user" | "assistant" | "file-history-snapshot" | "system" | "progress";
+export type JsonlEntryType = "user" | "assistant" | "attachment" | "file-history-snapshot" | "file-history-delta" | "system" | "progress";
 export interface JsonlEntryBase {
     uuid: string;
     timestamp: string;
@@ -28,12 +28,15 @@ export interface UserMessageEntry extends JsonlEntryBase {
     message: UserMessageContent;
     promptId?: string;
     permissionMode?: string;
-    toolUseResult?: {
-        stdout?: string;
-        stderr?: string;
-        interrupted?: boolean;
-        isImage?: boolean;
-    };
+    /**
+     * A RESULT object — or a plain string, which it is on a measured 557 real
+     * lines. The old object-only type is why the string case was skipped in
+     * silence: a shape check read `.stdout` off a string, got `undefined`, and
+     * moved on. `Record<string, unknown>` rather than an exhaustive field list
+     * because Claude Code adds keys here on its own schedule; `rewriter.ts` holds
+     * the allowlist of which ones are locations.
+     */
+    toolUseResult?: Record<string, unknown> | string;
     sourceToolAssistantUUID?: string;
 }
 export interface AssistantMessageEntry extends JsonlEntryBase {

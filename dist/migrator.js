@@ -1,10 +1,11 @@
-import { rmSync, existsSync, mkdtempSync, renameSync, } from "node:fs";
+import { rmSync, existsSync, readdirSync, mkdtempSync, renameSync, } from "node:fs";
 import { join, dirname, relative, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
 import { encodeProjectPath } from "./platform.js";
 import { errorMessage } from "./errors.js";
+import { EXPORTED_SESSION_DIR_NAMES } from "./paths.js";
 function isWithin(child, parent) {
     const rel = relative(parent, child);
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
@@ -174,17 +175,48 @@ export async function migrateSession(options) {
         const sourceEncoded = encodeProjectPath(sourceProjectPath);
         const sourceProjectDir = join(sourceConfigDir, "projects", sourceEncoded);
         let cleanedUp = false;
+        // What the cleanup KEPT because no bundle carried it, collected across every
+        // moved session so the warning names them once rather than per session.
+        const keptUncarried = new Set();
         for (const movedId of movedIds) {
             const jsonlPath = join(sourceProjectDir, `${movedId}.jsonl`);
             if (existsSync(jsonlPath))
                 rmSync(jsonlPath);
             const sessionSubDir = join(sourceProjectDir, movedId);
-            if (existsSync(sessionSubDir))
-                rmSync(sessionSubDir, { recursive: true });
+            if (existsSync(sessionSubDir)) {
+                // **Delete only what the export carried** (#124). This used to be a
+                // flat `rmSync(sessionSubDir, { recursive: true })`, which deleted the
+                // whole session directory — including anything Claude Code had written
+                // there that no version of this plugin knows how to export. That is
+                // migrate's own documented hazard (`--exclude` drops a layer from the
+                // bundle while cleanup still deletes the source) applied to a name
+                // nobody registered as a layer, and it has already cost two: a
+                // session's `workflows/` run records and scripts, and
+                // `auto-mode-classifier-error.txt`. Both were found by hand-diffing a
+                // real migration, not by this code noticing.
+                //
+                // So the direction is inverted: remove the carried names, leave
+                // everything else where it is, and report it. A user who wants the rest
+                // gone can delete a directory; nobody can recover one migrate removed.
+                for (const name of readdirSync(sessionSubDir)) {
+                    if (EXPORTED_SESSION_DIR_NAMES.includes(name)) {
+                        rmSync(join(sessionSubDir, name), { recursive: true, force: true });
+                    }
+                    else {
+                        keptUncarried.add(name);
+                    }
+                }
+                // Gone only if nothing unrecognised was left in it.
+                if (readdirSync(sessionSubDir).length === 0)
+                    rmSync(sessionSubDir, { recursive: true });
+            }
             const fileHistoryDir = join(sourceConfigDir, "file-history", movedId);
             if (existsSync(fileHistoryDir))
                 rmSync(fileHistoryDir, { recursive: true });
             cleanedUp = true;
+        }
+        if (keptUncarried.size > 0) {
+            imported.warnings.push(`The source session folder${movedIds.size === 1 ? "" : "s"} still hold${movedIds.size === 1 ? "s" : ""} ${[...keptUncarried].sort().map((n) => JSON.stringify(n)).join(", ")}, which no export carries — so ${movedIds.size === 1 ? "it was" : "they were"} left in place rather than deleted with the rest. Claude Code writes these; sesh-mover does not know how to move them. Copy them by hand if you want them at the destination, then remove the source folder yourself. Nothing else about the migration is affected.`);
         }
         // Step 4: Optionally rename the actual project directory. The
         // preconditions are decided by the same helper the dry-run preview uses,

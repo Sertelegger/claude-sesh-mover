@@ -10,6 +10,7 @@ import {
 import { dirname, join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { writeManifest, computeLayerDigest, layerFiles, layerFilePath } from "./manifest.js";
+import { EXPORTED_SESSION_DIR_NAMES } from "./paths.js";
 import { discoverSessions } from "./discovery.js";
 import { detectPlatform } from "./platform.js";
 import { extractSummaryFromFile } from "./summary.js";
@@ -415,6 +416,26 @@ async function exportSessions(
       sessionLayers.add("file-history");
     }
     record(session.sessionId, sessionLayers);
+
+    // DISCLOSE what this export is walking past (#124). Claude Code owns the
+    // session directory and adds to it on its own schedule; the copies above
+    // join two fixed names and never enumerate it, so anything else — of any
+    // type — is invisible. Twice already: `workflows/` (Workflow run records
+    // and the scripts that produced them, now present in more sessions than
+    // `subagents/`) and `auto-mode-classifier-error.txt`. Both were found by
+    // hand-diffing a real migration, which is the expensive way.
+    //
+    // A warning rather than a carry, because carrying is a separate decision
+    // with its own disclosure consequences — anything added here travels on the
+    // default-on session-end auto-push, which is the reasoning that keeps
+    // `plans/` off the hub. Saying so costs a readdir and makes the next name
+    // announce itself instead of waiting to be missed.
+    for (const name of existsSync(sessionBase) ? readdirSync(sessionBase, { withFileTypes: true }) : []) {
+      if (EXPORTED_SESSION_DIR_NAMES.includes(name.name)) continue;
+      warnings.push(
+        `This session's folder also holds ${JSON.stringify(name.name)}, which sesh-mover does not carry — it is not in the bundle. Claude Code writes it; copy it by hand if you need it at the destination. \`migrate\` leaves it in place rather than deleting it.`
+      );
+    }
 
     const summary = noSummary
       ? session.slug

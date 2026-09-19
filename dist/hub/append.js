@@ -34,6 +34,9 @@ export async function readDeltaChainInfo(deltaPath) {
     const rl = createInterface({ input, crlfDelay: Infinity });
     let headerPresent = false;
     let firstEntryParentUuid = null;
+    let firstEntryKind = "none";
+    let compactionLogicalParentUuid;
+    let compactionTrigger;
     let seen = 0;
     let scanned = 0;
     try {
@@ -64,6 +67,29 @@ export async function readDeltaChainInfo(deltaPath) {
             if (!isConversationEntry(obj))
                 continue;
             firstEntryParentUuid = obj.parentUuid ?? null;
+            // Detect on the marker Claude Code actually writes — NOT on
+            // `parentUuid === null && logicalParentUuid present`, which is a derived
+            // heuristic that also matches a plain session root and would recreate
+            // exactly the conflation this field exists to end. If a future build
+            // renames the subtype this falls back to "root"/"none" and behaves as it
+            // did before #129, which is already fail-safe. Load-bearing, because no
+            // boundary in the corpus this was measured on was written by the
+            // installed build — the newest observed was several versions older.
+            if (obj.type === "system" && obj.subtype === "compact_boundary") {
+                firstEntryKind = "compact-boundary";
+                const lp = obj.logicalParentUuid;
+                if (typeof lp === "string" && lp !== "")
+                    compactionLogicalParentUuid = lp;
+                const meta = obj.compactMetadata;
+                if (typeof meta?.trigger === "string")
+                    compactionTrigger = meta.trigger;
+            }
+            else if (firstEntryParentUuid !== null) {
+                firstEntryKind = "anchored";
+            }
+            else {
+                firstEntryKind = "root";
+            }
             break;
         }
     }
@@ -71,7 +97,14 @@ export async function readDeltaChainInfo(deltaPath) {
         rl.close();
         input.destroy();
     }
-    return { headerPresent, firstEntryParentUuid, lastEntryUuid: readLastEntryUuid(deltaPath) };
+    return {
+        headerPresent,
+        firstEntryParentUuid,
+        lastEntryUuid: readLastEntryUuid(deltaPath),
+        firstEntryKind,
+        ...(compactionLogicalParentUuid !== undefined ? { compactionLogicalParentUuid } : {}),
+        ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
+    };
 }
 /**
  * Rewrite context for a same-machine session copy: identical platform and user,
@@ -135,7 +168,25 @@ export function identityRewriteContext() {
  */
 export async function tryAppendContinuation(a) {
     const info = await readDeltaChainInfo(a.deltaPath);
+    // NOTE THE ORDER: this runs BEFORE the chain guard below, so a compacted
+    // continuation never reaches `chain-mismatch` and never builds a
+    // `HubPullDivergence`. That is correct and must stay — a boundary-first delta
+    // is not a fork, and routing it through the divergence machinery would let
+    // `--on-divergence skip` (what `/sesh-mover:pull` always passes) stop the
+    // whole chain on it.
     if (!info.lastEntryUuid || info.firstEntryParentUuid === null) {
+        if (info.firstEntryKind === "compact-boundary") {
+            return {
+                kind: "declined",
+                reason: "compacted",
+                detail: `this continuation begins at a Claude Code compaction boundary` +
+                    `${info.compactionTrigger ? ` (trigger "${info.compactionTrigger}")` : ""}: ` +
+                    `Claude Code severs the parentUuid chain there by design, so there is no entry for the ` +
+                    `splice to chain onto` +
+                    `${info.compactionLogicalParentUuid ? `, and its logicalParentUuid ${info.compactionLogicalParentUuid} is a diagnostic rather than an anchor` : ""}` +
+                    `. Nothing local was touched.`,
+            };
+        }
         return {
             kind: "declined",
             reason: "no-delta-entries",

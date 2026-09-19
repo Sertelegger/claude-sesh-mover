@@ -1,11 +1,49 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, } from "node:fs";
 import { dirname, join } from "node:path";
-import { encodeProjectPath } from "./platform.js";
+import { encodeProjectPath, legacyEncodeProjectPath } from "./platform.js";
 import { userSeshMoverDir } from "./paths.js";
 import { readManifest } from "./manifest.js";
 import { readLastEntryUuid } from "./jsonl.js";
 export function syncStatePath(projectPath) {
-    return join(userSeshMoverDir(), "sync-state", `${encodeProjectPath(projectPath)}.json`);
+    const path = join(userSeshMoverDir(), "sync-state", `${encodeProjectPath(projectPath)}.json`);
+    // #126 changed the encoder, and THIS FILE IS NAMED WITH IT. Without the
+    // rename the old file becomes unreachable with no error, and the loss is
+    // silent and four-fold:
+    //
+    //   - the content-hash `imported` registry: idempotent import stops deduping,
+    //     so a re-import duplicates every session;
+    //   - `hub.threadByLocalSession`: the next push mints a SECOND thread for a
+    //     local session that already has one;
+    //   - `hub.workspaceGenerations`: the merge-ancestor intersection empties and
+    //     every future 3-way merge degrades to no-ancestor;
+    //   - each peer's `sent` ledger: the next push ships a full bundle instead of
+    //     a delta.
+    //
+    // Done HERE rather than in the readers because this is the one chokepoint —
+    // a second call site is how half the readers end up still opening the old
+    // name. Create-safe: a no-op when neither file exists, and it never
+    // overwrites a file already at the new name.
+    migrateLegacySyncStateFile(path, projectPath);
+    return path;
+}
+function migrateLegacySyncStateFile(newPath, projectPath) {
+    if (existsSync(newPath))
+        return;
+    const legacy = legacyEncodeProjectPath(projectPath);
+    if (legacy === encodeProjectPath(projectPath))
+        return;
+    const legacyPath = join(userSeshMoverDir(), "sync-state", `${legacy}.json`);
+    if (!existsSync(legacyPath))
+        return;
+    try {
+        mkdirSync(dirname(newPath), { recursive: true });
+        renameSync(legacyPath, newPath);
+    }
+    catch {
+        // Losing the rename costs bookkeeping, never session data — every caller
+        // treats an absent state file as "fresh". It must never throw: every hub
+        // verb reaches this, including the unattended session-end auto-push.
+    }
 }
 /**
  * A record whose KEYS come from outside this machine, built with NO PROTOTYPE.
