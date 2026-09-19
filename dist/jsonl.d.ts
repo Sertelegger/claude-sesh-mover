@@ -36,7 +36,20 @@ export declare const MAX_ENTRY_SCAN_BYTES: number;
  * `next.parentUuid !== prev.uuid`. Mostly sibling fans written back-to-back
  * under one parent (an `attachment` run followed by the `user` entry it belongs
  * to), sometimes a jump as far as 59 entries back; none of the 197 involved
- * `isSidechain`. So a continuation cut at such a boundary still fails
+ * `isSidechain`. Re-measured on recent transcripts that rate is now ~11%, the
+ * growth driven almost entirely by longer `attachment` runs.
+ *
+ * **COMPACTION is a second, structural cause, and it is a different shape**
+ * (#129). At a `{"type":"system","subtype":"compact_boundary"}` entry Claude
+ * Code severs the chain deliberately: `parentUuid` is HARD NULL rather than a
+ * different-but-present uuid, and continuity moves to `logicalParentUuid` —
+ * which is not a "previous head" pointer and must not be used as one, since a
+ * measured 4 of 16 real boundaries point FORWARD, into the block the boundary
+ * introduces. A boundary IS a conversation entry by this predicate (it has a
+ * non-empty uuid, and other entries' `parentUuid` point at it), making it the
+ * first structurally chain-broken one — and that is emphatically NOT a reason
+ * to add a type denylist here. `hub/append.ts` distinguishes it instead, so the
+ * decline can say "compacted" rather than "empty or unparseable". So a continuation cut at such a boundary still fails
  * `tryAppendContinuation`'s chain guard even though this predicate answered
  * correctly. That residual is pre-existing and out of scope here — see the
  * ledger's Task 7 carry — but do not read this function as closing it.

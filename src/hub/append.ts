@@ -37,6 +37,35 @@ export interface DeltaChainInfo {
   /** Anchor: the parentUuid of the first REAL (non-header) entry. */
   firstEntryParentUuid: string | null;
   lastEntryUuid: string | null;
+  /**
+   * WHY the anchor is what it is (#129).
+   *
+   * `firstEntryParentUuid === null` is overloaded across three disjoint causes,
+   * and the decline text named only two of them:
+   *
+   * - `"none"` — no conversation entry in the window: empty, unparseable,
+   *   oversized, or all bookkeeping.
+   * - `"root"` — a full-session bundle. A session's first user entry also has a
+   *   null `parentUuid`.
+   * - `"compact-boundary"` — Claude Code severed the chain at a compaction.
+   *   Measured: 16 of 16 real boundaries carry `parentUuid: null`, and 15 of 16
+   *   were `trigger: "auto"`, so this reaches users who never typed `/compact`.
+   *
+   * Free to compute — the parse loop already holds the entry it broke on.
+   */
+  firstEntryKind: "anchored" | "compact-boundary" | "root" | "none";
+  /**
+   * The boundary's `logicalParentUuid`, for the decline message ONLY.
+   *
+   * **Never an anchor.** Measured across 16 real boundaries: 11 point at the
+   * immediately preceding entry, 1 points earlier, and 4 point FORWARD — their
+   * first occurrence is after the boundary, inside the block it introduces. So
+   * it is not a "previous head" pointer, and splicing on it would turn today's
+   * harmless fragment fallback into a divergence prompt in a quarter of cases.
+   */
+  compactionLogicalParentUuid?: string;
+  /** The boundary's `compactMetadata.trigger` (`auto` | `manual`), for the message. */
+  compactionTrigger?: string;
 }
 
 /**
@@ -59,6 +88,9 @@ export async function readDeltaChainInfo(deltaPath: string): Promise<DeltaChainI
   const rl = createInterface({ input, crlfDelay: Infinity });
   let headerPresent = false;
   let firstEntryParentUuid: string | null = null;
+  let firstEntryKind: DeltaChainInfo["firstEntryKind"] = "none";
+  let compactionLogicalParentUuid: string | undefined;
+  let compactionTrigger: string | undefined;
   let seen = 0;
   let scanned = 0;
   try {
@@ -85,13 +117,39 @@ export async function readDeltaChainInfo(deltaPath: string): Promise<DeltaChainI
       // once the header line (if any) is behind us.
       if (!isConversationEntry(obj)) continue;
       firstEntryParentUuid = (obj.parentUuid as string | undefined) ?? null;
+      // Detect on the marker Claude Code actually writes — NOT on
+      // `parentUuid === null && logicalParentUuid present`, which is a derived
+      // heuristic that also matches a plain session root and would recreate
+      // exactly the conflation this field exists to end. If a future build
+      // renames the subtype this falls back to "root"/"none" and behaves as it
+      // did before #129, which is already fail-safe. Load-bearing, because no
+      // boundary in the corpus this was measured on was written by the
+      // installed build — the newest observed was several versions older.
+      if (obj.type === "system" && obj.subtype === "compact_boundary") {
+        firstEntryKind = "compact-boundary";
+        const lp = obj.logicalParentUuid;
+        if (typeof lp === "string" && lp !== "") compactionLogicalParentUuid = lp;
+        const meta = obj.compactMetadata as { trigger?: unknown } | undefined;
+        if (typeof meta?.trigger === "string") compactionTrigger = meta.trigger;
+      } else if (firstEntryParentUuid !== null) {
+        firstEntryKind = "anchored";
+      } else {
+        firstEntryKind = "root";
+      }
       break;
     }
   } finally {
     rl.close();
     input.destroy();
   }
-  return { headerPresent, firstEntryParentUuid, lastEntryUuid: readLastEntryUuid(deltaPath) };
+  return {
+    headerPresent,
+    firstEntryParentUuid,
+    lastEntryUuid: readLastEntryUuid(deltaPath),
+    firstEntryKind,
+    ...(compactionLogicalParentUuid !== undefined ? { compactionLogicalParentUuid } : {}),
+    ...(compactionTrigger !== undefined ? { compactionTrigger } : {}),
+  };
 }
 
 /**
@@ -155,6 +213,17 @@ export interface AppendAttempt {
 export type AppendDeclineReason =
   /** The base's head uuid is not the delta's anchor (checked twice: before and after the O(delta) prep). */
   | "chain-mismatch"
+  /**
+   * The continuation begins at a Claude Code COMPACTION BOUNDARY (#129), where
+   * `parentUuid` is null by design. Split out of `no-delta-entries`, whose text
+   * said "empty, unparseable, or a full-session bundle with no anchor" — none
+   * of which is true here. The bundle is complete and undamaged; there is
+   * simply no entry for a splice to chain onto.
+   *
+   * Widening this union is a LIBRARY change: `src/index.ts` re-exports this
+   * module, so a consumer switching exhaustively on it breaks. Changelog it.
+   */
+  | "compacted"
   /** The base looks like a live session and `force` was not set. */
   | "recently-active"
   /** The bundle carries nothing appendable (empty, or a full session with no anchor). */
@@ -212,7 +281,26 @@ export type AppendOutcome =
  */
 export async function tryAppendContinuation(a: AppendAttempt): Promise<AppendOutcome> {
   const info = await readDeltaChainInfo(a.deltaPath);
+  // NOTE THE ORDER: this runs BEFORE the chain guard below, so a compacted
+  // continuation never reaches `chain-mismatch` and never builds a
+  // `HubPullDivergence`. That is correct and must stay — a boundary-first delta
+  // is not a fork, and routing it through the divergence machinery would let
+  // `--on-divergence skip` (what `/sesh-mover:pull` always passes) stop the
+  // whole chain on it.
   if (!info.lastEntryUuid || info.firstEntryParentUuid === null) {
+    if (info.firstEntryKind === "compact-boundary") {
+      return {
+        kind: "declined",
+        reason: "compacted",
+        detail:
+          `this continuation begins at a Claude Code compaction boundary` +
+          `${info.compactionTrigger ? ` (trigger "${info.compactionTrigger}")` : ""}: ` +
+          `Claude Code severs the parentUuid chain there by design, so there is no entry for the ` +
+          `splice to chain onto` +
+          `${info.compactionLogicalParentUuid ? `, and its logicalParentUuid ${info.compactionLogicalParentUuid} is a diagnostic rather than an anchor` : ""}` +
+          `. Nothing local was touched.`,
+      };
+    }
     return {
       kind: "declined",
       reason: "no-delta-entries",

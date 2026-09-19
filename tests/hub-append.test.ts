@@ -1486,3 +1486,123 @@ describe("adoptHubBranch", () => {
     }
   });
 });
+
+/**
+ * # A continuation that begins at a Claude Code compaction boundary (#129)
+ *
+ * Claude Code severs the `parentUuid` chain at a compaction: the boundary entry
+ * carries `parentUuid: null` and moves continuity to `logicalParentUuid`.
+ * Measured on this machine: 16 distinct boundaries in 10 transcripts, 16/16
+ * with a null parent, and 15/16 `trigger: "auto"` — so it reaches users who
+ * never typed `/compact`.
+ *
+ * The outcome was always fail-safe. What was wrong is the EXPLANATION: the
+ * `firstEntryParentUuid === null` short-circuit runs before the chain guard, so
+ * the decline was `no-delta-entries`, whose text says "empty, unparseable, or a
+ * full-session bundle with no anchor". None of those is true — the bundle is
+ * complete and undamaged.
+ *
+ * The fixture below is the real 2.1.x shape (keys taken verbatim from a live
+ * boundary; values redacted).
+ *
+ * These are Linux-provable: the whole mechanism is JSON parsing and string
+ * comparison, with no platform-specific behaviour to chase.
+ */
+describe("append — a compaction boundary (#129)", () => {
+  const boundary = (over: Record<string, unknown> = {}): string =>
+    JSON.stringify({
+      type: "system",
+      subtype: "compact_boundary",
+      uuid: "cf3b9970-202f-4813-96db-d04bb6a2311c",
+      parentUuid: null,
+      logicalParentUuid: "449ede85-3751-4c0a-9d1f-2b9a8c7e1d33",
+      compactMetadata: { trigger: "auto", preTokens: 969425, postTokens: 23086 },
+      timestamp: "2026-09-01T10:00:00Z",
+      sessionId: "11111111-2222-3333-4444-555555555555",
+      cwd: "/home/dev/repos/x",
+      version: "2.1.272",
+      ...over,
+    }) + "\n";
+
+  it("classifies the boundary rather than reporting no anchor", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "sesh-compact-"));
+    const delta = join(dir, "delta.jsonl");
+    writeFileSync(delta, boundary());
+
+    const info = await readDeltaChainInfo(delta);
+    expect(info.firstEntryParentUuid).toBeNull();
+    expect(info.firstEntryKind).toBe("compact-boundary");
+    expect(info.compactionLogicalParentUuid).toBe("449ede85-3751-4c0a-9d1f-2b9a8c7e1d33");
+    expect(info.compactionTrigger).toBe("auto");
+  });
+
+  /**
+   * A full-session bundle's first entry ALSO has a null parentUuid. If the
+   * detector keyed on "null parent + logicalParentUuid present" instead of on
+   * the subtype, it would match a plain root too — recreating exactly the
+   * conflation this field exists to end.
+   */
+  it("does not classify an ordinary session root as a compaction", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "sesh-root-"));
+    const delta = join(dir, "delta.jsonl");
+    writeFileSync(
+      delta,
+      JSON.stringify({
+        type: "user", uuid: "root-1", parentUuid: null,
+        timestamp: "2026-09-01T10:00:00Z", sessionId: "s", cwd: "/x", version: "2.1.81",
+        message: { role: "user", content: "hello" },
+      }) + "\n"
+    );
+    const info = await readDeltaChainInfo(delta);
+    expect(info.firstEntryParentUuid).toBeNull();
+    expect(info.firstEntryKind).toBe("root");
+  });
+
+  /**
+   * If a future build renames the subtype, this must fall back to today's
+   * behaviour rather than mis-detecting. No boundary in the corpus this was
+   * measured on was written by the installed build, so the fallback is
+   * load-bearing rather than defensive padding.
+   */
+  it("falls back to today's classification when the subtype is unrecognised", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "sesh-renamed-"));
+    const delta = join(dir, "delta.jsonl");
+    writeFileSync(delta, boundary({ subtype: "compaction_boundary_v2" }));
+    const info = await readDeltaChainInfo(delta);
+    expect(info.firstEntryKind).toBe("root");
+    expect(info.compactionLogicalParentUuid).toBeUndefined();
+  });
+
+  it("declines with `compacted`, and the message names compaction rather than damage", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "sesh-compact-decline-"));
+    const base = join(dir, "base.jsonl");
+    const delta = join(dir, "delta.jsonl");
+    writeFileSync(
+      base,
+      JSON.stringify({
+        type: "user", uuid: "base-head", parentUuid: null,
+        timestamp: "2026-09-01T09:00:00Z", sessionId: "s", cwd: "/x", version: "2.1.81",
+        message: { role: "user", content: "base" },
+      }) + "\n"
+    );
+    writeFileSync(delta, boundary());
+
+    const outcome = await tryAppendContinuation({
+      basePath: base, deltaPath: delta, opNowMs: Date.now(), force: false,
+    } as Parameters<typeof tryAppendContinuation>[0]);
+
+    expect(outcome.kind).toBe("declined");
+    if (outcome.kind !== "declined") return;
+    expect(outcome.reason).toBe("compacted");
+    expect(outcome.detail).toMatch(/compaction boundary/i);
+    expect(outcome.detail).toContain("auto");
+    // It must NOT keep claiming the bundle is broken.
+    expect(outcome.detail).not.toMatch(/empty, unparseable/i);
+    // And it must name no flag: --force-append cannot reach this decline.
+    expect(outcome.detail).not.toMatch(/--force-append/);
+  });
+});

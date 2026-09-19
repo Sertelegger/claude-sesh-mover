@@ -11,6 +11,35 @@ export interface DeltaChainInfo {
     /** Anchor: the parentUuid of the first REAL (non-header) entry. */
     firstEntryParentUuid: string | null;
     lastEntryUuid: string | null;
+    /**
+     * WHY the anchor is what it is (#129).
+     *
+     * `firstEntryParentUuid === null` is overloaded across three disjoint causes,
+     * and the decline text named only two of them:
+     *
+     * - `"none"` — no conversation entry in the window: empty, unparseable,
+     *   oversized, or all bookkeeping.
+     * - `"root"` — a full-session bundle. A session's first user entry also has a
+     *   null `parentUuid`.
+     * - `"compact-boundary"` — Claude Code severed the chain at a compaction.
+     *   Measured: 16 of 16 real boundaries carry `parentUuid: null`, and 15 of 16
+     *   were `trigger: "auto"`, so this reaches users who never typed `/compact`.
+     *
+     * Free to compute — the parse loop already holds the entry it broke on.
+     */
+    firstEntryKind: "anchored" | "compact-boundary" | "root" | "none";
+    /**
+     * The boundary's `logicalParentUuid`, for the decline message ONLY.
+     *
+     * **Never an anchor.** Measured across 16 real boundaries: 11 point at the
+     * immediately preceding entry, 1 points earlier, and 4 point FORWARD — their
+     * first occurrence is after the boundary, inside the block it introduces. So
+     * it is not a "previous head" pointer, and splicing on it would turn today's
+     * harmless fragment fallback into a divergence prompt in a quarter of cases.
+     */
+    compactionLogicalParentUuid?: string;
+    /** The boundary's `compactMetadata.trigger` (`auto` | `manual`), for the message. */
+    compactionTrigger?: string;
 }
 /**
  * Bounded read of a continuation bundle's chain endpoints: the leading lines up
@@ -78,6 +107,17 @@ export interface AppendAttempt {
 export type AppendDeclineReason = 
 /** The base's head uuid is not the delta's anchor (checked twice: before and after the O(delta) prep). */
 "chain-mismatch"
+/**
+ * The continuation begins at a Claude Code COMPACTION BOUNDARY (#129), where
+ * `parentUuid` is null by design. Split out of `no-delta-entries`, whose text
+ * said "empty, unparseable, or a full-session bundle with no anchor" — none
+ * of which is true here. The bundle is complete and undamaged; there is
+ * simply no entry for a splice to chain onto.
+ *
+ * Widening this union is a LIBRARY change: `src/index.ts` re-exports this
+ * module, so a consumer switching exhaustively on it breaks. Changelog it.
+ */
+ | "compacted"
 /** The base looks like a live session and `force` was not set. */
  | "recently-active"
 /** The bundle carries nothing appendable (empty, or a full session with no anchor). */

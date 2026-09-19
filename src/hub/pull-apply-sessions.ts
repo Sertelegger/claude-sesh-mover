@@ -838,6 +838,20 @@ export async function runApplySessionsStage(
             );
           }
           // fall through to the fragment import
+        } else if (outcome.reason === "compacted") {
+          // #129. NOT an error and not damage: the sending machine's session
+          // was compacted, Claude Code severs the parentUuid chain at that
+          // boundary by design, and the entries themselves arrived in full.
+          //
+          // NAMES NO FLAG, deliberately. None helps — `--force-append` skips
+          // only the liveness guard, two returns further down in `append.ts`,
+          // so it cannot reach this decline. Naming one would also owe
+          // `tests/hub-warning-flags.test.ts` a `retry-works` proof that no
+          // re-run could satisfy.
+          reasons.push(
+            `Thread ${threadId} was compacted on the machine that pushed it, so this continuation could not be spliced onto the local transcript: Claude Code severs the entry chain at a compaction boundary by design, and there is nothing for the splice to attach to. This is not an error and nothing was lost — the entries arrived in full and were imported as a separate session, nothing local was touched, and the thread continues normally from the next continuation.`
+          );
+          // fall through to the fragment import
         } else {
           // THIS bundle is foreclosed — the fragment import below records
           // it, so nothing reaches it again — but the flag is not, and the
