@@ -2,6 +2,179 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.12.0] — 2026-09-19
+
+Every fix here came out of one real event: two projects and 190 sessions moved
+between Claude profiles, followed by an agent hand-diffing 6,382 files. Nothing
+in this release was found by the test suite. Two of the defects were invisible
+in the result JSON by construction, and one was silent corruption on a
+filesystem most Linux containers use.
+
+It also carries a compatibility review against **Claude Code 2.1.277**, which
+turned up more than the migration did — including the most serious defect in
+the release, which made `import` report success while writing where Claude Code
+never reads.
+
+### Fixed
+
+- **`import` wrote sessions into a directory Claude Code never reads, and said
+  it worked ([#126]).** `encodeProjectPath` replaced only the path separator.
+  Claude Code replaces **every non-alphanumeric** and caps the name at 200
+  characters with a base36 hash suffix. So any project path containing a `.`, a
+  `_`, a space or a version suffix encoded to the wrong folder — and on import
+  that fails silently: the transcript is written, the command reports success,
+  and the session never appears in Claude Code.
+
+  > **If you imported or migrated a session for a project whose path contains
+  > anything but letters, digits and `/`, it may be sitting in the wrong
+  > folder.** This release finds it: `discovery.ts` also scans the old name, so
+  > `/sesh-mover:browse` and `/sesh-mover:migrate` can still see those sessions
+  > and move them into place. Nothing is deleted and nothing needs undoing.
+
+  The encoder is now a verbatim port, verified against every real project
+  directory rather than against the rule it was read from. `sync-state.ts`
+  renames its own file forward, because that file is *named* with the encoding
+  and losing it would silently cost the import-dedup registry, the hub thread
+  map, the workspace generations and every peer's sent ledger. `lock.ts`
+  deliberately does not migrate: a stale holder record would make the liveness
+  probe answer "unknown", which that module treats as alive.
+
+  The four fixtures this had before were all paths where the old and new rules
+  agree, which is exactly why it shipped and stayed.
+
+- **A moved session still pointed at the machine it came from ([#127]).** The
+  rewriter dispatched on two entry types, so every field the transcript format
+  has grown since survived a move untouched. Measured on one real 13,427-line
+  transcript: `cwd` was rewritten 9,235 times out of 9,235, while
+  `attachment.snapshot.workingDirectory` and file-history's `realParentDir`
+  were rewritten **zero** times out of 3 and 59.
+
+  `attachment` is about a third of all lines and had no branch at all. It
+  carries a *second, parallel* working directory plus the pre-rendered reminder
+  quoting it — so a resumed session was told, in the context the model actually
+  reads, that it sits in a directory that does not exist. `file-history`
+  rewrote a backup's key and not its own value, leaving one object naming the
+  target machine in its key and the source in `realParentDir`, which is the
+  field a `/rewind` restore consults to re-create a parent directory.
+  `toolUseResult.persistedOutputPath` is the cleanest case: the plugin carries
+  the `tool-results` layer *and* renames it to the new session id, then left the
+  pointer naming the source.
+
+  What governs it now is a rule rather than a field list, because a list goes
+  stale on the next Claude Code release: **a field is rewritten if its value is
+  a LOCATION and left verbatim if it is CONTENT**, tie-broken by *does a second
+  copy of these bytes travel in this bundle?* That is why `Agent.prompt` is left
+  alone — 387 of 439 measured prompts are byte-identical to a subagent
+  transcript carried in the same bundle, so rewriting it would manufacture two
+  copies that disagree.
+
+- **A bundle could read files off the machine importing it ([#125]).** The three
+  per-session layers were copied with a predicate that resolves symlinks, so an
+  entry in a bundle's `subagents/`, `tool-results/` or `file-history/` pointing
+  anywhere on the importing machine was read and written into the target
+  session. Measured end to end before the fix: `success: true`, **no warnings**,
+  host file content in the target.
+
+  The manifest digest is not a defence here. Tampering with an honest bundle is
+  caught, but a bundle *assembled* with a symlink carries a digest computed over
+  what the link points at. Archive bundles were never exposed — the tar reader
+  refuses symlink entries — and a `--format dir` bundle never passes through it,
+  which is the shape most likely to be handed over by hand. `memory/` and
+  `plans/` have had this guard since 0.6.x; the session layers never got it.
+  What made it worth code rather than a note is the hub: a linked project's
+  session-end auto-push is on by default, so content landed this way would be
+  uploaded without the user opening anything.
+
+- **`migrate` deleted files no bundle had carried ([#124]).** Cleanup removed
+  the whole session folder, including anything Claude Code writes there that no
+  version of this plugin exports. It has already cost two such directories —
+  Workflow run records and scripts, and an auto-mode diagnostic — found only by
+  hand-diffing a real migration. Cleanup now removes only what was carried,
+  keeps the rest where it is, and names it; `export` discloses every entry it
+  walks past. The list is a closed set the code treats as incomplete, so the
+  next directory Claude Code adds announces itself instead of being deleted.
+
+- **Export and import failed, or silently corrupted, on any session that had run
+  a Workflow ([#121]).** Claude Code writes `subagents/workflows/<id>/`, and
+  every layer walk was flat, so the copy met a directory. What happened then
+  depended on the filesystem, which is why it looked like two bugs: a non-empty
+  directory threw (`EISDIR`, or `ENOTSUP` on macOS, whose `copyfile` reports any
+  non-regular file as a socket — which sent the first report looking for a
+  socket that was not there), while an **empty** one on a filesystem reporting
+  `st_size` 0 for directories — btrfs, which most Linux containers use — threw
+  nothing and wrote a **zero-byte file** into the bundle that then passed the
+  bundle's own integrity check.
+
+  The digest moved with the copy, because they are one invariant: the digest
+  must cover exactly what the bundle carries. A flat directory still hashes
+  byte-identically, so no existing bundle changes meaning.
+
+- **A compacted session's continuation was reported as a damaged bundle
+  ([#129]).** Claude Code severs the entry chain at a compaction by design, so
+  the continuation could not be spliced — correctly. But the decline said the
+  bundle had "no appendable entries (empty, unparseable, or a full-session
+  bundle with no anchor)", and none of those is true: the bundle is complete.
+  Measured across 16 real boundaries, 15 were triggered automatically, so this
+  reached people who never typed `/compact`. The pull now says the thread was
+  compacted on the sending machine, that the entries arrived in full, and that
+  nothing local was touched.
+
+- **A path named in `.sesh-mover-include` that is a symlink is no longer dropped
+  in silence ([#119]).** It is still not carried — following it would put the
+  link target's bytes in the bundle — but it is now named, one line below a
+  comment calling silent omission the thing that check exists to prevent.
+
+### Changed
+
+- `AppendDeclineReason` gains a `compacted` member. This type is re-exported
+  from the library entrypoint, so **a consumer switching exhaustively over it
+  will need a new arm**. It is the only breaking surface in this release.
+- `UserMessageEntry.toolUseResult` is now `Record<string, unknown> | string`.
+  It really is a plain string on hundreds of real lines, and the old
+  object-only type is why that case was skipped in silence.
+- `attachment` and `file-history-delta` join `JsonlEntryType`.
+
+### Documentation
+
+- The hook-registration section was re-verified against 2.1.277 with live A/B
+  runs. **The configuration is unchanged and still correct**; four of the
+  reasons given for it were not. A plugin's SessionEnd `timeout` does not widen
+  the shared budget — it is ignored entirely. An async SessionStart hook's
+  output is not discarded; it arrives late. The payload list was missing
+  `hook_event_name`, which is always present. And a JSONC comment breaks the
+  whole plugin load, not just the hooks.
+- The rewriter's governing rule, the encoder's three failure modes, and
+  compaction as a second structural cause of chain mismatch are all written
+  down at their sites.
+- **Parse JSONL, never grep it.** Measured twice this cycle: a key-order
+  mismatch made `grep` report 9 transcripts where parsing found 2,273, and an
+  investigation's own output landed in the transcripts it was searching, so a
+  sweep matched its own quoted evidence.
+
+### Known limitations
+
+- **The Windows project-path encoding is inferred, not observed.** The rule is
+  read verbatim from the shipped build, but no Windows build was available to
+  confirm what string reaches the encoder there. The live check that would
+  settle it now *skips* rather than passing vacuously, so running the suite on
+  a Windows machine with a real `%USERPROFILE%\.claude\projects` will say
+  plainly whether it agrees.
+- A pulled continuation still splices the sending machine's `session_id` into a
+  transcript you already own. Decided rather than overlooked — the mapping is
+  buildable, and needs its own cross-machine proof.
+- `hub reindex` still re-signs whatever is on the hub ([#122]), so the repair
+  tool can vouch for bytes it did not author. No message offers a reindex as a
+  remedy, which limits it in practice but does not close it.
+
+[#119]: https://github.com/Sertelegger/claude-sesh-mover/issues/119
+[#121]: https://github.com/Sertelegger/claude-sesh-mover/issues/121
+[#122]: https://github.com/Sertelegger/claude-sesh-mover/issues/122
+[#124]: https://github.com/Sertelegger/claude-sesh-mover/issues/124
+[#125]: https://github.com/Sertelegger/claude-sesh-mover/issues/125
+[#126]: https://github.com/Sertelegger/claude-sesh-mover/issues/126
+[#127]: https://github.com/Sertelegger/claude-sesh-mover/issues/127
+[#129]: https://github.com/Sertelegger/claude-sesh-mover/issues/129
+
 ## [0.11.0] — 2026-09-08
 
 ### Added
