@@ -11,6 +11,7 @@ import type {
 } from "./types.js";
 import {
   detectPlatform,
+  encodeProjectPath,
   extractUserFromPath,
   getCurrentUser,
   samePlatformFamily,
@@ -25,6 +26,23 @@ export interface RewriteContext {
   targetPlatform: Platform;
   sourceUser: string;
   targetUser: string;
+  /**
+   * source session id -> the id this import minted for it (#127).
+   *
+   * Present only when the caller can name the WHOLE set — i.e. an import or
+   * pull of a bundle. It carries two jobs that are the same lookup: the
+   * `session_id` / `continuedInSessionId` references, and the session-id
+   * SEGMENT inside a path like
+   * `<configDir>/projects/<encoded>/<sessionId>/tool-results/…`.
+   *
+   * Absent means "leave every reference byte-identical", which is correct
+   * rather than degraded: measured over 205,946 real lines, roughly one
+   * `session_id` line in six names a run that has no transcript even on the
+   * machine that wrote it. There is nothing to map it to.
+   */
+  sessionIdMap?: ReadonlyMap<string, string>;
+  /** `[encode(sourceProjectPath), encode(targetProjectPath)]`, or absent when equal. */
+  encodedProject?: readonly [from: string, to: string];
 }
 
 /**
@@ -111,6 +129,36 @@ function normalizeSeparators(tail: string, targetPlatform: Platform): string {
   return targetPlatform === "win32"
     ? tail.replace(/\//g, "\\")
     : tail.replace(/\\/g, "/");
+}
+
+/**
+ * The primitive for a field that is a path IN ITS ENTIRETY but whose interior
+ * may carry ids this import is renaming (#127).
+ *
+ * `rewriteWholePath` alone is not enough for the largest such family.
+ * `realParentDir` (6,358 occurrences measured) looks like
+ * `/tmp/claude-1000/-home-dev-repos-x/<sourceSessionId>/scratchpad`: the
+ * leading `/tmp/claude-1000` matches no mapping, so the prefix pass hands it
+ * back untouched — and the two things that ARE stale sit mid-path.
+ *
+ * The interior pass matches whole `/`- or `\`-delimited SEGMENTS and nothing
+ * else. An encoded project name and a session id are each exactly one segment,
+ * and segment matching is what makes a prefix collision between two encoded
+ * names structurally impossible here — unlike `rewriteString`, which needs a
+ * lookahead guard for the same job.
+ */
+export function rewritePathValue(input: string, ctx: RewriteContext): string {
+  const mapped = rewriteWholePath(input, ctx);
+  if (!ctx.encodedProject && !ctx.sessionIdMap) return mapped;
+  const isSep = /^[/\\]$/;
+  return mapped
+    .split(/([/\\])/)
+    .map((seg) => {
+      if (isSep.test(seg)) return seg;
+      if (ctx.encodedProject && seg === ctx.encodedProject[0]) return ctx.encodedProject[1];
+      return ctx.sessionIdMap?.get(seg) ?? seg;
+    })
+    .join("");
 }
 
 export function rewriteString(input: string, ctx: RewriteContext): string {
@@ -234,6 +282,28 @@ export function buildPathMappings(
     }
   }
 
+  // The ENCODED project-folder name appears INSIDE paths that are otherwise
+  // correctly mapped — `<configDir>/projects/<encoded>/…` and
+  // `/tmp/claude-*/<encoded>/…` — so without this a rewritten stdout line comes
+  // out half target and half source, naming nothing on either machine (#127).
+  // Encoding forward is well defined; this module only refuses to DECODE.
+  //
+  // A prefix collision between two encoded names (`-home-dev-repos-tzun` inside
+  // `-home-dev-repos-tzun-sdk`) is already handled by `rewriteString`'s
+  // boundary lookahead, which requires the next character to be a separator or
+  // a token terminator — and `-` is neither. Do not add a second guard here.
+  if (sourceProjectPath !== targetProjectPath) {
+    const encodedFrom = encodeProjectPath(sourceProjectPath);
+    const encodedTo = encodeProjectPath(targetProjectPath);
+    if (encodedFrom !== encodedTo) {
+      mappings.push({
+        from: encodedFrom,
+        to: encodedTo,
+        description: `Encoded project dir: ${encodedFrom} -> ${encodedTo}`,
+      });
+    }
+  }
+
   // Sort longest-from first to prevent prefix collisions
   mappings.sort((a, b) => b.from.length - a.from.length);
 
@@ -267,7 +337,13 @@ export type RewriteSource = Pick<
 export function buildImportRewriteContext(
   source: RewriteSource,
   targetProjectPath: string,
-  targetConfigDir: string
+  targetConfigDir: string,
+  /**
+   * source session id -> newly minted id, when the caller can name the whole
+   * set (#127). Omit it and every session reference is left byte-identical,
+   * which is the correct answer for a caller that cannot.
+   */
+  sessionIdMap?: ReadonlyMap<string, string>
 ): RewriteContext {
   const targetPlatform = detectPlatform();
   const sourceUser =
@@ -288,6 +364,15 @@ export function buildImportRewriteContext(
     targetPlatform,
     sourceUser,
     targetUser,
+    ...(sessionIdMap !== undefined ? { sessionIdMap } : {}),
+    // The encoded pair is derived from the SAME two project paths the mappings
+    // are, so it can never disagree with them (#127).
+    ...(source.sourceProjectPath !== targetProjectPath
+      ? { encodedProject: [
+          encodeProjectPath(source.sourceProjectPath),
+          encodeProjectPath(targetProjectPath),
+        ] as const }
+      : {}),
   };
 }
 
@@ -295,6 +380,152 @@ function getHomePath(platform: Platform, user: string): string {
   if (platform === "win32") return `C:\\Users\\${user}`;
   if (platform === "darwin") return `/Users/${user}`;
   return `/home/${user}`;
+}
+
+/**
+ * # Which fields get translated, and the rule that decides the NEXT one
+ *
+ * **A field is rewritten if its value is a LOCATION; it is left verbatim if its
+ * value is CONTENT. Decide by what the value IS, never by what the key is
+ * called.**
+ *
+ * - **LOCATION** — the value says *where* on a filesystem something is: a path
+ *   in its entirety, or an invocation that names paths. Locations are
+ *   translated wherever they occur, in a tool INPUT exactly as in a tool
+ *   RESULT, because a bundle's whole contract is that every filesystem fact in
+ *   it describes the machine you are reading it on.
+ * - **CONTENT** — bytes that were, or would be, the contents of a file, or
+ *   prose addressed to a person or a model. Never translated, for the reason
+ *   user and assistant text is not, plus a stronger one: **a second copy of
+ *   those bytes usually travels in the same bundle and is not translated** —
+ *   the file in the workspace payload, and the subagent transcript whose first
+ *   user message this module refuses to touch. One stale copy beats two copies
+ *   that disagree.
+ * - **The tie-breaker for the next field, in one question:** *does a second
+ *   copy of these bytes travel in this bundle?* Yes, leave it. No, and the
+ *   value is a path, translate it. Neither is clear — leave it, which is this
+ *   module's stated preferred failure mode.
+ *
+ * The tables are an ALLOWLIST, and the default for anything unclassified is
+ * LEAVE — including every field of every `mcp__*` tool, whose schemas we do not
+ * own. The corpus is why a denylist would not do: `Workflow.script` is named
+ * like a location and held JavaScript in 67 of 67 measured values.
+ */
+const TOOL_RESULT_PATH_FIELDS = [
+  "persistedOutputPath",
+  "transcriptDir",
+  "scriptPath",
+  "filePath",
+  "outputFile",
+  "originalFilePath",
+] as const;
+
+/**
+ * Free text that may CONTAIN a path. Note what is absent and why:
+ * `originalFile` is NOT here despite the name — 78 of 637 measured values start
+ * with a shebang, so it is file bytes, and file bytes are CONTENT.
+ */
+const TOOL_RESULT_TEXT_FIELDS = [
+  "stdout",
+  "stderr",
+  "message",
+  "backgroundCwdHint",
+] as const;
+
+/**
+ * Tool INPUT fields that are locations, keyed by tool name.
+ *
+ * An input is a machine-readable argument object, not prose — `Read.file_path`
+ * is a location in exactly the sense `toolUseResult.filePath` is, and the
+ * bundle's contract says locations describe the machine you are reading them
+ * on. Until #127 there was no `assistant` branch at all, so every one of these
+ * survived a move and a resumed session re-read its own history as a list of
+ * operations on paths that do not exist here.
+ *
+ * ALLOWLIST, and deliberately short. What is NOT here, and why, so the next
+ * reader does not re-litigate it:
+ *
+ * - `Write.content`, `Edit.old_string` / `new_string` — file bytes. CONTENT.
+ * - `Workflow.script` — named like a location, held JavaScript in 67 of 67
+ *   measured values. The reason the table is an allowlist rather than a
+ *   denylist on key names.
+ * - `Agent.prompt` — 387 of 439 measured prompts are byte-identical to the
+ *   first user message of a subagent transcript that travels in the SAME
+ *   bundle and is left verbatim by rule. Rewriting it would manufacture two
+ *   copies of one text, inside one bundle, that disagree — and the cause would
+ *   be us, not drift.
+ * - `Grep.pattern`, every `description` — prose or a regex.
+ * - Every field of every `mcp__*` tool — schemas we do not own.
+ */
+const TOOL_INPUT_PATH_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  Read: ["file_path"],
+  Write: ["file_path"],
+  Edit: ["file_path"],
+  NotebookEdit: ["notebook_path"],
+  Glob: ["path"],
+  Grep: ["path"],
+  Workflow: ["scriptPath"],
+};
+
+/** Whole-path fields on an `attachment`'s environment snapshot. */
+const ATTACHMENT_PATH_FIELDS = [
+  "workingDirectory",
+  "scratchpadDirectory",
+] as const;
+
+/**
+ * A file-history backup record's own paths.
+ *
+ * **The KEY and its VALUE are the same fact.** Before #127 only the key was
+ * rewritten, so one object named the target machine in its key and the source
+ * machine in `realParentDir` — and `realParentDir` is the field a `/rewind`
+ * restore consults to re-create the parent directory. That makes this the
+ * highest WRITE-side risk in the set. Do not re-split them.
+ */
+function rewriteBackupValue(value: unknown, ctx: RewriteContext): unknown {
+  if (!value || typeof value !== "object") return value;
+  const b = { ...(value as Record<string, unknown>) };
+  if (typeof b.realParentDir === "string") b.realParentDir = rewritePathValue(b.realParentDir, ctx);
+  return b;
+}
+
+/** Rewrite the LOCATION fields of one tool-use input, per `TOOL_INPUT_PATH_FIELDS`. */
+function rewriteToolInput(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: RewriteContext
+): Record<string, unknown> {
+  const out = { ...input };
+  for (const field of TOOL_INPUT_PATH_FIELDS[toolName] ?? []) {
+    if (typeof out[field] === "string") out[field] = rewritePathValue(out[field] as string, ctx);
+  }
+  // `command` is free text that NAMES paths — a location by the rule above, not
+  // prose. Bash and Monitor are the two tools that carry one.
+  if ((toolName === "Bash" || toolName === "Monitor") && typeof out.command === "string") {
+    out.command = rewriteString(out.command, ctx);
+  }
+  return out;
+}
+
+/**
+ * Which shape of the wire equation a stored `wire.command` had BEFORE any
+ * rewriting — the only thing the re-derivation needs from it.
+ *
+ * `plain` when the wire form equalled the input verbatim, `cd` when it was the
+ * `cd <cwd> && <input>` form, `none` when neither held. `none` is not a
+ * failure: Claude Code's own check already fails for those, so it is already
+ * ignoring the wire form, and reproducing that is correct.
+ */
+function wireEquationShape(
+  wireCommand: string,
+  originalInputCommand: string,
+  originalCwd: string | undefined
+): "plain" | "cd" | "none" {
+  if (wireCommand === originalInputCommand) return "plain";
+  if (originalCwd !== undefined && wireCommand === `cd ${originalCwd} && ${originalInputCommand}`) {
+    return "cd";
+  }
+  return "none";
 }
 
 export function rewriteEntry(
@@ -307,6 +538,36 @@ export function rewriteEntry(
   // Rewrite sessionId
   if (newSessionId) {
     result.sessionId = newSessionId;
+  }
+
+  // `sessionId` (camel) is WHICH FILE this entry is in — 205,376 of 205,376
+  // measured entries equal their transcript's filename stem, across every entry
+  // type — so the unconditional restamp above is right for it.
+  //
+  // `session_id` (snake) is WHO WROTE IT: the id of the RUN that authored the
+  // entry, preserved verbatim when the entry is carried into a different file
+  // (compaction, a fork, a resume — and, on a machine that uses this plugin,
+  // our own imports). So it is MAPPED when the referent travels in this bundle
+  // and left BYTE-IDENTICAL when it does not. Never assigned: measured, ~24% of
+  // `session_id` lines do not name their own transcript, so stamping the new id
+  // over them fabricates authorship. Same rule as `manifest.ts`'s
+  // `isAgentTranscript` — do not write a field into a schema we do not own.
+  //
+  // `sessionId` is the file; `session_id` is the process. Never harmonize them.
+  // `bridgeSessionId` is a cloud namespace and `sessionKind` is a kind; neither
+  // is ever mapped.
+  if (typeof result.session_id === "string") {
+    result.session_id = ctx.sessionIdMap?.get(result.session_id) ?? result.session_id;
+  }
+  // A real session->session edge, and Claude Code dereferences it: it hides the
+  // PARENT from the resume list only when `<same dir>/<continuedInSessionId>.jsonl`
+  // exists with real content. After an import the pointer names the source
+  // machine's id, that file does not exist, and the imported parent is offered
+  // for resume beside its own continuation. Fail-open — mapping closes it when
+  // both ends travel together.
+  if (typeof result.continuedInSessionId === "string") {
+    result.continuedInSessionId =
+      ctx.sessionIdMap?.get(result.continuedInSessionId) ?? result.continuedInSessionId;
   }
 
   // Rewrite cwd (always) — whole-path field, not free text.
@@ -337,30 +598,245 @@ export function rewriteEntry(
     }
     // Do NOT rewrite plain string user message content
 
-    // Rewrite toolUseResult stdout/stderr
-    if (result.toolUseResult) {
+    // `toolUseResult` is a RESULT — the machine telling us where things are —
+    // so every location in it is translated. Until #127 only `stdout`/`stderr`
+    // were, which left the pointers stale while the bytes they point at were
+    // carried and renamed: `persistedOutputPath` names a file in the
+    // `tool-results` layer that this very import renames to a new session id.
+    if (typeof result.toolUseResult === "string") {
+      // It is a plain string on a measured 557 lines. The old shape check read
+      // `tr.stdout` off a string, got `undefined`, and skipped the whole value
+      // in silence.
+      result.toolUseResult = rewriteString(result.toolUseResult, ctx);
+    } else if (result.toolUseResult) {
       const tr = result.toolUseResult as Record<string, unknown>;
-      if (typeof tr.stdout === "string") {
-        tr.stdout = rewriteString(tr.stdout, ctx);
+      // Whole-path fields. `rewritePathValue`, not `rewriteWholePath`: several
+      // of these embed the encoded project name and the session id mid-path.
+      for (const k of TOOL_RESULT_PATH_FIELDS) {
+        if (typeof tr[k] === "string") tr[k] = rewritePathValue(tr[k] as string, ctx);
       }
-      if (typeof tr.stderr === "string") {
-        tr.stderr = rewriteString(tr.stderr, ctx);
+      // Free text that may CONTAIN paths.
+      for (const k of TOOL_RESULT_TEXT_FIELDS) {
+        if (typeof tr[k] === "string") tr[k] = rewriteString(tr[k] as string, ctx);
+      }
+      const file = tr.file as Record<string, unknown> | undefined;
+      if (file && typeof file.filePath === "string") {
+        file.filePath = rewritePathValue(file.filePath, ctx);
+      }
+      for (const k of ["changedFiles", "filenames"] as const) {
+        const arr = (tr.bashEditDiff as Record<string, unknown> | undefined)?.[k] ?? tr[k];
+        if (Array.isArray(arr)) {
+          const out = arr.map((v) => (typeof v === "string" ? rewritePathValue(v, ctx) : v));
+          if (tr.bashEditDiff && (tr.bashEditDiff as Record<string, unknown>)[k]) {
+            (tr.bashEditDiff as Record<string, unknown>)[k] = out;
+          } else if (tr[k]) {
+            tr[k] = out;
+          }
+        }
+      }
+      const bed = tr.bashEditDiff as Record<string, unknown> | undefined;
+      if (bed && Array.isArray(bed.files)) {
+        bed.files = (bed.files as Array<Record<string, unknown>>).map((f) =>
+          f && typeof f.filePath === "string" ? { ...f, filePath: rewritePathValue(f.filePath, ctx) } : f
+        );
+      }
+      if (Array.isArray(tr.content)) {
+        tr.content = (tr.content as Array<Record<string, unknown>>).map((b) =>
+          b?.type === "text" && typeof b.text === "string"
+            ? { ...b, text: rewriteString(b.text as string, ctx) }
+            : b
+        );
+      } else if (typeof tr.content === "string") {
+        tr.content = rewriteString(tr.content, ctx);
       }
     }
   }
 
-  // Rewrite file-history-snapshot trackedFileBackups keys
+  /**
+   * The `assistant` branch. There was none until #127, which is the structural
+   * reason every tool INPUT in every transcript survived a move untouched.
+   */
+  if (result.type === "assistant" && result.message) {
+    const msg = result.message as Record<string, unknown>;
+    // Snapshot what the equation's right-hand side looked like BEFORE anything
+    // moved. The wire form can only be re-derived by knowing which of the two
+    // shapes it originally had, and both comparands are about to change.
+    const originalCommand = new Map<string, string>();
+    if (Array.isArray(msg.content)) {
+      for (const b of msg.content as Array<Record<string, unknown>>) {
+        if (b?.type === "tool_use" && typeof b.id === "string") {
+          const inp = b.input as Record<string, unknown> | undefined;
+          if (inp && typeof inp.command === "string") originalCommand.set(b.id, inp.command);
+        }
+      }
+      msg.content = (msg.content as Array<Record<string, unknown>>).map((block) => {
+        if (block?.type !== "tool_use" || !block.input || typeof block.name !== "string") return block;
+        return { ...block, input: rewriteToolInput(block.name, block.input as Record<string, unknown>, ctx) };
+      });
+    }
+
+    /**
+     * THE WIRE TRIPLE, and it moves as one.
+     *
+     * Claude Code re-checks `wire.command === "cd " + wic.cwd + " && " +
+     * input.command` (or `=== input.command`) on resume and on every API
+     * message build, and USES the wire form when it passes. Rewriting one leg
+     * is the only outcome strictly worse than doing nothing: the check fails
+     * silently, the wire form is discarded, and nothing on our side says so.
+     *
+     * So `command` is RE-DERIVED from the already-rewritten parts rather than
+     * rewritten in place. `rewriteString` is not a homomorphism over
+     * concatenation — its guard-character lookbehind and URL back-scan are
+     * context-sensitive — so rewriting a prefix and a suffix independently is
+     * not guaranteed to reproduce the rewrite of their concatenation, and a
+     * one-character disagreement voids the wire form.
+     *
+     * When the relation did not hold BEFORE the rewrite, the wire value is left
+     * alone. That is not a gap: Claude Code's own check already fails for those
+     * (measured: 2 of 1,825, both unicode-escape normalizations), so it is
+     * already falling back to the stored input and reproducing the failure
+     * changes nothing.
+     */
+    const wic = result.wireIngestContext as Record<string, Record<string, unknown>> | undefined;
+    const originalWic: Record<string, string> = {};
+    if (wic && typeof wic === "object") {
+      for (const [id, v] of Object.entries(wic)) {
+        // Measured 631/631: the ONLY subkey is `cwd`, always a string — and 1
+        // of them is a strict subdirectory of the entry's own cwd, which is why
+        // it is mapped like a path rather than stamped with `result.cwd`.
+        if (v && typeof v.cwd === "string") {
+          originalWic[id] = v.cwd;
+          v.cwd = rewritePathValue(v.cwd, ctx);
+        }
+      }
+    }
+    const wti = result.wireToolInputs as Record<string, Record<string, unknown>> | undefined;
+    if (wti && typeof wti === "object" && Array.isArray(msg.content)) {
+      const byId = new Map<string, Record<string, unknown>>();
+      for (const b of msg.content as Array<Record<string, unknown>>) {
+        if (b?.type === "tool_use" && typeof b.id === "string") byId.set(b.id, b);
+      }
+      for (const [id, wire] of Object.entries(wti)) {
+        if (!wire || typeof wire !== "object") continue;
+        const block = byId.get(id);
+        const name = typeof block?.name === "string" ? block.name : undefined;
+        const input = block?.input as Record<string, unknown> | undefined;
+        const beforeCmd = typeof wire.command === "string" ? wire.command : undefined;
+        if (name) {
+          const rewritten = rewriteToolInput(name, wire, ctx);
+          for (const k of Object.keys(rewritten)) {
+            if (k !== "command") wire[k] = rewritten[k];
+          }
+        }
+        const origCmd = originalCommand.get(id);
+        if (beforeCmd !== undefined && origCmd !== undefined && input && typeof input.command === "string") {
+          const origCwd = originalWic[id];
+          const newCwd = (wic?.[id]?.cwd as string | undefined) ?? origCwd;
+          const shape = wireEquationShape(beforeCmd, origCmd, origCwd);
+          if (shape === "plain") {
+            wire.command = input.command;
+          } else if (shape === "cd" && newCwd !== undefined) {
+            wire.command = `cd ${newCwd} && ${input.command as string}`;
+          }
+          // `none`: the relation did not hold before the rewrite either, so
+          // Claude Code is already ignoring this wire form. Leave it untouched
+          // rather than manufacture an agreement that was never there.
+        }
+      }
+    }
+  }
+
+  /**
+   * `attachment` — the most common entry type in a modern transcript (about a
+   * third of all lines, and roughly half of all CONVERSATION entries), and
+   * until #127 it had no branch at all.
+   *
+   * The one that matters most is a SECOND, PARALLEL cwd:
+   * `attachment.snapshot.workingDirectory`, plus the pre-rendered
+   * system-reminder text that quotes it. The top-level `cwd` above was being
+   * rewritten correctly while these were not — so a resumed session was told,
+   * in the context the model actually reads, that it sits in a directory that
+   * does not exist on this machine.
+   */
+  if (result.type === "attachment" && result.attachment) {
+    const att = result.attachment as Record<string, unknown>;
+    const snap = att.snapshot as Record<string, unknown> | undefined;
+    if (snap) {
+      for (const k of ATTACHMENT_PATH_FIELDS) {
+        if (typeof snap[k] === "string") snap[k] = rewritePathValue(snap[k] as string, ctx);
+      }
+      if (Array.isArray(snap.additionalWorkingDirectories)) {
+        snap.additionalWorkingDirectories = (snap.additionalWorkingDirectories as unknown[]).map(
+          (d) => (typeof d === "string" ? rewritePathValue(d, ctx) : d)
+        );
+      }
+    }
+    // cwd-change deltas: `field` is "workingDirectory" on virtually every one.
+    if (Array.isArray(att.changes)) {
+      att.changes = (att.changes as Array<Record<string, unknown>>).map((c) => {
+        if (!c) return c;
+        const out = { ...c };
+        for (const k of ["from", "to"] as const) {
+          if (typeof out[k] === "string") out[k] = rewritePathValue(out[k] as string, ctx);
+        }
+        return out;
+      });
+    }
+    for (const k of ["filename", "path"] as const) {
+      if (typeof att[k] === "string") att[k] = rewritePathValue(att[k] as string, ctx);
+    }
+    if (Array.isArray(att.files)) {
+      att.files = (att.files as Array<Record<string, unknown>>).map((f) =>
+        f && typeof f.path === "string" ? { ...f, path: rewritePathValue(f.path, ctx) } : f
+      );
+    }
+    const attFile = (att.content as Record<string, unknown> | undefined)?.file as
+      | Record<string, unknown>
+      | undefined;
+    if (attFile && typeof attFile.filePath === "string") {
+      attFile.filePath = rewritePathValue(attFile.filePath, ctx);
+    }
+    // Free text that may contain paths. `systemPrompt` is deliberately absent:
+    // it is prose addressed to a model, i.e. CONTENT.
+    for (const k of ["stdout", "stderr", "command", "text", "banner"] as const) {
+      if (typeof att[k] === "string") att[k] = rewriteString(att[k] as string, ctx);
+    }
+    if (typeof att.content === "string") att.content = rewriteString(att.content, ctx);
+    // The pre-rendered reminder the model actually sees on resume.
+    for (const k of ["rendered", "renderedInHumanTurn"] as const) {
+      if (Array.isArray(result[k])) {
+        result[k] = (result[k] as Array<Record<string, unknown>>).map((b) =>
+          b && typeof b.content === "string"
+            ? { ...b, content: rewriteString(b.content as string, ctx) }
+            : b
+        );
+      }
+    }
+  }
+
+  // Rewrite file-history-snapshot trackedFileBackups keys AND values
   if (result.type === "file-history-snapshot" && result.snapshot) {
     const snapshot = result.snapshot as Record<string, unknown>;
     if (snapshot.trackedFileBackups) {
       const backups = snapshot.trackedFileBackups as Record<string, unknown>;
       const newBackups: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(backups)) {
-        const newKey = rewriteWholePath(key, ctx);
-        newBackups[newKey] = value;
+        const newKey = rewritePathValue(key, ctx);
+        newBackups[newKey] = rewriteBackupValue(value, ctx);
       }
       snapshot.trackedFileBackups = newBackups;
     }
+  }
+
+  /**
+   * `file-history-delta` — a whole entry type with no branch until #127,
+   * carrying two absolute paths of its own.
+   */
+  if (result.type === "file-history-delta") {
+    if (typeof result.trackingPath === "string") {
+      result.trackingPath = rewritePathValue(result.trackingPath, ctx);
+    }
+    result.backup = rewriteBackupValue(result.backup, ctx);
   }
 
   return result;

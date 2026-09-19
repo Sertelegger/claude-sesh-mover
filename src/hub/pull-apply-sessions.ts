@@ -532,6 +532,14 @@ export async function runApplySessionsStage(
         // Identical derivation to importSession's — same manifest, same
         // target — so a spliced continuation and an imported fragment
         // carry byte-identical rewrites.
+        // Deliberately NO sessionIdMap (#127). A pulled continuation is
+        // spliced into a transcript the user ALREADY OWNS, so an unmapped
+        // `session_id` leaves one file carrying two run namespaces — the same
+        // defect as on import, on a worse file. `pull.ts` does hold the
+        // peer-session -> local-base-session pair in sync-state's
+        // `hub.threadByLocalSession`, so a one-entry map is buildable; it is
+        // out of 0.12.0 because it needs its own cross-machine proof. Decided,
+        // not overlooked.
         const ctx = buildImportRewriteContext(
           bundleManifest,
           projectPath,
