@@ -6,6 +6,7 @@ import {
   writeFileSync,
   readdirSync,
   readFileSync,
+  symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -409,12 +410,91 @@ describe("manifest", () => {
       expect(await computeLayerDigest(join(dir, "file-history"))).not.toBe(before);
     });
 
-    it("ignores directories, so it covers exactly the flat file set the copy paths copy", async () => {
+    /**
+     * INVERTED BY #121, and the old name is worth remembering: it read "ignores
+     * directories, so it covers exactly the flat file set the copy paths copy".
+     * The *reason* was right and is kept — the digest must cover exactly what
+     * the copies carry — but the copies stopped being flat when Claude Code
+     * started writing `subagents/workflows/<wf_id>/`, so "ignore directories"
+     * became the thing that broke the invariant instead of the thing that held
+     * it. All four sites walk `layerFiles` now.
+     */
+    it("covers nested files, because that is what the copy paths now carry", async () => {
       const { computeLayerDigest } = await import("../src/manifest.js");
       const before = await computeLayerDigest(join(dir, "file-history"));
       mkdirSync(join(dir, "file-history", "sub"));
-      writeFileSync(join(dir, "file-history", "sub", "x"), "ignored\n");
+      writeFileSync(join(dir, "file-history", "sub", "x"), "carried\n");
+      const withNested = await computeLayerDigest(join(dir, "file-history"));
+      expect(withNested).not.toBe(before);
+      // And the CONTENT of a nested file is covered, not merely its presence.
+      writeFileSync(join(dir, "file-history", "sub", "x"), "edited\n");
+      expect(await computeLayerDigest(join(dir, "file-history"))).not.toBe(withNested);
+      rmSync(join(dir, "file-history", "sub"), { recursive: true });
       expect(await computeLayerDigest(join(dir, "file-history"))).toBe(before);
+    });
+
+    /**
+     * THE COMPATIBILITY PROPERTY, and the whole reason recursing the digest is
+     * safe to ship. Every bundle in existence has a FLAT layer tree — a nested
+     * one could not be exported, because the copy threw — so as long as a flat
+     * directory hashes exactly as it did before #121, no existing bundle's
+     * recorded digest changes meaning. A mismatch is not cosmetic: `importer.ts`
+     * drops the whole layer with a warning.
+     *
+     * The frozen value below was produced by the PRE-#121 implementation. Do not
+     * regenerate it from the current code — that would turn this guard into a
+     * tautology, which is the failure this repo has found seven times.
+     */
+    it("hashes a flat directory byte-identically to the pre-#121 implementation", async () => {
+      const { computeLayerDigest } = await import("../src/manifest.js");
+      const flat = mkdtempSync(join(tmpdir(), "layerdigest-compat-"));
+      writeFileSync(join(flat, "agent-a.jsonl"), "a\n");
+      writeFileSync(join(flat, "agent-b.meta.json"), "{}\n");
+      expect(await computeLayerDigest(flat)).toBe(
+        "sha256:cf3966ad0cb8add5d05ee122f9bfe9d5f304a75829a32739e5882dfbe14b6be5"
+      );
+      rmSync(flat, { recursive: true, force: true });
+    });
+
+    /**
+     * A symlink to a FILE keeps being hashed, and that is deliberate rather than
+     * incidental. The leaf predicate stayed `statSync().isFile()`, which
+     * resolves links, exactly as before #121; recursion is decided separately by
+     * `Dirent.isDirectory()`, which does NOT. Swapping the leaf to
+     * `Dirent.isFile()` would have been tidier and would have silently changed
+     * the digest of every such directory. `copyFileSync` dereferences too, so
+     * the copy and the digest still agree — which is the invariant.
+     */
+    it("still follows a symlink to a file, so flat directories holding one are unchanged", async () => {
+      const { computeLayerDigest } = await import("../src/manifest.js");
+      const outside = mkdtempSync(join(tmpdir(), "layerdigest-target-"));
+      writeFileSync(join(outside, "target"), "{}\n");
+      const d = mkdtempSync(join(tmpdir(), "layerdigest-sym-"));
+      writeFileSync(join(d, "agent-a.jsonl"), "a\n");
+      symlinkSync(join(outside, "target"), join(d, "agent-b.meta.json"));
+      expect(await computeLayerDigest(d)).toBe(
+        "sha256:cf3966ad0cb8add5d05ee122f9bfe9d5f304a75829a32739e5882dfbe14b6be5"
+      );
+      rmSync(d, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    });
+
+    /**
+     * A symlinked DIRECTORY is never walked. `Dirent.isDirectory()` reports the
+     * entry's own type, so it answers false for a link and the walk stops there
+     * — without this, a link under a layer directory would pull an arbitrary
+     * subtree into the bundle and into the digest.
+     */
+    it("does not walk a symlinked directory", async () => {
+      const { layerFiles } = await import("../src/manifest.js");
+      const outside = mkdtempSync(join(tmpdir(), "layerdigest-esc-"));
+      writeFileSync(join(outside, "secret.txt"), "s\n");
+      const d = mkdtempSync(join(tmpdir(), "layerdigest-link-"));
+      writeFileSync(join(d, "agent-a.jsonl"), "a\n");
+      symlinkSync(outside, join(d, "linkdir"));
+      expect(layerFiles(d)).toEqual(["agent-a.jsonl"]);
+      rmSync(d, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     });
   });
 

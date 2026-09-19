@@ -300,10 +300,14 @@ void _hashedLayersAreExportLayers;
  * per-file map is ~10 KB of manifest for ONE session and hundreds of KB for a
  * `--scope all` export of a busy project. Three keys per session is O(1).
  *
- * The directory listing is deliberately flat (`readdirSync`, files only): that
- * is exactly the set `copyDirIfExists` in exporter.ts copies and
- * `copyLayerDirs` in hub/pull.ts copies, so the digest can never cover a file
- * the bundle does not actually carry, or miss one it does.
+ * The listing comes from `layerFiles` below, and that sharing IS the invariant:
+ * it is exactly the set `copyDirIfExists` in exporter.ts copies, that
+ * `copyLayerDirs` in hub/pull-apply-sessions.ts copies, and that importer.ts
+ * applies — so the digest can never cover a file the bundle does not actually
+ * carry, or miss one it does. It used to say this while all four sites
+ * *separately* did a flat `readdirSync`, which held only while the tree was
+ * flat; #121 made it false (Claude Code writes `subagents/workflows/<id>/`)
+ * and the coupling is a shared function now rather than a shared habit.
  *
  * Names are hashed alongside contents. In principle a filesystem that
  * re-normalises Unicode filenames on extraction could turn that into a false
@@ -312,17 +316,107 @@ void _hashedLayersAreExportLayers;
  * `<hex>@v<n>`), and the failure direction is a warning plus a skipped
  * auxiliary layer, never lost transcript data.
  */
+/**
+ * Every file a layer directory carries, as POSIX-separated paths relative to
+ * it, sorted — **the ONE walk the digest and all three copy paths share** (#121).
+ *
+ * Recursive, because Claude Code writes `subagents/workflows/<wf_id>/` for any
+ * session that has run a Workflow. Before #121 every one of those four sites
+ * did its own flat `readdirSync`, which agreed only by accident of the tree
+ * being flat; when it stopped being flat the copies threw and the digest went
+ * silently blind to the subtree, in the same release.
+ *
+ * Two predicates, and they are deliberately NOT the same one:
+ *
+ * - **Recurse on `dirent.isDirectory()`.** A `Dirent` reports the entry's own
+ *   type, so a symlink-to-directory answers `false` and is never walked. That
+ *   is the safe default and it matches `payload/workspace.ts`'s walk.
+ * - **Take a leaf on `statSync(...).isFile()`**, which RESOLVES symlinks. That
+ *   is what this function did before #121, and keeping it is what makes the
+ *   output byte-identical for a flat directory — including one holding a
+ *   symlink to a file. Compatibility is the whole reason: every bundle in
+ *   existence has a flat layer tree (a nested one could not be exported, see
+ *   #121), so identical-on-flat means no existing bundle's recorded digest
+ *   changes meaning. A `Dirent.isFile()` leaf test would have been tidier and
+ *   would have silently re-hashed every such directory.
+ *
+ * Anything that is neither — a socket, a FIFO, a dangling link — is skipped,
+ * and must be: `computeIntegrityHashFromFile` opens a read stream, so a FIFO
+ * would hang rather than throw.
+ *
+ * Separators are normalised to `/` so a bundle written on Windows and read on
+ * POSIX hashes identically; `join` would emit `workflows\\wf1\\x` there.
+ */
+export function layerFiles(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (abs: string, prefix: string): void => {
+    let entries;
+    try {
+      entries = readdirSync(abs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const rel = prefix === "" ? e.name : `${prefix}/${e.name}`;
+      if (e.isDirectory()) {
+        walk(join(abs, e.name), rel);
+        continue;
+      }
+      try {
+        if (statSync(join(abs, e.name)).isFile()) out.push(rel);
+      } catch {
+        // Dangling symlink, or a race with a file being removed. Not carried,
+        // not hashed — the two stay in agreement, which is the point.
+      }
+    }
+  };
+  walk(dir, "");
+  // Explicit comparator: UTF-16 code-unit order, identical on every platform,
+  // never the host locale's collation.
+  out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return out;
+}
+
+/**
+ * Is this layer entry an AGENT TRANSCRIPT — i.e. a file the apply side must
+ * path-rewrite rather than byte-copy?
+ *
+ * **`.jsonl` is not the test, and recursion is exactly what makes it wrong**
+ * (#121). At the top level of `subagents/` every `.jsonl` happens to be an
+ * `agent-<id>.jsonl` transcript, so `endsWith(".jsonl")` was right by accident
+ * for as long as the walk was flat. One level down there is a second shape:
+ * `workflows/<wf_id>/journal.jsonl`, whose lines are `{type, key, agentId,
+ * label, phase, result}` — no `uuid`, no `cwd`, no `sessionId`. Counted across
+ * this machine: 1920 nested `agent-*.jsonl` against 58 `journal.jsonl`.
+ *
+ * Running a journal through the rewrite would not merely be pointless, it would
+ * CORRUPT it: `rewriteEntry` assigns `result.sessionId = newSessionId`
+ * unconditionally, so every one of those lines would gain a `sessionId` field
+ * it never had, in a schema this plugin does not own and cannot validate.
+ *
+ * A name test rather than a structural one, which is the opposite of the rule
+ * `isConversationEntry` follows, and deliberately: the structural question here
+ * is "is this a file whose paths belong to this machine", and the only honest
+ * way to ask it is to parse every line before deciding how to copy the file.
+ * `agent-` is the grammar Claude Code writes, it is what the flat rule already
+ * meant in practice, and being wrong costs a byte-copy of a transcript rather
+ * than a fabricated field in a foreign one — the safe direction.
+ */
+export function isAgentTranscript(relOrName: string): boolean {
+  const base = relOrName.slice(relOrName.lastIndexOf("/") + 1);
+  return base.startsWith("agent-") && base.endsWith(".jsonl");
+}
+
+/** Resolve a `layerFiles` relative path back to an absolute one. */
+export function layerFilePath(dir: string, rel: string): string {
+  return join(dir, ...rel.split("/"));
+}
+
 export async function computeLayerDigest(dir: string): Promise<string | null> {
   if (!existsSync(dir)) return null;
   let names: string[];
   try {
-    names = readdirSync(dir).filter((n) => {
-      try {
-        return statSync(join(dir, n)).isFile();
-      } catch {
-        return false;
-      }
-    });
+    names = layerFiles(dir);
   } catch {
     return null;
   }
@@ -334,7 +428,7 @@ export async function computeLayerDigest(dir: string): Promise<string | null> {
   const hash = createHash("sha256");
   hash.update(`${names.length}\n`);
   for (const name of names) {
-    const fileHash = await computeIntegrityHashFromFile(join(dir, name));
+    const fileHash = await computeIntegrityHashFromFile(layerFilePath(dir, name));
     hash.update(`${name}\0${fileHash}\n`);
   }
   return `sha256:${hash.digest("hex")}`;
