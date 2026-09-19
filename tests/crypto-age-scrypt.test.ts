@@ -15,7 +15,7 @@
  * evidence of correctness), and the differential ones, which are the evidence.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -209,7 +209,20 @@ describe.skipIf(!HAVE_PASSPHRASE_ORACLE)("scrypt — differential against the re
         const outFile = join(dir, `ours-${n}.${name}.out`);
         const r = oracleDecryptPassphrase(bin, PASS, encFile, outFile);
         expect(r.status, `${name} rejected our ${n}-byte file: ${r.transcript}`).toBe(0);
-        expect(readFileSync(outFile).equals(plain), `${name} produced different bytes`).toBe(true);
+        // The claim under test is about OUR file: the oracle accepts it and
+        // recovers the same bytes. Exit 0 is the acceptance half.
+        //
+        // For the EMPTY payload the oracles differ from each other, and that is
+        // the oracle's business rather than ours: age 1.1.1 exits 0 and writes
+        // no `-o` file at all, while 1.2.1 (what CI pins) creates an empty one.
+        // Measured on 1.1.1: n=0 produced no file, n=1 and n=100 produced 1 and
+        // 100 bytes. So an absent file after a clean exit is read as empty
+        // content — which is what it means — and ONLY when the payload really
+        // is empty. Any other size still demands the file, so this cannot hide
+        // an oracle that silently wrote nothing.
+        const got = existsSync(outFile) ? readFileSync(outFile) : Buffer.alloc(0);
+        expect(existsSync(outFile) || n === 0, `${name} wrote no output for a ${n}-byte payload`).toBe(true);
+        expect(got.equals(plain), `${name} produced different bytes`).toBe(true);
       }
     }
   });
