@@ -1320,6 +1320,10 @@ hub
   .description("Rebuild this machine's hub index for the current project from its own bundles")
   .option("--project-path <path>", "Override project path (default: cwd)")
   .option("--source-config-dir <path>", "Override Claude config dir")
+  .option(
+    "--unsigned",
+    "Rebuild without re-signing. Use when you suspect the hub's bundles were altered — a rebuild signs whatever is there now"
+  )
   .action(async (opts) => {
     try {
       const configDir = resolveConfigDir(opts.sourceConfigDir);
@@ -1332,7 +1336,10 @@ hub
         return;
       }
       const { hubReindex } = await import("./hub/reindex.js");
-      output(await hubReindex({ configDir, projectPath, hubPath }));
+      // `--unsigned` is read straight off the flag and has no config key, by
+      // owner ruling (#122): a standing configuration must not be able to
+      // pre-answer a question about trust. Same rule as `--force-unkeyed`.
+      output(await hubReindex({ configDir, projectPath, hubPath, unsigned: !!opts.unsigned }));
     } catch (e) {
       outputError("hub-reindex", e as Error);
     }

@@ -137,6 +137,21 @@ const SPLICE_THEN_FORK: RetryProof = {
   reruns: "hubPull",
 };
 
+  /**
+ * Shared by the two #122 disclosures below. `hub reindex` is a projection
+ * with no "already up to date" short-circuit anywhere in it — every run
+ * rebuilds from the hub's bundles plus local sync-state — so unlike almost
+ * every other `retry-works` entry in this file, the claim needs no argument
+ * about what the operation recorded. There is nothing it can record that
+ * forecloses itself, which is why this is the one command whose messages may
+ * advise re-running it in EITHER direction.
+ */
+const REINDEX_RERUN: RetryProof = {
+  test: "hub-reindex.test.ts",
+  name: "re-runs in both directions: --unsigned strips the signatures, and a plain re-run restores them",
+  reruns: "hubReindex",
+};
+
 const REGISTRY: FlagUse[] = [
   // ---- the pull pipeline (src/hub/pull*.ts) --------------------------------
   {
@@ -441,6 +456,20 @@ const REGISTRY: FlagUse[] = [
       name: "refuses an unlinked project, and reindex works once push has linked it",
       reruns: "hubReindex",
     },
+  },
+  {
+    file: "src/hub/reindex.ts",
+    match: "Rebuilt records were left UNSIGNED (--unsigned)",
+    klass: "retry-works",
+    why: "The #122 disclosure on the flagged path. It advises re-running WITHOUT the flag once the operator has satisfied themselves the hub's bundles are the ones this machine wrote, and that re-run genuinely restores the signatures — proved by the round trip in provenBy, which deliberately does NOT delete the index between the two runs, because the claim is that reindex re-runs over its own output. The advice is not optional politeness: --unsigned leaves records every peer that has pinned this machine reads as a downgrade, so a user who stopped there would have traded a laundering risk for a standing alarm.",
+    provenBy: REINDEX_RERUN,
+  },
+  {
+    file: "src/hub/reindex.ts",
+    match: "**Never run this in response to another machine reporting a signature mismatch**",
+    klass: "retry-works",
+    why: "The #122 disclosure on the DEFAULT path, and the reason #122 was filed: a rebuild re-signs over whatever is at the derived path on the hub, and it cannot do better — the digest a push signs is stored inside the signature, which lived in the index this command is rebuilding, so nothing local survives to corroborate the bytes against. That makes an honest repair and a laundered substitution identical from in here. --unsigned is named as the way out and the re-run reaches it (provenBy), which is what separates this from `pull-apply-workspace.ts`'s digest-mismatch entry above: there the remedy is a fresh push because the pull has recorded its bundles, here the same command simply runs again.",
+    provenBy: REINDEX_RERUN,
   },
   {
     file: "src/hub/rekey.ts",

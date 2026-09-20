@@ -30,6 +30,25 @@ export interface HubReindexOptions {
   configDir: string;
   projectPath: string;
   hubPath: string;
+  /**
+   * Rebuild records WITHOUT re-signing them (#122).
+   *
+   * A FLAG and never a config key — the same rule `--force-unkeyed` and
+   * `push --full` follow, for the same reason: a standing configuration must
+   * not be able to pre-answer a question about trust. A config key here would
+   * let a machine be configured to always launder.
+   *
+   * Pass it when you have a REASON to suspect the hub's bytes — in practice,
+   * when a peer reported a signature mismatch. That is the one case where
+   * re-signing is exactly wrong, and the one case this machine cannot detect
+   * for itself: a repair and a laundering are identical from in here.
+   *
+   * The cost is real and is why it is not the default: an unsigned record from
+   * a machine a peer has pinned reads as a DOWNGRADE, so every bundle of a
+   * routine repair would raise an alarm that means nothing — which is how
+   * people learn to click through the one that does.
+   */
+  unsigned?: boolean;
 }
 
 // bundleFileName (layout.ts) writes `${sanitizedIso}-${bundleId}.tar.gz`,
@@ -271,11 +290,17 @@ export async function hubReindex(
       // similar. A bundle whose signature cannot be rebuilt (no key, or a
       // workspace artifact that is gone) is left unsigned rather than signed
       // with a statement that is not true.
-      const signature = await rebuildSignature({
-        backend, hubId: probe.hub?.hubId ?? "", projectId: local.projectId, machineId: machine.id,
-        bundleId: parsed.bundleId, pushedAt: parsed.pushedAt, file, tarPath,
-        hasWorkspace, warnings,
-      });
+      // `--unsigned` skips the re-signature entirely (#122). Not merely
+      // "sign nothing this time": the record is rebuilt exactly as it would
+      // otherwise be, minus the statement, so a peer sees an honest unsigned
+      // record rather than one attesting bytes this machine cannot vouch for.
+      const signature = opts.unsigned
+        ? null
+        : await rebuildSignature({
+            backend, hubId: probe.hub?.hubId ?? "", projectId: local.projectId, machineId: machine.id,
+            bundleId: parsed.bundleId, pushedAt: parsed.pushedAt, file, tarPath,
+            hasWorkspace, warnings,
+          });
 
       for (const s of manifest.sessions) {
         // Same mapping as push's index-projection step: a continuation
@@ -403,6 +428,34 @@ export async function hubReindex(
       }
     }
     await writeMachineIndex(backend, built);
+
+    /**
+     * THE DISCLOSURE (#122), and it ships on the DEFAULT path because the
+     * default is the dangerous one.
+     *
+     * A rebuild re-signs from whatever is at the derived path on the hub. It
+     * cannot do otherwise: `bundleDigest` is computed once at push time and
+     * stored INSIDE the signature, which lives in the index file — so when the
+     * index is lost, which is the premise of this command, no local record of
+     * any bundle's plaintext digest survives. There is nothing to corroborate
+     * against, and a statement that omitted `bundleDigest` would not be a
+     * statement.
+     *
+     * The consequence is a feedback loop that closes through the user: a peer
+     * reports a signature mismatch, someone runs the documented repair tool on
+     * the machine that pushed, and the attacker's bytes acquire that machine's
+     * real signature. The error disappears, which is more convincing than the
+     * attack was.
+     *
+     * So: say it, every time, and name the one thing that must not be done.
+     * This is a warning and not a control — the capability is unchanged — and
+     * pretending otherwise would be worse than the silence it replaces.
+     */
+    warnings.push(
+      opts.unsigned
+        ? `Rebuilt records were left UNSIGNED (--unsigned), so this machine vouched for nothing. Every machine that has pinned this one will read them as a downgrade and say so on the next pull; that is expected here and is the point. Once you have established that the hub's bundles are the ones this machine wrote, re-run \`sesh-mover hub reindex\` without the flag to restore signatures.`
+        : `Rebuilt records were re-signed with this machine's key over WHATEVER IS ON THE HUB NOW. A rebuild has nothing to compare those bytes against — the digest a push signs is kept inside the signature, which was in the index this command is rebuilding — so a signature here attests where a bundle sits, not that its contents are unchanged. **Never run this in response to another machine reporting a signature mismatch**: doing so signs the bytes that machine is complaining about, and the complaint stops. If that is why you are here, re-run with --unsigned and compare fingerprints out of band with \`sesh-mover hub trust\` first.`
+    );
 
     return {
       success: true,
