@@ -167,7 +167,10 @@ describe("hub reindex", () => {
       expect(result.projects).toEqual([
         { projectId: pushed.projectId, threads: 1, bundlesScanned: 1 },
       ]);
-      expect(result.warnings).toEqual([]);
+      // Since #122 a rebuild ALWAYS discloses that it re-signed over whatever
+      // is on the hub, so "no warnings" is no longer the clean-run shape. The
+      // assertion that still matters is that nothing ELSE was reported.
+      expect(result.warnings.filter((w) => !/re-signed with this machine's key/.test(w))).toEqual([]);
 
       const rebuilt = await readMachineIndex(backend, pushed.projectId, machine.id);
       expect(rebuilt).not.toBeNull();
@@ -220,7 +223,10 @@ describe("hub reindex", () => {
       const result = await hubReindex({ configDir, projectPath, hubPath: hub });
       expect(result.success).toBe(true);
       if (!result.success) return;
-      expect(result.warnings).toEqual([]);
+      // Since #122 a rebuild ALWAYS discloses that it re-signed over whatever
+      // is on the hub, so "no warnings" is no longer the clean-run shape. The
+      // assertion that still matters is that nothing ELSE was reported.
+      expect(result.warnings.filter((w) => !/re-signed with this machine's key/.test(w))).toEqual([]);
 
       const rebuilt = await readMachineIndex(backend, first.projectId, machine.id);
       expect(rebuilt).not.toBeNull();
@@ -805,7 +811,10 @@ describe("hub reindex", () => {
       expect(result.projects).toEqual([
         { projectId: pushed.projectId, threads: 1, bundlesScanned: 1 },
       ]);
-      expect(result.warnings).toEqual([]);
+      // Since #122 a rebuild ALWAYS discloses that it re-signed over whatever
+      // is on the hub, so "no warnings" is no longer the clean-run shape. The
+      // assertion that still matters is that nothing ELSE was reported.
+      expect(result.warnings.filter((w) => !/re-signed with this machine's key/.test(w))).toEqual([]);
 
       const rebuilt = await readMachineIndex(backend, pushed.projectId, machine.id);
       expect(rebuilt).not.toBeNull();
@@ -925,6 +934,177 @@ describe("hub reindex: an unreachable hub", () => {
     } finally {
       restore.restore();
       for (const d of [home, base]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * # The re-sign path, and what a rebuild can honestly claim (#122)
+ *
+ * **These are the first tests this path has ever had.** Before them, no file
+ * that called `hubReindex` mentioned a signature at all — so the behaviour was
+ * a characterisation of the code rather than a guard, and #86 shipped the
+ * re-signing with nothing pinning it.
+ *
+ * The thing being pinned is narrow and worth stating: a rebuild re-signs over
+ * whatever is at the derived path on the hub, and it CANNOT do better.
+ * `bundleDigest` is computed once at push time and stored inside the signature,
+ * which lives in the index file — so when the index is lost, which is the
+ * premise of this command, no local record of any bundle's plaintext digest
+ * survives. There is nothing to corroborate against.
+ *
+ * That makes the disclosure the control, and `--unsigned` the escape hatch for
+ * the one case the machine cannot detect for itself: a repair and a laundering
+ * look identical from in here.
+ *
+ * Linux-provable — signing, hashing and string comparison, no platform surface.
+ */
+describe("hub reindex — signing (#122)", () => {
+  it("re-signs rebuilt records by default, and says it signed the hub's current bytes", async () => {
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-sig-"));
+    const home = join(base, "home");
+    mkdirSync(home, { recursive: true });
+    const restore = overrideHome(home);
+    try {
+      const hub = join(base, "hub");
+      mkdirSync(hub, { recursive: true });
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const { indexPath } = await import("../src/hub/layout.js");
+      await backend.delete(indexPath(pushed.projectId, machine.id));
+
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const rebuilt = await readMachineIndex(backend, pushed.projectId, machine.id);
+      const records = Object.values(rebuilt!.threads).flatMap((t) => t.bundles);
+      expect(records.length).toBeGreaterThan(0);
+      expect(records.every((r) => r.signature != null)).toBe(true);
+
+      const said = result.warnings.join(" ");
+      expect(said).toMatch(/re-signed with this machine's key/);
+      // The sentence that carries the whole point: never answer a peer's
+      // mismatch report with this command.
+      expect(said).toMatch(/Never run this in response to another machine reporting a signature mismatch/i);
+      expect(said).toContain("--unsigned");
+    } finally {
+      restore.restore();
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves records unsigned under --unsigned, and warns that peers will see a downgrade", async () => {
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-unsigned-"));
+    const home = join(base, "home");
+    mkdirSync(home, { recursive: true });
+    const restore = overrideHome(home);
+    try {
+      const hub = join(base, "hub");
+      mkdirSync(hub, { recursive: true });
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const { indexPath } = await import("../src/hub/layout.js");
+      await backend.delete(indexPath(pushed.projectId, machine.id));
+
+      const result = await hubReindex({ configDir, projectPath, hubPath: hub, unsigned: true });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const rebuilt = await readMachineIndex(backend, pushed.projectId, machine.id);
+      const records = Object.values(rebuilt!.threads).flatMap((t) => t.bundles);
+      expect(records.length).toBeGreaterThan(0);
+      // Rebuilt in full, minus the statement — not "skipped".
+      expect(records.every((r) => r.signature == null)).toBe(true);
+      expect(records.every((r) => typeof r.bundleId === "string" && r.bundleId.length > 0)).toBe(true);
+
+      const said = result.warnings.join(" ");
+      expect(said).toMatch(/UNSIGNED/);
+      expect(said).toMatch(/downgrade/i);
+      // It must not also claim it signed anything.
+      expect(said).not.toMatch(/re-signed with this machine's key/);
+    } finally {
+      restore.restore();
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The retry proof for both disclosures, and the reason this command may say
+   * "re-run" at all where most of this codebase's messages may not.
+   *
+   * `hub reindex` records nothing that forecloses itself. It is a projection:
+   * every run rebuilds the index from the bundles on the hub plus local
+   * sync-state, with no "already up to date" short-circuit anywhere in it. So
+   * `--unsigned` and its absence are two runs of the same repair, in either
+   * order, as many times as you like — which is exactly what makes the advice
+   * on both branches followable rather than a tenth foreclosure.
+   *
+   * Registered as `provenBy` for both entries in `tests/hub-warning-flags.test.ts`.
+   */
+  it("re-runs in both directions: --unsigned strips the signatures, and a plain re-run restores them", async () => {
+    const base = mkdtempSync(join(tmpdir(), "sesh-reindex-rerun-"));
+    const home = join(base, "home");
+    mkdirSync(home, { recursive: true });
+    const restore = overrideHome(home);
+    try {
+      const hub = join(base, "hub");
+      mkdirSync(hub, { recursive: true });
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir);
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true, claudeVersion: "2.1.81",
+      });
+      expect(pushed.success).toBe(true);
+      if (!pushed.success) return;
+
+      const backend = createFsBackend(hub);
+      const machine = loadOrCreateMachineId();
+      const { indexPath } = await import("../src/hub/layout.js");
+      const signaturesNow = async () => {
+        const idx = await readMachineIndex(backend, pushed.projectId, machine.id);
+        return Object.values(idx!.threads).flatMap((t) => t.bundles).map((r) => r.signature ?? null);
+      };
+
+      // Run 1 — the flagged repair. Someone who was told to compare
+      // fingerprints out of band before vouching for anything.
+      await backend.delete(indexPath(pushed.projectId, machine.id));
+      const first = await hubReindex({ configDir, projectPath, hubPath: hub, unsigned: true });
+      expect(first.success).toBe(true);
+      const afterUnsigned = await signaturesNow();
+      expect(afterUnsigned.length).toBeGreaterThan(0);
+      expect(afterUnsigned.every((s) => s === null)).toBe(true);
+
+      // Run 2 — the advice on run 1's own warning, followed literally. No
+      // second delete: the point is that the command re-runs over its own
+      // output rather than needing the index removed again.
+      const second = await hubReindex({ configDir, projectPath, hubPath: hub });
+      expect(second.success).toBe(true);
+      const afterResign = await signaturesNow();
+      expect(afterResign.length).toBe(afterUnsigned.length);
+      expect(afterResign.every((s) => s != null)).toBe(true);
+    } finally {
+      restore.restore();
+      rmSync(base, { recursive: true, force: true });
     }
   });
 });
