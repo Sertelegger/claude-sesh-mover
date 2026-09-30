@@ -293,15 +293,25 @@ export type BundleEncryptionPlan =
  * It exists because the three have different remedies and only ONE of them
  * takes `--force-unkeyed`, so a caller has to tell them apart — and the obvious
  * way to do that, checking whether `unkeyedMachines` is empty, is wrong for two
- * of the three: the census is reported WHOLE, so `self-unkeyed` carries this
+ * of the three: the census is reported WHOLE, so `self-unkeyed` may carry this
  * machine's own entry and `no-recipients` carries every machine on the hub.
  * Branching on the message text is banned everywhere else in this codebase for
  * the same reason it would be wrong here.
  *
  * - `unkeyed-machines` — machines OTHER than this one publish no usable key.
  *   The only one `--force-unkeyed` applies to.
- * - `self-unkeyed` — the pushing machine publishes no usable key of its own.
- *   Not overridable; the remedy is local (`~/.sesh-mover/identity.age`).
+ * - `self-unkeyed` — a bundle addressed from this census could not be read back
+ *   by this machine. Not overridable, and it has TWO causes whose remedies share
+ *   nothing: this machine has no readable key of its own (remedy:
+ *   `~/.sesh-mover/identity.age`, restored before it is ever replaced), or the
+ *   hub's record for this machine does not read back with the key it holds even
+ *   though the refusing command re-published that record as its first step
+ *   (remedy: the `machines/<id>.json` the suggestion names — a synced hub still
+ *   catching up, or a sync conflict; the key is fine and must not be touched).
+ *   No structured field distinguishes the two causes: each arm's `suggestion`
+ *   names its remedy for a human to read, and that is all it is for. A caller
+ *   that needs to act differently on them needs a new discriminator here, not a
+ *   match on `error` or `suggestion`.
  * - `no-recipients` — nobody on the hub publishes a usable key, so there is
  *   nothing to encrypt to. Not overridable: a bundle encrypted to an empty
  *   recipient list is readable by nobody, which is worse than the plaintext
@@ -370,6 +380,44 @@ export type SelfRecipientCheck =
       suggestion: string;
     };
 
+/**
+ * What the census showed for THIS machine's own record, as a noun phrase. The
+ * two arms that use it fire only after the refusing command re-published that
+ * record, so the sentence may report what reading it back showed and nothing
+ * more: a record the census could not read, or one that is gone altogether, is
+ * the sync-client case the arms are written for, and calling either "a
+ * different key" (#160's first wording did) sends the user looking for the
+ * wrong thing.
+ */
+function ownRecordAsSeen(census: HubRecipientSet, thisMachineId: string): string {
+  if (census.recipients.some((r) => r.machineId === thisMachineId)) {
+    return `a different key at machines/${thisMachineId}.json`;
+  }
+  switch (census.unkeyed.find((u) => u.machineId === thisMachineId)?.reason) {
+    case "no-key":
+      return `a record with no key at machines/${thisMachineId}.json`;
+    case "bad-key":
+      return `a key that is not an age recipient at machines/${thisMachineId}.json`;
+    case "unreadable-record":
+      return `a record that could not be read at machines/${thisMachineId}.json`;
+    default:
+      // Absent from the listing — or `unsafe-id`, whose display id cannot be
+      // this machine's, since a local machine id is always a safe one.
+      return `no record at all at machines/${thisMachineId}.json`;
+  }
+}
+
+/**
+ * The remedy both read-back arms share. Not "nothing will help": a hub that is a
+ * synced folder or a network share may simply not have caught up with a write
+ * made a moment ago, and trying again is then the whole fix. What it rules out
+ * is re-running a command FOR its registration, which is the one thing the
+ * refusing command demonstrably already did.
+ */
+function readBackRemedy(thisMachineId: string): string {
+  return `If the hub is a synced folder or a network share it may simply not have caught up yet, and trying again in a moment is then enough. If it keeps happening, re-running a command to rewrite the record is not a fix by itself: look at machines/${thisMachineId}.json in the hub directory for a sync conflict or a copy a sync client reverted.`;
+}
+
 export function checkSelfIsRecipient(input: {
   census: HubRecipientSet;
   /** `loadOrCreateMachineId().id` — this operation's own machine. Display only. */
@@ -378,6 +426,15 @@ export function checkSelfIsRecipient(input: {
    * The `age1…` recipient this machine can derive from its own identity file
    * RIGHT NOW, or `null` when that file is absent or unreadable. Deliberately
    * not read from the census; see above.
+   *
+   * **Precondition, which the refusal text relies on:** the caller has already
+   * run `registerMachine` in this operation, so the hub was just told this
+   * machine publishes exactly this recipient. Both callers (`hub push` and
+   * `hub rekey`) do, before the census is read — that ordering is what lets
+   * the `no-recipients` and record-mismatch `self-unkeyed` suggestions say the
+   * record "has not read back" instead of asking the user to re-register. A
+   * caller that skips the registration gets a suggestion describing a write
+   * it never made.
    */
   thisMachineRecipient: string | null;
 }): SelfRecipientCheck {
@@ -396,8 +453,13 @@ export function checkSelfIsRecipient(input: {
       ok: false,
       refusal: "no-recipients",
       error: "This hub's bundles are encrypted and no registered machine publishes a usable public key, so there is nobody to encrypt to.",
+      // Reachable only after the refusing command re-registered THIS machine
+      // with the key it holds (the precondition on `thisMachineRecipient`;
+      // the unreadable-key case returned above), so "nobody" includes a
+      // record we wrote moments ago. Advice to re-register is not the remedy;
+      // the record not reading back is the fact to report.
       suggestion:
-        "Nothing was written to the hub. A bundle encrypted to an empty recipient list is readable by nobody, which is worse than the plaintext this hub is refusing. Run any hub command on each machine you want to be able to read this project — registration publishes the public half of that machine's key on every push and pull — then try again.",
+        `Nothing was written to the hub. A bundle encrypted to an empty recipient list is readable by nobody, which is worse than the plaintext this hub is refusing. This command re-published this machine's own record, with the key it holds, as its first step moments ago, yet reading the hub back found no usable key for any machine — for this one, ${ownRecordAsSeen(census, input.thisMachineId)} — so that write has not read back. ${readBackRemedy(input.thisMachineId)}`,
     };
   }
   if (!census.recipients.some((r) => r.recipient === input.thisMachineRecipient)) {
@@ -405,8 +467,12 @@ export function checkSelfIsRecipient(input: {
       ok: false,
       refusal: "self-unkeyed",
       error: `This hub's bundles are encrypted and the hub's record for this machine (${input.thisMachineId}) does not publish the key this machine actually holds, so a bundle addressed to that record could not be read back here.`,
+      // Same ordering as `no-recipients`: the refusing command has already
+      // rewritten this record with the key checked here, so a mismatch means
+      // the hub is not showing that write. (A REPLACED identity cannot reach
+      // this arm — the re-registration publishes the replacement.)
       suggestion:
-        "Nothing was written to the hub, and this is not overridable — a hub full of bundles the machine that wrote them cannot open is never the right answer. The usual cause is a registration that did not land: this machine's record on the hub carries an older public key, or none, because the identity file was unreadable the last time it checked in. Run `sesh-mover hub status` (or any hub command) so the record is rewritten with the current key, then try again. If instead the identity file was REPLACED, note that every bundle already encrypted to the old key stays unreadable here whatever you do next, so restore the old identity from a backup before going further.",
+        `Nothing was written to the hub, and this is not overridable — a hub full of bundles the machine that wrote them cannot open is never the right answer. This command re-published this machine's record, with the key this machine holds, as its first step moments ago, yet reading the hub back showed ${ownRecordAsSeen(census, input.thisMachineId)} — so that write has not read back. ${readBackRemedy(input.thisMachineId)}`,
     };
   }
   return { ok: true, recipients: census.recipients.map((r) => r.recipient) };
@@ -468,7 +534,9 @@ export function planBundleEncryption(input: {
    *
    * Deliberately not read from the census: see `checkSelfIsRecipient` for why
    * the roster's answer to this question can be stale in both directions, and
-   * why a stale answer is silent and permanent.
+   * why a stale answer is silent and permanent. Same precondition as there:
+   * `registerMachine` has already run in this operation, or two of the
+   * refusals describe a registration that never happened.
    */
   thisMachineRecipient: string | null;
   forceUnkeyed: boolean;
@@ -511,7 +579,7 @@ export function planBundleEncryption(input: {
         refusal: "unkeyed-machines",
         error: `This hub requires encrypted bundles and ${census.unkeyed.length} registered machine(s) cannot be encrypted to: ${named.join("; ")}.`,
         suggestion:
-          "Nothing was uploaded, and nothing on the hub changed. A push writes a bundle once, addressed to the machines the hub lists at that moment, so a machine left out of it reads nothing of this thread until THIS machine re-addresses its own bundles with `sesh-mover hub rekey` — and never, if this machine is gone by then. Upgrade and run any hub command on each machine above so it publishes its key, or, if a machine is decommissioned, delete its machines/<id>.json from the hub directory. To upload anyway, accepting that those machines cannot read this bundle until a later rekey here, re-run with --force-unkeyed.",
+          "Nothing was uploaded, and nothing on the hub changed. A push writes a bundle once, addressed to the machines the hub lists at that moment, so a machine left out of it reads nothing of this thread until THIS machine re-addresses its own bundles with `hub rekey` (`/sesh-mover:hub-rekey`) — and never, if this machine is gone by then. On each machine above, upgrade sesh-mover if it predates encryption, then run a plain `hub encrypt` there once (`/sesh-mover:hub-encrypt`, which only reports the setting) or push or pull any project on this hub from it — those publish its key; `hub status`, `whereis` and `hub trust` publish nothing. If a machine is decommissioned, delete its machines/<id>.json from the hub directory. To upload anyway, accepting that those machines cannot read this bundle until a later rekey here, re-run with --force-unkeyed.",
         warnings,
       };
     }

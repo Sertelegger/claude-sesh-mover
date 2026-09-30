@@ -11,6 +11,7 @@ import {
   readdirSync,
   chmodSync,
   cpSync,
+  realpathSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { tmpdir, platform } from "node:os";
@@ -472,8 +473,11 @@ describe("cli", () => {
           "Nothing to pull: every bundle the machine each thread resolves to lists has already been received here."
         );
         // A refusal applies nothing: no second copy of the session landed.
+        // Under the PHYSICAL path (#149): pull resolves `--project-path` the
+        // way Claude Code keys a project folder, and on macOS the temp root
+        // sits behind the /var -> /private/var link.
         const sessions = readdirSync(
-          join(configDirB, "projects", encodeProjectPath(target))
+          join(configDirB, "projects", encodeProjectPath(realpathSync(target)))
         ).filter((f) => f.endsWith(".jsonl"));
         expect(sessions).toHaveLength(1);
       } finally {

@@ -74,6 +74,7 @@
 import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { errorMessage } from "../errors.js";
@@ -465,6 +466,59 @@ export function escrowRecoverySteps(escrowPath) {
         `age -d ${escrowPath} > ${identityFilePath()} && chmod 600 ${identityFilePath()}   # restore this machine's identity`,
     ];
 }
+/**
+ * The two lines that enable an escrow from the user's OWN shell — the only
+ * place a passphrase may be typed (see the comment on `hub escrow` in
+ * `cli.ts`). Spelled once, like `escrowRecoverySteps`, because a refusal prints
+ * them at exactly the moment the user cannot check them against anything.
+ *
+ * **Never a bare `sesh-mover`** (#134). No documented install puts it on PATH:
+ * a plugin install is a directory in Claude Code's plugin cache, and the
+ * package is not on npm. A line that fails with "command not found" pushes the
+ * user toward asking Claude to run it instead — i.e. toward typing the
+ * passphrase into the transcript the SessionEnd auto-push uploads, which is the
+ * one path this whole verb is built to prevent. So the line runs `node` on the
+ * absolute path of the `cli.js` that printed it, which is by construction the
+ * installed version.
+ *
+ * - **POSIX: bash or zsh.** `read -s` is not POSIX — dash and fish reject it —
+ *   and `IFS=` is load-bearing rather than tidy: without it `read` strips
+ *   leading and trailing whitespace (measured in both shells), so a passphrase
+ *   with an edge space would be escrowed under a key its owner cannot type at
+ *   `age`'s prompt, and the mismatch would surface only during a recovery.
+ *   `-r` does the same job for backslashes. The whole line is a SUBSHELL for
+ *   the reason the PowerShell one is a script block: it runs in the user's
+ *   interactive shell, and without the parentheses the passphrase stays in
+ *   `SESH_ESCROW` there for the rest of the session. `printf` is a builtin in
+ *   both shells, subshell or not, so the passphrase is never in an argv.
+ *   On Windows the path is a drive-letter path, which Git Bash's Windows `node`
+ *   opens and a WSL shell's Linux `node` does not — so WSL is named only for a
+ *   Claude Code that itself runs inside WSL, and native Windows is pointed at
+ *   the PowerShell line.
+ * - **PowerShell (Windows).** `Read-Host -AsSecureString` does not echo, and the
+ *   `$OutputEncoding` set inside the script block (so it does not outlive the
+ *   command) is what makes Windows PowerShell 5.1 send UTF-8 instead of ASCII,
+ *   which turns every non-ASCII character into `?` without a word. The newline
+ *   PowerShell appends, CRLF included, is what `cli.ts`'s one-trailing-newline
+ *   strip absorbs.
+ *
+ * `<path>` stays a placeholder: the destination is the user's choice and the
+ * refusals print before one has been checked.
+ */
+export function escrowEnableRecipes(cliEntry) {
+    const tail = "hub escrow --enable --passphrase-stdin --out <path>";
+    // Single quotes in both shells: nothing inside is expanded. POSIX closes and
+    // reopens around an embedded quote; PowerShell doubles it, and treats the
+    // typographic single quotes as quotes too.
+    const posixPath = `'${cliEntry.replace(/'/g, "'\\''")}'`;
+    const psPath = `'${cliEntry.replace(/['\u2018\u2019\u201A\u201B]/g, "$&$&")}'`;
+    return {
+        posix: `( IFS= read -rs SESH_ESCROW && printf '%s' "$SESH_ESCROW" | node ${posixPath} ${tail} )`,
+        powershell: "& { $p = Read-Host -Prompt 'Escrow passphrase' -AsSecureString; " +
+            "$OutputEncoding = [System.Text.UTF8Encoding]::new($false); " +
+            `[System.Net.NetworkCredential]::new('', $p).Password | node ${psPath} ${tail} }`,
+    };
+}
 function refuse(refusal, error, suggestion, extra = {}) {
     return {
         success: false,
@@ -579,29 +633,43 @@ export async function hubEscrow(opts) {
         };
     }
     // ---- enable ----
+    const recipes = escrowEnableRecipes(opts.cliEntry ?? fileURLToPath(new URL("../cli.js", import.meta.url)));
+    // EVERY passphrase refusal goes through this one builder, so every one of
+    // them ends with both lines — whatever the cause. The skill doc and the
+    // command doc answer `refusal: "passphrase"` with "re-print the two lines its
+    // suggestion carries" without asking which cause it was, and they must not
+    // have to: a cause that printed no line would leave the model nothing to copy
+    // but its memory, and a line retyped from memory is how a bare `sesh-mover`
+    // or a `read` without `IFS=` reaches a user. The empty-passphrase and
+    // line-break refusals once carried neither line.
+    const refusePassphrase = (error, why) => refuse("passphrase", error, `${why}\nRun one of these in YOUR OWN SHELL, never in a chat session — ` +
+        "in bash or zsh (on Windows, Git Bash — or WSL only if Claude Code itself runs inside WSL, " +
+        "since the path below belongs to this install):\n" +
+        `  ${recipes.posix}\n` +
+        "or in PowerShell (the one to use on native Windows):\n" +
+        `  ${recipes.powershell}\n` +
+        "with <path> replaced by where the escrow should go.");
     if (opts.passphrase.kind === "not-requested") {
-        return refuse("passphrase", "Enabling the escrow needs a passphrase, and the only way to supply one is --passphrase-stdin.", "Run this in YOUR OWN SHELL, never in a chat session:\n" +
-            "  read -rs SESH_ESCROW && printf '%s' \"$SESH_ESCROW\" | " +
-            "sesh-mover hub escrow --enable --passphrase-stdin --out <path>\n" +
-            "There is no flag and no config key for it: a flag lands in shell history, a config file " +
-            "sits in plaintext beside what it protects, and an environment variable leaks through " +
-            "/proc and is inherited by every subprocess this plugin spawns, including git.");
+        return refusePassphrase("Enabling the escrow needs a passphrase, and the only way to supply one is --passphrase-stdin.", "Nothing was written. There is no flag and no config key for it: a flag lands in shell " +
+            "history, a config file sits in plaintext beside what it protects, and an environment " +
+            "variable leaks through /proc and is inherited by every subprocess this plugin spawns, " +
+            "including git.");
     }
     if (opts.passphrase.kind === "terminal") {
-        return refuse("passphrase", "Standard input is a terminal, so reading the passphrase would echo it.", "Pipe it instead:\n" +
-            "  read -rs SESH_ESCROW && printf '%s' \"$SESH_ESCROW\" | " +
-            "sesh-mover hub escrow --enable --passphrase-stdin --out <path>");
+        return refusePassphrase("Standard input is a terminal, so reading the passphrase would echo it.", "Nothing was read and nothing was written. Pipe the passphrase in instead: both lines below " +
+            "read it without echoing it.");
     }
     const passphrase = opts.passphrase.bytes;
     if (passphrase.length === 0) {
-        return refuse("passphrase", "The passphrase was empty.", "An empty passphrase is not a weak escrow, it is a public one: every age implementation " +
+        return refusePassphrase("The passphrase was empty.", "An empty passphrase is not a weak escrow, it is a public one: every age implementation " +
             "would open the file. Nothing was written.");
     }
     if (passphrase.includes(0x0a) || passphrase.includes(0x0d)) {
-        return refuse("passphrase", "The passphrase contains a line break.", "age reads a passphrase as a single line from the terminal, so a passphrase with a line " +
+        return refusePassphrase("The passphrase contains a line break.", "age reads a passphrase as a single line from the terminal, so a passphrase with a line " +
             "break in it could never be typed back in — the escrow would be unrecoverable by the " +
             "standard tool, which is the only tool recovery has. One trailing newline is stripped for " +
-            "you; a line break in the middle is refused.");
+            "you; a line break in the middle is refused. Nothing was written. Both lines below read " +
+            "a single line of what you type.");
     }
     if (!opts.outPath) {
         return refuse("no-out", "--out is required: the escrow is written to a path you name.", "There is no default. A default would put a passphrase-wrapped private key somewhere the " +
@@ -614,7 +682,7 @@ export async function hubEscrow(opts) {
             ? "This machine has no identity to escrow yet."
             : `This machine's identity file cannot be read (${identity.cause}): ${identity.detail}`, identity.state === "absent"
             ? "An identity is minted the first time this machine registers on a hub. Run " +
-                "`sesh-mover hub init` or one push or pull, then escrow it."
+                "`/sesh-mover:hub-init`, or push or pull any project on a hub, then escrow it."
             : "Fix the identity file first. Escrowing is a copy — copying an unreadable key produces " +
                 "an unreadable escrow, and nothing here overwrites or replaces the file.");
     }

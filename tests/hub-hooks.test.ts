@@ -591,6 +591,174 @@ describe("hub hook-session-end (CLI)", () => {
   });
 
   /**
+   * #140's cost, paid on this endpoint. Forwarding the export's warnings onto
+   * push's result reaches the auto-push with no further work — and the
+   * breadcrumb keeps only its first `MAX_AUTO_PUSH_NOTES` notes. #124's
+   * disclosure is one sentence per entry per session, and forwarded at the
+   * export (before the payload runs) six of them would push the TRACKED-secret
+   * disclosure above out of the breadcrumb `commands/push.md` tells the skill
+   * to relay it from. So the disclosure is ONE note, after the payload's.
+   */
+  it("keeps the carry disclosure in the breadcrumb beside what the session folder did not carry", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const g = (args: string[]): void => {
+      execFileSync("git", args, { cwd: project, stdio: "ignore" });
+    };
+    g(["init", "-q"]);
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "Test"]);
+    g(["remote", "add", "origin", "https://github.com/User/Repo.git"]);
+    writeFileSync(join(project, ".env"), "DB_PASSWORD=old\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    writeFileSync(join(project, ".gitignore"), ".env\n");
+    g(["add", ".gitignore"]);
+    g(["commit", "-q", "-m", "ignore env"]);
+    writeFileSync(join(project, ".env"), "DB_PASSWORD=hunter2_NEW\n");
+
+    const restore = overrideHome(home);
+    try {
+      const { hubInit } = await import("../src/hub/init.js");
+      await hubInit({ hubPath: hubDir, configScope: "user", cwd: home });
+      const { loadOrCreateMachineId } = await import("../src/machine.js");
+      const { createFsBackend } = await import("../src/hub/backend.js");
+      const { createHubProject } = await import("../src/hub/identity.js");
+      await createHubProject(createFsBackend(hubDir), project, loadOrCreateMachineId().id);
+    } finally {
+      restore.restore();
+    }
+    const { realpathSync } = await import("node:fs");
+    const projectReal = realpathSync(project);
+    if (projectReal !== project) {
+      cpSync(
+        join(configDir, "projects", encodeProjectPath(project)),
+        join(configDir, "projects", encodeProjectPath(projectReal)),
+        { recursive: true }
+      );
+    }
+    // More uncarried names than the breadcrumb has room for notes.
+    const sessionDir = join(configDir, "projects", encodeProjectPath(projectReal), sessionId);
+    const uncarried = ["future-a", "future-b", "future-c", "future-d", "future-e", "future-f"];
+    for (const name of uncarried) mkdirSync(join(sessionDir, name), { recursive: true });
+
+    const r = runHook(JSON.stringify({ cwd: projectReal, session_id: sessionId }));
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe("");
+
+    const { peekSyncState } = await import("../src/sync-state.js");
+    const restore2 = overrideHome(home);
+    let recorded;
+    try {
+      recorded = peekSyncState(projectReal).hub?.lastAutoPush;
+    } finally {
+      restore2.restore();
+    }
+    expect(recorded?.ok).toBe(true);
+    const notes = recorded!.notes;
+    // The secret-bearing disclosure survived the cap…
+    expect(notes.join(" ")).toMatch(/TRACKS/);
+    // …and the walk-past disclosure is there too, as exactly one note naming
+    // every entry.
+    const walkPast = notes.filter((n) => uncarried.some((u) => n.includes(u)));
+    expect(walkPast).toHaveLength(1);
+    for (const u of uncarried) expect(walkPast[0]).toContain(u);
+    // …and it comes AFTER the payload's, so no count of export warnings can
+    // be what pushes the carry disclosure past the cap.
+    expect(notes.findIndex((n) => /TRACKS/.test(n))).toBeLessThan(notes.indexOf(walkPast[0]));
+  });
+
+  /**
+   * The same cap, and the warning #140 first put past it: the UNSIGNED push.
+   * `skills/session-porter/SKILL.md` sends a user asking why a peer reports a
+   * signature downgrade from this machine to `lastAutoPush.notes`, because the
+   * auto-push has no other channel — so that sentence has to survive any count
+   * of export warnings. Five sessions the planner sends whole used to be five
+   * notes, forwarded ahead of the signing step, and the breadcrumb kept exactly
+   * those five.
+   *
+   * Two rules, each asserted so the other cannot hide it: the export's
+   * warnings go AFTER everything push itself says (the ordering assertion), and
+   * a push folds the planner's per-session reasons into ONE note (the count).
+   */
+  it("keeps the unsigned-push warning in the breadcrumb however many sessions went up whole", async () => {
+    const restore = overrideHome(home);
+    try {
+      const { hubInit } = await import("../src/hub/init.js");
+      await hubInit({ hubPath: hubDir, configScope: "user", cwd: home });
+      const { loadOrCreateMachineId } = await import("../src/machine.js");
+      const { createFsBackend } = await import("../src/hub/backend.js");
+      const { createHubProject } = await import("../src/hub/identity.js");
+      await createHubProject(createFsBackend(hubDir), project, loadOrCreateMachineId().id);
+    } finally {
+      restore.restore();
+    }
+    const { realpathSync } = await import("node:fs");
+    const projectReal = realpathSync(project);
+    const encodedDir = join(configDir, "projects", encodeProjectPath(projectReal));
+    if (projectReal !== project) {
+      cpSync(join(configDir, "projects", encodeProjectPath(project)), encodedDir, { recursive: true });
+    }
+    // Four more sessions beside the fixture's, each with its own entry uuids.
+    const original = readFileSync(join(encodedDir, `${sessionId}.jsonl`), "utf-8");
+    const ids = [sessionId];
+    for (let i = 1; i <= 4; i++) {
+      const id = `550e8400-e29b-41d4-a716-44665544010${i}`;
+      ids.push(id);
+      writeFileSync(
+        join(encodedDir, `${id}.jsonl`),
+        original.replaceAll(sessionId, id).replaceAll('"entry-', `"s${i}-entry-`)
+      );
+    }
+    // One uncarried name, so the walk-past note is in the same breadcrumb.
+    mkdirSync(join(encodedDir, sessionId, "future-a"), { recursive: true });
+
+    const first = runHook(JSON.stringify({ cwd: projectReal, session_id: sessionId }));
+    expect(first.status).toBe(0);
+    expect(first.stdout).toBe("");
+
+    // Every session loses the head the hub was sent, so the planner sends all
+    // five whole — and the signing key becomes unreadable (a directory at its
+    // name, which `loadOrCreateSigningKey` answers `unreadable` and never mints
+    // over), so this push goes up UNSIGNED.
+    for (const id of ids) {
+      const file = join(encodedDir, `${id}.jsonl`);
+      const lines = readFileSync(file, "utf-8").split("\n").filter((l) => l !== "");
+      writeFileSync(file, lines.slice(0, -1).join("\n") + "\n");
+    }
+    const keyPath = join(home, ".sesh-mover", "signing.key");
+    expect(existsSync(keyPath)).toBe(true);
+    rmSync(keyPath);
+    mkdirSync(keyPath);
+
+    const second = runHook(JSON.stringify({ cwd: projectReal, session_id: sessionId }));
+    expect(second.status).toBe(0);
+    expect(second.stdout).toBe("");
+
+    const { peekSyncState } = await import("../src/sync-state.js");
+    const restore2 = overrideHome(home);
+    let recorded;
+    try {
+      recorded = peekSyncState(projectReal).hub?.lastAutoPush;
+    } finally {
+      restore2.restore();
+    }
+    expect(recorded?.ok).toBe(true);
+    const notes = recorded!.notes;
+    const unsigned = notes.findIndex((n) => n.includes("pushed UNSIGNED"));
+    expect(unsigned, notes.join("\n")).toBeGreaterThanOrEqual(0);
+    // ONE note for five sessions sent whole. (Only the first id is asserted:
+    // the breadcrumb truncates a note at 500 characters, and a manual push's
+    // result is where the whole sentence is read.)
+    const whole = notes.filter((n) => /sending whole/.test(n));
+    expect(whole, notes.join("\n")).toHaveLength(1);
+    expect(whole[0]).toContain(ids[0]);
+    // After the push's own warnings, so no count of them can displace it.
+    expect(unsigned).toBeLessThan(notes.indexOf(whole[0]));
+    const walkPast = notes.findIndex((n) => n.includes("future-a"));
+    expect(walkPast, notes.join("\n")).toBeGreaterThan(unsigned);
+  });
+
+  /**
    * The breadcrumb has to be READABLE, and #75's refusal is what broke that.
    *
    * `recordAutoPushOutcome` (cli.ts) renders a failed push as

@@ -399,6 +399,9 @@ describe("hub rekey", () => {
       expect(out.warnings.join(" ")).toMatch(/keyless-peer-1/);
       // The disclosure has to say the thing that makes proceeding defensible.
       expect(out.warnings.join(" ")).toMatch(/idempotent/);
+      // And name what makes that peer includable: only the verbs that register
+      // a machine publish its key, so "once it checks in" named nothing (#160).
+      expect(out.warnings.join(" ")).toMatch(/a plain `hub encrypt`, a push or a pull on each/);
     } finally {
       teardown(s);
     }

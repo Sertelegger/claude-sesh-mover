@@ -137,6 +137,13 @@ export interface HubEscrowOptions {
     /** The configured hub directory, or null when none is configured. */
     hubPath: string | null;
     /**
+     * The absolute path of the `cli.js` this run came in through, which the
+     * passphrase refusals print into the shell line the user is told to run.
+     * `cli.ts` passes its own; absent, it is the `cli.js` shipped beside this
+     * module. See `escrowEnableRecipes` for why it is never a bare `sesh-mover`.
+     */
+    cliEntry?: string;
+    /**
      * Tests only, so the shape can be exercised without paying ~0.5 s and 256 MiB
      * per case. `cli.ts` never passes it — there is no flag, on purpose: there is
      * no MINIMUM work factor (logN 1 decrypts cleanly under age, measured), so a
@@ -225,5 +232,48 @@ export declare function checkEscrowDestination(outPath: string, ctx: {
  * on a machine rebuilt from nothing.
  */
 export declare function escrowRecoverySteps(escrowPath: string): string[];
+/**
+ * The two lines that enable an escrow from the user's OWN shell — the only
+ * place a passphrase may be typed (see the comment on `hub escrow` in
+ * `cli.ts`). Spelled once, like `escrowRecoverySteps`, because a refusal prints
+ * them at exactly the moment the user cannot check them against anything.
+ *
+ * **Never a bare `sesh-mover`** (#134). No documented install puts it on PATH:
+ * a plugin install is a directory in Claude Code's plugin cache, and the
+ * package is not on npm. A line that fails with "command not found" pushes the
+ * user toward asking Claude to run it instead — i.e. toward typing the
+ * passphrase into the transcript the SessionEnd auto-push uploads, which is the
+ * one path this whole verb is built to prevent. So the line runs `node` on the
+ * absolute path of the `cli.js` that printed it, which is by construction the
+ * installed version.
+ *
+ * - **POSIX: bash or zsh.** `read -s` is not POSIX — dash and fish reject it —
+ *   and `IFS=` is load-bearing rather than tidy: without it `read` strips
+ *   leading and trailing whitespace (measured in both shells), so a passphrase
+ *   with an edge space would be escrowed under a key its owner cannot type at
+ *   `age`'s prompt, and the mismatch would surface only during a recovery.
+ *   `-r` does the same job for backslashes. The whole line is a SUBSHELL for
+ *   the reason the PowerShell one is a script block: it runs in the user's
+ *   interactive shell, and without the parentheses the passphrase stays in
+ *   `SESH_ESCROW` there for the rest of the session. `printf` is a builtin in
+ *   both shells, subshell or not, so the passphrase is never in an argv.
+ *   On Windows the path is a drive-letter path, which Git Bash's Windows `node`
+ *   opens and a WSL shell's Linux `node` does not — so WSL is named only for a
+ *   Claude Code that itself runs inside WSL, and native Windows is pointed at
+ *   the PowerShell line.
+ * - **PowerShell (Windows).** `Read-Host -AsSecureString` does not echo, and the
+ *   `$OutputEncoding` set inside the script block (so it does not outlive the
+ *   command) is what makes Windows PowerShell 5.1 send UTF-8 instead of ASCII,
+ *   which turns every non-ASCII character into `?` without a word. The newline
+ *   PowerShell appends, CRLF included, is what `cli.ts`'s one-trailing-newline
+ *   strip absorbs.
+ *
+ * `<path>` stays a placeholder: the destination is the user's choice and the
+ * refusals print before one has been checked.
+ */
+export declare function escrowEnableRecipes(cliEntry: string): {
+    posix: string;
+    powershell: string;
+};
 export declare function hubEscrow(opts: HubEscrowOptions): Promise<HubEscrowResult | HubEscrowRefusedResult>;
 //# sourceMappingURL=escrow.d.ts.map

@@ -288,9 +288,15 @@ payloadMachineId, known, tempRoot) {
         const attempt = await fetchAncestorWorkspace(backend, ref, tempRoot);
         if (attempt.dir !== null) {
             if (n > 0) {
-                warnings.push(`Merged against an older workspace generation (${ref.bundleId}) than the closest one shared with the other machine, which could not be fetched — so files that changed here since then may be reported as conflicts even where the other machine left them alone.`);
+                warnings.push(`Merged against an older workspace generation (${ref.bundleId}) than the closest one shared with machine ${payloadMachineId} (${candidates[0].bundleId}), which could not be fetched — so files that changed here since then may be reported as conflicts even where the other machine left them alone.`);
             }
-            return { dir: attempt.dir, warnings };
+            return {
+                dir: attempt.dir,
+                generation: {
+                    bundleId: ref.bundleId, file: ref.file, machineId: payloadMachineId, fallback: n > 0,
+                },
+                warnings,
+            };
         }
         if (attempt.warning)
             warnings.push(attempt.warning);
@@ -305,11 +311,23 @@ payloadMachineId, known, tempRoot) {
  * a `localDeleted` row cannot be claimed to be a deletion, only described.
  * Silence on either would look exactly like a successful sync.
  *
+ * And one thing it WROTE has to be said just as loudly: `taken` (#156). A taken
+ * file is replaced atomically, content and mode, with no sidecar and no backup
+ * — the only write in the merge that leaves nothing of the local copy behind.
+ * With the right ancestor that is the intended fast-forward; with a wrong one
+ * it is a silent revert that reads as a clean merge, and this sentence is then
+ * the only trace of it. What makes it recoverable is that `taken` requires the
+ * local copy to equal the ANCESTOR's, so the bytes it replaced are that
+ * generation's — still on the hub in `ancestor.file` for as long as that
+ * artifact is kept. `merged` gets a count for the same reason: it is the other
+ * row that rewrites a local file, and `workspaceUnpacked.fileCount` folds both
+ * into one number that names nothing.
+ *
  * No remedy sentence tells the user to "re-pull to get this" — the bundle is
  * recorded as received by the end of this pull, so a re-run finds nothing to
  * do. Remedies here are things that change the NEXT pull's outcome.
  */
-function describeWorkspaceMerge(r) {
+function describeWorkspaceMerge(r, ancestor) {
     const out = [];
     const names = (paths) => paths.slice(0, 5).join(", ") + (paths.length > 5 ? `, and ${paths.length - 5} more` : "");
     const count = (n) => `${n} workspace file${n === 1 ? "" : "s"}`;
@@ -318,6 +336,11 @@ function describeWorkspaceMerge(r) {
     // broken English on the most common case of all ("1 workspace file were…").
     const were = (n) => (n === 1 ? "was" : "were");
     const they = (n) => (n === 1 ? "It is" : "They are");
+    // On a fallback `chooseMergeAncestor` has already named the generation, and
+    // why it is not the closest one; saying it twice would read as two merges.
+    if (!ancestor.fallback) {
+        out.push(`This project's files were merged 3-way against workspace generation ${ancestor.bundleId}, the newest generation this machine holds that machine ${ancestor.machineId}'s payload declares it descends from.`);
+    }
     if (r.conflicted.length > 0) {
         out.push(`${count(r.conflicted.length)} ${were(r.conflicted.length)} merged with conflict markers and need resolving by hand — search for "<<<<<<< local": ${names(r.conflicted)}. Conflicts are normal here: edits on adjacent lines conflict, and a file added independently on both machines conflicts over its whole length.`);
     }
@@ -347,6 +370,13 @@ function describeWorkspaceMerge(r) {
     }
     if (r.restored.length > 0) {
         out.push(`${count(r.restored.length)} that you had deleted here ${were(r.restored.length)} changed on the other machine, so ${r.restored.length === 1 ? "it came" : "they came"} back rather than losing that work: ${names(r.restored)}. Delete ${r.restored.length === 1 ? "it" : "them"} again if you still don't want ${r.restored.length === 1 ? "it" : "them"}.`);
+    }
+    if (r.taken.length > 0) {
+        const one = r.taken.length === 1;
+        out.push(`${count(r.taken.length)} ${were(r.taken.length)} unchanged here since workspace generation ${ancestor.bundleId} and changed on machine ${ancestor.machineId}, so ${one ? "it was" : "they were"} replaced with that machine's copy, content and file mode: ${names(r.taken)}. That is how a change made only on the other machine arrives, and it keeps no sidecar and no backup — so if ${one ? "this is not a change" : "one of these is not a change"} you expected, what ${one ? "it" : "they"} held here is that generation's copy, still on the hub in ${ancestor.file} for as long as that snapshot is kept there.`);
+    }
+    if (r.merged.length > 0) {
+        out.push(`${count(r.merged.length)} changed on both machines ${were(r.merged.length)} merged 3-way without conflicts: ${names(r.merged)}.`);
     }
     return out;
 }
@@ -691,16 +721,17 @@ export async function runApplyWorkspaceStage(input) {
         // --target-path has no sync-state there and therefore no generation
         // history, which is correct: that tree shares nothing with the hub.
         const known = knownWorkspaceGenerations(readSyncState(effectiveProjectPath));
-        let ancestorDir = null;
+        let ancestor = null;
         // --force-workspace is an explicit "overwrite, don't combine", so it
         // skips the ancestor hunt entirely rather than fetching a tree nothing
         // will read.
         if (hasRealContent && !forceWorkspace) {
-            const ancestor = await chooseMergeAncestor(backend, chainWorkspaceBases, machineId, known, tempRoot);
-            ancestorDir = ancestor.dir;
-            reasons.push(...ancestor.warnings);
+            const chosen = await chooseMergeAncestor(backend, chainWorkspaceBases, machineId, known, tempRoot);
+            if (chosen.dir !== null)
+                ancestor = { dir: chosen.dir, generation: chosen.generation };
+            reasons.push(...chosen.warnings);
         }
-        if (ancestorDir !== null) {
+        if (ancestor !== null) {
             // No git probe up front, deliberately. mergeWorkspaceTrees only needs
             // git for files changed on BOTH sides; take/keep/create/no-op rows —
             // the overwhelming majority on a routine pull — are decided by
@@ -720,7 +751,7 @@ export async function runApplyWorkspaceStage(input) {
                 return stageSkip(reasons, inc.unverified ? { unpacked: null, unverified: true } : { unpacked: null, declaredMissing: true });
             }
             const report = await mergeWorkspaceTrees({
-                ancestorDir,
+                ancestorDir: ancestor.dir,
                 incomingDir: inc.dir,
                 targetDir: effectiveProjectPath,
             });
@@ -740,7 +771,7 @@ export async function runApplyWorkspaceStage(input) {
                 ...(inc.digest !== undefined ? { digest: inc.digest } : {}),
             });
             writeSyncState(stateWs);
-            reasons.push(...describeWorkspaceMerge(report));
+            reasons.push(...describeWorkspaceMerge(report, ancestor.generation));
             return stageOk({ unpacked, merge: report }, reasons);
         }
         else if (hasRealContent && !forceWorkspace && !targetPathGiven) {

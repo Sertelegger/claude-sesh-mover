@@ -262,7 +262,7 @@ export async function hubRekey(
     }
     if (census.unkeyed.length > 0) {
       warnings.push(
-        `${census.unkeyed.length} registered machine(s) publish no usable public key, so the new headers are not addressed to them: ${census.unkeyed.map(describeUnkeyed).join("; ")}. Unlike a push, that is not a refusal here — this operation is idempotent, so once those machines check in with a key, running it again includes them.`
+        `${census.unkeyed.length} registered machine(s) publish no usable public key, so the new headers are not addressed to them: ${census.unkeyed.map(describeUnkeyed).join("; ")}. Unlike a push, that is not a refusal here — this operation is idempotent, so once those machines publish a key (a plain \`hub encrypt\`, a push or a pull on each does it), running it again includes them.`
       );
     }
     if (narrowed.length > 0) {

@@ -453,6 +453,87 @@ describe("importer", () => {
       expect(result.warnings.some((w) => w.includes("listed in no index"))).toBe(true);
     });
 
+    /**
+     * #144, apply side. Every bundle 0.12.0 and earlier wrote from a project
+     * holding Claude Code's consolidation lock carries it, and the exporter's
+     * new exclusion does nothing for those — so the importer refuses to land
+     * one. Planted by hand into an export the real exporter produced, because
+     * that exporter no longer writes it.
+     */
+    describe("an old bundle carrying memory/.consolidate-lock (#144)", () => {
+      const LOCK = ".consolidate-lock";
+      const plantLock = (bundle: string, pid: string) =>
+        writeFileSync(join(bundle, "memory", LOCK), pid);
+
+      it("does not create the lock on a target that has none, and does not warn about it", async () => {
+        plantLock(exportPath, "4242");
+        const result = await runImport();
+        expect(result.success).toBe(true);
+        if (!result.success || !("memoryIndex" in result)) return;
+
+        expect(existsSync(join(targetMemDir(), LOCK))).toBe(false);
+        // The rest of the layer still lands.
+        expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
+        expect(result.memoryIndex?.unindexed).toEqual([]);
+        expect(result.warnings.join("\n")).not.toContain(LOCK);
+      });
+
+      it("leaves the target's own lock alone: no park, no index line, no warning", async () => {
+        seedMemory(LOCK, "1111");
+        plantLock(exportPath, "4242");
+        const result = await runImport();
+        expect(result.success).toBe(true);
+        if (!result.success || !("memoryIndex" in result)) return;
+
+        expect(readMemory(LOCK)).toBe("1111");
+        expect(readdirSync(targetMemDir()).filter((f) => f.includes("incoming"))).toEqual([]);
+        expect(readMemory("MEMORY.md")).not.toContain(LOCK);
+        expect(result.memoryConflicts).toBeUndefined();
+        expect(result.warnings.join("\n")).not.toContain(LOCK);
+      });
+
+      it("a bundle memory folder holding only the lock is no memory layer here either", async () => {
+        // What a 0.12.0 export of a project whose memory held nothing else
+        // looks like. Nothing in it lands, so nothing about it is a write:
+        // no memory root in the write set, no directory created, no
+        // `memoryDir` reported as though the run had written there.
+        for (const name of readdirSync(join(exportPath, "memory"))) {
+          rmSync(join(exportPath, "memory", name));
+        }
+        plantLock(exportPath, "4242");
+
+        const plan = await runImport({ dryRun: true });
+        expect(plan.success).toBe(true);
+        if (!plan.success || !("writeSet" in plan)) return;
+        expect(plan.writeSet?.roots.map((r) => r.layer)).not.toContain("memory");
+        const declined = await runImport({ dryRun: true, noMemory: true });
+        expect(declined.success).toBe(true);
+        if (!declined.success || !("writeSet" in declined)) return;
+        expect(declined.writeSet?.roots.map((r) => r.layer)).not.toContain("memory");
+
+        const result = await runImport();
+        expect(result.success).toBe(true);
+        if (!result.success || !("importedSessions" in result)) return;
+        expect(existsSync(targetMemDir())).toBe(false);
+        expect("memoryDir" in result ? result.memoryDir : undefined).toBeUndefined();
+      });
+
+      it("is left out of the dry run's plan and of the --no-memory count", async () => {
+        plantLock(exportPath, "4242");
+        const plan = await runImport({ dryRun: true });
+        expect(plan.success).toBe(true);
+        if (!plan.success || !("memoryPlan" in plan)) return;
+        expect(plan.memoryPlan?.map((e) => e.filename)).not.toContain(LOCK);
+        expect(plan.writeSet?.entries.map((e) => e.path).join("\n")).not.toContain(LOCK);
+
+        const declined = await runImport({ dryRun: true, noMemory: true });
+        expect(declined.success).toBe(true);
+        if (!declined.success || !("memorySkipped" in declined)) return;
+        // MEMORY.md and test_memory.md — the lock is not a memory to decline.
+        expect(declined.memorySkipped).toBe(2);
+      });
+    });
+
     it("drops incoming prose from the index and says so", async () => {
       seedMemory("MEMORY.md", "- [Local note](local-note.md) — mine\n");
       const from = await exportWithMemory({

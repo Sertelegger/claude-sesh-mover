@@ -3473,6 +3473,63 @@ describe("hub pull — workspace 3-way merge", () => {
     }
   });
 
+  /**
+   * #156. A `taken` row is an ATOMIC OVERWRITE of a local file with no sidecar
+   * and no backup, and until this it was the one decision the merge never put
+   * into words — the only trace was `workspaceUnpacked.fileCount`, a sum that
+   * folds it in with created and merged files. With the right ancestor that is
+   * the ordinary fast-forward; with a wrong one (#37: the base is chosen from a
+   * peer's self-reported `basedOn`) it is a silent revert that reads as a clean
+   * merge. So the sentence has to name the files, and say where what they held
+   * still is: `taken` requires local == ancestor, so it is that generation's
+   * copy on the hub. The ancestor itself is named on the success path too, not
+   * only when a fallback happened.
+   */
+  it("names each file a merge replaced, and the generation that still holds what it replaced (#156)", async () => {
+    const w = await arrangeWorkspacePair();
+    try {
+      w.useA();
+      const machineA = loadOrCreateMachineId().id;
+      writeFileSync(join(w.projectA, "README.md"), "hello from A\n");
+      writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A-EDIT" }));
+      await w.pushFromA();
+
+      w.useB();
+      // The generation B's tree last shared with A — the bootstrap's. Read
+      // BEFORE the pull, which advances it.
+      const gen1 = readSyncState(w.projectB).hub!.lastWorkspace!;
+      writeFileSync(join(w.projectB, "shared.txt"), wsLines({ 8: "B-EDIT" }));
+
+      const pull = await w.pullOnB();
+      expect(pull.success).toBe(true);
+      if (!pull.success) return;
+      const p = pull as HubPullResult;
+      expect(p.workspaceMerge!.taken).toEqual(["README.md"]);
+      expect(p.workspaceMerge!.merged).toEqual(["shared.txt"]);
+      expect(readFileSync(join(w.projectB, "README.md"), "utf-8")).toBe("hello from A\n");
+
+      const taken = p.warnings.find((s) => s.includes("README.md"));
+      expect(taken, "no warning names the file the merge overwrote").toBeDefined();
+      expect(taken).toContain(
+        `1 workspace file was unchanged here since workspace generation ${gen1.bundleId} and changed on machine ${machineA}, so it was replaced with that machine's copy`
+      );
+      expect(taken).toContain("no sidecar and no backup");
+      // Where the replaced bytes still are — the generation's own artifact.
+      expect(taken).toContain(gen1.file);
+
+      expect(p.warnings).toContain(
+        "1 workspace file changed on both machines was merged 3-way without conflicts: shared.txt."
+      );
+      // The ancestor, on the SUCCESS path — before #156 it was named only when
+      // a fetch failure had forced a fallback to an older one.
+      expect(p.warnings.join(" ")).toContain(
+        `merged 3-way against workspace generation ${gen1.bundleId}, the newest generation this machine holds that machine ${machineA}'s payload declares it descends from`
+      );
+    } finally {
+      w.cleanup();
+    }
+  });
+
   it("writes conflict markers, never a silent overwrite, when both machines edit the same line", async () => {
     const w = await arrangeWorkspacePair();
     try {
@@ -3969,10 +4026,17 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(readSyncState(w.projectB).hub?.workspaceGenerations).toHaveLength(2);
 
       w.useA();
+      const machineA = loadOrCreateMachineId().id;
       writeFileSync(join(w.projectA, "shared.txt"), wsLines({ 2: "A2", 4: "A4" }));
+      // Changed only on A, and unchanged on B since BOTH generations B holds —
+      // so it is `taken` whichever of them the merge runs against, and the
+      // sentence has to say which one it was (#156).
+      writeFileSync(join(w.projectA, "README.md"), "hello from A\n");
       await w.pushFromA();
 
       w.useB();
+      // Read before poisoning: [closest, older], newest first.
+      const [closest, older] = readSyncState(w.projectB).hub!.workspaceGenerations!;
       // sync-state is an ordinary JSON file in the user's home; a traversing
       // path in it must not become a read outside the hub directory. The
       // bundleId is left intact so the poisoned entry is still the CHOSEN
@@ -3999,6 +4063,27 @@ describe("hub pull — workspace 3-way merge", () => {
       expect(text).toContain("A4");      // the other machine's new edit arrived
       expect(text).toContain("B-EDIT");  // and this machine's survived
       expect(text).not.toContain("<<<<<<<");
+
+      // #156, the fallback half. The fallback warning names both generations
+      // and the machine whose payload declared the closer one, since that
+      // declaration is the self-report (#37) a person would want to check.
+      expect(warned).toContain(
+        `Merged against an older workspace generation (${older.bundleId}) than the closest one shared with machine ${machineA} (${closest.bundleId})`
+      );
+      // It already named the ancestor, so the success-path sentence must not
+      // name it a second time — two sentences would read as two merges.
+      expect(warned).not.toContain("merged 3-way against workspace generation");
+      // The replaced file's recovery pointer is the generation the merge ACTUALLY
+      // ran against — the older one, whose copy is what `taken` proved the local
+      // file held — never the closer one it could not fetch, whose recorded
+      // file here is the poisoned path the guard just refused.
+      expect(p.workspaceMerge!.taken).toEqual(["README.md"]);
+      const taken = p.warnings.find((m) => m.includes("README.md"));
+      expect(taken, "no warning names the file the merge overwrote").toBeDefined();
+      expect(taken).toContain(`unchanged here since workspace generation ${older.bundleId} and changed on machine ${machineA}`);
+      expect(taken).toContain(`still on the hub in ${older.file}`);
+      expect(taken).not.toContain(closest.bundleId);
+      expect(taken).not.toContain("etc/passwd");
     } finally {
       w.cleanup();
     }
