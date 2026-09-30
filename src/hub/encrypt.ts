@@ -26,8 +26,11 @@
  * **A version field cannot stop an old plugin; it can only let a new one
  * notice.** This is the noticing, and it is a diagnosis rather than an
  * enforcement. The gate is deliberately not overridable: the honest remedies are
- * to upgrade that machine and let it run any hub command once, or — if it is
- * decommissioned — to delete its record from the hub, which is the same remedy
+ * to upgrade that machine and let it run a plain `hub encrypt`, a push or a pull
+ * once — the verbs that call `registerMachine`; `hub status`, `whereis` and
+ * `hub trust` never touch a machine record, so naming "any hub command" sent
+ * users to the diagnostic that cannot help (#160) — or, if it is decommissioned,
+ * to delete its record from the hub, which is the same remedy
  * `collectHubRecipients` already names for the fact that the machine roster only
  * ever grows. An override here would be a flag on the verb whose whole job is to
  * ask the question, offered to the user least equipped to answer it; the place
@@ -133,7 +136,11 @@ export interface HubEncryptOptions {
    * Flip the hub-wide switch on. Absent = report.
    *
    * A read still writes ONE thing: this machine's own `machines/<id>.json`, via
-   * the `registerMachine` call every hub verb makes. Saying "writes nothing"
+   * the `registerMachine` call push, pull, `hub init`, `hub reindex`, `hub rekey`
+   * and `hub compact` make too — though not `hub status`, `whereis`, `hub trust`,
+   * `hub escrow`, `hub retire`, `hub delete` or `hub unlink`, which is why this
+   * report is the one to name when a machine only needs to re-publish its key
+   * and has no project to push. Saying "writes nothing"
    * would be the convenient simplification and it is false — and the write is
    * useful rather than incidental, since it is what publishes this machine's
    * public key and so makes it a recipient of everything pushed afterwards.
@@ -215,7 +222,7 @@ export async function hubEncrypt(
       reason: "stale-machines",
       error: `${stale.length} machine(s) registered on this hub last checked in on a plugin version that predates encryption at rest: ${stale.map(describeStale).join("; ")}.`,
       suggestion:
-        `Nothing was changed. Those machines do not read this hub's encryption setting at all, so sealing the hub would not stop them pushing your sessions to it in the clear — it would only stop you noticing. Upgrade sesh-mover to ${MIN_ENCRYPTION_PLUGIN_VERSION} or later on each machine above and run any hub command there once, which refreshes its record; then try again. If a machine is decommissioned, delete its machines/<id>.json from the hub directory — that is also what stops it being carried as a recipient of every future bundle.`,
+        `Nothing was changed. Those machines do not read this hub's encryption setting at all, so sealing the hub would not stop them pushing your sessions to it in the clear — it would only stop you noticing. Upgrade sesh-mover to ${MIN_ENCRYPTION_PLUGIN_VERSION} or later on each machine above, then run a plain \`hub encrypt\` there once (\`/sesh-mover:hub-encrypt\`, which only reports the setting) or push or pull any project on this hub from it — those refresh its record; \`hub status\`, \`whereis\` and \`hub trust\` do not. Then try again. If a machine is decommissioned, delete its machines/<id>.json from the hub directory — that is also what stops it being carried as a recipient of every future bundle.`,
       staleMachines: stale,
     };
   }
@@ -288,7 +295,7 @@ export async function hubEncrypt(
   }
   if (enabled && census.unkeyed.length > 0) {
     warnings.push(
-      `${census.unkeyed.length} registered machine(s) publish no usable public key, so a push to this hub will refuse until they check in: ${census.unkeyed.map((u) => u.machineId).join(", ")}.`
+      `${census.unkeyed.length} registered machine(s) publish no usable public key, so a push to this hub will refuse until each of them publishes one — a plain \`hub encrypt\`, a push or a pull on that machine does it, after upgrading it if it predates encryption: ${census.unkeyed.map((u) => u.machineId).join(", ")}.`
     );
   }
 

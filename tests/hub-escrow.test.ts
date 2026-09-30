@@ -16,15 +16,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { homeEnv, overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
-import { runCli } from "./helpers/run-cli.js";
+import { cliPath, runCli } from "./helpers/run-cli.js";
 import {
   canonicalPath,
   checkEscrowDestination,
+  escrowEnableRecipes,
   escrowRecordPath,
   homeDirs,
   hubEscrow,
@@ -32,14 +33,120 @@ import {
 } from "../src/hub/escrow.js";
 import { AgeDecryptStream } from "../src/crypto/age.js";
 import { identityFilePath, loadOrCreateIdentity } from "../src/crypto/identity-file.js";
-import { HAVE_PTY, runUnderPty, through } from "./helpers/age-oracle.js";
+import {
+  HAVE_PASSPHRASE_ORACLE, HAVE_PTY, ORACLES, oracleDecryptPassphrase, runUnderPty, through,
+} from "./helpers/age-oracle.js";
+import { spawnSync } from "node:child_process";
 
 const isPosix = process.platform !== "win32";
+
+/**
+ * The shells the POSIX line claims, by absolute path because the line runs with
+ * a PATH holding nothing but `node`. bash is required for the shell tests to run
+ * at all; zsh joins them wherever it is installed, since the line says "bash or
+ * zsh" and `read` differs between the two in exactly the flags it depends on.
+ */
+const POSIX_SHELLS = isPosix
+  ? ["bash", "zsh"].flatMap((name) => {
+      const found = [`/bin/${name}`, `/usr/bin/${name}`].find((p) => existsSync(p));
+      return found ? [found] : [];
+    })
+  : [];
+const BASH = POSIX_SHELLS.find((p) => p.endsWith("/bash")) ?? null;
+
+/**
+ * Every enable line in a doc, split into the ones spelled in full and counts of
+ * every place one STARTS. A copy that drops `IFS=` or `-r`, loses the subshell,
+ * or goes back to a bare `sesh-mover` stops matching the strict pattern but
+ * still starts like one, so the numbers disagree.
+ *
+ * Two independent start counts, because each misses what the other catches: a
+ * `read` of `SESH_ESCROW` with ANY flags or none (including `-p 'prompt'`,
+ * whose quoted argument would otherwise end the match), and every pipe into an
+ * enable, which is the one thing a recipe cannot do without whatever it reads
+ * the passphrase into and whichever shell it is for. The pipe count stops at a
+ * backtick so it cannot join two inline-code spans of prose into a line.
+ *
+ * A third, because a copy can feed the enable with no pipe at all — a
+ * here-string, a `<` redirect — and then neither start count nor the pipe count
+ * sees it: every place an EXECUTABLE (`node <path>` or a bare `sesh-mover`)
+ * runs the enable with `--passphrase-stdin`. Prose that names the flags has no
+ * executable in front of them, so it is not counted.
+ */
+function docEnableLines(text: string): {
+  posix: string[];
+  powershell: string[];
+  posixStarts: number;
+  powershellStarts: number;
+  pipedEnables: number;
+  invokedEnables: number;
+} {
+  return {
+    posix: [...text.matchAll(/\( IFS= read -rs SESH_ESCROW && printf '%s' "\$SESH_ESCROW" \| node "[^"\n]+" hub escrow --enable --passphrase-stdin --out <path> \)/g)].map((m) => m[0]),
+    powershell: [...text.matchAll(/& \{ \$p = Read-Host -Prompt 'Escrow passphrase' -AsSecureString; [^`\n]* hub escrow --enable --passphrase-stdin --out <path> \}/g)].map((m) => m[0]),
+    posixStarts: [...text.matchAll(/\bread(?:\s+-[A-Za-z]+(?:\s+(?:'[^'\n]*'|"[^"\n]*"))?)*\s+SESH_ESCROW\b/g)].length,
+    powershellStarts: [...text.matchAll(/Read-Host -Prompt 'Escrow passphrase'/g)].length,
+    pipedEnables: [...text.matchAll(/\|[^|\n`]*\bhub escrow --enable --passphrase-stdin/g)].length,
+    invokedEnables: [...text.matchAll(/(?:\bsesh-mover|\bnode\s+(?:"[^"\n]*"|'[^'\n]*'|[^\s`]+))\s+hub escrow --enable --passphrase-stdin/g)].length,
+  };
+}
 
 /** Cheap work factor: this file is about the verb, not about scrypt. */
 const CHEAP = 10;
 const PASS = "an escrow passphrase";
 const given: EscrowPassphraseInput = { kind: "given", bytes: Buffer.from(PASS) };
+
+/**
+ * The copies test below is only as good as `docEnableLines`' idea of where an
+ * enable line STARTS: a copy it does not count as a start is a copy it never
+ * asks to be spelled in full. So the counter is pinned on its own, against the
+ * spellings a hand-edited doc actually drifts into — a `read` with no flags, one
+ * whose flags are split or take a prompt argument, a different variable name,
+ * and a PowerShell line that dropped `-Prompt` — each beside one correct line,
+ * so the only thing that can make the verdict "complete" is the counter
+ * missing the stray.
+ */
+describe("docEnableLines", () => {
+  const FULL_POSIX =
+    `( IFS= read -rs SESH_ESCROW && printf '%s' "$SESH_ESCROW" | node "/p/dist/cli.js" hub escrow --enable --passphrase-stdin --out <path> )`;
+  const complete = (text: string) => {
+    const f = docEnableLines(text);
+    return (
+      f.posix.length === f.posixStarts &&
+      f.powershell.length === f.powershellStarts &&
+      f.posix.length + f.powershell.length === f.pipedEnables &&
+      f.posix.length + f.powershell.length === f.invokedEnables
+    );
+  };
+
+  it("counts a line spelled in full as complete", () => {
+    expect(complete(FULL_POSIX)).toBe(true);
+    expect(complete(escrowEnableRecipes("/p/dist/cli.js").powershell.replace("node '/p/dist/cli.js'", 'node "/p/dist/cli.js"'))).toBe(true);
+  });
+
+  it.each([
+    ["a flagless read with a bare sesh-mover", `read SESH_ESCROW && printf '%s' "$SESH_ESCROW" | sesh-mover hub escrow --enable --passphrase-stdin --out <path>`],
+    ["split flags", `IFS= read -r -s SESH_ESCROW && printf '%s' "$SESH_ESCROW" | sesh-mover hub escrow --enable --passphrase-stdin --out <path>`],
+    ["a prompt argument", `IFS= read -rsp 'Passphrase: ' SESH_ESCROW && printf '%s' "$SESH_ESCROW" | sesh-mover hub escrow --enable --passphrase-stdin --out <path>`],
+    ["another variable", `read -rs PASS && printf '%s' "$PASS" | sesh-mover hub escrow --enable --passphrase-stdin --out <path>`],
+    ["a PowerShell line without -Prompt", `& { $p = Read-Host 'Escrow passphrase' -AsSecureString; [System.Net.NetworkCredential]::new('', $p).Password | sesh-mover hub escrow --enable --passphrase-stdin --out <path> }`],
+    // No `read`, no `Read-Host` and no pipe, so none of the three start counts
+    // above sees them — yet each one runs the enable with the passphrase coming
+    // from somewhere the recipe does not control.
+    ["a here-string with no pipe", `node "/p/dist/cli.js" hub escrow --enable --passphrase-stdin --out <path> <<< "$PASS"`],
+    ["a bare sesh-mover fed from a file", `sesh-mover hub escrow --enable --passphrase-stdin --out <path> < passphrase.txt`],
+  ])("does not call a doc complete when it also holds %s", (_label, stray) => {
+    expect(complete(`${FULL_POSIX}\n\n${stray}\n`)).toBe(false);
+  });
+
+  it("does not count prose that names the flags as a line", () => {
+    expect(
+      complete(
+        `${FULL_POSIX}\nDo not drop \`IFS=\` or \`-r\`: without them \`read\` strips edge spaces, and the parentheses keep a \`SESH_ESCROW\` variable from outliving the line. \`hub escrow --enable --passphrase-stdin --out <path>\`, run from your own shell.`
+      )
+    ).toBe(true);
+  });
+});
 
 describe("hub escrow", () => {
   let home: string;
@@ -155,9 +262,19 @@ describe("hub escrow", () => {
       if (r.success) return;
       expect(r.refusal).toBe("passphrase");
       // The recipe is load-bearing: it is what keeps collection out of the
-      // chat transcript, which the SessionEnd auto-push would upload.
-      expect(r.suggestion).toContain("read -rs SESH_ESCROW");
+      // chat transcript, which the SessionEnd auto-push would upload. Both
+      // shells get one (#134), and neither names a bare `sesh-mover`, which no
+      // documented install puts on PATH.
+      expect(r.suggestion).toContain("IFS= read -rs SESH_ESCROW");
+      expect(r.suggestion).toContain("Read-Host -Prompt 'Escrow passphrase' -AsSecureString");
       expect(r.suggestion).toContain("--passphrase-stdin");
+      expect(r.suggestion).not.toMatch(/\|\s*sesh-mover /);
+      // The path in both lines is this install's, so on native Windows it is a
+      // drive-letter path that a WSL shell's Linux `node` cannot open: WSL is
+      // offered only for a Claude Code running inside it, and native Windows
+      // is sent to the PowerShell line.
+      expect(r.suggestion).toContain("WSL only if Claude Code itself runs inside WSL");
+      expect(r.suggestion).toContain("PowerShell (the one to use on native Windows)");
       expect(existsSync(out)).toBe(false);
 
       const retried = await hubEscrow({
@@ -236,6 +353,10 @@ describe("hub escrow", () => {
       // And it did NOT mint one as a side effect: escrowing a key that has
       // never encrypted anything is not what the user asked for.
       expect(existsSync(identityFilePath())).toBe(false);
+      // The way to get one is a slash command, not a bare `sesh-mover` that no
+      // documented install puts on PATH (#134).
+      expect(r.suggestion).toContain("/sesh-mover:hub-init");
+      expect(r.suggestion).not.toMatch(/`sesh-mover /);
     });
 
     it("refuses when the identity file is present but unreadable", async () => {
@@ -617,6 +738,50 @@ describe("hub escrow", () => {
       expect(r.body).toMatchObject({ reason: "escrow-refused", refusal: "passphrase" });
     });
 
+    /**
+     * Both docs answer EVERY `refusal: "passphrase"` the same way: re-print,
+     * verbatim, the two lines its `suggestion` carries. They have to — the
+     * alternative is the model retyping them from memory, which is how a bare
+     * `sesh-mover` or a `read` without `IFS=` reaches a user, and a line that
+     * fails in the user's shell is what sends them back to typing the
+     * passphrase into the chat. That instruction is only true if all FOUR causes
+     * carry both lines, and the empty-passphrase and line-break refusals used to
+     * carry neither.
+     *
+     * So each cause is produced the way a user produces it — through the CLI,
+     * the terminal one on a real pty, since a piped stdin can never reach it —
+     * and its suggestion must hold both lines for the `cli.js` that ran. No
+     * identity exists here, deliberately: every passphrase refusal fires before
+     * the identity is read.
+     */
+    const PASSPHRASE_CAUSES: Array<{ cause: string; args: string[]; input?: string; pty?: true; error: string }> = [
+      { cause: "no --passphrase-stdin", args: [], error: "--passphrase-stdin" },
+      { cause: "stdin is a terminal", args: ["--passphrase-stdin"], pty: true, error: "terminal" },
+      { cause: "an empty passphrase", args: ["--passphrase-stdin"], input: "", error: "empty" },
+      { cause: "a line break inside the passphrase", args: ["--passphrase-stdin"], input: "two\nlines\n", error: "line break" },
+    ];
+    for (const c of PASSPHRASE_CAUSES) {
+      it.skipIf(c.pty === true && !HAVE_PTY)(`the passphrase refusal for ${c.cause} carries both enable lines for the cli.js that ran`, () => {
+        const out = join(outside, "e.age");
+        const args = ["--enable", ...c.args, "--out", out];
+        const ran = c.pty
+          ? (() => {
+              const r = runUnderPty(0, [process.execPath, cliPath(), "hub", "escrow", ...args, "--project-path", project], "");
+              return { status: r.status, body: JSON.parse(r.transcript.replace(/\r/g, "")) };
+            })()
+          : cli(args, c.input);
+        expect(ran.status).toBe(2);
+        expect(ran.body).toMatchObject({ success: false, reason: "escrow-refused", refusal: "passphrase" });
+        expect(ran.body.error, "a different refusal than the one this row is for").toContain(c.error);
+        const printed = (ran.body.suggestion as string).split("\n").map((l) => l.trim());
+        const want = escrowEnableRecipes(realpathSync(cliPath()));
+        expect(printed, `${c.cause}: no bash/zsh line for the cli.js that ran`).toContain(want.posix);
+        expect(printed, `${c.cause}: no PowerShell line for the cli.js that ran`).toContain(want.powershell);
+        expect(existsSync(out)).toBe(false);
+        expect(existsSync(identityFilePath()), "a passphrase refusal minted an identity").toBe(false);
+      });
+    }
+
     it("--enable and --disable together is a bad invocation, exit 1", () => {
       const r = cli(["--enable", "--disable"]);
       expect(r.status).toBe(1);
@@ -642,6 +807,271 @@ describe("hub escrow", () => {
           ).toBeGreaterThan(0)
         )
       );
+    });
+
+    /**
+     * #134. The line a refusal prints is the one thing a user is told to type,
+     * and until this nothing ran it: the retry-works proof called `hubEscrow()`
+     * in-process, so the printed line could name an executable no install puts
+     * on PATH (it did: a bare `sesh-mover`) and still pass. So this runs what a
+     * user runs, in the shell the line is for: first the refused invocation,
+     * then the recipe it printed, with only `<path>` filled in.
+     *
+     * PATH holds `node` and NOTHING else — a PATH that happened to contain an
+     * `npm i -g` or `npm link` of this package would pass a bare `sesh-mover`
+     * too, which is exactly the install nobody documents.
+     *
+     * The passphrase has an edge space at each end and a backslash, because the
+     * recipe's `read` otherwise rewrites both before anything sees them — IFS
+     * trimming and backslash escapes — and the escrow would then open only for
+     * a passphrase the user never typed. `age` at its own prompt keeps them.
+     * bash, not `sh`: dash has no `read -s`, which is why the line says bash
+     * or zsh.
+     */
+    /**
+     * Runs `line` the way a user's shell would, with PATH holding only `node`,
+     * and reports what the shell itself still held afterwards. The recipe runs
+     * in the user's INTERACTIVE shell, so a passphrase it left in a shell
+     * variable would sit there for the rest of that session — in `set` output,
+     * in any later `env`-style dump — which is why the line is a subshell.
+     */
+    function runAsPrinted(shell: string, bin: string, line: string, input: string) {
+      const ran = spawnSync(shell, ["-c", `${line}\nrc=$?\nprintf '\\n--after:%s:[%s]' "$rc" "\${SESH_ESCROW-unset}"`], {
+        input, encoding: "utf-8", cwd: project, env: { ...homeEnv(home), PATH: bin },
+      });
+      const at = ran.stdout.lastIndexOf("\n--after:");
+      const trailer = /^\n--after:(\d+):\[(.*)\]$/s.exec(ran.stdout.slice(at));
+      return {
+        stderr: ran.stderr,
+        status: trailer ? Number(trailer[1]) : null,
+        leftBehind: trailer ? trailer[2] : null,
+        stdout: at >= 0 ? ran.stdout.slice(0, at) : ran.stdout,
+      };
+    }
+
+    /** A bin directory holding `node` and nothing else, under `outside` so afterEach removes it. */
+    function nodeOnlyBin(): string {
+      const bin = join(outside, "bin");
+      mkdirSync(bin);
+      symlinkSync(process.execPath, join(bin, "node"));
+      return bin;
+    }
+
+    /**
+     * The passphrase has an edge space at each end and a backslash, because the
+     * recipe's `read` otherwise rewrites both before anything sees them — IFS
+     * trimming and backslash escapes — and the escrow would then open only for a
+     * passphrase the user never typed. `age` at its own prompt keeps them.
+     */
+    const EDGED = "  an edged pass\\phrase  ";
+
+    async function expectOpensWith(out: string, passphrase: string, label: string): Promise<void> {
+      const identity = readFileSync(identityFilePath(), "utf-8");
+      const opened = await through(readFileSync(out), new AgeDecryptStream({ passphrase: Buffer.from(passphrase) }));
+      expect(opened.toString("utf-8"), `${label}: the escrow does not open with the passphrase as typed`).toBe(identity);
+      // And through the tool recovery actually uses, typing it at age's own prompt.
+      if (HAVE_PASSPHRASE_ORACLE) {
+        const recovered = `${out}.recovered`;
+        const run = oracleDecryptPassphrase(ORACLES[0].bin, passphrase, out, recovered);
+        expect(run.status, `${label}: ${run.transcript}`).toBe(0);
+        expect(readFileSync(recovered, "utf-8"), label).toBe(identity);
+      }
+    }
+
+    it.skipIf(!BASH)("the printed shell line enables the escrow exactly as printed, with only node on PATH", async () => {
+      loadOrCreateIdentity();
+      const bin = nodeOnlyBin();
+      const cliEntry = join(import.meta.dirname, "..", "dist", "cli.js");
+      for (const shell of POSIX_SHELLS) {
+        const inShell = (line: string, input: string) => runAsPrinted(shell, bin, line, input);
+        const out = join(outside, `${shell.split("/").pop()}.age`);
+
+        const refused = inShell(`node '${cliEntry}' hub escrow --enable --out '${out}'`, "");
+        expect(refused.status, `${shell}: ${refused.stderr}`).toBe(2);
+        const body = JSON.parse(refused.stdout);
+        expect(body.refusal).toBe("passphrase");
+        const recipe = (body.suggestion as string)
+          .split("\n").map((l) => l.trim()).find((l) => l.includes("SESH_ESCROW"));
+        expect(recipe, "the refusal printed no shell line").toBeDefined();
+        expect(recipe).toContain("--enable --passphrase-stdin --out <path>");
+
+        const ran = inShell(recipe!.replace("<path>", `'${out}'`), `${EDGED}\n`);
+        expect(ran.status, `${shell}: the printed line failed: ${ran.stderr}`).toBe(0);
+        expect(JSON.parse(ran.stdout)).toMatchObject({ success: true, action: "enabled" });
+        expect(ran.leftBehind, `${shell}: the printed line left the passphrase in the user's shell`).toBe("unset");
+        await expectOpensWith(out, EDGED, shell);
+      }
+    });
+
+    /**
+     * #134's first-met copies. The line a user sees first is not the CLI's — it
+     * is step 1 of `commands/hub-escrow.md`, which the model prints verbatim
+     * after Claude Code has replaced `${CLAUDE_PLUGIN_ROOT}` in it, and its
+     * hand-copied twins in the README and the skill doc. Nothing ran those
+     * until this, so a copy could drop `IFS=` or go back to a bare
+     * `sesh-mover` with the suite green.
+     *
+     * Two checks, doing different jobs. Every copy must equal
+     * `escrowEnableRecipes` apart from how the path is spelled (a template
+     * there, the path of the cli.js that ran here), so the executed CLI line
+     * vouches for them all. And the command doc's line is run itself, with
+     * the plugin root substituted the way Claude Code substitutes it — a plain
+     * textual replace — because the double-quoted spelling it uses is not the
+     * CLI's single-quoted one and nothing else executes it.
+     */
+    it.skipIf(!BASH)("the command doc's enable line runs as printed once the plugin root is filled in, and every doc copy matches the CLI's", async () => {
+      const root = join(import.meta.dirname, "..");
+      const spellPath = (line: string) =>
+        line.replace(/node "(?:\$\{CLAUDE_PLUGIN_ROOT\}|<plugin dir>)\/dist\/cli\.js"/, "node <CLI>");
+      const cliLines = escrowEnableRecipes("/CLI");
+      const expected = {
+        posix: cliLines.posix.replace("node '/CLI'", "node <CLI>"),
+        powershell: cliLines.powershell.replace("node '/CLI'", "node <CLI>"),
+      };
+      // The skill doc carries NO copy, on purpose: it tells the model to copy
+      // both lines verbatim from `/sesh-mover:hub-escrow` or from the CLI's own
+      // refusal, so there is nothing in it that could drift from either.
+      const copies: Array<[string, { posix: number; powershell: number }]> = [
+        ["commands/hub-escrow.md", { posix: 1, powershell: 1 }],
+        ["README.md", { posix: 1, powershell: 1 }],
+        ["skills/session-porter/SKILL.md", { posix: 0, powershell: 0 }],
+      ];
+      for (const [file, want] of copies) {
+        const found = docEnableLines(readFileSync(join(root, file), "utf-8"));
+        expect(found.posix.length, `${file}: an enable line is not spelled in full`).toBe(found.posixStarts);
+        expect(found.powershell.length, `${file}: a PowerShell enable line is not spelled in full`).toBe(found.powershellStarts);
+        expect(found.posix.length + found.powershell.length, `${file}: something is piped into an enable that is not a line spelled in full`).toBe(found.pipedEnables);
+        expect(found.posix.length + found.powershell.length, `${file}: an enable is run with --passphrase-stdin outside a line spelled in full`).toBe(found.invokedEnables);
+        expect({ posix: found.posix.length, powershell: found.powershell.length }, file).toEqual(want);
+        for (const line of found.posix) expect(spellPath(line), file).toBe(expected.posix);
+        for (const line of found.powershell) expect(spellPath(line), file).toBe(expected.powershell);
+      }
+
+      loadOrCreateIdentity();
+      const bin = nodeOnlyBin();
+      const [docLine] = docEnableLines(readFileSync(join(root, "commands", "hub-escrow.md"), "utf-8")).posix;
+      const asPrinted = docLine.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => root);
+      for (const shell of POSIX_SHELLS) {
+        const out = join(outside, `doc-${shell.split("/").pop()}.age`);
+        const ran = runAsPrinted(shell, bin, asPrinted.replace("<path>", `'${out}'`), `${EDGED}\n`);
+        expect(ran.status, `${shell}: the command doc's line failed: ${ran.stderr}`).toBe(0);
+        expect(JSON.parse(ran.stdout)).toMatchObject({ success: true, action: "enabled" });
+        expect(ran.leftBehind, `${shell}: the doc's line left the passphrase in the user's shell`).toBe("unset");
+        await expectOpensWith(out, EDGED, `${shell} (doc line)`);
+      }
+    });
+
+    /**
+     * N2 of #134's re-review. When `${CLAUDE_PLUGIN_ROOT}` reaches the model
+     * unexpanded, step 1 of `commands/hub-escrow.md` used to fall back to
+     * `printf '%s\n' "${CLAUDE_PLUGIN_ROOT}"` in the Bash tool — which, with the
+     * variable unset there too, exits 0 and prints an EMPTY line, and the model
+     * then handed the user `node "/dist/cli.js" …`: a line that fails with
+     * "Cannot find module", the exact nudge toward pasting the passphrase into
+     * the chat instead. It is also SKILL.md's only source for the two lines,
+     * since the skill doc carries no copy of them.
+     *
+     * The replacement is the enable REFUSAL, and this pins each property the
+     * docs claim for it against the docs' own spelling of the run:
+     * - one run, spelled identically in both docs, with no `--passphrase-stdin`,
+     *   so the CLI never reads stdin;
+     * - it refuses before the identity check and before `--out` is looked at,
+     *   so it works on a machine that has never registered and leaves the home
+     *   directory exactly as empty as it found it;
+     * - its `suggestion` carries BOTH lines, byte-equal to `escrowEnableRecipes`
+     *   for the cli.js that actually ran;
+     * - with the variable unset it fails LOUDLY — non-zero, nothing on stdout —
+     *   so there is no line to print, which is the branch the docs tell the
+     *   model to report instead.
+     */
+    it.skipIf(!BASH)("the doc fallback for an unfilled plugin root is the enable refusal, and an unset root yields no line at all", () => {
+      const root = join(import.meta.dirname, "..");
+      const fallback = /`(node "\$\{CLAUDE_PLUGIN_ROOT\}\/dist\/cli\.js" hub escrow --enable[^`]*)`/g;
+      const runs = ["commands/hub-escrow.md", "skills/session-porter/SKILL.md"].map((file) => {
+        const found = [...readFileSync(join(root, file), "utf-8").matchAll(fallback)].map((m) => m[1]);
+        expect(found, `${file}: no single enable-refusal run to take the two lines from`).toHaveLength(1);
+        return found[0];
+      });
+      expect(runs[1], "the skill doc and the command doc prescribe different runs").toBe(runs[0]);
+      const [run] = runs;
+      expect(run, "the fallback run would read a passphrase").not.toContain("--passphrase-stdin");
+
+      const bin = nodeOnlyBin();
+      const inBash = (env: Record<string, string>) =>
+        spawnSync(BASH!, ["-c", run], {
+          input: "a passphrase the fallback must never read\n",
+          encoding: "utf-8",
+          cwd: project,
+          env: { ...homeEnv(home), PATH: bin, ...env },
+        });
+
+      const ran = inBash({ CLAUDE_PLUGIN_ROOT: root });
+      expect(ran.status, ran.stderr).toBe(2);
+      const body = JSON.parse(ran.stdout);
+      expect(body).toMatchObject({ success: false, reason: "escrow-refused", refusal: "passphrase" });
+      const printed = (body.suggestion as string).split("\n").map((l) => l.trim());
+      const want = escrowEnableRecipes(realpathSync(join(root, "dist", "cli.js")));
+      expect(printed, "the refusal did not print the bash/zsh line for the cli.js that ran").toContain(want.posix);
+      expect(printed, "the refusal did not print the PowerShell line for the cli.js that ran").toContain(want.powershell);
+      expect(readdirSync(home), "the fallback run wrote something").toEqual([]);
+
+      const unset = inBash({});
+      expect(unset.status, "an unset plugin root did not fail").not.toBe(0);
+      expect(unset.stdout, "an unset plugin root still produced output to take a line from").toBe("");
+    });
+
+    it.skipIf(!BASH)("quotes the cli path in both lines so nothing in it is expanded", () => {
+      // A plugin cache path is under the user's home, and a home can hold any
+      // of these. An unescaped quote would split the argument; `$`, `"` and a
+      // backtick would be expanded by the shell before node ever saw the path.
+      const weird = "/tmp/it's a \"dir\" $HOME/`id`/cli.js";
+      const { posix, powershell } = escrowEnableRecipes(weird);
+      const quoted = posix.slice(posix.indexOf("| node ") + "| node ".length, posix.lastIndexOf(" hub escrow"));
+      expect(spawnSync(BASH!, ["-c", `printf '%s' ${quoted}`], { encoding: "utf-8" }).stdout).toBe(weird);
+      // PowerShell's single-quoted string escapes a quote by doubling it, and
+      // expands nothing else.
+      expect(powershell).toContain(`| node '/tmp/it''s a "dir" $HOME/\`id\`/cli.js' hub escrow`);
+    });
+
+    /**
+     * #134's second half: the PowerShell line. WINDOWS-ONLY, and its proof lives
+     * on the Windows runner — this repo's Linux machines have no PowerShell, so
+     * it has never been observed passing here. `Read-Host` is replaced by a
+     * function of the same name (functions outrank cmdlets), so everything else
+     * on the printed line runs as printed: the `$OutputEncoding` it sets is what
+     * stops Windows PowerShell 5.1 sending a non-ASCII passphrase as `?`, which
+     * is why the passphrase here is not ASCII, and the CRLF PowerShell appends
+     * is what the CLI's one-trailing-newline strip has to absorb.
+     */
+    it.runIf(process.platform === "win32")("the printed PowerShell line enables the escrow exactly as printed, non-ASCII included", async () => {
+      loadOrCreateIdentity();
+      const shells = ["powershell.exe", "pwsh.exe"].filter(
+        (s) => spawnSync(s, ["-NoProfile", "-NonInteractive", "-Command", "exit 0"]).status === 0
+      );
+      expect(shells.length, "no PowerShell on this Windows machine").toBeGreaterThan(0);
+      const refused = cli(["--enable", "--out", join(outside, "unused.age")]);
+      const recipe = (refused.body.suggestion as string)
+        .split("\n").map((l) => l.trim()).find((l) => l.startsWith("& {"));
+      expect(recipe, "the refusal printed no PowerShell line").toBeDefined();
+      const passphrase = "pässwörd mit Ünïcode";
+      for (const shell of shells) {
+        const out = join(outside, `${shell}.age`);
+        const script =
+          "function Read-Host { param([string]$Prompt, [switch]$AsSecureString) " +
+          `ConvertTo-SecureString '${passphrase}' -AsPlainText -Force }\n` +
+          `${recipe!.replace("<path>", `'${out}'`)}\nexit $LASTEXITCODE\n`;
+        const ran = spawnSync(
+          shell,
+          ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+          { encoding: "utf-8", cwd: project, env: { ...process.env, ...homeEnv(home) } }
+        );
+        expect(ran.status, `${shell}: ${ran.stderr}${ran.stdout}`).toBe(0);
+        const opened = await through(readFileSync(out), new AgeDecryptStream({ passphrase: Buffer.from(passphrase, "utf-8") }));
+        expect(opened.toString("utf-8"), `${shell}: the escrow does not open with the passphrase as typed`).toBe(
+          readFileSync(identityFilePath(), "utf-8")
+        );
+        cli(["--disable"]);
+      }
     });
 
     it("an unsafe --out is refused with the rule named, exit 2", () => {

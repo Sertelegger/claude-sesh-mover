@@ -42,10 +42,14 @@ import { hubInit } from "../src/hub/init.js";
 import { hubPush } from "../src/hub/push.js";
 import { hubPull } from "../src/hub/pull.js";
 import { hubReindex } from "../src/hub/reindex.js";
+import { hubStatus } from "../src/hub/status.js";
+import { hubWhereis } from "../src/hub/whereis.js";
+import { hubTrust } from "../src/hub/trust.js";
 import {
   hubEncrypt, isEncryptionCapableVersion, MIN_ENCRYPTION_PLUGIN_VERSION,
 } from "../src/hub/encrypt.js";
 import { collectHubRecipients, planBundleEncryption } from "../src/hub/encryption.js";
+import type { HubRecipientSet } from "../src/hub/encryption.js";
 import { writeLocalProjectId } from "../src/hub/identity.js";
 import { createFsBackend } from "../src/hub/backend.js";
 import { readAllIndexes } from "../src/hub/index-file.js";
@@ -289,6 +293,183 @@ describe("planBundleEncryption (pure)", () => {
     });
     expect(plan.kind).toBe("refuse");
     expect(plan.kind === "refuse" && plan.warnings.join(" ")).toMatch(/neither true nor false/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #160 — which verbs publish a machine's key, and the remedies that name them
+// ---------------------------------------------------------------------------
+
+/**
+ * A remedy that says "run any hub command" on a machine is false: only the
+ * verbs that call `registerMachine` rewrite `machines/<id>.json`, and the one a
+ * user reaches for first — `hub status`, the diagnostic — is read-only by its
+ * own contract. So the remedies now NAME the publishing verbs, and this block
+ * pins both halves of that sentence against behaviour: the verbs it names do
+ * rewrite a stale record, and the ones it names as not publishing do not.
+ *
+ * The two arms that fire AFTER the refusing command has already re-registered
+ * this machine (`no-recipients`, and `self-unkeyed` on a record mismatch) must
+ * not advise re-registering at all — the command just did, and it did not read
+ * back.
+ *
+ * The third test passed against the unfixed code, and is labelled for what it
+ * is: a CHARACTERIZATION of the verb matrix the new text relies on (the one the
+ * issue measured). It is proven by mutation instead — a report-only `hub
+ * encrypt` that stops registering fails it, and so does a `hub status` that
+ * starts — so the day either verb changes, the sentence naming it fails here.
+ */
+describe("which verbs publish a machine's key (#160)", () => {
+  const policy = { required: true, preferred: false, unappliedPreference: false, malformedSetting: false };
+  const PUBLISHING_REMEDY = /plain `hub encrypt`[^.]*`\/sesh-mover:hub-encrypt`[^.]*push or pull any project on this hub/;
+  const NOT_PUBLISHING = "`hub status`, `whereis` and `hub trust`";
+
+  it("the un-keyed and stale-machine refusals name the verbs that publish, and never 'any hub command'", async () => {
+    const me = { machineId: "me", name: "me", recipient: generateIdentity().recipient };
+    const unkeyed = planBundleEncryption({
+      policy,
+      census: { recipients: [me], unkeyed: [{ machineId: "laptop", name: "laptop", reason: "no-key" as const }] },
+      thisMachineId: "me", thisMachineRecipient: me.recipient, forceUnkeyed: false,
+    });
+    expect(unkeyed.kind === "refuse" && unkeyed.refusal).toBe("unkeyed-machines");
+    const unkeyedText = unkeyed.kind === "refuse" ? unkeyed.suggestion : "";
+    expect(unkeyedText).toMatch(PUBLISHING_REMEDY);
+    expect(unkeyedText).toContain(NOT_PUBLISHING);
+    expect(unkeyedText).not.toMatch(/any hub command/i);
+
+    const home = mkdtempSync(join(tmpdir(), "sesh-enc-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-enc-hub-"));
+    const restore = overrideHome(home);
+    try {
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      plantMachine(hub, "11111111-1111-4111-8111-111111111111", {
+        name: "old-desktop", pluginVersion: "0.9.0", ageRecipient: generateIdentity().recipient,
+      });
+      const stale = (await hubEncrypt({ hubPath: hub, enable: true, cwd: home })) as HubEncryptRefusedResult;
+      expect(stale.reason).toBe("stale-machines");
+      expect(stale.suggestion).toMatch(PUBLISHING_REMEDY);
+      expect(stale.suggestion).toContain(NOT_PUBLISHING);
+      expect(stale.suggestion).not.toMatch(/any hub command/i);
+    } finally {
+      restore.restore();
+      for (const d of [home, hub]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Every census shape either arm can see for THIS machine's record, because
+   * the sentence has to report what the read-back showed and nothing more. A
+   * record the census could not read, or a record gone altogether, is exactly
+   * the sync-client case the text is written for — and the first version of it
+   * told the user "the hub now shows a different key there" about both.
+   * `laptop` is a keyed peer, so each `self-unkeyed` shape gets past the
+   * empty-census arm.
+   */
+  it("the two arms reached only after this machine re-registered point at its record, not at a command", () => {
+    const held = generateIdentity().recipient;
+    const laptop = { machineId: "laptop", name: "laptop", recipient: generateIdentity().recipient };
+    const shapes: Array<{ census: HubRecipientSet; refusal: string; seen: RegExp }> = [
+      { census: { recipients: [], unkeyed: [] }, refusal: "no-recipients", seen: /no record at all/ },
+      {
+        census: { recipients: [], unkeyed: [{ machineId: "me", name: "me", reason: "unreadable-record" }] },
+        refusal: "no-recipients", seen: /a record that could not be read/,
+      },
+      {
+        census: { recipients: [{ machineId: "me", name: "me", recipient: generateIdentity().recipient }], unkeyed: [] },
+        refusal: "self-unkeyed", seen: /a different key/,
+      },
+      {
+        census: { recipients: [laptop], unkeyed: [{ machineId: "me", name: "me", reason: "unreadable-record" }] },
+        refusal: "self-unkeyed", seen: /a record that could not be read/,
+      },
+      {
+        census: { recipients: [laptop], unkeyed: [{ machineId: "me", name: "me", reason: "no-key" }] },
+        refusal: "self-unkeyed", seen: /a record with no key/,
+      },
+      {
+        census: { recipients: [laptop], unkeyed: [{ machineId: "me", name: "me", reason: "bad-key" }] },
+        refusal: "self-unkeyed", seen: /a key that is not an age recipient/,
+      },
+      { census: { recipients: [laptop], unkeyed: [] }, refusal: "self-unkeyed", seen: /no record at all/ },
+    ];
+    for (const { census, refusal, seen } of shapes) {
+      const plan = planBundleEncryption({
+        policy, census, thisMachineId: "me", thisMachineRecipient: held, forceUnkeyed: false,
+      });
+      const label = JSON.stringify(census);
+      expect(plan.kind === "refuse" && plan.refusal, label).toBe(refusal);
+      const text = plan.kind === "refuse" ? plan.suggestion : "";
+      // What the read-back showed, and only that: a record the census could not
+      // read is not "a different key".
+      expect(text, label).toMatch(seen);
+      if (!census.recipients.some((r) => r.machineId === "me")) {
+        expect(text, label).not.toMatch(/different key/);
+      }
+      // The record, by name — the thing a sync client reverted or conflicted.
+      expect(text, label).toContain("machines/me.json");
+      expect(text, label).toContain("not read back");
+      // A share still catching up IS cured by trying again, so the text may not
+      // say that nothing will help — only that rewriting the record is not the
+      // fix by itself.
+      expect(text, label).not.toMatch(/will not help/);
+      expect(text, label).toMatch(/trying again/);
+      // No command to "rewrite the record": the refusing command just did.
+      expect(text, label).not.toMatch(/any hub command/i);
+      expect(text, label).not.toMatch(/hub status/);
+      expect(text, label).not.toMatch(/hub encrypt/);
+    }
+  });
+
+  it("the verbs named as publishing rewrite a stale record, and hub status, whereis and hub trust do not", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sesh-enc-home-"));
+    const hub = mkdtempSync(join(tmpdir(), "sesh-enc-hub-"));
+    const base = mkdtempSync(join(tmpdir(), "sesh-enc-fix-"));
+    const restore = overrideHome(home);
+    try {
+      const { configDir } = createFixtureTree(base);
+      const projectPath = createRealProject(base, configDir, "projA");
+      await hubInit({ hubPath: hub, configScope: "user", cwd: home });
+      const pushed = await hubPush({
+        configDir, projectPath, hubPath: hub, createProject: true,
+        noWorkspace: true, claudeVersion: CLAUDE_VERSION,
+      });
+      expect(pushed.success).toBe(true);
+
+      const recordFile = join(hub, "machines", `${loadOrCreateMachineId().id}.json`);
+      // The issue's own fixture: a record that says "old plugin, no keys".
+      const makeStale = (): void => {
+        const r = JSON.parse(readFileSync(recordFile, "utf-8")) as Record<string, unknown>;
+        delete r.ageRecipient;
+        delete r.signingPublicKey;
+        r.lastSeenAt = "2000-01-01T00:00:00.000Z";
+        r.pluginVersion = "0.9.0";
+        writeFileSync(recordFile, JSON.stringify(r, null, 2) + "\n");
+      };
+      const republished = (): boolean => {
+        const r = JSON.parse(readFileSync(recordFile, "utf-8")) as Record<string, unknown>;
+        return (
+          typeof r.ageRecipient === "string" && r.ageRecipient.startsWith("age1") &&
+          typeof r.signingPublicKey === "string" && r.pluginVersion === PLUGIN_VERSION
+        );
+      };
+
+      const verbs: Array<[string, () => Promise<unknown>, boolean]> = [
+        ["hub encrypt (report)", () => hubEncrypt({ hubPath: hub, cwd: home }), true],
+        ["push", () => hubPush({ configDir, projectPath, hubPath: hub, noWorkspace: true, claudeVersion: CLAUDE_VERSION }), true],
+        ["pull", () => hubPull({ configDir, projectPath, hubPath: hub, latest: true, claudeVersion: CLAUDE_VERSION }), true],
+        ["hub status", () => hubStatus({ cwd: projectPath }), false],
+        ["whereis", () => hubWhereis({ configDir, projectPath, hubPath: hub }), false],
+        ["hub trust", () => hubTrust({ projectPath, hubPath: hub }), false],
+      ];
+      for (const [name, run, publishes] of verbs) {
+        makeStale();
+        await run();
+        expect(republished(), `${name} ${publishes ? "did not rewrite" : "rewrote"} this machine's record`).toBe(publishes);
+      }
+    } finally {
+      restore.restore();
+      for (const d of [home, hub, base]) rmSync(d, { recursive: true, force: true });
+    }
   });
 });
 
@@ -581,6 +762,9 @@ describe("hub push into a sealed hub", () => {
       expect(sealed.unkeyedMachines.map((m) => m.machineId)).toEqual([
         "33333333-3333-4333-8333-333333333333",
       ]);
+      // The warning names the verbs that publish a key rather than "until they
+      // check in", which named none (#160).
+      expect(sealed.warnings.join(" ")).toMatch(/a plain `hub encrypt`, a push or a pull on that machine/);
 
       const pushOpts = {
         configDir, projectPath, hubPath: hub, createProject: true,

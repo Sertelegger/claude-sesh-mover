@@ -233,7 +233,7 @@ export async function hubRekey(opts) {
             warnings.push(`${other.length} of this machine's files could not be re-addressed and were left untouched (${other.map((f) => `${f.file}: ${f.message}`).join("; ")}). Nothing was half-written — each file is replaced atomically or not at all — so running this again after fixing the cause is safe and picks them up.`);
         }
         if (census.unkeyed.length > 0) {
-            warnings.push(`${census.unkeyed.length} registered machine(s) publish no usable public key, so the new headers are not addressed to them: ${census.unkeyed.map(describeUnkeyed).join("; ")}. Unlike a push, that is not a refusal here — this operation is idempotent, so once those machines check in with a key, running it again includes them.`);
+            warnings.push(`${census.unkeyed.length} registered machine(s) publish no usable public key, so the new headers are not addressed to them: ${census.unkeyed.map(describeUnkeyed).join("; ")}. Unlike a push, that is not a refusal here — this operation is idempotent, so once those machines publish a key (a plain \`hub encrypt\`, a push or a pull on each does it), running it again includes them.`);
         }
         if (narrowed.length > 0) {
             warnings.push(`${narrowed.length} file(s) came out addressed to FEWER machines than they went in. A re-wrap addresses a file to the hub's roster as it stands, and a recipient stanza carries an ephemeral share rather than a public key, so which machines were dropped cannot be recovered from the file — only that some were. The usual cause is a machines/<id>.json that has been removed or damaged since the file was written. Fixing the roster and running this again re-includes them.`);
