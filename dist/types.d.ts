@@ -4,7 +4,7 @@ import type { BundleFetchFailureKind } from "./hub/bundle-io.js";
 import type { EscrowRefusal, UnsafeOutRule } from "./hub/escrow.js";
 import type { ApplyResult, CarryMeta } from "./payload/carry.js";
 export type Platform = "darwin" | "linux" | "wsl1" | "wsl2" | "win32";
-export type JsonlEntryType = "user" | "assistant" | "attachment" | "file-history-snapshot" | "file-history-delta" | "system" | "progress";
+export type JsonlEntryType = "user" | "assistant" | "attachment" | "file-history-snapshot" | "file-history-delta" | "system" | "progress" | "relocated" | "frame-link";
 export interface JsonlEntryBase {
     uuid: string;
     timestamp: string;
@@ -38,6 +38,12 @@ export interface UserMessageEntry extends JsonlEntryBase {
      */
     toolUseResult?: Record<string, unknown> | string;
     sourceToolAssistantUUID?: string;
+    /**
+     * Since 2.1.278, on a tool-result entry: where the call ran, read back by
+     * Claude Code for auto-mode classifier requests. `rewriter.ts` translates its
+     * three paths (#135); the rest is not a location.
+     */
+    serverClassifierContext?: Record<string, unknown>;
 }
 export interface AssistantMessageEntry extends JsonlEntryBase {
     type: "assistant";

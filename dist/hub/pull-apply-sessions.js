@@ -7,7 +7,7 @@ import { errorMessage } from "../errors.js";
 import { applySharedLayers, importSession } from "../importer.js";
 import { computeIntegrityHashFromFile, isAgentTranscript, layerFilePath, walkLayer, } from "../manifest.js";
 import { findEntryOffsetByUuid, readLastConversationEntry, readLastEntryUuid, } from "../jsonl.js";
-import { buildImportRewriteContext, rewriteJsonlStream } from "../rewriter.js";
+import { buildImportRewriteContext, buildSessionIdMap, rewriteJsonlStream, } from "../rewriter.js";
 import { getApplicableAdapters } from "../version-adapters.js";
 import { readSyncState, recordSentToPeer } from "../sync-state.js";
 /**
@@ -289,17 +289,21 @@ export async function runApplySessionsStage(input) {
             if (baseSessionId) {
                 const basePath = join(targetProjectDir, `${baseSessionId}.jsonl`);
                 // Identical derivation to importSession's — same manifest, same
-                // target — so a spliced continuation and an imported fragment
-                // carry byte-identical rewrites.
-                // Deliberately NO sessionIdMap (#127). A pulled continuation is
-                // spliced into a transcript the user ALREADY OWNS, so an unmapped
-                // `session_id` leaves one file carrying two run namespaces — the same
-                // defect as on import, on a worse file. `pull.ts` does hold the
-                // peer-session -> local-base-session pair in sync-state's
-                // `hub.threadByLocalSession`, so a one-entry map is buildable; it is
-                // out of 0.12.0 because it needs its own cross-machine proof. Decided,
-                // not overlooked.
-                const ctx = buildImportRewriteContext(bundleManifest, projectPath, configDir);
+                // target, and the same `buildSessionIdMap` with the base in place of
+                // a minted id — so a spliced continuation and an imported fragment
+                // carry byte-identical rewrites apart from which session they land in.
+                //
+                // The map is what #137 added. The delta's lines are the SENDER's lines
+                // and carry its local id — `continuation.continuesLocalSessionId` in
+                // the manifest — in `session_id` and in every `tool-results/` pointer,
+                // while `copyLayerDirs` below puts those files under the BASE. With no
+                // map (0.12.0) the pointer named a directory that does not exist and
+                // the base carried two run namespaces. The pair comes from the
+                // manifest and `baseSessionId`; sync-state's `threadByLocalSession`,
+                // which the comment here used to name, is keyed by LOCAL ids and holds
+                // no peer's. Both splice paths share this context, and so does the
+                // subagent rewrite in `copyLayerDirs`.
+                const ctx = buildImportRewriteContext(bundleManifest, projectPath, configDir, buildSessionIdMap([[bundleSession, baseSessionId]]));
                 // Captured before the attempt, kept only if it succeeds: a declined
                 // append writes nothing, and recording an offset for it would make a
                 // later bundle discount entries that ARE the user's own.
