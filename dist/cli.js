@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolveConfigDir } from "./platform.js";
@@ -926,8 +927,10 @@ hub
 });
 // --- Encryption at rest (#91) ---
 //
-// One verb, two modes: a bare `hub encrypt` REPORTS and writes nothing, and
-// `--enable` flips the hub-wide switch. There is deliberately no `--disable`.
+// One verb, two modes: a bare `hub encrypt` REPORTS and changes no setting —
+// its one write is this machine's own `machines/<id>.json`, the key-publishing
+// registration push and pull also make — and `--enable` flips the hub-wide
+// switch. There is deliberately no `--disable`.
 // Turning encryption off is a confidentiality-reducing act with no urgency
 // attached to it — nothing breaks while it stays on, because the reader
 // branches on each bundle's own suffix and a plaintext bundle stays readable
@@ -1149,6 +1152,10 @@ hub
             passphrase,
             cwd: projectPath,
             hubPath: resolveHubPath(config),
+            // The entry that actually ran, so the shell line a refusal prints
+            // names a file that exists rather than a `sesh-mover` nothing puts on
+            // PATH (#134).
+            cliEntry: fileURLToPath(import.meta.url),
         }));
     }
     catch (e) {

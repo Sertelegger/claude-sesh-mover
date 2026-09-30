@@ -26,8 +26,11 @@
  * **A version field cannot stop an old plugin; it can only let a new one
  * notice.** This is the noticing, and it is a diagnosis rather than an
  * enforcement. The gate is deliberately not overridable: the honest remedies are
- * to upgrade that machine and let it run any hub command once, or — if it is
- * decommissioned — to delete its record from the hub, which is the same remedy
+ * to upgrade that machine and let it run a plain `hub encrypt`, a push or a pull
+ * once — the verbs that call `registerMachine`; `hub status`, `whereis` and
+ * `hub trust` never touch a machine record, so naming "any hub command" sent
+ * users to the diagnostic that cannot help (#160) — or, if it is decommissioned,
+ * to delete its record from the hub, which is the same remedy
  * `collectHubRecipients` already names for the fact that the machine roster only
  * ever grows. An override here would be a flag on the verb whose whole job is to
  * ask the question, offered to the user least equipped to answer it; the place
@@ -155,7 +158,7 @@ export async function hubEncrypt(opts) {
             command: "hub-encrypt",
             reason: "stale-machines",
             error: `${stale.length} machine(s) registered on this hub last checked in on a plugin version that predates encryption at rest: ${stale.map(describeStale).join("; ")}.`,
-            suggestion: `Nothing was changed. Those machines do not read this hub's encryption setting at all, so sealing the hub would not stop them pushing your sessions to it in the clear — it would only stop you noticing. Upgrade sesh-mover to ${MIN_ENCRYPTION_PLUGIN_VERSION} or later on each machine above and run any hub command there once, which refreshes its record; then try again. If a machine is decommissioned, delete its machines/<id>.json from the hub directory — that is also what stops it being carried as a recipient of every future bundle.`,
+            suggestion: `Nothing was changed. Those machines do not read this hub's encryption setting at all, so sealing the hub would not stop them pushing your sessions to it in the clear — it would only stop you noticing. Upgrade sesh-mover to ${MIN_ENCRYPTION_PLUGIN_VERSION} or later on each machine above, then run a plain \`hub encrypt\` there once (\`/sesh-mover:hub-encrypt\`, which only reports the setting) or push or pull any project on this hub from it — those refresh its record; \`hub status\`, \`whereis\` and \`hub trust\` do not. Then try again. If a machine is decommissioned, delete its machines/<id>.json from the hub directory — that is also what stops it being carried as a recipient of every future bundle.`,
             staleMachines: stale,
         };
     }
@@ -212,7 +215,7 @@ export async function hubEncrypt(opts) {
         warnings.push("Bundles are encrypted to every machine registered on this hub, so the authentication an encrypted bundle carries proves it came from SOMEONE holding the file key — the group, not the sender. A hub operator who is not one of your machines can no longer author a payload at all; a machine that is on this hub still can. Per-machine signing is a separate step and is not in this release.");
     }
     if (enabled && census.unkeyed.length > 0) {
-        warnings.push(`${census.unkeyed.length} registered machine(s) publish no usable public key, so a push to this hub will refuse until they check in: ${census.unkeyed.map((u) => u.machineId).join(", ")}.`);
+        warnings.push(`${census.unkeyed.length} registered machine(s) publish no usable public key, so a push to this hub will refuse until each of them publishes one — a plain \`hub encrypt\`, a push or a pull on that machine does it, after upgrading it if it predates encryption: ${census.unkeyed.map((u) => u.machineId).join(", ")}.`);
     }
     return {
         success: true,

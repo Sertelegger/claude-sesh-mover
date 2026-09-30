@@ -1227,7 +1227,7 @@ export interface HubPushResult {
  * refusals share this shape and only ONE of them takes `--force-unkeyed`, so a
  * caller has to tell them apart — and the obvious test is wrong for two of the
  * three, because `unkeyedMachines` is the census reported WHOLE: on
- * `self-unkeyed` it carries this machine's own entry, and on `no-recipients` it
+ * `self-unkeyed` it may carry this machine's own entry, and on `no-recipients` it
  * carries every machine on the hub. See `EncryptionRefusal`.
  *
  * `unkeyedMachines` is that census as `collectHubRecipients` reported it, never

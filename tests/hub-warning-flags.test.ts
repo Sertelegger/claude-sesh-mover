@@ -495,13 +495,13 @@ const REGISTRY: FlagUse[] = [
   },
   {
     file: "src/hub/escrow.ts",
-    match: "sesh-mover hub escrow --enable --passphrase-stdin --out <path>",
+    match: "hub escrow --enable --passphrase-stdin --out <path>",
     klass: "retry-works",
-    why: "The shell recipe, and it is the load-bearing sentence in this module — it is what keeps the passphrase out of the chat transcript that the SessionEnd auto-push then uploads. It appears in two refusals (no flag; stdin is a terminal) and neither writes anything, so running it is the remedy in both.",
+    why: "The shell recipe, and it is the load-bearing sentence in this module — it is what keeps the passphrase out of the chat transcript that the SessionEnd auto-push then uploads. `escrowEnableRecipes` builds both lines (bash/zsh and PowerShell) from this one tail, and all four passphrase refusals print them through one builder (no flag; stdin is a terminal; an empty passphrase; a line break inside one) and none of them writes anything, so running either line is the remedy in all four. The proof is the PRINTED LINE run in a shell (#134), not a second in-process call: the old provenBy re-ran `hubEscrow()` and so passed while the line named a bare `sesh-mover` that no documented install puts on PATH. The PowerShell half is proven only on the Windows runner.",
     provenBy: {
       test: "hub-escrow.test.ts",
-      name: "refuses to enable without --passphrase-stdin, and prints the shell recipe",
-      reruns: "hubEscrow",
+      name: "the printed shell line enables the escrow exactly as printed, with only node on PATH",
+      reruns: "inShell",
     },
   },
   {
