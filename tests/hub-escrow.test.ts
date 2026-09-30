@@ -811,6 +811,31 @@ describe("hub escrow", () => {
     });
 
     /**
+     * Windows PowerShell 5.1 can prepend a UTF-8 byte-order mark when it pipes
+     * text to a native command — measured on the windows-latest runner, where
+     * the recipe's pipe sent `efbbbf` ahead of the CRLF. Left in, the escrow
+     * would open only with an invisible character the user never typed, found
+     * out at recovery; and a BOM with nothing after it would slip past the
+     * empty-passphrase refusal, writing an escrow any reader can open.
+     */
+    it("drops a leading UTF-8 byte-order mark, so a PowerShell pipe produces the key the user typed", async () => {
+      loadOrCreateIdentity();
+      const f = join(outside, "bom.age");
+      expect(cli(["--enable", "--passphrase-stdin", "--out", f], "\uFEFFpw for stdin\r\n").status).toBe(0);
+      const opened = await through(readFileSync(f), new AgeDecryptStream({ passphrase: Buffer.from("pw for stdin") }));
+      expect(opened.length).toBeGreaterThan(0);
+    });
+
+    it("a byte-order mark and a line ending with nothing between them is an empty passphrase, refused", () => {
+      loadOrCreateIdentity();
+      const f = join(outside, "bom-only.age");
+      const r = cli(["--enable", "--passphrase-stdin", "--out", f], "\uFEFF\r\n");
+      expect(r.status).toBe(2);
+      expect(r.body).toMatchObject({ reason: "escrow-refused", refusal: "passphrase" });
+      expect(existsSync(f)).toBe(false);
+    });
+
+    /**
      * #134. The line a refusal prints is the one thing a user is told to type,
      * and until this nothing ran it: the retry-works proof called `hubEscrow()`
      * in-process, so the printed line could name an executable no install puts
@@ -1057,9 +1082,15 @@ describe("hub escrow", () => {
       const passphrase = "pässwörd mit Ünïcode";
       for (const shell of shells) {
         const out = join(outside, `${shell}.age`);
+        // The Read-Host stub builds its SecureString with no module at all.
+        // ConvertTo-SecureString lives in Microsoft.PowerShell.Security, and a
+        // powershell.exe (5.1) started from a pwsh step — which is how Actions
+        // runs `npm test` — inherits PowerShell 7's PSModulePath and can fail to
+        // load it: the stub then returned $null, the recipe piped an empty line,
+        // and the test was measuring the harness instead of the recipe.
         const script =
           "function Read-Host { param([string]$Prompt, [switch]$AsSecureString) " +
-          `ConvertTo-SecureString '${passphrase}' -AsPlainText -Force }\n` +
+          `$s = [System.Security.SecureString]::new(); foreach ($c in '${passphrase}'.ToCharArray()) { $s.AppendChar($c) }; $s }\n` +
           `${recipe!.replace("<path>", `'${out}'`)}\nexit $LASTEXITCODE\n`;
         const ran = spawnSync(
           shell,
@@ -1075,14 +1106,15 @@ describe("hub escrow", () => {
         // transcodes apart from one that does not.
         const probe =
           "function Read-Host { param([string]$Prompt, [switch]$AsSecureString) " +
-          `ConvertTo-SecureString '${passphrase}' -AsPlainText -Force }\n` +
+          `$s = [System.Security.SecureString]::new(); foreach ($c in '${passphrase}'.ToCharArray()) { $s.AppendChar($c) }; $s }\n` +
           "& { $p = Read-Host -Prompt 'x' -AsSecureString; $OutputEncoding = [System.Text.UTF8Encoding]::new($false); " +
           "[System.Net.NetworkCredential]::new('', $p).Password | node -e \"let b=[];process.stdin.on('data',d=>b.push(d)).on('end',()=>process.stdout.write(Buffer.concat(b).toString('hex')))\" }\n";
-        const sent = spawnSync(
+        const probed = spawnSync(
           shell,
           ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(probe, "utf16le").toString("base64")],
           { encoding: "utf-8", cwd: project, env: { ...process.env, ...homeEnv(home) } }
-        ).stdout.trim();
+        );
+        const sent = probed.stdout.trim();
         const want = Buffer.from(passphrase, "utf-8").toString("hex");
         let opened: Buffer;
         try {
@@ -1090,7 +1122,8 @@ describe("hub escrow", () => {
         } catch (e) {
           throw new Error(
             `${shell}: the escrow does not open with the passphrase as typed (${errorMessage(e)}). ` +
-              `UTF-8 of the passphrase is ${want} (+0d0a); this shell's pipe sent ${sent || "<nothing>"}`
+              `UTF-8 of the passphrase is ${want} (+0d0a); this shell's pipe sent ${sent || "<nothing>"}. ` +
+              `Recipe stderr: ${ran.stderr.trim() || "<none>"}. Probe stderr: ${probed.stderr.trim() || "<none>"}`
           );
         }
         expect(opened.toString("utf-8"), `${shell}: the escrow does not open with the passphrase as typed`).toBe(

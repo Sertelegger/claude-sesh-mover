@@ -1825,6 +1825,15 @@ function parseFormat(value) {
  * MIDDLE is refused further in (`hub/escrow.ts`) for the same reason: it could
  * never be typed back at that prompt.
  *
+ * **A leading UTF-8 byte-order mark is dropped**, for the same reason and a
+ * worse one. Windows PowerShell 5.1 can prepend one when it pipes text to a
+ * native command (measured on the windows-latest runner: `efbbbf` ahead of the
+ * CRLF, with the recipe's own `$OutputEncoding` set to a BOM-less UTF-8). Left
+ * in, the escrow opens only with an invisible character nobody can type at
+ * age's prompt; and a BOM with nothing after it is three bytes that pass the
+ * empty-passphrase refusal, so the escrow would be written under a passphrase
+ * anyone can supply. Dropped first, a BOM-only input is empty and refused.
+ *
  * Bounded, because stdin here is a pipe someone else can hold open: a
  * passphrase is not a stream.
  */
@@ -1842,6 +1851,8 @@ async function readPassphraseFromStdin() {
         chunks.push(b);
     }
     let bytes = Buffer.concat(chunks);
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
+        bytes = bytes.subarray(3);
     if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0a)
         bytes = bytes.subarray(0, -1);
     if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0d)
