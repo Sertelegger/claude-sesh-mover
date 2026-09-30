@@ -22,6 +22,7 @@ import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { homeEnv, overrideHome, type HomeOverrideHandle } from "./helpers/env.js";
 import { cliPath, runCli } from "./helpers/run-cli.js";
+import { errorMessage } from "../src/errors.js";
 import {
   canonicalPath,
   checkEscrowDestination,
@@ -1066,7 +1067,32 @@ describe("hub escrow", () => {
           { encoding: "utf-8", cwd: project, env: { ...process.env, ...homeEnv(home) } }
         );
         expect(ran.status, `${shell}: ${ran.stderr}${ran.stdout}`).toBe(0);
-        const opened = await through(readFileSync(out), new AgeDecryptStream({ passphrase: Buffer.from(passphrase, "utf-8") }));
+        // Diagnostic, not a second assertion: the exact bytes this shell hands
+        // a native command when it pipes the passphrase the way the recipe
+        // does — same Read-Host stub, same $OutputEncoding line, same pipe,
+        // into a byte dumper instead of the CLI. The passphrase is a fixture,
+        // so printing its bytes leaks nothing; they are what tells a shell that
+        // transcodes apart from one that does not.
+        const probe =
+          "function Read-Host { param([string]$Prompt, [switch]$AsSecureString) " +
+          `ConvertTo-SecureString '${passphrase}' -AsPlainText -Force }\n` +
+          "& { $p = Read-Host -Prompt 'x' -AsSecureString; $OutputEncoding = [System.Text.UTF8Encoding]::new($false); " +
+          "[System.Net.NetworkCredential]::new('', $p).Password | node -e \"let b=[];process.stdin.on('data',d=>b.push(d)).on('end',()=>process.stdout.write(Buffer.concat(b).toString('hex')))\" }\n";
+        const sent = spawnSync(
+          shell,
+          ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(probe, "utf16le").toString("base64")],
+          { encoding: "utf-8", cwd: project, env: { ...process.env, ...homeEnv(home) } }
+        ).stdout.trim();
+        const want = Buffer.from(passphrase, "utf-8").toString("hex");
+        let opened: Buffer;
+        try {
+          opened = await through(readFileSync(out), new AgeDecryptStream({ passphrase: Buffer.from(passphrase, "utf-8") }));
+        } catch (e) {
+          throw new Error(
+            `${shell}: the escrow does not open with the passphrase as typed (${errorMessage(e)}). ` +
+              `UTF-8 of the passphrase is ${want} (+0d0a); this shell's pipe sent ${sent || "<nothing>"}`
+          );
+        }
         expect(opened.toString("utf-8"), `${shell}: the escrow does not open with the passphrase as typed`).toBe(
           readFileSync(identityFilePath(), "utf-8")
         );

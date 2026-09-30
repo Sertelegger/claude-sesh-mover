@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, statSync } from "node:fs";
+import { createReadStream, createWriteStream, realpathSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -343,8 +343,8 @@ export function buildImportRewriteContext(source, targetProjectPath, targetConfi
  */
 sessionIdMap) {
     const targetPlatform = detectPlatform();
-    const sourceUser = extractUserFromPath(source.sourceProjectPath, source.sourcePlatform) ?? "unknown";
     const targetUser = getCurrentUser();
+    const sourceUser = sameAccountHere(source.sourcePlatform, extractUserFromPath(source.sourceProjectPath, source.sourcePlatform) ?? "unknown", targetPlatform, targetUser);
     return {
         mappings: buildPathMappings(source.sourcePlatform, targetPlatform, source.sourceProjectPath, targetProjectPath, source.sourceConfigDir, targetConfigDir, sourceUser, targetUser),
         sourcePlatform: source.sourcePlatform,
@@ -397,6 +397,41 @@ export function buildSessionIdMap(landings) {
             map.set(alias, landingId);
     }
     return map;
+}
+/**
+ * The source user, or the target user when the two name ONE account here.
+ *
+ * `sourceUser` is read off a path segment and `targetUser` off `userInfo()`, so
+ * the same account can arrive spelled twice: on Windows a path handed out by
+ * `os.tmpdir()` often names the user by its 8.3 alias (`C:\Users\RUNNER~1`)
+ * while `userInfo()` names it in full (`runneradmin`). Compared as strings that
+ * is two users, and `buildPathMappings` adds a home mapping from a directory to
+ * itself. That is not harmless: stage 1 applies mappings in sequence, so the
+ * home mapping re-spells every target path an earlier mapping has just
+ * produced under it, and anything that later matches a target path exactly —
+ * stage 3's `targetProjectDir` (#136) — misses the re-spelled copy. A same-
+ * machine migrate re-spelled every `cwd` the same way.
+ *
+ * The question is asked of THIS machine's filesystem, and only within one
+ * platform family: when both home paths resolve to the same directory, there is
+ * no second user to map to. A source home that does not exist here — the
+ * ordinary cross-machine case — keeps its mapping. `realpathSync.native`,
+ * deliberately, because it is the one that expands an 8.3 alias; any failure
+ * answers "not the same", which keeps the mapping exactly as before. Proved on
+ * Windows only (the #137 and migrate-in-place tests): Linux has no 8.3 names.
+ */
+function sameAccountHere(sourcePlatform, sourceUser, targetPlatform, targetUser) {
+    if (sourceUser === targetUser || !samePlatformFamily(sourcePlatform, targetPlatform))
+        return sourceUser;
+    try {
+        const a = realpathSync.native(getHomePath(sourcePlatform, sourceUser));
+        const b = realpathSync.native(getHomePath(targetPlatform, targetUser));
+        const caseless = process.platform === "win32" || process.platform === "darwin";
+        return (caseless ? a.toLowerCase() === b.toLowerCase() : a === b) ? targetUser : sourceUser;
+    }
+    catch {
+        return sourceUser;
+    }
 }
 function getHomePath(platform, user) {
     if (platform === "win32")
