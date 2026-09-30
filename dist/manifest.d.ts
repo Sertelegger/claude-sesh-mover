@@ -288,7 +288,15 @@ export declare function layerFiles(dir: string): string[];
 export declare function isAgentTranscript(relOrName: string): boolean;
 /** Resolve a `layerFiles` relative path back to an absolute one. */
 export declare function layerFilePath(dir: string, rel: string): string;
-export declare function computeLayerDigest(dir: string): Promise<string | null>;
+/**
+ * `keep`, when given, drops entries from the SAME walk before hashing — it is
+ * never a second enumeration. It exists for the memory layer, whose copy leaves
+ * out machine-local state (`MACHINE_LOCAL_MEMORY_NAMES`, #144): a digest over a
+ * set the copy did not ship can never match what a peer recorded from the
+ * bundle, so the layer would re-send forever. The exporter passes the one
+ * predicate to both the copy and the digest for that reason.
+ */
+export declare function computeLayerDigest(dir: string, keep?: (rel: string) => boolean): Promise<string | null>;
 /**
  * EXPORTED for #86's signed statement, which needs the same property for the
  * same reason and must not grow a second spelling of it: a signature over a

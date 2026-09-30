@@ -2,10 +2,10 @@
 
 import { Command } from "commander";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { resolveConfigDir } from "./platform.js";
+import { physicalProjectPath, resolveConfigDir } from "./platform.js";
 import {
   readConfig,
   readConfigOverrides,
@@ -321,6 +321,8 @@ program
   .action(async (opts) => {
     let tempExtractDir: string | undefined;
     try {
+      // First, so a destination refused as typed costs no extraction.
+      const target = physicalDestination("--target-project-path", opts.targetProjectPath);
       const onProgress = progressWriter(opts.progress);
       let fromPath = opts.from;
 
@@ -383,7 +385,7 @@ program
       const result = await importSession({
         exportPath: fromPath,
         targetConfigDir,
-        targetProjectPath: opts.targetProjectPath,
+        targetProjectPath: target.path,
         targetClaudeVersion: claudeVersion,
         dryRun: !!opts.dryRun,
         sessionIds: opts.sessionId,
@@ -421,8 +423,13 @@ program
       // extraction observation (a zstd frame with no checksum, say) describes
       // something that really happened to the user's bytes and is *more*
       // relevant when the import then fails, not less.
-      if (extractWarnings.length > 0) {
-        result.warnings = [...extractWarnings, ...(result.warnings ?? [])];
+      //
+      // The destination note (#149) joins them on the same terms: it is about
+      // the invocation, not the bundle, and it explains every path in the body
+      // — a refusal's included — whenever it differs from the one typed.
+      const before = [...extractWarnings, ...(target.note ? [target.note] : [])];
+      if (before.length > 0) {
+        result.warnings = [...before, ...(result.warnings ?? [])];
       }
       output(result);
     } catch (e) {
@@ -458,11 +465,23 @@ program
       const config = loadEffectiveConfig(sourceConfigDir, sourceProjectPath);
       const scope = parseScope(opts.scope ?? config.migrate.scope, "migrate");
 
+      // The TARGET only: it is the path the migrate writes under, encodes and
+      // stamps (#149). The source is read AS TYPED — discovery reads exactly
+      // the folders this spelling names (its own, and the pre-0.12.0 one) — so
+      // a source given through a symlink, with a trailing separator or
+      // relatively reads that spelling's own folder: empty for a project Claude
+      // Code filed ("No sessions found for this project"), and the one place a
+      // pre-#149 import misfiled sessions, which a migrate from that spelling
+      // to the physical path moves into place. Resolving it here would make
+      // that folder unreachable. `migrateSession` then leaves every session
+      // already in the folder this resolved target writes where it is, and
+      // refuses only when nothing else is left to move.
+      const target = physicalDestination("--target-project-path", opts.targetProjectPath);
       const result = await migrateSession({
         sourceConfigDir,
         targetConfigDir,
         sourceProjectPath,
-        targetProjectPath: opts.targetProjectPath,
+        targetProjectPath: target.path,
         scope,
         sessionId: opts.sessionId,
         excludeLayers: (opts.exclude ?? []) as ExportLayer[],
@@ -474,6 +493,12 @@ program
         onProgress,
       });
 
+      // Onto a refusal as well as a success, the way import does: both shapes
+      // carry `warnings`, and the refusal a resolved target can cause — every
+      // session already in the folder it resolved to, as when a symlink to the
+      // source was typed — is exactly where the spelling the user typed has to
+      // be named beside the one it resolved to.
+      if (target.note) result.warnings = [target.note, ...(result.warnings ?? [])];
       output(result);
     } catch (e) {
       outputError("migrate", e as Error);
@@ -1634,7 +1659,14 @@ program
   .action(async (opts) => {
     try {
       const configDir = resolveConfigDir(opts.sourceConfigDir);
-      const projectPath = opts.projectPath ?? process.cwd();
+      // BOTH paths, because either can be the write destination (#149): a pull
+      // writes under `--target-path` when one is given and under
+      // `--project-path` otherwise. `process.cwd()` is already physical, so the
+      // slash command's default passes through unchanged.
+      const project = physicalDestination("--project-path", opts.projectPath ?? process.cwd());
+      const target =
+        opts.targetPath === undefined ? null : physicalDestination("--target-path", opts.targetPath);
+      const projectPath = project.path;
       const config = loadEffectiveConfig(configDir, projectPath);
       // Validated before the hub lookup: a bad mode is a bad invocation, and
       // saying so should not depend on whether a hub happens to be configured.
@@ -1647,11 +1679,11 @@ program
       }
       const { hubPull } = await import("./hub/pull.js");
       const onProgress = progressWriter(opts.progress);
-      output(await hubPull({
+      const pulled = await hubPull({
         configDir, projectPath, hubPath,
         threadId: opts.thread,
         latest: !!opts.latest,
-        targetPath: opts.targetPath,
+        targetPath: target?.path,
         forceWorkspace: !!opts.forceWorkspace,
         applyCarry: !!opts.applyCarry,
         projectIdOverride: opts.projectId,
@@ -1661,7 +1693,8 @@ program
         ignoreRetirement: !!opts.ignoreRetirement,
         claudeVersion: getClaudeVersion(),
         onProgress,
-      }));
+      });
+      output(withLeadingNote(withLeadingNote(pulled, target?.note ?? null), project.note));
     } catch (e) {
       outputError("pull", e as Error);
     }
@@ -1692,6 +1725,65 @@ program
   });
 
 // --- Helpers ---
+
+/**
+ * A caller-typed WRITE destination, resolved to the spelling Claude Code files
+ * that directory's sessions under (`physicalProjectPath`, #149) — plus a note
+ * whenever the result is not what was typed.
+ *
+ * Here, at the CLI boundary, and nowhere below it: this is where a typed path
+ * enters, and everything downstream — the encoded folder, each transcript's
+ * `cwd`, the `history.jsonl` entry, the sync-state key — has to agree on one
+ * spelling, which it does by construction when it is handed only this one.
+ *
+ * Tidying an absolute path (a trailing slash, a doubled separator) is not worth
+ * a sentence. A followed symlink or a relative spelling is, because the folder
+ * and every recorded working directory now name something the user did not
+ * type. Descriptive, not advice: there is nothing to do differently.
+ *
+ * A leading `~` is THROWN, before anything is read or written — the one
+ * spelling this does not take as typed. It is shell syntax, and a shell that
+ * sees it quoted (`"~/x"`, the way every command line in `commands/*.md`
+ * quotes a path) or as `--flag=~/x` leaves it alone, so it arrives here
+ * literally and would resolve to a directory named `~` inside the working
+ * directory: an import filed under it, a `migrate --rename-dir` moved the
+ * project into it. Refused rather than expanded, because expanding is a
+ * decision about what the user meant (and `~user` is a lookup), where a
+ * refusal only costs a retype; `./~` is the spelling for a directory that
+ * really is named `~`. A thrown refusal is class 1 — a bad invocation.
+ */
+function physicalDestination(flag: string, typed: string): { path: string; note: string | null } {
+  if (typed.startsWith("~")) {
+    throw new Error(
+      `${flag} ${JSON.stringify(typed)} starts with "~", which only a shell expands, and this one reached sesh-mover unexpanded — taken as written it would name a directory called "~" inside ${JSON.stringify(process.cwd())}. Nothing was read or written. Spell the home directory out in full (or write "./~" if a directory named "~" really is meant).`
+    );
+  }
+  const path = physicalProjectPath(typed);
+  if (path === typed || (isAbsolute(typed) && path === resolve(typed))) {
+    return { path, note: null };
+  }
+  // Windows only makes the path absolute (`physicalProjectPath`), so the note
+  // must not claim a link was followed there.
+  const how =
+    process.platform === "win32"
+      ? "its absolute directory, never a relative spelling"
+      : "its physical absolute directory — symlinks followed, never a relative spelling";
+  return {
+    path,
+    note: `${flag} ${JSON.stringify(typed)} was taken as ${JSON.stringify(path)}: Claude Code files a project's sessions under ${how} — so that is the path used for the session folder and for the working directory each transcript records.`,
+  };
+}
+
+/**
+ * Put `note` first in a result's `warnings`, when it has that array. A result
+ * without one (a refusal that carries no disclosures) is returned untouched:
+ * this adds to an existing channel and never invents a field on a shape.
+ */
+function withLeadingNote<T>(result: T, note: string | null): T {
+  const warnings = (result as { warnings?: unknown }).warnings;
+  if (note !== null && Array.isArray(warnings)) warnings.unshift(note);
+  return result;
+}
 
 // Single predicate for both the collision gate and the --suffix loop, so a
 // plain directory export and an archive/zstd export of the same name can

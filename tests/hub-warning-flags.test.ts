@@ -733,6 +733,19 @@ const REGISTRY: FlagUse[] = [
   },
   {
     file: "src/migrator.ts",
+    match: "give that directory as --target-project-path; to move them to another config dir, give it as --target-config-dir",
+    klass: "retry-works",
+    why: "The nothing-to-move refusal (every session in scope is already in the folder the import would write, #126/#149) returns after discovery, which only reads, and before the export, the import and the cleanup, so the config dir and the source folder are byte-identical afterwards, and the same invocation with a target whose sessions are filed elsewhere has the whole migration left to perform.",
+    provenBy: {
+      test: "migrate-in-place.test.ts",
+      name: "refuses when every session is already in the folder it would write, and a different --target-project-path then migrates",
+      // The file's local wrapper over the built CLI's `migrate` — the test is
+      // CLI-level, so the operation it re-runs is that invocation.
+      reruns: "runMigrate",
+    },
+  },
+  {
+    file: "src/migrator.ts",
     match: "Migrate with --scope current requires --session-id",
     klass: "descriptive",
     why: "States the argument rule that was violated. The remedy is the next line, which is classified separately.",

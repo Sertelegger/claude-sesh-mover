@@ -12,7 +12,7 @@ import { readLocalProjectId, writeLocalProjectId } from "./hub/identity.js";
 import { unpackWorkspace } from "./payload/workspace.js";
 import { applyCarry, normalizeCarryMeta, orNotRecorded, } from "./payload/carry.js";
 import { isReadableDir } from "./hub/fs-probe.js";
-import { IGNORE_FILE_NAME, INCLUDE_FILE_NAME, isPluginStateName } from "./paths.js";
+import { IGNORE_FILE_NAME, INCLUDE_FILE_NAME, MACHINE_LOCAL_MEMORY_NAMES, isPluginStateName, } from "./paths.js";
 import { MEMORY_INDEX_NAME, appendIndexLines, formatMemoryPointer, memoryIndexTargets, unionMemoryIndex, } from "./memory-index.js";
 import { MAX_SIDECAR_ATTEMPTS, copyToNewFile, copyToUniqueName } from "./sidecar.js";
 import { errorMessage } from "./errors.js";
@@ -304,12 +304,28 @@ function reconcileSharedLayers(opts) {
     if (memoryRoot === "symlink") {
         warnings.push(`The memory folder in this bundle is a symlink, not a directory — nothing was read through it, and nothing in your memory folder was changed.`);
     }
+    // A bundle memory folder holding nothing but machine-local state (#144) is no
+    // memory layer — the exporter's rule since #144, applied here to the bundles
+    // 0.12.0 and earlier already wrote (and to their empty `memory/`, which they
+    // also shipped): no root in the write set, no directory created, no
+    // `memoryDir` reported for a run that wrote nothing there. A folder that
+    // cannot be listed counts as content, so the reconciliation below still
+    // runs and says what it could not read.
+    const memoryHasContent = memoryRoot === "present" &&
+        (() => {
+            try {
+                return readdirSync(memoryDir).some((f) => !MACHINE_LOCAL_MEMORY_NAMES.includes(f));
+            }
+            catch {
+                return true;
+            }
+        })();
     // OPT-OUT, where `plans/` below is opt-in. Both halves are DISCLOSED either
     // way — silence about a payload we chose not to write is what makes a flag
     // feel like a bug — and both count the files rather than reporting a boolean,
     // because "this bundle wanted to write 14 files here" is a different sentence
     // from "it wanted to write 1".
-    if (memoryRoot === "present" && !includeMemory) {
+    if (memoryHasContent && !includeMemory) {
         writeRoots.push({
             layer: "memory",
             path: join(targetProjectDir, "memory"),
@@ -322,7 +338,7 @@ function reconcileSharedLayers(opts) {
         try {
             // Names only: the root is not a symlink (checked above), no file in it is
             // opened, and nothing is written.
-            memorySkipped = readdirSync(memoryDir).filter((f) => isRegularFile(join(memoryDir, f))).length;
+            memorySkipped = readdirSync(memoryDir).filter((f) => !MACHINE_LOCAL_MEMORY_NAMES.includes(f) && isRegularFile(join(memoryDir, f))).length;
         }
         catch {
             memorySkipped = undefined;
@@ -331,7 +347,7 @@ function reconcileSharedLayers(opts) {
             warnings.push(`This bundle carries ${memorySkipped} memory file(s), and they were NOT written, because \`sesh-mover import --no-memory\` was passed. Every one of them is still in the bundle, so nothing was consumed by declining: re-run the same import without that flag to land them.`);
         }
     }
-    if (memoryRoot === "present" && includeMemory) {
+    if (memoryHasContent && includeMemory) {
         try {
             const targetMemDir = join(targetProjectDir, "memory");
             reportedMemoryDir = targetMemDir;
@@ -347,7 +363,17 @@ function reconcileSharedLayers(opts) {
             const indexPath = join(targetMemDir, MEMORY_INDEX_NAME);
             if (!plan)
                 mkdirSync(targetMemDir, { recursive: true });
-            const files = readdirSync(memoryDir).sort();
+            // Machine-local state never lands (#144). The exporter stopped carrying
+            // `.consolidate-lock`, but every bundle 0.12.0 and earlier wrote from a
+            // project that had one still does — and landing it resets this machine's
+            // consolidation clock (its mtime is the clock), while meeting this
+            // machine's own lock parked it as a conflicting "memory" and indexed it
+            // in MEMORY.md. Dropped here, before any verdict, so it is in no plan, no
+            // write set, no park and no "unreferenced" warning: silence is right for
+            // a file the user never wrote.
+            const files = readdirSync(memoryDir)
+                .filter((f) => !MACHINE_LOCAL_MEMORY_NAMES.includes(f))
+                .sort();
             // The local index, and whether we may write it at all. An index that
             // exists but cannot be read (a directory in its place, a DANGLING
             // SYMLINK, a permission problem) is left alone: overwriting it would be
