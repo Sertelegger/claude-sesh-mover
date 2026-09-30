@@ -39,7 +39,7 @@
  * encryption, whatever `PLUGIN_VERSION` happens to say. Its roster entry is
  * refreshed by the `registerMachine` call below before anything is read.
  */
-import type { ErrorResult, HubEncryptRefusedResult, HubEncryptResult, HubUnreachableResult } from "../types.js";
+import type { ErrorResult, HubEncryptRefusedResult, HubEncryptResult, HubIdentityChangedResult, HubUnreachableResult } from "../types.js";
 /**
  * The first plugin version that can produce and consume an encrypted bundle.
  *
@@ -102,5 +102,5 @@ export interface HubEncryptOptions {
      */
     cwd: string;
 }
-export declare function hubEncrypt(opts: HubEncryptOptions): Promise<HubEncryptResult | HubEncryptRefusedResult | HubUnreachableResult | ErrorResult>;
+export declare function hubEncrypt(opts: HubEncryptOptions): Promise<HubEncryptResult | HubEncryptRefusedResult | HubUnreachableResult | HubIdentityChangedResult | ErrorResult>;
 //# sourceMappingURL=encrypt.d.ts.map

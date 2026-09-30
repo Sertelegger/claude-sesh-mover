@@ -136,6 +136,10 @@ export async function runResolveStage(input) {
     // site, so handing it back would strand a one-line pure call in the caller
     // and drag a HubIndexJson import back into pull.ts.
     const resolved = resolveThreads(indexes);
-    return { kind: "proceed", value: { local, hub, hubPeerId, resolved }, reasons };
+    return {
+        kind: "proceed",
+        value: { local, hub, hubPeerId, previousHubIds: pre.previousHubIds, resolved },
+        reasons,
+    };
 }
 //# sourceMappingURL=pull-resolve.js.map

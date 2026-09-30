@@ -44,7 +44,7 @@ import { createFsBackend } from "./backend.js";
 import { collectHubRecipients, resolveHubEncryption } from "./encryption.js";
 import { registerMachine } from "./init.js";
 import { listMachineIds, readMachineRecord } from "./machines.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { compareVersions } from "../version-adapters.js";
@@ -121,7 +121,7 @@ export async function hubEncrypt(opts) {
     // this verb writes the same way.
     const probe = await probeHubReachable(opts.hubPath, backend);
     if (probe.state !== "ok")
-        return hubUnreachableRefusal("hub-encrypt", probe.state);
+        return hubProbeRefusal("hub-encrypt", probe);
     // The probe's own parse, reused: it is `JSON.parse`'s result cast to
     // `HubJson`, so at runtime it still carries every field a newer plugin wrote.
     // Re-reading here would cost a second round trip on a share and would open a

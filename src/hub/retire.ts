@@ -3,7 +3,7 @@ import { acquireProjectLock, describeLockSteal, LockBusyError, type LockHandle }
 import {
   readLocalProjectId, removeLocalProjectIdIfMatches,
 } from "./identity.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import {
   projectDir, projectJsonPath, tombstoneDirPath, tombstonePath,
   type HubProjectJson, type HubTombstoneJson,
@@ -16,8 +16,8 @@ import { createMachineNameLookup } from "./whereis.js";
 import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import type {
-  HubDeleteResult, HubLockBusyResult, HubRetireFailedResult, HubRetireResult,
-  HubUnreachableResult,
+  HubDeleteResult, HubIdentityChangedResult, HubLockBusyResult, HubRetireFailedResult,
+  HubRetireResult, HubUnreachableResult,
 } from "../types.js";
 
 /**
@@ -101,9 +101,11 @@ export interface HubDeleteOptions {
 }
 
 export type HubRetireOutcome =
-  | HubRetireResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult;
+  | HubRetireResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult
+  | HubIdentityChangedResult;
 export type HubDeleteOutcome =
-  | HubDeleteResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult;
+  | HubDeleteResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult
+  | HubIdentityChangedResult;
 
 /**
  * The one place `HubBackend.delete` is called.
@@ -199,7 +201,8 @@ interface Preamble {
  * which carries each verb's own success shape and would let a `hub delete`
  * return a `hub-retire` result.
  */
-type PreambleRefusal = HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult;
+type PreambleRefusal =
+  | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult | HubIdentityChangedResult;
 
 type PreambleOutcome =
   | { kind: "ok"; value: Preamble }
@@ -228,7 +231,7 @@ async function preamble(
 
   const backend = createFsBackend(opts.hubPath);
   const probe = await probeHubReachable(opts.hubPath, backend);
-  if (probe.state !== "ok") return { kind: "refuse", result: hubUnreachableRefusal(command, probe.state) };
+  if (probe.state !== "ok") return { kind: "refuse", result: hubProbeRefusal(command, probe) };
 
   let lock: LockHandle;
   try {

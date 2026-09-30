@@ -1,5 +1,5 @@
 import { type HubBackend } from "./backend.js";
-import type { HubDeleteResult, HubLockBusyResult, HubRetireFailedResult, HubRetireResult, HubUnreachableResult } from "../types.js";
+import type { HubDeleteResult, HubIdentityChangedResult, HubLockBusyResult, HubRetireFailedResult, HubRetireResult, HubUnreachableResult } from "../types.js";
 /**
  * Hub project retirement, in the two phases the owner's ruling on #43 settles:
  *
@@ -77,8 +77,8 @@ export interface HubDeleteOptions {
     hubPath: string;
     projectIdOverride?: string;
 }
-export type HubRetireOutcome = HubRetireResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult;
-export type HubDeleteOutcome = HubDeleteResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult;
+export type HubRetireOutcome = HubRetireResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult | HubIdentityChangedResult;
+export type HubDeleteOutcome = HubDeleteResult | HubRetireFailedResult | HubLockBusyResult | HubUnreachableResult | HubIdentityChangedResult;
 /**
  * The one place `HubBackend.delete` is called.
  *

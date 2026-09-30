@@ -94,11 +94,11 @@
  * project because of one damaged file, which is the opposite of what a repair
  * verb is for; the failures come back as data, one entry each.
  */
-import type { HubLockBusyResult, HubRekeyRefusedResult, HubRekeyResult, HubUnreachableResult } from "../types.js";
+import type { HubIdentityChangedResult, HubLockBusyResult, HubRekeyRefusedResult, HubRekeyResult, HubUnreachableResult } from "../types.js";
 export interface HubRekeyOptions {
     /** The project directory whose hub link names the project to rekey. */
     projectPath: string;
     hubPath: string;
 }
-export declare function hubRekey(opts: HubRekeyOptions): Promise<HubRekeyResult | HubRekeyRefusedResult | HubLockBusyResult | HubUnreachableResult>;
+export declare function hubRekey(opts: HubRekeyOptions): Promise<HubRekeyResult | HubRekeyRefusedResult | HubLockBusyResult | HubUnreachableResult | HubIdentityChangedResult>;
 //# sourceMappingURL=rekey.d.ts.map

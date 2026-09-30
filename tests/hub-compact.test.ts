@@ -33,6 +33,7 @@ import { compactionPath, indexPath } from "../src/hub/layout.js";
 import { loadOrCreateMachineId } from "../src/machine.js";
 import { acquireProjectLock } from "../src/hub/lock.js";
 import { getThreadId, readSyncState } from "../src/sync-state.js";
+import { extractArchive } from "../src/archiver.js";
 import { readLocalProjectId } from "../src/hub/identity.js";
 import type { HubCompactionJson, HubIndexJson } from "../src/hub/layout.js";
 import type { HubPushResult } from "../src/types.js";
@@ -447,5 +448,55 @@ describe("hub compact", () => {
     expect(second.success).toBe(true);
     if (!second.success) return;
     expect(second.retiredBundleIds).toEqual([]);
+  });
+
+  /**
+   * The memory-credit forget has to be keyed by the id `hubPush` credits
+   * under — the hub identity the probe just read — not by sync-state's
+   * `hub.hubId`, which is stamped when a project first writes hub data and
+   * never updated. After `hub init --accept-new-hub-id` the two differ, the
+   * forget missed the live credit, and the consolidated bundle went up
+   * without `memory/` while phase 2 was set to delete the only bundle that
+   * still carried it.
+   */
+  it("still carries memory/ in the consolidated bundle after an accepted hub-identity change", async () => {
+    await link();
+    await push();
+    extendSession(1);
+    await push();
+
+    // The hub is re-identified, and this machine accepts that on purpose.
+    const hubJsonPath = join(hubDir, "hub.json");
+    const hubJson = JSON.parse(readFileSync(hubJsonPath, "utf-8"));
+    const oldHubId = hubJson.hubId as string;
+    hubJson.hubId = "11111111-0000-4000-8000-00000000000b";
+    writeFileSync(hubJsonPath, JSON.stringify(hubJson, null, 2) + "\n");
+    const accepted = await hubInit({
+      hubPath: hubDir, configScope: "user", cwd: join(root, "home"), acceptNewHubId: true,
+    });
+    expect(accepted.success && "identity" in accepted && accepted.identity).toBe("accepted-change");
+    // The premise: sync-state still names the old id.
+    expect(readSyncState(projectPath).hub?.hubId).toBe(oldHubId);
+
+    await push(); // re-sends in full under the new ledger key, crediting memory there
+    extendSession(2);
+    await push(); // a continuation; memory already credited, so not re-sent
+
+    const out = await hubCompact({
+      configDir, projectPath, hubPath: hubDir, threadId: threadId(), claudeVersion: CLAUDE_VERSION,
+    });
+    expect(out.success, JSON.stringify(out)).toBe(true);
+    if (!out.success) return;
+    expect(out.phase).toBe("consolidated");
+
+    const bundles = (await ownIndex()).threads[threadId()].bundles;
+    const consolidated = bundles[bundles.length - 1];
+    expect(consolidated.bundleId).toBe(out.consolidatedBundleId);
+    const unpacked = join(root, "consolidated");
+    mkdirSync(unpacked);
+    await extractArchive(join(hubDir, consolidated.file), unpacked);
+    const manifest = JSON.parse(readFileSync(join(unpacked, "manifest.json"), "utf-8"));
+    expect(manifest.includedLayers).toContain("memory");
+    expect(existsSync(join(unpacked, "memory"))).toBe(true);
   });
 });

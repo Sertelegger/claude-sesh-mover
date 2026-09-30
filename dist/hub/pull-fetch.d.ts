@@ -14,6 +14,13 @@ export interface FetchStageInput {
      * id on two hubs is two different trust decisions.
      */
     hubId: string;
+    /**
+     * Ids this machine recorded for this hub address before `hubId`
+     * (`joined-hubs.ts`), so a bundle signed under a deliberately re-identified
+     * hub's earlier id verifies instead of reading as a lifted statement. Absent
+     * means none — every hub that was never re-identified.
+     */
+    previousHubIds?: readonly string[];
     /** The statement context's project half — the project this pull resolved. */
     projectId: string;
     /**

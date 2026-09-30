@@ -434,7 +434,104 @@ const REGISTRY: FlagUse[] = [
     klass: "descriptive",
     why: "The other arm of the same refusal, and the same judgement: the key is named as the state that explains the outcome. Deliberately not phrased as 'point hub.path at ...' — that would make it advice and put it back in front of the foreclosure question.",
   },
+  // ---- the joined-hub identity check (src/hub/joined-hubs.ts) ---------------
+  //
+  // The `identity-changed` wording. Every verb that probes the hub surfaces it
+  // — as a refusal from the writing verbs, pull and `hub trust`, and as a
+  // warning from `hub status` and `whereis` — which is why it lives in its own
+  // file rather than in preflight.ts, whose other lines are push's and pull's
+  // alone (see SURFACES).
+  {
+    file: "src/hub/joined-hubs.ts",
+    match: "or hub.path was switched to a different hub, or someone rewrote hub.json",
+    klass: "descriptive",
+    why: "hub.path is named as one of the two causes of the state being described, not as something to change. Nothing is asked of the user on this line; the remedies are the two lines below, and they come after the instruction to stop.",
+  },
+  {
+    file: "src/hub/joined-hubs.ts",
+    match: "Only if you re-created or switched the hub on purpose, re-join it with",
+    klass: "retry-works",
+    why: "The recorded-id refusal is taken by the probe before any pin lookup, any hub write and any local write, so the refusing verb records nothing that could foreclose it; once `hub init --accept-new-hub-id` records the new identity, the SAME verb runs from the top. It names `hub init` because both flags are that command's, not the refusing verb's. The sentence is gated on the user having made the change themselves, after an instruction to stop and investigate otherwise — the flag is a deliberate re-join, never the default next step.",
+    provenBy: {
+      test: "hub-joined-identity.test.ts",
+      name: "a deliberately re-created hub: pull refuses, --accept-new-hub-id re-joins, and bundles signed under the old id still pull",
+      reruns: "cli",
+    },
+  },
+  {
+    file: "src/hub/joined-hubs.ts",
+    match: "since a hub init with --scope user would point every other project at this hub too",
+    klass: "descriptive",
+    why: "Appended to the two re-join commands when the hub.path came from a project's own config: it says what the OTHER scope would do, as the reason the command names --scope project and where to run it. The remedy is the command on the line before; this line asks nothing of its own.",
+  },
+  {
+    file: "src/hub/joined-hubs.ts",
+    match: "Only if that hub is truly gone and you are replacing it on purpose, re-run",
+    klass: "retry-works",
+    why: "`hub init` at an address where this machine joined a hub before, now EMPTY or not there at all — an unmounted mount point (`hub-identity-not-present`). The refusal is taken before the mkdir, before hub.json is written and before any registration, so the same init plus --accept-new-hub-id runs from the top; the named command is `hub init` itself. The sentence before it steers the ordinary case (mount it, or wait, then the unchanged command) away from the flag.",
+    provenBy: {
+      test: "hub-joined-identity.test.ts",
+      name: "refuses to mint a new hub where this machine joined a different one (an unmounted mount point)",
+      reruns: "cli",
+    },
+  },
+  {
+    file: "src/hub/joined-hubs.ts",
+    match: "Only if there is no hub to wait for — you are starting a new one here, or the one those records name is truly gone — re-run",
+    klass: "retry-works",
+    why: "The EVIDENCE arm of `hub-identity-not-present`: no joined-hub record for the address, but this machine's own projects tie it to a hub (or not every project's config could be resolved, so that cannot be ruled out), and the directory is empty or missing. Taken before the mkdir, before hub.json is written and before any registration or local record, so the same init plus --accept-new-hub-id runs from the top and mints. The sentences before it steer the ordinary case (mount it, or wait, then the unchanged command) away from the flag, and the one after says no pin is carried.",
+    provenBy: {
+      test: "hub-joined-identity.test.ts",
+      name: "refuses to mint where this machine's own projects tie the path to a hub, with no record there (an unmounted share after upgrade)",
+      reruns: "cli",
+    },
+  },
+  {
+    file: "src/hub/joined-hubs.ts",
+    match: "Only if you switched hub.path or re-created the hub on purpose, record it as this machine",
+    klass: "retry-works",
+    why: "The evidence refusal (no record for this address, and the hub's id is not one this machine's sync-state or pins tie to it). Same guarantee as the recorded case — the refusal records nothing — and a plain `hub init --path` (with the --scope that supplied hub.path) is the whole remedy, because with no record there is nothing for the flag to override: an explicit first join is trust-on-first-use, like a first pin. The sentence after it says that join carries no pin over, which is the cost the user has to hear before taking it.",
+    provenBy: {
+      test: "hub-joined-identity.test.ts",
+      name: "refuses a hub this machine has no record of, and records it after hub init --path",
+      reruns: "cli",
+    },
+  },
   // ---- everything else in src/hub/ -----------------------------------------
+  {
+    file: "src/hub/init.ts",
+    match: "Pass an absolute --path — the full path to the synced folder or share.",
+    klass: "retry-works",
+    why: "#162: the relative-path refusal is taken before the mkdir and before any write, so the same invocation with an absolute --path runs from the top.",
+    provenBy: {
+      test: "hub-path-spelling.test.ts",
+      name: "refuses a relative --path before creating anything, and an absolute --path then succeeds",
+      reruns: "run",
+    },
+  },
+  {
+    file: "src/hub/init.ts",
+    match: "Wait for the sync client to finish and re-run `sesh-mover hub init` with the same --path",
+    klass: "retry-works",
+    why: "The hub-content-without-identity guard refuses before registerMachine and before any write — no hub.json, no machine record, no config, no joined-hub record — so re-running unchanged once hub.json lands joins the existing hub, and --accept-new-hub-id (the lost-hub path) mints one. The named test exercises both re-runs.",
+    provenBy: {
+      test: "hub-joined-identity.test.ts",
+      name: "refuses with exit 3 and writes nothing; --accept-new-hub-id creates and records",
+      reruns: "cli",
+    },
+  },
+  {
+    file: "src/hub/init.ts",
+    match: "was created there anyway because --accept-new-hub-id was passed",
+    klass: "descriptive",
+    why: "Restates the flag the user just passed on a hub init that minted a hub at a path this machine's own records tie to another identity, and says what it did and did not carry. Nothing is asked of the user; it names the flag as the cause of an outcome that already happened.",
+  },
+  {
+    file: "src/hub/init.ts",
+    match: "and this machine has now accepted that: --accept-new-hub-id was passed.",
+    klass: "descriptive",
+    why: "Restates the flag the user just passed and what it did, on a join that succeeded. Nothing is asked of the user except to recognise a mistake if it was one.",
+  },
   {
     file: "src/hub/init.ts",
     match: "Point --path at an empty directory or a valid sesh-mover hub.",
@@ -985,6 +1082,14 @@ const SURFACES: Record<string, string[]> = {
   "src/payload/carry.ts": ["push", "pull", "export", "import"],
   "src/payload/capture.ts": ["push", "export"],
   "src/hub/init.ts": ["init"],
+  // The joined-hub identity wording (`describeHubIdentityChange`) is surfaced
+  // by EVERY verb that probes the hub — as a refusal by the writing verbs, pull
+  // and trust, and as a warning by status and whereis — plus `hub init`'s own
+  // refusal. Its two flags are `init`'s, which is why both lines name it.
+  "src/hub/joined-hubs.ts": [
+    "push", "pull", "init", "status", "whereis", "trust", "reindex", "retire", "delete", "encrypt",
+    "rekey", "compact",
+  ],
   // The widest surface in the map, and it is not hedging: `HubIoTimeoutError`
   // is thrown from inside `HubBackend`, which every hub verb constructs, and
   // only push converts it to a typed refusal. Everywhere else it escapes as the

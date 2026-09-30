@@ -1,5 +1,5 @@
 import { type SelectReport } from "./pull-select.js";
-import type { ErrorResult, HubLockBusyResult, HubNoSuchProjectResult, HubPullListResult, HubPullResult, HubProjectRetiredResult, HubUnlinkedResult, HubUnreachableResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubIdentityChangedResult, HubLockBusyResult, HubNoSuchProjectResult, HubPullListResult, HubPullResult, HubProjectRetiredResult, HubUnlinkedResult, HubUnreachableResult, NotYetSyncedResult, OnDivergenceMode, ProgressEvent } from "../types.js";
 export interface HubPullOptions {
     configDir: string;
     projectPath: string;
@@ -91,7 +91,7 @@ export declare function reportPullResult(report: SelectReport, warnings: string[
  * making on its own, but it is not a shrinking of the body, and the margin it
  * reports is eight lines more generous than the body's own history.
  */
-export type HubPullOutcome = HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnreachableResult | HubProjectRetiredResult | HubLockBusyResult | ErrorResult;
+export type HubPullOutcome = HubPullResult | HubPullListResult | NotYetSyncedResult | HubUnlinkedResult | HubNoSuchProjectResult | HubUnreachableResult | HubIdentityChangedResult | HubProjectRetiredResult | HubLockBusyResult | ErrorResult;
 /**
  * Sequencing over the eight pull stages. What is worth knowing before reading
  * the body is in `tests/hub-pull-invariants.test.ts`'s "hubPull is sequencing"

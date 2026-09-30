@@ -74,7 +74,7 @@ import { buildIndexFile, readAllIndexes, readMachineIndex, writeMachineIndex } f
 import { acquireProjectLock } from "./lock.js";
 import { deleteHubFile } from "./retire.js";
 import { readLocalProjectId } from "./identity.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { COMPACTION_GRACE_MS, planAck, planRetirement } from "./compact-plan.js";
 import { hubPush } from "./push.js";
 import { errorMessage } from "../errors.js";
@@ -239,7 +239,7 @@ export async function hubCompact(opts) {
     const backend = createFsBackend(opts.hubPath);
     const probe = await probeHubReachable(opts.hubPath, backend);
     if (probe.state !== "ok")
-        return hubUnreachableRefusal("hub-compact", probe.state);
+        return hubProbeRefusal("hub-compact", probe);
     const me = loadOrCreateMachineId();
     const projectId = local.projectId;
     const warnings = [];
@@ -286,10 +286,16 @@ export async function hubCompact(opts) {
         // direction and only this one: the worst a forgotten credit costs is
         // re-sending a memory directory the hub already had, which is the failure
         // direction `forgetSentToPeer` is explicitly allowed to take.
-        const hub = peekSyncState(opts.projectPath).hub;
-        if (hub?.hubId) {
+        //
+        // Keyed by the hub identity the probe just read — the one `hubPush`
+        // credits under — and NOT by sync-state's `hub.hubId`, which is stamped
+        // when a project first writes hub data and never updated. After `hub init
+        // --accept-new-hub-id` the two differ, and a forget keyed by the stale one
+        // missed the live credit: the consolidated bundle went up without
+        // `memory/` while this run set out to delete the only bundle carrying it.
+        {
             const state = readSyncState(opts.projectPath);
-            forgetSentToPeer(state, { id: `hub:${hub.hubId}` }, {
+            forgetSentToPeer(state, { id: `hub:${probe.hub.hubId}` }, {
                 localSessionIds: sessionIds,
                 memoryDigest: true,
             });

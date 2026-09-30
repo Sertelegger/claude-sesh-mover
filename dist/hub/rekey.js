@@ -101,7 +101,7 @@ import { readLocalProjectId } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { bundleDir, isEncryptedBundleFile, workspaceDir } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { readIdentityFile } from "../crypto/identity-file.js";
 import { loadOrCreateMachineId } from "../machine.js";
 export async function hubRekey(opts) {
@@ -123,7 +123,7 @@ export async function hubRekey(opts) {
     const backend = createFsBackend(opts.hubPath);
     const probe = await probeHubReachable(opts.hubPath, backend);
     if (probe.state !== "ok")
-        return hubUnreachableRefusal("hub-rekey", probe.state);
+        return hubProbeRefusal("hub-rekey", probe);
     let lock;
     try {
         // This machine's own files only, so no other machine can be writing them —

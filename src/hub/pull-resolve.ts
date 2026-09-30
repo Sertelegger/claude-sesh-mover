@@ -8,7 +8,8 @@ import { resolveThreads, type ResolvedThread } from "./threads.js";
 import { findRetirement, retiredPullRefusal } from "./tombstone.js";
 import { readMachineId } from "../machine.js";
 import type {
-  HubNoSuchProjectResult, HubProjectRetiredResult, HubUnlinkedResult, HubUnreachableResult,
+  HubIdentityChangedResult, HubNoSuchProjectResult, HubProjectRetiredResult, HubUnlinkedResult,
+  HubUnreachableResult,
 } from "../types.js";
 
 export interface ResolveStageInput {
@@ -55,6 +56,13 @@ export interface ResolveStageValue {
   hub: HubJson;
   /** `hub:<hubId>`, the peer id the hub's own receipt ledger is kept under. */
   hubPeerId: string;
+  /**
+   * Ids this machine recorded for this hub address before the current one —
+   * forwarded to the signature gate, which accepts a statement signed under
+   * one of them. Only ever this machine's own record (`joined-hubs.ts`), never
+   * anything the hub says.
+   */
+  previousHubIds: string[];
   resolved: ResolvedThread[];
 }
 
@@ -86,6 +94,7 @@ export type ResolveStageOutcome =
         | HubUnlinkedResult
         | HubUnreachableResult
         | HubNoSuchProjectResult
+        | HubIdentityChangedResult
         | HubProjectRetiredResult;
     };
 
@@ -224,5 +233,9 @@ export async function runResolveStage(
   // and drag a HubIndexJson import back into pull.ts.
   const resolved = resolveThreads(indexes);
 
-  return { kind: "proceed", value: { local, hub, hubPeerId, resolved }, reasons };
+  return {
+    kind: "proceed",
+    value: { local, hub, hubPeerId, previousHubIds: pre.previousHubIds, resolved },
+    reasons,
+  };
 }

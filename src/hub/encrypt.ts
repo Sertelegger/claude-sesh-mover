@@ -45,14 +45,15 @@ import { createFsBackend } from "./backend.js";
 import { collectHubRecipients, resolveHubEncryption } from "./encryption.js";
 import { registerMachine } from "./init.js";
 import { listMachineIds, readMachineRecord } from "./machines.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { errorMessage } from "../errors.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import { compareVersions } from "../version-adapters.js";
 import { readConfigOverrides, writeConfigOverrides, setConfigOverride } from "../config.js";
 import { projectSeshMoverDir, userSeshMoverDir } from "../paths.js";
 import type {
-  ErrorResult, HubEncryptRefusedResult, HubEncryptResult, HubUnreachableResult,
+  ErrorResult, HubEncryptRefusedResult, HubEncryptResult, HubIdentityChangedResult,
+  HubUnreachableResult,
 } from "../types.js";
 
 /**
@@ -166,7 +167,9 @@ export interface HubEncryptOptions {
 
 export async function hubEncrypt(
   opts: HubEncryptOptions
-): Promise<HubEncryptResult | HubEncryptRefusedResult | HubUnreachableResult | ErrorResult> {
+): Promise<
+  HubEncryptResult | HubEncryptRefusedResult | HubUnreachableResult | HubIdentityChangedResult | ErrorResult
+> {
   const backend = createFsBackend(opts.hubPath);
 
   // The same reachability probe push, pull and reindex take, and the same plain
@@ -176,7 +179,7 @@ export async function hubEncrypt(
   // (`writeAtomic` mkdir -p's a phantom hub into an unmounted mount point) and
   // this verb writes the same way.
   const probe = await probeHubReachable(opts.hubPath, backend);
-  if (probe.state !== "ok") return hubUnreachableRefusal("hub-encrypt", probe.state);
+  if (probe.state !== "ok") return hubProbeRefusal("hub-encrypt", probe);
 
   // The probe's own parse, reused: it is `JSON.parse`'s result cast to
   // `HubJson`, so at runtime it still carries every field a newer plugin wrote.

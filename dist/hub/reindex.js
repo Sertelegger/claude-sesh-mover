@@ -6,7 +6,7 @@ import { bundleDir } from "./layout.js";
 import { fetchBundleArchive } from "./bundle-io.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { readLocalProjectId } from "./identity.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { registerMachine } from "./init.js";
 import { buildIndexFile, readMachineIndex, writeMachineIndex, } from "./index-file.js";
 import { errorMessage } from "../errors.js";
@@ -96,7 +96,7 @@ export async function hubReindex(opts) {
     // half — that call writes.
     const probe = await probeHubReachable(opts.hubPath, createFsBackend(opts.hubPath));
     if (probe.state !== "ok") {
-        return hubUnreachableRefusal("hub-reindex", probe.state);
+        return hubProbeRefusal("hub-reindex", probe);
     }
     // Reindex only ever (re)writes THIS machine's own index file, but a
     // concurrent push (or another reindex) could be rebuilding/writing that

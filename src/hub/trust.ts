@@ -14,8 +14,17 @@
  * This verb is the answer to that residue: print a fingerprint, let a human
  * compare it against the same fingerprint shown on the other machine, and
  * record the result as `confirmed`. That is the only step in this feature that
- * does not depend on trusting the hub, and it is why #86's "Done when" clause
- * is achievable at all.
+ * does not take the hub's word for a KEY, and it is why #86's "Done when"
+ * clause is achievable at all.
+ *
+ * It does still rest on one earlier trust, and saying so is the difference
+ * between this sentence and the one it replaces: a pin — confirmed or not — is
+ * kept under the hub identity this machine JOINED, and that identity came from
+ * the hub's own `hub.json` once, at `hub init` or at the upgrade-time seed
+ * (`joined-hubs.ts`). What keeps that from being a standing trust is that a
+ * later change to it refuses every hub verb, this one included, before any pin
+ * is read; until this machine remembered the id, one rewritten field of
+ * `hub.json` made every confirmed pin invisible.
  *
  * **It is optional by owner ruling**, because a single-owner fleet may
  * reasonably decline the ceremony — and a feature nobody runs is worse than one
@@ -46,11 +55,11 @@
 
 import { createFsBackend, type HubBackend } from "./backend.js";
 import { listMachineIds, readMachineRecord } from "./machines.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { findPin, readPins, recordPin } from "./pins.js";
 import { keyFingerprint } from "../crypto/signing-key.js";
 import { loadOrCreateMachineId } from "../machine.js";
-import type { HubUnreachableResult } from "../types.js";
+import type { HubIdentityChangedResult, HubUnreachableResult } from "../types.js";
 
 export interface TrustedMachine {
   machineId: string;
@@ -99,7 +108,8 @@ export interface HubTrustRefusedResult {
 export type HubTrustOutcome =
   | HubTrustResult
   | HubTrustRefusedResult
-  | HubUnreachableResult;
+  | HubUnreachableResult
+  | HubIdentityChangedResult;
 
 export interface HubTrustOptions {
   projectPath: string;
@@ -128,8 +138,12 @@ function sameFingerprint(a: string, b: string): boolean {
  */
 export async function hubTrust(opts: HubTrustOptions): Promise<HubTrustOutcome> {
   const backend = createFsBackend(opts.hubPath);
+  // BEFORE any pin is read: the probe refuses a `hub.json` whose identity is
+  // not the one this machine joined (`joined-hubs.ts`). Pins are keyed by hub
+  // id, so listing — or confirming — against a rewritten id would read an
+  // empty pin set and record a `confirmed` pin under the attacker's id.
   const probe = await probeHubReachable(opts.hubPath, backend);
-  if (probe.state !== "ok") return hubUnreachableRefusal("hub-trust", probe.state);
+  if (probe.state !== "ok") return hubProbeRefusal("hub-trust", probe);
 
   const warnings: string[] = [];
   // The probe already parsed `hub.json` — take its copy rather than opening a
@@ -213,7 +227,7 @@ export async function hubTrust(opts: HubTrustOptions): Promise<HubTrustOutcome> 
   const unconfirmed = machines.filter((m) => m.machineId !== me.id && m.pinned === "tofu").length;
   if (unconfirmed > 0) {
     warnings.push(
-      `${unconfirmed} machine(s) are pinned on first use but not confirmed out of band. That is the default and is not an error — it means this machine trusted the hub once for those keys. Confirming a fingerprint is the only step in signing that does not depend on trusting the hub.`
+      `${unconfirmed} machine(s) are pinned on first use but not confirmed out of band. That is the default and is not an error — it means this machine trusted the hub once for those keys. Confirming a fingerprint is the only step in signing that does not take the hub's word for a key. Like every pin, a confirmed one is kept under the hub identity this machine joined; if that identity ever changes, every hub command here refuses until you deliberately re-join.`
     );
   }
   const conflicts = machines.filter((m) => m.conflict);

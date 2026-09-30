@@ -1,4 +1,4 @@
-import type { HubLockBusyResult, HubReindexFailedResult, HubReindexResult, HubUnreachableResult } from "../types.js";
+import type { HubIdentityChangedResult, HubLockBusyResult, HubReindexFailedResult, HubReindexResult, HubUnreachableResult } from "../types.js";
 export interface HubReindexOptions {
     configDir: string;
     projectPath: string;
@@ -23,5 +23,5 @@ export interface HubReindexOptions {
      */
     unsigned?: boolean;
 }
-export declare function hubReindex(opts: HubReindexOptions): Promise<HubReindexResult | HubReindexFailedResult | HubLockBusyResult | HubUnreachableResult>;
+export declare function hubReindex(opts: HubReindexOptions): Promise<HubReindexResult | HubReindexFailedResult | HubLockBusyResult | HubUnreachableResult | HubIdentityChangedResult>;
 //# sourceMappingURL=reindex.d.ts.map

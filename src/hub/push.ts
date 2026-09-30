@@ -39,8 +39,9 @@ import {
   setPeerMemoryDigest, forgetSentToPeer,
 } from "../sync-state.js";
 import type {
-  ErrorResult, HubEncryptionRefusedResult, HubLockBusyResult, HubNoSuchProjectResult,
-  HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult, ProgressEvent,
+  ErrorResult, HubEncryptionRefusedResult, HubIdentityChangedResult, HubLockBusyResult,
+  HubNoSuchProjectResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult,
+  ProgressEvent,
 } from "../types.js";
 
 export interface HubPushOptions {
@@ -369,6 +370,7 @@ export type HubPushOutcome =
   | HubPushFailedResult
   | HubUnreachableResult
   | HubNoSuchProjectResult
+  | HubIdentityChangedResult
   | HubEncryptionRefusedResult
   | ErrorResult;
 
