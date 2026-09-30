@@ -1109,6 +1109,7 @@ describe("rewriter — 2.1.27x path fields (#127)", () => {
       targetUser: "tgtuser",
       sessionIdMap: new Map([["old-session", "new-session"]]),
       encodedProject: [encodeProjectPathForTest(src), encodeProjectPathForTest(tgt)] as const,
+      targetProjectDir: `/tgt/cfg/projects/${encodeProjectPathForTest(tgt)}`,
     };
   };
 
@@ -1352,6 +1353,10 @@ describe("rewriter — 2.1.27x path fields (#127)", () => {
     // The half-rewritten shape is the bug: target config dir, source project.
     expect(stdout).not.toContain("-home-dev-repos-proj");
     expect(stdout).toContain("-tgt-proj");
+    // …and one segment further right, the session id (#136). The two
+    // assertions above held while this still read `old-session`, a path that
+    // exists on neither machine — so the whole path is pinned, not a fragment.
+    expect(stdout).toBe("wrote /tgt/cfg/projects/-tgt-proj/new-session/tool-results/z.txt");
   });
 
   /**
@@ -1397,5 +1402,486 @@ describe("rewriter — 2.1.27x path fields (#127)", () => {
     );
     expect(out.session_id).toBe("old-session");
     expect(out.continuedInSessionId).toBe("old-session");
+  });
+});
+
+describe("rewriter — the session id inside FREE-TEXT paths (#136)", () => {
+  const SRC_CFG_PATH = "/home/dev/.claude/projects/-home-dev-repos-proj/old-session/tool-results/b5.txt";
+  const TGT_CFG_PATH = "/tgt/cfg/projects/-tgt-proj/new-session/tool-results/b5.txt";
+
+  const ctxFor = async (): Promise<import("../src/rewriter.js").RewriteContext> => {
+    const { buildPathMappings } = await import("../src/rewriter.js");
+    return {
+      mappings: buildPathMappings("linux", "linux", "/home/dev/repos/proj", "/tgt/proj", "/home/dev/.claude", "/tgt/cfg", "dev", "tgtuser"),
+      sourcePlatform: "linux",
+      targetPlatform: "linux",
+      sourceUser: "dev",
+      targetUser: "tgtuser",
+      sessionIdMap: new Map([["old-session", "new-session"]]),
+      encodedProject: ["-home-dev-repos-proj", "-tgt-proj"] as const,
+      targetProjectDir: "/tgt/cfg/projects/-tgt-proj",
+    };
+  };
+
+  /**
+   * The issue's unit repro. Claude Code saves a large tool output under the
+   * session's own `tool-results/` and replaces the tool_result TEXT with a
+   * `<persisted-output>` block quoting the path — that text is the copy the
+   * model reads. The structured `persistedOutputPath` was mapped by #127; the
+   * text came out naming the target config dir, the target encoded name and
+   * the SOURCE session id: a directory that exists on neither machine.
+   */
+  it("maps the session id in a <persisted-output> pointer, so it agrees with persistedOutputPath", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const out = rewriteEntry(
+      {
+        type: "user",
+        uuid: "u1",
+        message: {
+          role: "user",
+          content: [{
+            type: "tool_result", tool_use_id: "t1",
+            content: `<persisted-output>\nOutput too large (41.2KB). Full output saved to: ${SRC_CFG_PATH}\n\nPreview (first 2KB):\nx\n</persisted-output>`,
+          }],
+        },
+        toolUseResult: { stdout: "x", persistedOutputPath: SRC_CFG_PATH },
+      },
+      await ctxFor(),
+      "new-session"
+    );
+    const text = ((out.message as Record<string, Array<Record<string, string>>>).content)[0].content;
+    expect(text).toContain(`Full output saved to: ${TGT_CFG_PATH}\n`);
+    expect((out.toolUseResult as Record<string, string>).persistedOutputPath).toBe(TGT_CFG_PATH);
+  });
+
+  /**
+   * A bare uuid in prose is CONTENT — it says nothing about where anything is,
+   * and there is no way to tell it from any other uuid. Only a segment of a
+   * path already recognized as this import's own session directory moves.
+   */
+  it("never maps a bare session id in prose", async () => {
+    const { rewriteString } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    expect(rewriteString("resumed old-session after lunch", ctx)).toBe("resumed old-session after lunch");
+    expect(rewriteString("see /old-session/notes", ctx)).toBe("see /old-session/notes");
+  });
+
+  /**
+   * The boundary, stated so a later widening is a decision rather than drift.
+   * A session-id segment OUTSIDE `<configDir>/projects/<encoded>/` is left
+   * alone in free text: `/tmp/claude-<uid>/<encoded>/<sid>/…` names a scratchpad
+   * no bundle carries, and `<sid>.jsonl` is a transcript FILE whose segment is
+   * not the id (the whole-path pass matches exact segments too).
+   */
+  it("maps only the session-directory segment directly under the target project dir", async () => {
+    const { rewriteString } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    expect(rewriteString("ls /tmp/claude-1000/-home-dev-repos-proj/old-session/scratchpad", ctx)).toBe(
+      "ls /tmp/claude-1000/-tgt-proj/old-session/scratchpad"
+    );
+    expect(rewriteString("wc -l /home/dev/.claude/projects/-home-dev-repos-proj/old-session.jsonl", ctx)).toBe(
+      "wc -l /tgt/cfg/projects/-tgt-proj/old-session.jsonl"
+    );
+    // The directory itself, at the end of a token, is the session directory.
+    expect(rewriteString("ls /home/dev/.claude/projects/-home-dev-repos-proj/old-session", ctx)).toBe(
+      "ls /tgt/cfg/projects/-tgt-proj/new-session"
+    );
+    // An id this import is not renaming is left exactly as it was.
+    expect(rewriteString("ls /home/dev/.claude/projects/-home-dev-repos-proj/other-session/x", ctx)).toBe(
+      "ls /tgt/cfg/projects/-tgt-proj/other-session/x"
+    );
+    // The directory must START the path: this one only ends like it.
+    expect(rewriteString("ls /backup/tgt/cfg/projects/-tgt-proj/old-session/x", ctx)).toBe(
+      "ls /backup/tgt/cfg/projects/-tgt-proj/old-session/x"
+    );
+  });
+
+  /**
+   * Recognition must not depend on a mapping having fired. Importing back into
+   * the same project under the same config dir emits no mapping at all, and the
+   * id is still renamed — so a pointer that already names the right directory
+   * must still move to the new session.
+   */
+  it("maps the id when neither the config dir nor the project moved", async () => {
+    const { rewriteString, buildPathMappings } = await import("../src/rewriter.js");
+    const ctx = {
+      mappings: buildPathMappings("linux", "linux", "/home/dev/repos/proj", "/home/dev/repos/proj", "/home/dev/.claude", "/home/dev/.claude", "dev", "dev"),
+      sourcePlatform: "linux" as const,
+      targetPlatform: "linux" as const,
+      sourceUser: "dev",
+      targetUser: "dev",
+      sessionIdMap: new Map([["old-session", "new-session"]]),
+      targetProjectDir: "/home/dev/.claude/projects/-home-dev-repos-proj",
+    };
+    expect(ctx.mappings).toEqual([]);
+    expect(rewriteString(`saved to: ${SRC_CFG_PATH}`, ctx)).toBe(
+      "saved to: /home/dev/.claude/projects/-home-dev-repos-proj/new-session/tool-results/b5.txt"
+    );
+  });
+
+  /** Cross-family, the pointer is rewritten into backslashes before the id is found. */
+  it("maps the id in a cross-family pointer (linux -> win32)", async () => {
+    const { rewriteString, buildPathMappings } = await import("../src/rewriter.js");
+    const ctx = {
+      mappings: buildPathMappings("linux", "win32", "/home/dev/repos/proj", "E:\\proj", "/home/dev/.claude", "C:\\Users\\dev\\.claude", "dev", "dev"),
+      sourcePlatform: "linux" as const,
+      targetPlatform: "win32" as const,
+      sourceUser: "dev",
+      targetUser: "dev",
+      sessionIdMap: new Map([["old-session", "new-session"]]),
+      encodedProject: ["-home-dev-repos-proj", "E--proj"] as const,
+      targetProjectDir: "C:\\Users\\dev\\.claude\\projects\\E--proj",
+    };
+    expect(rewriteString(`saved to: ${SRC_CFG_PATH}`, ctx)).toBe(
+      "saved to: C:\\Users\\dev\\.claude\\projects\\E--proj\\new-session\\tool-results\\b5.txt"
+    );
+  });
+
+  /** Same rule as stage 1 (#108): a path inside a URL is left alone. */
+  it("leaves the id alone inside a URL", async () => {
+    const { rewriteString } = await import("../src/rewriter.js");
+    const url = "file:///tgt/cfg/projects/-tgt-proj/old-session/tool-results/b5.txt";
+    expect(rewriteString(url, await ctxFor())).toBe(url);
+  });
+
+  /**
+   * `rewriteString` also serves Bash `input.command`, so the new stage moves one
+   * leg of the wire triple. It must still move as one: `command` is re-derived
+   * from the rewritten input, never rewritten in place.
+   */
+  it("keeps the wire equation intact when a Bash command names the persisted output", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const cmd = `head -50 ${SRC_CFG_PATH}`;
+    const out = rewriteEntry(
+      {
+        type: "assistant",
+        uuid: "a1",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tb", name: "Bash", input: { command: cmd } }],
+        },
+        wireIngestContext: { tb: { cwd: "/home/dev/repos/proj" } },
+        wireToolInputs: { tb: { command: `cd /home/dev/repos/proj && ${cmd}` } },
+      },
+      await ctxFor()
+    );
+    const input = (out.message as Record<string, Array<Record<string, Record<string, string>>>>).content[0].input;
+    const wic = out.wireIngestContext as Record<string, Record<string, string>>;
+    const wti = out.wireToolInputs as Record<string, Record<string, string>>;
+    expect(input.command).toBe(`head -50 ${TGT_CFG_PATH}`);
+    expect(wti.tb.command).toBe(`cd ${wic.tb.cwd} && ${input.command}`);
+  });
+
+  /**
+   * Stage 3's pattern is compiled once per context and cached. The cache must
+   * answer to the directory, not only to the object: a context whose
+   * `targetProjectDir` changed after first use must not keep matching the old one.
+   */
+  it("follows a context's target project dir, not a pattern cached from an earlier one", async () => {
+    const { rewriteString } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    expect(rewriteString(`saved to: ${SRC_CFG_PATH}`, ctx)).toBe(`saved to: ${TGT_CFG_PATH}`);
+    ctx.targetProjectDir = "/elsewhere/cfg/projects/-tgt-proj";
+    expect(rewriteString(`saved to: ${SRC_CFG_PATH}`, ctx)).toBe(
+      "saved to: /tgt/cfg/projects/-tgt-proj/old-session/tool-results/b5.txt"
+    );
+    expect(rewriteString("saved to: /elsewhere/cfg/projects/-tgt-proj/old-session/x", ctx)).toBe(
+      "saved to: /elsewhere/cfg/projects/-tgt-proj/new-session/x"
+    );
+  });
+
+  it("builds the target project dir into the import context", async () => {
+    const { buildImportRewriteContext } = await import("../src/rewriter.js");
+    const { encodeProjectPath } = await import("../src/platform.js");
+    const cfg = join(tmpdir(), "cfg-136");
+    const ctx = buildImportRewriteContext(
+      { sourcePlatform: "linux", sourceProjectPath: "/home/dev/repos/proj", sourceConfigDir: "/home/dev/.claude" },
+      "/tgt/proj",
+      cfg,
+      new Map([["old-session", "new-session"]])
+    );
+    expect(ctx.targetProjectDir).toBe(join(cfg, "projects", encodeProjectPath("/tgt/proj")));
+  });
+});
+
+describe("rewriter — continuation session ids (#137)", () => {
+  /**
+   * A continuation's lines carry the SENDER's local id, which the manifest names
+   * as `continuesLocalSessionId`; the bundle's own id names only the synthetic
+   * header. Both land in the same session, so both map to it.
+   */
+  it("maps a continuation's continuesLocalSessionId to the session it lands in", async () => {
+    const { buildSessionIdMap } = await import("../src/rewriter.js");
+    const map = buildSessionIdMap([
+      [{ sessionId: "bundle-cont", continuation: { continuesLocalSessionId: "sender-local", fromEntryIndex: 3, fromEntryUuid: "" } }, "landing"],
+    ]);
+    expect(map.get("bundle-cont")).toBe("landing");
+    expect(map.get("sender-local")).toBe("landing");
+  });
+
+  /**
+   * A bundle session's own id always wins over a continuation alias for the
+   * same string, whatever the order — "only when it is not already a key".
+   */
+  it("never lets a continuation alias override a session the bundle itself carries", async () => {
+    const { buildSessionIdMap } = await import("../src/rewriter.js");
+    const cont = { sessionId: "c1", continuation: { continuesLocalSessionId: "s1", fromEntryIndex: 1, fromEntryUuid: "" } };
+    const full = { sessionId: "s1" };
+    for (const order of [[[cont, "new-c1"], [full, "new-s1"]], [[full, "new-s1"], [cont, "new-c1"]]] as const) {
+      const map = buildSessionIdMap(order);
+      expect(map.get("s1")).toBe("new-s1");
+      expect(map.get("c1")).toBe("new-c1");
+    }
+  });
+});
+
+describe("rewriter — location fields that survived a move (#135)", () => {
+  const ctxFor = async (): Promise<import("../src/rewriter.js").RewriteContext> => {
+    const { buildPathMappings } = await import("../src/rewriter.js");
+    return {
+      mappings: buildPathMappings("linux", "linux", "/home/dev/repos/proj", "/tgt/proj", "/home/dev/.claude", "/tgt/cfg", "dev", "tgtuser"),
+      sourcePlatform: "linux",
+      targetPlatform: "linux",
+      sourceUser: "dev",
+      targetUser: "tgtuser",
+      sessionIdMap: new Map([["old-session", "new-session"]]),
+      encodedProject: ["-home-dev-repos-proj", "-tgt-proj"] as const,
+      targetProjectDir: "/tgt/cfg/projects/-tgt-proj",
+    };
+  };
+  const SCRATCH = "/tmp/claude-1000/-home-dev-repos-proj/old-session/scratchpad";
+  const SCRATCH_TGT = "/tmp/claude-1000/-tgt-proj/new-session/scratchpad";
+
+  /**
+   * Rows 1-3. On two-thirds of tool-result entries since 2.1.278, read back by
+   * Claude Code as `priorTurnContext` for auto-mode classifier requests. Three
+   * whole paths; `git_state.root` is `null` outside a repo and stays `null`.
+   * `platform` is not a path and is left as it is.
+   */
+  it("rewrites serverClassifierContext's three paths, and leaves a null root null", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const entry = (root: string | null): Record<string, unknown> => ({
+      type: "user",
+      uuid: "u1",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+      serverClassifierContext: {
+        tool_use_ids: ["t1"],
+        context: {
+          live_cwd: "/home/dev/repos/proj/sub",
+          platform: "linux",
+          git_state: { cwd: "/home/dev/repos/proj/sub", root, branch: "main" },
+        },
+      },
+    });
+    const scc = (e: Record<string, unknown>) =>
+      (e.serverClassifierContext as Record<string, Record<string, Record<string, unknown> | string>>).context;
+    const a = scc(rewriteEntry(entry("/home/dev/repos/proj"), ctx));
+    expect(a.live_cwd).toBe("/tgt/proj/sub");
+    expect((a.git_state as Record<string, unknown>).cwd).toBe("/tgt/proj/sub");
+    expect((a.git_state as Record<string, unknown>).root).toBe("/tgt/proj");
+    expect((a.git_state as Record<string, unknown>).branch).toBe("main");
+    expect(a.platform).toBe("linux");
+    const b = scc(rewriteEntry(entry(null), ctx));
+    expect((b.git_state as Record<string, unknown>).root).toBeNull();
+  });
+
+  /**
+   * Rows 4 and 6-7: tool INPUT locations, and each has a wire copy that must
+   * move with it. `SendUserFile.files` is an ARRAY, which `rewriteToolInput`
+   * could not express before.
+   */
+  it("rewrites SendUserFile.files and Artifact.file_path/root, input and wire copy alike", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const out = rewriteEntry(
+      {
+        type: "assistant",
+        uuid: "a1",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "ts", name: "SendUserFile", input: { files: [`${SCRATCH}/report.pdf`, 7] } },
+            { type: "tool_use", id: "ta", name: "Artifact", input: { file_path: `${SCRATCH}/site/index.html`, root: `${SCRATCH}/site`, title: "/home/dev/repos/proj" } },
+          ],
+        },
+        wireToolInputs: {
+          ts: { files: [`${SCRATCH}/report.pdf`, 7] },
+          ta: { file_path: `${SCRATCH}/site/index.html`, root: `${SCRATCH}/site` },
+        },
+      },
+      await ctxFor()
+    );
+    const blocks = (out.message as Record<string, Array<Record<string, Record<string, unknown>>>>).content;
+    const wti = out.wireToolInputs as Record<string, Record<string, unknown>>;
+    expect(blocks[0].input.files).toEqual([`${SCRATCH_TGT}/report.pdf`, 7]);
+    expect(wti.ts.files).toEqual(blocks[0].input.files);
+    expect(blocks[1].input.file_path).toBe(`${SCRATCH_TGT}/site/index.html`);
+    expect(blocks[1].input.root).toBe(`${SCRATCH_TGT}/site`);
+    // Prose beside them is not a location.
+    expect(blocks[1].input.title).toBe("/home/dev/repos/proj");
+    expect(wti.ta.file_path).toBe(blocks[1].input.file_path);
+    expect(wti.ta.root).toBe(blocks[1].input.root);
+  });
+
+  /**
+   * Rows 5, 8, 13, 14. `path` is keyed on the Artifact result's SHAPE, not on
+   * its name: Claude Code's memory-store read tool also returns a top-level
+   * `path`, and that one names a document inside a store, not a place on this
+   * filesystem — the control below.
+   */
+  it("rewrites SendUserFile attachments, the Artifact path, a PDF's outputDir and TaskStop's command", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const tr = (toolUseResult: Record<string, unknown>) =>
+      rewriteEntry({ type: "user", uuid: "u", message: { role: "user", content: "x" }, toolUseResult }, ctx, "new-session")
+        .toolUseResult as Record<string, unknown>;
+
+    const send = tr({ attachments: [{ path: `${SCRATCH}/report.pdf`, size: 10 }, null] });
+    expect((send.attachments as Array<Record<string, unknown> | null>)[0]).toEqual({ path: `${SCRATCH_TGT}/report.pdf`, size: 10 });
+    expect((send.attachments as unknown[])[1]).toBeNull();
+
+    const art = tr({ url: "https://example.com/a", path: `${SCRATCH}/site/index.html`, artifact_id: "slug", title: "t" });
+    expect(art.path).toBe(`${SCRATCH_TGT}/site/index.html`);
+    // Artifact's SECOND result shape: created from a type, which carries the
+    // same `file_path`-derived `path` and no `artifact_id` (2.1.283-2.1.285).
+    const fromType = tr({
+      created_from_type: true, url: "https://example.com/b", version: "1", path: `${SCRATCH}/site/index.html`,
+      type: { url: "https://example.com/t", release: "r1" }, own_files: [], type_files: [],
+    });
+    expect(fromType.path).toBe(`${SCRATCH_TGT}/site/index.html`);
+
+    const pdf = tr({
+      type: "parts",
+      file: {
+        filePath: "/home/dev/repos/proj/doc.pdf",
+        originalSize: 1,
+        outputDir: "/home/dev/.claude/projects/-home-dev-repos-proj/old-session/tool-results/pdf-1",
+        count: 1,
+      },
+    });
+    expect((pdf.file as Record<string, unknown>).outputDir).toBe("/tgt/cfg/projects/-tgt-proj/new-session/tool-results/pdf-1");
+
+    const stop = tr({ message: "stopped", task_id: "b1", task_type: "local_bash", command: "tail -f /home/dev/repos/proj/log.txt" });
+    expect(stop.command).toBe("tail -f /tgt/proj/log.txt");
+  });
+
+  it("leaves a memory-store read's `path` alone — a store key, not a location", async () => {
+    const { rewriteEntry, buildPathMappings } = await import("../src/rewriter.js");
+    // Cross-family, where the token engine WOULD rewrite a `/tmp/…` string.
+    const ctx = {
+      mappings: buildPathMappings("linux", "win32", "/home/dev/repos/proj", "E:\\proj", "/home/dev/.claude", "C:\\Users\\dev\\.claude", "dev", "dev"),
+      sourcePlatform: "linux" as const,
+      targetPlatform: "win32" as const,
+      sourceUser: "dev",
+      targetUser: "dev",
+    };
+    const out = rewriteEntry(
+      {
+        type: "user",
+        uuid: "u",
+        message: { role: "user", content: "x" },
+        toolUseResult: { outcome: "ok", path: "/tmp/notes.md", store_kind: "personal", content: "c" },
+      },
+      ctx
+    );
+    expect((out.toolUseResult as Record<string, unknown>).path).toBe("/tmp/notes.md");
+  });
+
+  /**
+   * Rows 10-12 and 15, on `attachment` entries. `nested_memory`'s `content` is an
+   * OBJECT whose `path` is a location and whose `content` is the file's bytes —
+   * CONTENT, left verbatim; before this its sibling `attachment.path` was
+   * rewritten and `content.path` was not, so one attachment named both machines.
+   */
+  it("rewrites task_status, nested_memory and instructions locations, and leaves file bytes alone", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const ctx = await ctxFor();
+    const att = (attachment: Record<string, unknown>) =>
+      rewriteEntry({ type: "attachment", uuid: "at", attachment }, ctx, "new-session").attachment as Record<string, unknown>;
+
+    const task = att({
+      type: "task_status", taskId: "b1", taskType: "local_bash", description: "tail /home/dev/repos/proj/log",
+      status: "running", deltaSummary: null,
+      outputFilePath: "/tmp/claude-1000/-home-dev-repos-proj/old-session/tasks/b1.output",
+      shell: { command: "tail -f /home/dev/repos/proj/log.txt", kind: "bash", toolUseId: "t1" },
+    });
+    expect(task.outputFilePath).toBe("/tmp/claude-1000/-tgt-proj/new-session/tasks/b1.output");
+    expect((task.shell as Record<string, unknown>).command).toBe("tail -f /tgt/proj/log.txt");
+    expect((task.shell as Record<string, unknown>).kind).toBe("bash");
+    // `description` is prose addressed to a person.
+    expect(task.description).toBe("tail /home/dev/repos/proj/log");
+
+    const nested = att({
+      type: "nested_memory",
+      path: "/home/dev/repos/proj/CLAUDE.md",
+      content: { path: "/home/dev/repos/proj/CLAUDE.md", type: "Project", content: "cd /home/dev/repos/proj" },
+      displayPath: "CLAUDE.md",
+    });
+    expect(nested.path).toBe("/tgt/proj/CLAUDE.md");
+    expect((nested.content as Record<string, unknown>).path).toBe("/tgt/proj/CLAUDE.md");
+    expect((nested.content as Record<string, unknown>).content).toBe("cd /home/dev/repos/proj");
+
+    const instr = att({
+      type: "instructions",
+      files: [{ path: "/home/dev/repos/proj/CLAUDE.md", content: "x", type: "Project" }],
+      removed: ["/home/dev/.claude/projects/-home-dev-repos-proj/memory/old.md", 3],
+      changed: true,
+    });
+    expect(instr.removed).toEqual(["/tgt/cfg/projects/-tgt-proj/memory/old.md", 3]);
+
+    // The control for the `instructions` gate. `removed` is a generic name, the
+    // tables are an allowlist and the default is LEAVE: on any other attachment
+    // type the same array — path-shaped on purpose, so a rewrite would show —
+    // comes out byte-identical.
+    const other = { type: "deferred_tools_delta", added: [], removed: ["/home/dev/repos/proj/x"] };
+    expect(att(structuredClone(other))).toEqual(other);
+  });
+
+  /**
+   * Row 9: `frame-link`, an entry type with no uuid and no branch. Claude Code
+   * reads its `path` for the artifact's label.
+   */
+  it("rewrites a frame-link entry's path", async () => {
+    const { rewriteEntry } = await import("../src/rewriter.js");
+    const out = rewriteEntry(
+      { type: "frame-link", sessionId: "old-session", path: `${SCRATCH}/site/index.html`, frameUrl: "https://example.com/f", title: "t", artifactCount: 1 },
+      await ctxFor(),
+      "new-session"
+    );
+    expect(out.path).toBe(`${SCRATCH_TGT}/site/index.html`);
+    expect(out.frameUrl).toBe("https://example.com/f");
+  });
+
+  /**
+   * Row 16. Claude Code's loader takes `relocatedCwd ?? <head cwd>` as the
+   * session's project path and compares it against a directory, so it must come
+   * out EXACTLY as the top-level `cwd` does — the same function, not a sibling.
+   */
+  it("rewrites relocated.relocatedCwd exactly as it rewrites cwd", async () => {
+    const { rewriteEntry, buildPathMappings } = await import("../src/rewriter.js");
+    for (const ctx of [
+      await ctxFor(),
+      {
+        mappings: buildPathMappings("win32", "linux", "C:\\Users\\dev\\proj", "/home/dev/proj", "C:\\Users\\dev\\.claude", "/home/dev/.claude", "dev", "dev"),
+        sourcePlatform: "win32" as const,
+        targetPlatform: "linux" as const,
+        sourceUser: "dev",
+        targetUser: "dev",
+      },
+    ]) {
+      const dir = ctx.sourcePlatform === "win32" ? "C:\\Users\\dev\\proj\\my sub" : "/home/dev/repos/proj/my sub";
+      const moved = rewriteEntry({ type: "relocated", sessionId: "old-session", relocatedCwd: dir }, ctx, "new-session");
+      const asCwd = rewriteEntry({ type: "user", uuid: "u", cwd: dir, message: { role: "user", content: "x" } }, ctx);
+      expect(moved.relocatedCwd).toBe(asCwd.cwd);
+      expect(moved.relocatedCwd).not.toBe(dir);
+      expect(moved.sessionId).toBe("new-session");
+    }
+    // The one directory where the two whole-path functions differ: a session
+    // that moved into its own scratchpad. `cwd` keeps its interior segments,
+    // so `relocatedCwd` must too — a sibling function would diverge here only.
+    const ctx = await ctxFor();
+    const moved = rewriteEntry({ type: "relocated", sessionId: "old-session", relocatedCwd: SCRATCH }, ctx, "new-session");
+    const asCwd = rewriteEntry({ type: "user", uuid: "u", cwd: SCRATCH, message: { role: "user", content: "x" } }, ctx);
+    expect(moved.relocatedCwd).toBe(asCwd.cwd);
   });
 });

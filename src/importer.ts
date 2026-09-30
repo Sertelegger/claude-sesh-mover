@@ -24,7 +24,7 @@ import {
   isAgentTranscript,
   walkLayer,
 } from "./manifest.js";
-import { rewriteJsonlStream, buildImportRewriteContext } from "./rewriter.js";
+import { rewriteJsonlStream, buildImportRewriteContext, buildSessionIdMap } from "./rewriter.js";
 import { encodeProjectPath } from "./platform.js";
 import {
   getApplicableAdapters,
@@ -1949,11 +1949,17 @@ export async function importSession(
 
   // Step 2: Build path mappings (shared with hub/pull.ts's append path — see
   // buildImportRewriteContext for why this must not be re-derived locally)
+  //
+  // The context's map is WIDER than `sessionIdMap` and must stay a separate
+  // object: a continuation's content also answers to the sender's local id
+  // (`buildSessionIdMap`, #137), while `sessionIdMap` is the one-per-session
+  // registry the rollback below iterates — an alias in it would be a second
+  // entry for the same minted id.
   const ctx = buildImportRewriteContext(
     manifest,
     targetProjectPath,
     targetConfigDir,
-    sessionIdMap
+    buildSessionIdMap(targetSessions.map((s) => [s, sessionIdMap.get(s.sessionId)!] as const))
   );
 
   // Step 3: Verify per-session integrity (before any rewriting)

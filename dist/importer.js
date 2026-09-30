@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, readdirSync, existsSync, copyFileSync, appendF
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, layerFilePath, isAgentTranscript, walkLayer, } from "./manifest.js";
-import { rewriteJsonlStream, buildImportRewriteContext } from "./rewriter.js";
+import { rewriteJsonlStream, buildImportRewriteContext, buildSessionIdMap } from "./rewriter.js";
 import { encodeProjectPath } from "./platform.js";
 import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
 import { foreignKeyedRecord, readSyncState, writeSyncState } from "./sync-state.js";
@@ -1525,7 +1525,13 @@ export async function importSession(options) {
     }
     // Step 2: Build path mappings (shared with hub/pull.ts's append path — see
     // buildImportRewriteContext for why this must not be re-derived locally)
-    const ctx = buildImportRewriteContext(manifest, targetProjectPath, targetConfigDir, sessionIdMap);
+    //
+    // The context's map is WIDER than `sessionIdMap` and must stay a separate
+    // object: a continuation's content also answers to the sender's local id
+    // (`buildSessionIdMap`, #137), while `sessionIdMap` is the one-per-session
+    // registry the rollback below iterates — an alias in it would be a second
+    // entry for the same minted id.
+    const ctx = buildImportRewriteContext(manifest, targetProjectPath, targetConfigDir, buildSessionIdMap(targetSessions.map((s) => [s, sessionIdMap.get(s.sessionId)])));
     // Step 3: Verify per-session integrity (before any rewriting)
     const integrityFailedSessions = new Set();
     /** `<sessionId>\0<layer>` for every layer directory that failed its digest. */

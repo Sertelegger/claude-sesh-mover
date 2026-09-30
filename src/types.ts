@@ -22,7 +22,9 @@ export type JsonlEntryType =
   | "file-history-snapshot"
   | "file-history-delta"
   | "system"
-  | "progress";
+  | "progress"
+  | "relocated"
+  | "frame-link";
 
 export interface JsonlEntryBase {
   uuid: string;
@@ -59,6 +61,12 @@ export interface UserMessageEntry extends JsonlEntryBase {
    */
   toolUseResult?: Record<string, unknown> | string;
   sourceToolAssistantUUID?: string;
+  /**
+   * Since 2.1.278, on a tool-result entry: where the call ran, read back by
+   * Claude Code for auto-mode classifier requests. `rewriter.ts` translates its
+   * three paths (#135); the rest is not a location.
+   */
+  serverClassifierContext?: Record<string, unknown>;
 }
 
 export interface AssistantMessageEntry extends JsonlEntryBase {
