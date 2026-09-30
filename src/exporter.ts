@@ -10,7 +10,7 @@ import {
 import { dirname, join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { writeManifest, computeLayerDigest, layerFiles, layerFilePath } from "./manifest.js";
-import { EXPORTED_SESSION_DIR_NAMES } from "./paths.js";
+import { EXPORTED_SESSION_DIR_NAMES, MACHINE_LOCAL_MEMORY_NAMES } from "./paths.js";
 import { discoverSessions } from "./discovery.js";
 import { detectPlatform } from "./platform.js";
 import { extractSummaryFromFile } from "./summary.js";
@@ -72,8 +72,20 @@ async function computeSessionLayerDigests(
  * point of the return value is that `includedLayers` is derived from what is on
  * disk rather than from what was asked for — see `ExportManifest.includedLayers`.
  */
-function copyDirIfExists(srcDir: string, destDir: string): boolean {
+function copyDirIfExists(
+  srcDir: string,
+  destDir: string,
+  keep?: (rel: string) => boolean
+): boolean {
   if (!existsSync(srcDir)) return false;
+  // A FILTERED layer is different, and only the memory layer is one (#144): a
+  // directory holding nothing but what the filter drops held only machine-local
+  // state, which is no memory at all, so nothing lands and the layer is not
+  // declared. That covers an empty memory folder too, which used to ship as an
+  // empty `memory/` and be declared although it held nothing for an import to
+  // land. The unfiltered rule above is unchanged for the session layers.
+  const files = keep ? layerFiles(srcDir).filter(keep) : layerFiles(srcDir);
+  if (keep && files.length === 0) return false;
   mkdirSync(destDir, { recursive: true });
   // RECURSIVE, through the same `layerFiles` the digest walks (#121). Claude
   // Code writes `subagents/workflows/<wf_id>/` for any session that has run a
@@ -94,7 +106,7 @@ function copyDirIfExists(srcDir: string, destDir: string): boolean {
   // even under `dereference: true`, and `archiver.ts`'s `assertSafeEntries`
   // refuses a `SymbolicLink` tar entry — so it would trade a broken export for
   // a bundle this plugin cannot import.
-  for (const rel of layerFiles(srcDir)) {
+  for (const rel of files) {
     const dest = join(destDir, ...rel.split("/"));
     mkdirSync(dirname(dest), { recursive: true });
     copyFileSync(layerFilePath(srcDir, rel), dest);
@@ -161,6 +173,20 @@ export interface ExportOptions {
   sessionId?: string;
   /** Restrict an all-sessions export to this subset (exportAllSessions only). */
   sessionIds?: string[];
+  /**
+   * The sessions to choose from, already discovered by the caller — taken in
+   * place of this export's own `discoverSessions(configDir, projectPath)`, and
+   * then narrowed by `sessionId`/`sessionIds` exactly as a discovered list is.
+   *
+   * `migrate` passes it, because it has to know which FOLDER each session came
+   * from on both sides of the export: before it, to leave out the sessions
+   * already in the folder the import will write (#126's remedy — re-importing
+   * one there only changes its id), and after the import, to delete each moved
+   * session from the folder it was found in. Discovery reads two folders for
+   * one path, so that folder is not derivable from the path, and one discovery
+   * handed through is the only way all three steps see the same sessions.
+   */
+  discovered?: DiscoveredSession[];
   outputDir: string;
   name: string;
   excludeLayers: ExportLayer[];
@@ -193,6 +219,31 @@ export interface ExportOptions {
    * directory, and `resolvePayloadBudgets` is the one resolver.
    */
   payloadBudgets?: { workspaceMaxBytes: number; carryMaxBytes: number };
+  /**
+   * Who reads this export's per-session warnings (#124, #140), which decides
+   * their SHAPE — never whether they are made. Two of them are per session:
+   * the walk-past disclosure, and the incremental planner's reason for sending
+   * a session whole instead of as a delta.
+   *
+   * `"export"` (the default, and what `export` and `migrate` get): one warning
+   * per uncarried entry per session, worded for a bundle the user is holding
+   * and for `migrate`'s cleanup, which leaves the entry in place; and one per
+   * session the planner sends whole.
+   *
+   * `"hub"` (`hub push`): ONE warning for each of the two, however many
+   * sessions and entries — the walk-past one naming each entry and how many
+   * sessions hold it, the planner's naming each session — appended after every
+   * other warning this export produces. The SessionEnd auto-push has no channel
+   * but `hub status`'s `lastAutoPush`, which keeps only its first
+   * `MAX_AUTO_PUSH_NOTES` notes, so what an export contributes there has to be
+   * BOUNDED: a sentence per session is unbounded, and five of them were enough
+   * to cut the unsigned-push warning out of that breadcrumb. (Push also
+   * forwards them after its own warnings; the two rules together are what
+   * keep a push's own disclosures in.) The per-bundle wording also drops what
+   * does not fit a push — there is no `migrate` here, and no bundle in the
+   * user's hands to copy from.
+   */
+  warningsFor?: "export" | "hub";
   onProgress?: (ev: ProgressEvent) => void;
 }
 
@@ -267,7 +318,7 @@ export async function exportSession(
   }
 
   // Find the session
-  const sessions = discoverSessions(configDir, projectPath);
+  const sessions = options.discovered ?? discoverSessions(configDir, projectPath);
   const target = sessionId
     ? sessions.find((s) => s.sessionId === sessionId)
     : sessions[0];
@@ -290,7 +341,7 @@ export async function exportAllSessions(
 ): Promise<ExportResult | ErrorResult> {
   const { configDir, projectPath, sessionIds, outputDir, name } = options;
 
-  let sessions = discoverSessions(configDir, projectPath);
+  let sessions = options.discovered ?? discoverSessions(configDir, projectPath);
   if (sessions.length === 0) {
     return {
       success: false,
@@ -351,6 +402,40 @@ async function exportSessions(
 
   mkdirSync(join(exportPath, "sessions"), { recursive: true });
 
+  // DISCLOSE what this export is walking past (#124). Claude Code owns the
+  // session directory and adds to it on its own schedule; the layer copies join
+  // two fixed names and never enumerate it, so anything else — of any type — is
+  // invisible. Twice already: `workflows/` (Workflow run records and the
+  // scripts that produced them, now present in more sessions than
+  // `subagents/`) and `auto-mode-classifier-error.txt`. Both were found by
+  // hand-diffing a real migration, which is the expensive way.
+  //
+  // A warning rather than a carry, because carrying is a separate decision with
+  // its own disclosure consequences — anything added here travels on the
+  // default-on session-end auto-push, which is the reasoning that keeps
+  // `plans/` off the hub. Saying so costs a readdir and makes the next name
+  // announce itself instead of waiting to be missed.
+  //
+  // ONE function for both session loops (#140): the continuation loop had no
+  // listing at all, which is how the disclosure came to reach no push.
+  const uncarriedSessions = new Map<string, number>();
+  /** The planner's reasons, held for the one folded note a push gets. */
+  const sentWholeReasons: string[] = [];
+  const discloseUncarried = (sessionBase: string): void => {
+    const names = existsSync(sessionBase)
+      ? readdirSync(sessionBase)
+          .filter((name) => !EXPORTED_SESSION_DIR_NAMES.includes(name))
+          .sort()
+      : [];
+    for (const name of names) {
+      uncarriedSessions.set(name, (uncarriedSessions.get(name) ?? 0) + 1);
+      if (options.warningsFor === "hub") continue;
+      warnings.push(
+        `This session's folder also holds ${JSON.stringify(name)}, which sesh-mover does not carry — it is not in the bundle. Claude Code writes it; copy it by hand if you need it at the destination. \`migrate\` leaves it in place rather than deleting it.`
+      );
+    }
+  };
+
   const sessionManifests: SessionManifest[] = [];
 
   let toFull: DiscoveredSession[] = sessions;
@@ -371,7 +456,11 @@ async function exportSessions(
       incremental.peerSent,
       (session) => uuidsBySession.get(session.sessionId)!
     );
-    warnings.push(...plan.warnings);
+    // Per session, so a push folds them into one — see `warningsFor`. Every
+    // warning the planner gives today is a reason it sent a session whole
+    // (diff.ts), which is what the folded note says of all of them.
+    if (options.warningsFor === "hub") sentWholeReasons.push(...plan.warnings);
+    else warnings.push(...plan.warnings);
     toFull = plan.full;
     toContinuation = plan.continuation;
   }
@@ -416,26 +505,7 @@ async function exportSessions(
       sessionLayers.add("file-history");
     }
     record(session.sessionId, sessionLayers);
-
-    // DISCLOSE what this export is walking past (#124). Claude Code owns the
-    // session directory and adds to it on its own schedule; the copies above
-    // join two fixed names and never enumerate it, so anything else — of any
-    // type — is invisible. Twice already: `workflows/` (Workflow run records
-    // and the scripts that produced them, now present in more sessions than
-    // `subagents/`) and `auto-mode-classifier-error.txt`. Both were found by
-    // hand-diffing a real migration, which is the expensive way.
-    //
-    // A warning rather than a carry, because carrying is a separate decision
-    // with its own disclosure consequences — anything added here travels on the
-    // default-on session-end auto-push, which is the reasoning that keeps
-    // `plans/` off the hub. Saying so costs a readdir and makes the next name
-    // announce itself instead of waiting to be missed.
-    for (const name of existsSync(sessionBase) ? readdirSync(sessionBase, { withFileTypes: true }) : []) {
-      if (EXPORTED_SESSION_DIR_NAMES.includes(name.name)) continue;
-      warnings.push(
-        `This session's folder also holds ${JSON.stringify(name.name)}, which sesh-mover does not carry — it is not in the bundle. Claude Code writes it; copy it by hand if you need it at the destination. \`migrate\` leaves it in place rather than deleting it.`
-      );
-    }
+    discloseUncarried(sessionBase);
 
     const summary = noSummary
       ? session.slug
@@ -502,6 +572,12 @@ async function exportSessions(
       contLayers.add("file-history");
     }
     record(newSessionId, contLayers);
+    // The SAME folder the full loop lists, read from the same local session:
+    // a continuation carries this session's layers exactly as a full export
+    // does, so it walks past exactly the same entries. It used to skip the
+    // listing, and `push` is incremental by construction — so after a
+    // session's first push, no push of it ever said what stayed behind.
+    discloseUncarried(contBase);
 
     sessionManifests.push({
       sessionId: newSessionId,
@@ -578,16 +654,29 @@ async function exportSessions(
     // importer reconciles into a directory the target owns, and no bundle has
     // ever expressed "remove this file". A memory deleted here simply stops
     // being re-sent.
+    //
+    // Machine-local state is left out of all THREE — the decision digest, the
+    // copy and the recorded digest — through one predicate (#144). Leaving it
+    // out of only the copy is the failure to avoid: the source digest would
+    // then describe a set no bundle ever carries and never match the ledger
+    // again. A digest a peer recorded before this rule included the lock, so a
+    // project that has one re-sends its memory exactly once after upgrading and
+    // then matches; a project without one hashes byte-identically to before.
     const encoded = sessions[0].encodedProjectDir;
     const memoryDir = join(configDir, "projects", encoded, "memory");
-    const sourceDigest = await computeLayerDigest(memoryDir);
+    const isMemoryContent = (rel: string): boolean => !MACHINE_LOCAL_MEMORY_NAMES.includes(rel);
+    const sourceDigest = await computeLayerDigest(memoryDir, isMemoryContent);
     const peerAlreadyHasIt =
       sourceDigest !== null &&
       incremental?.peerMemoryDigest != null &&
       incremental.peerMemoryDigest === sourceDigest;
-    if (!peerAlreadyHasIt && copyDirIfExists(memoryDir, join(exportPath, "memory"))) {
+    if (
+      !peerAlreadyHasIt &&
+      copyDirIfExists(memoryDir, join(exportPath, "memory"), isMemoryContent)
+    ) {
       bundleLayers.add("memory");
-      memoryDigest = (await computeLayerDigest(join(exportPath, "memory"))) ?? undefined;
+      memoryDigest =
+        (await computeLayerDigest(join(exportPath, "memory"), isMemoryContent)) ?? undefined;
     }
   }
 
@@ -710,6 +799,29 @@ async function exportSessions(
 
   for (const layer of excludeLayers) {
     warnings.push(`${layer} excluded by user request`);
+  }
+
+  // LAST, and one note each, on a push — see `ExportOptions.warningsFor`. What
+  // did not travel comes first: it is the one a peer cannot discover for
+  // itself, where a session sent whole only costs a bigger upload.
+  if (options.warningsFor === "hub" && uncarriedSessions.size > 0) {
+    const listed = [...uncarriedSessions.keys()]
+      .sort()
+      .map((name) => {
+        const n = uncarriedSessions.get(name)!;
+        return `${JSON.stringify(name)} (${n} session${n === 1 ? "" : "s"})`;
+      })
+      .join(", ");
+    const one = uncarriedSessions.size === 1;
+    warnings.push(
+      `This push did not carry ${one ? "an entry" : `${uncarriedSessions.size} entries`} that Claude Code keeps in a session's folder: ${listed}. sesh-mover does not know how to move ${one ? "it" : "them"}, so another machine that pulls these sessions will not have ${one ? "it" : "them"}. Nothing was removed — ${one ? "it is" : "they are"} still here on this machine.`
+    );
+  }
+  if (sentWholeReasons.length > 0) {
+    const one = sentWholeReasons.length === 1;
+    warnings.push(
+      `This push sent ${one ? "a session" : `${sentWholeReasons.length} sessions`} whole rather than as a delta — a larger upload, and a new full bundle on the hub — because ${one ? "it no longer matches" : "they no longer match"} what this machine last sent there: ${sentWholeReasons.join(" ")}`
+    );
   }
 
   return {

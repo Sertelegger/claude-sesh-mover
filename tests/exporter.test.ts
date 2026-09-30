@@ -609,6 +609,78 @@ describe("exporter", () => {
       );
     });
 
+    /**
+     * #144 — `memory/.consolidate-lock` is Claude Code's machine-local
+     * consolidation lock, not a memory: its MTIME is what Claude Code reads as
+     * "memory was last consolidated at", so a copy landing on another machine
+     * with a fresh mtime defers that machine's consolidation as if it had just
+     * run, and a conflicting one got parked and indexed in MEMORY.md.
+     */
+    describe("the consolidation lock is machine-local state (#144)", () => {
+      const srcMemory = () => join(configDir, "projects", ENCODED, "memory");
+      const LOCK = ".consolidate-lock";
+
+      it("is not copied into the bundle, and the digest is taken without it", async () => {
+        const { readManifest, computeLayerDigest } = await import("../src/manifest.js");
+        writeFileSync(join(srcMemory(), LOCK), "4242");
+        const result = await incrementalExport("inc-memory-lock");
+
+        expect(existsSync(join(result.exportPath, "memory", LOCK))).toBe(false);
+        // The rest of the layer still travels.
+        expect(existsSync(join(result.exportPath, "memory", "test_memory.md"))).toBe(true);
+        const manifest = readManifest(result.exportPath);
+        expect(manifest.includedLayers).toContain("memory");
+        expect(manifest.memoryDigest).toBe(
+          await computeLayerDigest(join(result.exportPath, "memory"))
+        );
+      });
+
+      it("a lock whose PID changed does not re-ship an unchanged memory layer", async () => {
+        const { readManifest } = await import("../src/manifest.js");
+        writeFileSync(join(srcMemory(), LOCK), "4242");
+        const first = await incrementalExport("inc-memory-lock-a");
+        const digest = readManifest(first.exportPath).memoryDigest!;
+
+        // Another process consolidated: new PID, new mtime, same memories.
+        writeFileSync(join(srcMemory(), LOCK), "9999");
+        const second = await incrementalExport("inc-memory-lock-b", digest);
+        expect(existsSync(join(second.exportPath, "memory"))).toBe(false);
+        expect(readManifest(second.exportPath).includedLayers).not.toContain("memory");
+      });
+
+      it("a digest recorded with the lock inside re-ships once, then settles", async () => {
+        // What 0.12.0 and earlier recorded for a project holding a lock: the
+        // digest of a copy that CONTAINED it. The exporter now decides on a
+        // lock-free digest, so that one record can never match again — which
+        // must cost exactly one re-send and then converge, never re-ship
+        // forever.
+        const { readManifest, computeLayerDigest } = await import("../src/manifest.js");
+        writeFileSync(join(srcMemory(), LOCK), "4242");
+        const legacyDigest = (await computeLayerDigest(srcMemory()))!;
+
+        const once = await incrementalExport("inc-memory-lock-legacy-a", legacyDigest);
+        expect(readManifest(once.exportPath).includedLayers).toContain("memory");
+        const settled = readManifest(once.exportPath).memoryDigest!;
+        expect(settled).not.toBe(legacyDigest);
+
+        const again = await incrementalExport("inc-memory-lock-legacy-b", settled);
+        expect(readManifest(again.exportPath).includedLayers).not.toContain("memory");
+      });
+
+      it("a memory folder holding only the lock declares no memory layer", async () => {
+        const { readManifest } = await import("../src/manifest.js");
+        for (const name of readdirSync(srcMemory())) rmSync(join(srcMemory(), name));
+        writeFileSync(join(srcMemory(), LOCK), "4242");
+        const result = await incrementalExport("inc-memory-lock-only");
+
+        expect(existsSync(join(result.exportPath, "memory"))).toBe(false);
+        const manifest = readManifest(result.exportPath);
+        expect(manifest.includedLayers).not.toContain("memory");
+        expect(manifest.includedLayers).toEqual(layersOnDisk(result.exportPath));
+        expect(manifest.memoryDigest).toBeUndefined();
+      });
+    });
+
     it("plans stay off the incremental path, and the manifest says so", async () => {
       const { readManifest } = await import("../src/manifest.js");
       const result = await incrementalExport("inc-plans");

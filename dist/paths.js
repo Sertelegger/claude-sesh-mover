@@ -115,6 +115,30 @@ export function ignoreFilePath(projectPath) {
  * safe against the next name without anyone having to learn it first.
  */
 export const EXPORTED_SESSION_DIR_NAMES = ["subagents", "tool-results"];
+/**
+ * Entries of `<configDir>/projects/<encoded>/memory/` that are MACHINE-LOCAL
+ * STATE rather than memories, and so never travel with the memory layer (#144).
+ *
+ * Claude Code's names again, kept here for the same one-copy reason as the list
+ * above: the exporter's copy, the exporter's `memoryDigest` and the importer's
+ * reconciliation must agree on it, and a second spelling is how the digest ends
+ * up describing a set the copy did not ship — which never matches again, so the
+ * layer re-sends on every push.
+ *
+ * `.consolidate-lock` is automatic memory consolidation's lock. It holds the
+ * PID of the last process to take it, and its MTIME is what Claude Code reads
+ * as "memory was last consolidated at" — so a copy, which lands with a fresh
+ * mtime, defers the target machine's consolidation as if it had just run, and
+ * a copy meeting the target's own lock was parked and indexed in `MEMORY.md`
+ * like a conflicting memory. Its content changes whenever a different process
+ * consolidates, which alone changed `memoryDigest` and re-shipped the layer.
+ *
+ * A closed list of names, NOT "every dot-name". A census of 17 real memory
+ * directories found no other dot-named entry, and an unknown name is content
+ * someone put there: dropping it silently is a carry decision with nothing to
+ * disclose it. Add a name here only once what it IS is known.
+ */
+export const MACHINE_LOCAL_MEMORY_NAMES = [".consolidate-lock"];
 /** `<projectPath>/.sesh-mover-project.json`. */
 export function projectJsonFilePath(projectPath) {
     return join(projectPath, PROJECT_JSON_FILE_NAME);

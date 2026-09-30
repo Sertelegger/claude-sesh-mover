@@ -355,7 +355,15 @@ export function isAgentTranscript(relOrName) {
 export function layerFilePath(dir, rel) {
     return join(dir, ...rel.split("/"));
 }
-export async function computeLayerDigest(dir) {
+/**
+ * `keep`, when given, drops entries from the SAME walk before hashing — it is
+ * never a second enumeration. It exists for the memory layer, whose copy leaves
+ * out machine-local state (`MACHINE_LOCAL_MEMORY_NAMES`, #144): a digest over a
+ * set the copy did not ship can never match what a peer recorded from the
+ * bundle, so the layer would re-send forever. The exporter passes the one
+ * predicate to both the copy and the digest for that reason.
+ */
+export async function computeLayerDigest(dir, keep) {
     if (!existsSync(dir))
         return null;
     let names;
@@ -365,6 +373,8 @@ export async function computeLayerDigest(dir) {
     catch {
         return null;
     }
+    if (keep)
+        names = names.filter(keep);
     // Explicit comparator: UTF-16 code-unit order, identical on every platform,
     // never the host locale's collation (which `sort()` does not use, but which
     // a future "readable" comparator would).
