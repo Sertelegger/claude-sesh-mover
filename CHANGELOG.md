@@ -347,6 +347,12 @@ project ([#162]); and `hub reindex --unsigned`, which settles [#122].
 
 ### Known limitations
 
+- **Claude Code 2.1.288 to 2.1.290 could lose a session's last messages when
+  quitting.** Its own 2.1.291 notes: "Fixed a regression in 2.1.288 where the
+  last messages of a session could be lost when quitting". sesh-mover moves
+  what is on disk, so a session exported or pushed from those builds, the
+  session-end auto-push included, carries the same gap. Use 2.1.291 or later.
+  Everything this release depends on was re-checked against 2.1.291.
 - **The hub identity is trusted once.** The first join at a hub path, or the
   first contact at a path this machine has no record for (every path after
   upgrading, and one set with `configure --set hub.path` rather than
