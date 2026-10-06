@@ -212,15 +212,25 @@ export type BundleEncryptionPlan = {
  * It exists because the three have different remedies and only ONE of them
  * takes `--force-unkeyed`, so a caller has to tell them apart — and the obvious
  * way to do that, checking whether `unkeyedMachines` is empty, is wrong for two
- * of the three: the census is reported WHOLE, so `self-unkeyed` carries this
+ * of the three: the census is reported WHOLE, so `self-unkeyed` may carry this
  * machine's own entry and `no-recipients` carries every machine on the hub.
  * Branching on the message text is banned everywhere else in this codebase for
  * the same reason it would be wrong here.
  *
  * - `unkeyed-machines` — machines OTHER than this one publish no usable key.
  *   The only one `--force-unkeyed` applies to.
- * - `self-unkeyed` — the pushing machine publishes no usable key of its own.
- *   Not overridable; the remedy is local (`~/.sesh-mover/identity.age`).
+ * - `self-unkeyed` — a bundle addressed from this census could not be read back
+ *   by this machine. Not overridable, and it has TWO causes whose remedies share
+ *   nothing: this machine has no readable key of its own (remedy:
+ *   `~/.sesh-mover/identity.age`, restored before it is ever replaced), or the
+ *   hub's record for this machine does not read back with the key it holds even
+ *   though the refusing command re-published that record as its first step
+ *   (remedy: the `machines/<id>.json` the suggestion names — a synced hub still
+ *   catching up, or a sync conflict; the key is fine and must not be touched).
+ *   No structured field distinguishes the two causes: each arm's `suggestion`
+ *   names its remedy for a human to read, and that is all it is for. A caller
+ *   that needs to act differently on them needs a new discriminator here, not a
+ *   match on `error` or `suggestion`.
  * - `no-recipients` — nobody on the hub publishes a usable key, so there is
  *   nothing to encrypt to. Not overridable: a bundle encrypted to an empty
  *   recipient list is readable by nobody, which is worse than the plaintext
@@ -296,6 +306,15 @@ export declare function checkSelfIsRecipient(input: {
      * The `age1…` recipient this machine can derive from its own identity file
      * RIGHT NOW, or `null` when that file is absent or unreadable. Deliberately
      * not read from the census; see above.
+     *
+     * **Precondition, which the refusal text relies on:** the caller has already
+     * run `registerMachine` in this operation, so the hub was just told this
+     * machine publishes exactly this recipient. Both callers (`hub push` and
+     * `hub rekey`) do, before the census is read — that ordering is what lets
+     * the `no-recipients` and record-mismatch `self-unkeyed` suggestions say the
+     * record "has not read back" instead of asking the user to re-register. A
+     * caller that skips the registration gets a suggestion describing a write
+     * it never made.
      */
     thisMachineRecipient: string | null;
 }): SelfRecipientCheck;
@@ -355,7 +374,9 @@ export declare function planBundleEncryption(input: {
      *
      * Deliberately not read from the census: see `checkSelfIsRecipient` for why
      * the roster's answer to this question can be stale in both directions, and
-     * why a stale answer is silent and permanent.
+     * why a stale answer is silent and permanent. Same precondition as there:
+     * `registerMachine` has already run in this operation, or two of the
+     * refusals describe a registration that never happened.
      */
     thisMachineRecipient: string | null;
     forceUnkeyed: boolean;

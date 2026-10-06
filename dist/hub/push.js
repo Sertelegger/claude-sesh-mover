@@ -502,6 +502,10 @@ export async function hubPush(opts) {
                     // rest of `state.peers[hubPeerId]`.
                     peerMemoryDigest: state.peers[hubPeerId]?.memoryDigest ?? null,
                 },
+                // At most one note per kind, forwarded after every warning of push's
+                // own at the bottom — the auto-push breadcrumb keeps only its first
+                // few notes (#140).
+                warningsFor: "hub",
                 onProgress: opts.onProgress,
             });
             if (!exportResult.success) {
@@ -551,7 +555,12 @@ export async function hubPush(opts) {
                     bundleId: null, pushedSessions: [], upToDate: true, hasWorkspace: false,
                     // Nothing was uploaded, so nothing was encrypted. The hub's policy is
                     // reported by `hub encrypt`, not inferred from a no-op push.
-                    bundleEncrypted: false, warnings,
+                    // The export's own warnings too (#140), though none can reach here
+                    // today: the planner only explains a session it sends WHOLE, and the
+                    // walk-past disclosure only lists a session it sends at all, so an
+                    // export that sends nothing says nothing. Forwarded anyway, so a
+                    // warning the exporter learns to give later is not dropped here.
+                    bundleEncrypted: false, warnings: [...warnings, ...exportResult.warnings],
                     // Unreachable under `--full` in practice — a forgotten ledger makes
                     // every discovered session a full one, and a project with no sessions
                     // at all fails in the exporter above. Reported anyway so the field's
@@ -946,6 +955,26 @@ export async function hubPush(opts) {
             // file exists. Computed by `capturePayload` — same rule, both transports —
             // and reported here.
             const ignoredNotCarried = payload.ignoredNotCarried;
+            // The EXPORT's warnings (#140), which push used to read nothing of but
+            // `success` and `exportPath`: the planner's reason for sending sessions
+            // whole rather than as deltas (a bigger upload, and a new full bundle,
+            // that nothing explained), and #124's disclosure of what a session's
+            // folder holds that no bundle carries — the push is where that omission
+            // actually crosses to another machine.
+            //
+            // LAST, after every warning push itself produced, and that order is the
+            // point. The SessionEnd auto-push's only channel is `hub status`'s
+            // `lastAutoPush`, which keeps the first `MAX_AUTO_PUSH_NOTES` notes, and
+            // push's own include the two sentences the docs send a user to that
+            // breadcrumb for: the gitignored-but-tracked carry disclosure
+            // (`commands/push.md`) and the UNSIGNED-push warning above, which is the
+            // only local trace of what a peer will report as a signature downgrade
+            // (`skills/session-porter/SKILL.md`). Forwarded straight after the
+            // payload's, five sessions sent whole were five notes ahead of the
+            // signing step and cut that warning out. The exporter also folds each
+            // kind into ONE note for a push (`ExportOptions.warningsFor`), so what it
+            // adds here is bounded as well as last.
+            warnings.push(...exportResult.warnings);
             return {
                 success: true, command: "push", projectId: local.projectId,
                 bundleId, pushedSessions, upToDate: false, hasWorkspace,

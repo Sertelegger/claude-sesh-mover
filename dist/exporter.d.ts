@@ -1,4 +1,4 @@
-import type { ExportLayer, ExportResult, ExportPayloadPlanResult, ErrorResult, SyncStateSessionSent, ProgressEvent } from "./types.js";
+import type { ExportLayer, ExportResult, ExportPayloadPlanResult, ErrorResult, DiscoveredSession, SyncStateSessionSent, ProgressEvent } from "./types.js";
 export interface IncrementalExportOptions {
     sourceMachineId: string;
     sourceMachineName: string;
@@ -24,6 +24,20 @@ export interface ExportOptions {
     sessionId?: string;
     /** Restrict an all-sessions export to this subset (exportAllSessions only). */
     sessionIds?: string[];
+    /**
+     * The sessions to choose from, already discovered by the caller — taken in
+     * place of this export's own `discoverSessions(configDir, projectPath)`, and
+     * then narrowed by `sessionId`/`sessionIds` exactly as a discovered list is.
+     *
+     * `migrate` passes it, because it has to know which FOLDER each session came
+     * from on both sides of the export: before it, to leave out the sessions
+     * already in the folder the import will write (#126's remedy — re-importing
+     * one there only changes its id), and after the import, to delete each moved
+     * session from the folder it was found in. Discovery reads two folders for
+     * one path, so that folder is not derivable from the path, and one discovery
+     * handed through is the only way all three steps see the same sessions.
+     */
+    discovered?: DiscoveredSession[];
     outputDir: string;
     name: string;
     excludeLayers: ExportLayer[];
@@ -59,6 +73,31 @@ export interface ExportOptions {
         workspaceMaxBytes: number;
         carryMaxBytes: number;
     };
+    /**
+     * Who reads this export's per-session warnings (#124, #140), which decides
+     * their SHAPE — never whether they are made. Two of them are per session:
+     * the walk-past disclosure, and the incremental planner's reason for sending
+     * a session whole instead of as a delta.
+     *
+     * `"export"` (the default, and what `export` and `migrate` get): one warning
+     * per uncarried entry per session, worded for a bundle the user is holding
+     * and for `migrate`'s cleanup, which leaves the entry in place; and one per
+     * session the planner sends whole.
+     *
+     * `"hub"` (`hub push`): ONE warning for each of the two, however many
+     * sessions and entries — the walk-past one naming each entry and how many
+     * sessions hold it, the planner's naming each session — appended after every
+     * other warning this export produces. The SessionEnd auto-push has no channel
+     * but `hub status`'s `lastAutoPush`, which keeps only its first
+     * `MAX_AUTO_PUSH_NOTES` notes, so what an export contributes there has to be
+     * BOUNDED: a sentence per session is unbounded, and five of them were enough
+     * to cut the unsigned-push warning out of that breadcrumb. (Push also
+     * forwards them after its own warnings; the two rules together are what
+     * keep a push's own disclosures in.) The per-bundle wording also drops what
+     * does not fit a push — there is no `migrate` here, and no bundle in the
+     * user's hands to copy from.
+     */
+    warningsFor?: "export" | "hub";
     onProgress?: (ev: ProgressEvent) => void;
 }
 /**

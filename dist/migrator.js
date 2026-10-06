@@ -1,14 +1,37 @@
 import { rmSync, existsSync, readdirSync, mkdtempSync, renameSync, } from "node:fs";
 import { join, dirname, relative, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
+import { discoverSessions } from "./discovery.js";
 import { exportSession, exportAllSessions } from "./exporter.js";
 import { importSession } from "./importer.js";
-import { encodeProjectPath } from "./platform.js";
+import { encodeProjectPath, physicalProjectPath } from "./platform.js";
 import { errorMessage } from "./errors.js";
 import { EXPORTED_SESSION_DIR_NAMES } from "./paths.js";
 function isWithin(child, parent) {
     const rel = relative(parent, child);
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+/**
+ * A session folder, spelled so that two spellings of ONE directory compare
+ * equal — the test behind "is this the folder the import will write".
+ *
+ * The config dir physically: the CLI resolves neither config dir, and a folder
+ * under either spelling (a trailing separator, a symlink) is one place on disk.
+ *
+ * Case-folded on darwin and win32, and only there: on those platforms two
+ * names differing only in letter case are one directory, so a target typed
+ * `/Users/me/Proj` over a source `/Users/me/proj` writes into the folder the
+ * source's sessions are in — while on Linux they are two directories and the
+ * move is real. Keyed on the platform rather than probed on the volume: a
+ * case-SENSITIVE macOS volume makes two distinct folders compare equal here,
+ * which errs toward leaving a session in place (or refusing), never toward
+ * re-minting or deleting one.
+ */
+function folderIdentity(configDir, encoded) {
+    const folder = join(physicalProjectPath(configDir), "projects", encoded);
+    return process.platform === "darwin" || process.platform === "win32"
+        ? folder.toLowerCase()
+        : folder;
 }
 /**
  * Single source of truth for the `--rename-dir` preconditions, shared by the
@@ -90,6 +113,65 @@ export async function migrateSession(options) {
             suggestion: "Pass --session-id <id> to move one session, or --scope all to intentionally move every session for this project.",
         };
     }
+    // WHICH sessions move (#126, #149). Discovery reads up to two folders for
+    // one source path — `encodeProjectPath(source)`, where Claude Code files it,
+    // and `legacyEncodeProjectPath(source)`, where a pre-0.12.0 import misfiled
+    // sessions for any path with a `.`, a `_` or a space — while the import
+    // writes exactly one: `encodeProjectPath(target)` in the target config dir.
+    //
+    // A session found IN that write folder is already where the import would
+    // put it, so it stays, under its own id. Moving it would not be a no-op: the
+    // import mints a new id for every session and cleanup deletes the original,
+    // so `claude --resume <oldId>` and the hub's `threadByLocalSession` would
+    // both lose it under a result that says success. Every other session moves —
+    // which is what makes `migrate R -> R` the remedy 0.12.0 promised for #126:
+    // it leaves R's own sessions alone and brings the legacy folder's into place.
+    // Only when nothing is left to move is the migrate refused, on a dry run too.
+    //
+    // Decided on FOLDERS, never on paths, because the folder is what the import
+    // writes: a target through a symlink to the source (the CLI resolves it), a
+    // link whose own path encodes the same as its target's, two directories whose
+    // names differ only in punctuation (`/a/b-c`, `/a/b.c`) — each writes a
+    // folder the source's sessions may already be in, and none of them may
+    // re-mint one there. The source is taken as typed, because discovery reads
+    // exactly the folders its spelling names; that is how sessions a pre-#149
+    // import filed under a symlinked or trailing-separator spelling are moved to
+    // the physical path.
+    //
+    // ONE discovery, handed to the export (`ExportOptions.discovered`), so the
+    // skip, the export and the cleanup all see the same sessions — and cleanup
+    // deletes each moved one from the folder it was FOUND in, which is not
+    // derivable from the path when there are two.
+    const discovered = discoverSessions(sourceConfigDir, sourceProjectPath);
+    const writeFolder = folderIdentity(targetConfigDir, encodeProjectPath(targetProjectPath));
+    const isInPlace = (s) => folderIdentity(sourceConfigDir, s.encodedProjectDir) === writeFolder;
+    const inScope = (s) => scope !== "current" || s.sessionId === sessionId;
+    const staying = discovered.filter(isInPlace);
+    const movable = discovered.filter((s) => !isInPlace(s));
+    const stayingInScope = staying.filter(inScope);
+    if (stayingInScope.length > 0 && !movable.some(inScope)) {
+        const folder = join(sourceConfigDir, "projects", stayingInScope[0].encodedProjectDir);
+        const n = stayingInScope.length;
+        const what = scope === "current"
+            ? `session ${sessionId} is`
+            : n === 1
+                ? "the one session found for the source is"
+                : `all ${n} sessions found for the source are`;
+        return {
+            success: false,
+            command: "migrate",
+            error: `Nothing to move: ${what} already in ${JSON.stringify(folder)}, which is the folder this migrate would write the target's sessions to: the source (${JSON.stringify(sourceProjectPath)}) and the target (${JSON.stringify(targetProjectPath)}) name the same one. Migrating ${n === 1 ? "it anyway would re-import it" : "them anyway would re-import each one"} into that same folder under a NEW session id and delete the original, so \`claude --resume <id>\` and the hub's record of each session's thread would both stop finding ${n === 1 ? "it" : "them"}.`,
+            suggestion: "Nothing was written or deleted. To move these sessions to another project directory, give that directory as --target-project-path; to move them to another config dir, give it as --target-config-dir.",
+        };
+    }
+    // Said on the dry run and the real run alike: the preview must not list
+    // fewer sessions than the source holds without saying why.
+    const inPlaceWarnings = [];
+    if (stayingInScope.length > 0) {
+        const n = stayingInScope.length;
+        const folder = join(sourceConfigDir, "projects", stayingInScope[0].encodedProjectDir);
+        inPlaceWarnings.push(`${n === 1 ? "Session" : `${n} sessions:`} ${stayingInScope.map((s) => s.sessionId).join(", ")} ${n === 1 ? "is" : "are"} already in ${JSON.stringify(folder)}, the folder this migrate writes the target's sessions to, so ${n === 1 ? "it is" : "they are"} left where ${n === 1 ? "it is" : "they are"}, under ${n === 1 ? "its" : "their"} own id${n === 1 ? "" : "s"} — moving ${n === 1 ? "it" : "them"} there would only re-import ${n === 1 ? "it" : "them"} under a new id and delete the original. Only the sessions found in another folder are moved.`);
+    }
     // Create temp directory for the intermediate export
     const tempExportDir = mkdtempSync(join(tmpdir(), "sesh-mover-migrate-"));
     try {
@@ -101,6 +183,9 @@ export async function migrateSession(options) {
             name: "migrate-temp",
             excludeLayers,
             claudeVersion,
+            // Every session found outside the write folder — the in-place ones are
+            // not the export's to see. `sessionId` still narrows it for --scope current.
+            discovered: movable,
             onProgress,
         };
         const exportResult = scope === "current" && sessionId
@@ -154,6 +239,7 @@ export async function migrateSession(options) {
                 planConflicts: dryResult.planConflicts,
                 warnings: [
                     ...selfMigrationWarnings,
+                    ...inPlaceWarnings,
                     // The export runs for real even on a dry run (into a temp staging
                     // dir), so its warnings are already true of what the real migrate
                     // would carry — including the `--exclude` disclosure the apply path
@@ -172,47 +258,64 @@ export async function migrateSession(options) {
         const movedIds = new Set(imported.importedSessions.map((s) => s.originalId));
         for (const s of imported.skippedSessions ?? [])
             movedIds.add(s.originalId);
-        const sourceEncoded = encodeProjectPath(sourceProjectPath);
-        const sourceProjectDir = join(sourceConfigDir, "projects", sourceEncoded);
+        // From the folder each one was FOUND in, never `encodeProjectPath(source)`:
+        // a session moved out of the legacy folder is not in that one, and deleting
+        // there left the moved session behind as a duplicate (and could reach a
+        // same-id copy that was never moved). The export saw exactly `movable`, so
+        // every moved id is in this map.
+        const foundIn = new Map();
+        for (const s of movable) {
+            const folders = foundIn.get(s.sessionId) ?? new Set();
+            folders.add(s.encodedProjectDir);
+            foundIn.set(s.sessionId, folders);
+        }
+        // `file-history/<id>` is keyed by id ALONE, so a session left in place that
+        // shares an id with a moved copy (only a hand copy makes one: every import
+        // mints a new id) shares its file-history too, and keeps it.
+        const stayingIds = new Set(staying.map((s) => s.sessionId));
         let cleanedUp = false;
         // What the cleanup KEPT because no bundle carried it, collected across every
         // moved session so the warning names them once rather than per session.
         const keptUncarried = new Set();
         for (const movedId of movedIds) {
-            const jsonlPath = join(sourceProjectDir, `${movedId}.jsonl`);
-            if (existsSync(jsonlPath))
-                rmSync(jsonlPath);
-            const sessionSubDir = join(sourceProjectDir, movedId);
-            if (existsSync(sessionSubDir)) {
-                // **Delete only what the export carried** (#124). This used to be a
-                // flat `rmSync(sessionSubDir, { recursive: true })`, which deleted the
-                // whole session directory — including anything Claude Code had written
-                // there that no version of this plugin knows how to export. That is
-                // migrate's own documented hazard (`--exclude` drops a layer from the
-                // bundle while cleanup still deletes the source) applied to a name
-                // nobody registered as a layer, and it has already cost two: a
-                // session's `workflows/` run records and scripts, and
-                // `auto-mode-classifier-error.txt`. Both were found by hand-diffing a
-                // real migration, not by this code noticing.
-                //
-                // So the direction is inverted: remove the carried names, leave
-                // everything else where it is, and report it. A user who wants the rest
-                // gone can delete a directory; nobody can recover one migrate removed.
-                for (const name of readdirSync(sessionSubDir)) {
-                    if (EXPORTED_SESSION_DIR_NAMES.includes(name)) {
-                        rmSync(join(sessionSubDir, name), { recursive: true, force: true });
+            for (const encodedDir of foundIn.get(movedId) ?? []) {
+                const sourceProjectDir = join(sourceConfigDir, "projects", encodedDir);
+                const jsonlPath = join(sourceProjectDir, `${movedId}.jsonl`);
+                if (existsSync(jsonlPath))
+                    rmSync(jsonlPath);
+                const sessionSubDir = join(sourceProjectDir, movedId);
+                if (existsSync(sessionSubDir)) {
+                    // **Delete only what the export carried** (#124). This used to be a
+                    // flat `rmSync(sessionSubDir, { recursive: true })`, which deleted the
+                    // whole session directory — including anything Claude Code had written
+                    // there that no version of this plugin knows how to export. That is
+                    // migrate's own documented hazard (`--exclude` drops a layer from the
+                    // bundle while cleanup still deletes the source) applied to a name
+                    // nobody registered as a layer, and it has already cost two: a
+                    // session's `workflows/` run records and scripts, and
+                    // `auto-mode-classifier-error.txt`. Both were found by hand-diffing a
+                    // real migration, not by this code noticing.
+                    //
+                    // So the direction is inverted: remove the carried names, leave
+                    // everything else where it is, and report it. A user who wants the rest
+                    // gone can delete a directory; nobody can recover one migrate removed.
+                    for (const name of readdirSync(sessionSubDir)) {
+                        if (EXPORTED_SESSION_DIR_NAMES.includes(name)) {
+                            rmSync(join(sessionSubDir, name), { recursive: true, force: true });
+                        }
+                        else {
+                            keptUncarried.add(name);
+                        }
                     }
-                    else {
-                        keptUncarried.add(name);
-                    }
+                    // Gone only if nothing unrecognised was left in it.
+                    if (readdirSync(sessionSubDir).length === 0)
+                        rmSync(sessionSubDir, { recursive: true });
                 }
-                // Gone only if nothing unrecognised was left in it.
-                if (readdirSync(sessionSubDir).length === 0)
-                    rmSync(sessionSubDir, { recursive: true });
             }
             const fileHistoryDir = join(sourceConfigDir, "file-history", movedId);
-            if (existsSync(fileHistoryDir))
+            if (!stayingIds.has(movedId) && existsSync(fileHistoryDir)) {
                 rmSync(fileHistoryDir, { recursive: true });
+            }
             cleanedUp = true;
         }
         if (keptUncarried.size > 0) {
@@ -277,7 +380,12 @@ export async function migrateSession(options) {
             // regardless — so the excluded layer is destroyed rather than left
             // behind. "<layer> excluded by user request" is the only thing that says
             // so, and returning only the IMPORT's warnings swallowed it.
-            warnings: [...selfMigrationWarnings, ...exported.warnings, ...imported.warnings],
+            warnings: [
+                ...selfMigrationWarnings,
+                ...inPlaceWarnings,
+                ...exported.warnings,
+                ...imported.warnings,
+            ],
         };
     }
     finally {

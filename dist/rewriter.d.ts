@@ -1,4 +1,4 @@
-import type { ExportManifest, PathMapping, RewriteReport, Platform, VersionAdapter } from "./types.js";
+import type { ExportManifest, PathMapping, RewriteReport, Platform, SessionManifest, VersionAdapter } from "./types.js";
 export interface RewriteContext {
     mappings: PathMapping[];
     sourcePlatform: Platform;
@@ -6,13 +6,22 @@ export interface RewriteContext {
     sourceUser: string;
     targetUser: string;
     /**
-     * source session id -> the id this import minted for it (#127).
+     * source session id -> the id of the session its content LANDS in (#127) —
+     * the id this import minted for it, or the base a continuation is spliced
+     * onto. Build it with `buildSessionIdMap`, which also keys a continuation's
+     * `continuesLocalSessionId` (#137).
      *
      * Present only when the caller can name the WHOLE set — i.e. an import or
      * pull of a bundle. It carries two jobs that are the same lookup: the
      * `session_id` / `continuedInSessionId` references, and the session-id
      * SEGMENT inside a path like
-     * `<configDir>/projects/<encoded>/<sessionId>/tool-results/…`.
+     * `<configDir>/projects/<encoded>/<sessionId>/tool-results/…`. That second
+     * job is not the same everywhere: in a whole-path field rewritten by
+     * `rewritePathValue` ANY segment equal to a key moves, while in free text
+     * (`rewriteString`) only the segment directly under `targetProjectDir` does
+     * (#136), because free text is also prose and a uuid there is not known to be
+     * a path at all. `cwd` and `relocatedCwd` go through `rewriteWholePath`,
+     * which maps no interior segment, and keep theirs.
      *
      * Absent means "leave every reference byte-identical", which is correct
      * rather than degraded: measured over 205,946 real lines, roughly one
@@ -22,6 +31,18 @@ export interface RewriteContext {
     sessionIdMap?: ReadonlyMap<string, string>;
     /** `[encode(sourceProjectPath), encode(targetProjectPath)]`, or absent when equal. */
     encodedProject?: readonly [from: string, to: string];
+    /**
+     * The TARGET `<configDir>/projects/<encoded project>` directory — the one
+     * place in free text where a session id is known to be a path segment and
+     * not prose (#136). Every session this import writes lives directly under it,
+     * `tool-results/` included.
+     *
+     * Carried as a value rather than recognized off `mappings`, because the
+     * mappings are empty exactly when nothing moved but the ids — an import back
+     * into the same project under the same config dir — and the id still has to.
+     * Absent means free text keeps every session id it has.
+     */
+    targetProjectDir?: string;
 }
 /**
  * The primitive for a field that is a path IN ITS ENTIRETY but whose interior
@@ -65,11 +86,35 @@ export type RewriteSource = Pick<ExportManifest, "sourcePlatform" | "sourceProje
  */
 export declare function buildImportRewriteContext(source: RewriteSource, targetProjectPath: string, targetConfigDir: string, 
 /**
- * source session id -> newly minted id, when the caller can name the whole
- * set (#127). Omit it and every session reference is left byte-identical,
- * which is the correct answer for a caller that cannot.
+ * source session id -> the session its content lands in, when the caller
+ * can name the whole set (#127) — from `buildSessionIdMap`. Omit it and
+ * every session reference is left byte-identical, which is the correct
+ * answer for a caller that cannot.
  */
 sessionIdMap?: ReadonlyMap<string, string>): RewriteContext;
+/**
+ * THE construction of a `RewriteContext.sessionIdMap`: which source ids a
+ * bundle's sessions answer to, and the session each one's content lands in.
+ *
+ * A session answers to its own bundle id — and, for a CONTINUATION, also to
+ * `continuation.continuesLocalSessionId` (#137). A continuation's lines are the
+ * sender's lines verbatim: its bundle id is minted at export and stamped only on
+ * the synthetic header, while every `session_id` the sender's run wrote and
+ * every `<configDir>/projects/<encoded>/<id>/tool-results/…` pointer carries the
+ * sender's LOCAL id. Keying only the bundle id — what the importer did until
+ * #137, while the splice passed no map at all — maps nothing a continuation
+ * actually contains.
+ *
+ * `landingId` is the importer's minted id, or the base session a splice or an
+ * adoption writes into; the layer files land under that same id on every path,
+ * which is what makes the mapped pointer resolve.
+ *
+ * A session's own bundle id always wins over a continuation alias for the same
+ * string, in either order: the bundle's own session is a stronger fact than a
+ * self-report naming a session that is not here. Among aliases, the first wins.
+ * Both are only reachable with a hand-built manifest.
+ */
+export declare function buildSessionIdMap(landings: ReadonlyArray<readonly [session: Pick<SessionManifest, "sessionId" | "continuation">, landingId: string]>): Map<string, string>;
 export declare function rewriteEntry(entry: Record<string, unknown>, ctx: RewriteContext, newSessionId?: string): Record<string, unknown>;
 export interface TransformLineOptions {
     adapters?: VersionAdapter[];

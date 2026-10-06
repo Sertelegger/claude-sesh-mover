@@ -4,7 +4,7 @@ import type { BundleFetchFailureKind } from "./hub/bundle-io.js";
 import type { EscrowRefusal, UnsafeOutRule } from "./hub/escrow.js";
 import type { ApplyResult, CarryMeta } from "./payload/carry.js";
 export type Platform = "darwin" | "linux" | "wsl1" | "wsl2" | "win32";
-export type JsonlEntryType = "user" | "assistant" | "attachment" | "file-history-snapshot" | "file-history-delta" | "system" | "progress";
+export type JsonlEntryType = "user" | "assistant" | "attachment" | "file-history-snapshot" | "file-history-delta" | "system" | "progress" | "relocated" | "frame-link";
 export interface JsonlEntryBase {
     uuid: string;
     timestamp: string;
@@ -38,6 +38,12 @@ export interface UserMessageEntry extends JsonlEntryBase {
      */
     toolUseResult?: Record<string, unknown> | string;
     sourceToolAssistantUUID?: string;
+    /**
+     * Since 2.1.278, on a tool-result entry: where the call ran, read back by
+     * Claude Code for auto-mode classifier requests. `rewriter.ts` translates its
+     * three paths (#135); the rest is not a location.
+     */
+    serverClassifierContext?: Record<string, unknown>;
 }
 export interface AssistantMessageEntry extends JsonlEntryBase {
     type: "assistant";
@@ -1227,7 +1233,7 @@ export interface HubPushResult {
  * refusals share this shape and only ONE of them takes `--force-unkeyed`, so a
  * caller has to tell them apart — and the obvious test is wrong for two of the
  * three, because `unkeyedMachines` is the census reported WHOLE: on
- * `self-unkeyed` it carries this machine's own entry, and on `no-recipients` it
+ * `self-unkeyed` it may carry this machine's own entry, and on `no-recipients` it
  * carries every machine on the hub. See `EncryptionRefusal`.
  *
  * `unkeyedMachines` is that census as `collectHubRecipients` reported it, never

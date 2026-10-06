@@ -1,6 +1,7 @@
-import { createReadStream, createWriteStream, statSync } from "node:fs";
+import { createReadStream, createWriteStream, realpathSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { applyAdapters } from "./version-adapters.js";
 import { detectPlatform, encodeProjectPath, extractUserFromPath, getCurrentUser, samePlatformFamily, translatePath, } from "./platform.js";
 import { errorMessage } from "./errors.js";
@@ -147,7 +148,82 @@ export function rewriteString(input, ctx) {
             targetUser: ctx.targetUser,
         }));
     }
-    return result;
+    return mapSessionDirSegments(result, ctx);
+}
+/**
+ * Stage 3 of `rewriteString`: the session-id segment of a path into this
+ * import's own session directories (#136).
+ *
+ * #127 taught stage 1 the encoded project name, so a free-text
+ * `<configDir>/projects/<encoded>/<sessionId>/tool-results/x.txt` came out
+ * with the target config dir, the target encoded name and the SOURCE session
+ * id — a directory that exists on neither machine, in the `<persisted-output>`
+ * text the model reads, beside a `persistedOutputPath` that `rewritePathValue`
+ * had mapped correctly.
+ *
+ * It runs on the FINISHED text, after both earlier stages, and matches the
+ * TARGET directory — so it recognizes the path the same way whether a mapping
+ * moved it there, the token engine did, or it never needed to move. Three
+ * things keep it from reading prose as a path:
+ *
+ * - only the ONE segment directly under `targetProjectDir` is a candidate, and
+ *   only an exact key of the map is replaced. A bare uuid in a sentence is
+ *   CONTENT; `/tmp/claude-<uid>/<encoded>/<sessionId>/…` names a scratchpad no
+ *   bundle carries and keeps its id here (a whole-path field still maps it);
+ *   `<sessionId>.jsonl` is a file name, not the id, exactly as in
+ *   `rewritePathValue`.
+ * - the directory must not continue a longer token (`GUARD_CHARS`, stage 2's
+ *   rule), so `/x/tgt/cfg/projects/…` is some other directory.
+ * - a match inside a URL is left alone (`URL_PREFIX`, stage 1's rule).
+ *
+ * Separators are matched as `[/\\]` because the target may be Windows while
+ * the text arrived with either.
+ */
+function mapSessionDirSegments(text, ctx) {
+    const ids = ctx.sessionIdMap;
+    const root = ctx.targetProjectDir?.replace(/[/\\]+$/, "");
+    if (!ids || ids.size === 0 || !root)
+        return text;
+    const matcher = sessionDirMatcher(ctx, root);
+    // Cheap reject: every match contains the directory's last segment, and most
+    // free text does not.
+    if (!text.includes(matcher.lastSegment))
+        return text;
+    return text.replace(matcher.re, (m, seg, offset, whole) => {
+        const to = ids.get(seg);
+        if (to === undefined)
+            return m;
+        if (URL_PREFIX.test(whole.slice(0, offset)))
+            return m;
+        return m.slice(0, m.length - seg.length) + to;
+    });
+}
+/**
+ * Stage 3's pattern depends only on the context's `targetProjectDir`, while
+ * `rewriteString` runs on every free-text field of every entry — and every
+ * Bash command naming a scratchpad under the target's encoded project passes
+ * the cheap reject — so it is compiled once per context rather than per call.
+ * Keyed weakly on the context object, and re-checked against `root`, so a
+ * caller that builds a new context, or edits one, never matches a stale
+ * directory. Reusing a `g` regex is safe here: `String.prototype.replace`
+ * resets `lastIndex` before it starts.
+ */
+const sessionDirMatchers = new WeakMap();
+function sessionDirMatcher(ctx, root) {
+    const cached = sessionDirMatchers.get(ctx);
+    if (cached && cached.root === root)
+        return cached;
+    const segments = root.split(/[/\\]/);
+    const matcher = {
+        root,
+        lastSegment: segments[segments.length - 1],
+        re: new RegExp(`(?<![${GUARD_CHARS}])` +
+            segments.map(escapeRegex).join("[/\\\\]") +
+            "[/\\\\]" +
+            "([^/\\\\\\s\"'`)\\]}>,;:]+)", "g"),
+    };
+    sessionDirMatchers.set(ctx, matcher);
+    return matcher;
 }
 // Like rewriteString, but for fields that are a path in their entirety (cwd,
 // trackedFileBackups keys) rather than free text that may merely *contain*
@@ -260,14 +336,15 @@ export function buildPathMappings(sourcePlatform, targetPlatform, sourceProjectP
  */
 export function buildImportRewriteContext(source, targetProjectPath, targetConfigDir, 
 /**
- * source session id -> newly minted id, when the caller can name the whole
- * set (#127). Omit it and every session reference is left byte-identical,
- * which is the correct answer for a caller that cannot.
+ * source session id -> the session its content lands in, when the caller
+ * can name the whole set (#127) — from `buildSessionIdMap`. Omit it and
+ * every session reference is left byte-identical, which is the correct
+ * answer for a caller that cannot.
  */
 sessionIdMap) {
     const targetPlatform = detectPlatform();
-    const sourceUser = extractUserFromPath(source.sourceProjectPath, source.sourcePlatform) ?? "unknown";
     const targetUser = getCurrentUser();
+    const sourceUser = sameAccountHere(source.sourcePlatform, extractUserFromPath(source.sourceProjectPath, source.sourcePlatform) ?? "unknown", targetPlatform, targetUser);
     return {
         mappings: buildPathMappings(source.sourcePlatform, targetPlatform, source.sourceProjectPath, targetProjectPath, source.sourceConfigDir, targetConfigDir, sourceUser, targetUser),
         sourcePlatform: source.sourcePlatform,
@@ -283,7 +360,78 @@ sessionIdMap) {
                     encodeProjectPath(targetProjectPath),
                 ] }
             : {}),
+        // The directory every session this import writes lands in — the importer's
+        // and the pull's `targetProjectDir`, spelled the same way (#136).
+        targetProjectDir: join(targetConfigDir, "projects", encodeProjectPath(targetProjectPath)),
     };
+}
+/**
+ * THE construction of a `RewriteContext.sessionIdMap`: which source ids a
+ * bundle's sessions answer to, and the session each one's content lands in.
+ *
+ * A session answers to its own bundle id — and, for a CONTINUATION, also to
+ * `continuation.continuesLocalSessionId` (#137). A continuation's lines are the
+ * sender's lines verbatim: its bundle id is minted at export and stamped only on
+ * the synthetic header, while every `session_id` the sender's run wrote and
+ * every `<configDir>/projects/<encoded>/<id>/tool-results/…` pointer carries the
+ * sender's LOCAL id. Keying only the bundle id — what the importer did until
+ * #137, while the splice passed no map at all — maps nothing a continuation
+ * actually contains.
+ *
+ * `landingId` is the importer's minted id, or the base session a splice or an
+ * adoption writes into; the layer files land under that same id on every path,
+ * which is what makes the mapped pointer resolve.
+ *
+ * A session's own bundle id always wins over a continuation alias for the same
+ * string, in either order: the bundle's own session is a stronger fact than a
+ * self-report naming a session that is not here. Among aliases, the first wins.
+ * Both are only reachable with a hand-built manifest.
+ */
+export function buildSessionIdMap(landings) {
+    const map = new Map();
+    for (const [session, landingId] of landings)
+        map.set(session.sessionId, landingId);
+    for (const [session, landingId] of landings) {
+        const alias = session.continuation?.continuesLocalSessionId;
+        if (alias !== undefined && !map.has(alias))
+            map.set(alias, landingId);
+    }
+    return map;
+}
+/**
+ * The source user, or the target user when the two name ONE account here.
+ *
+ * `sourceUser` is read off a path segment and `targetUser` off `userInfo()`, so
+ * the same account can arrive spelled twice: on Windows a path handed out by
+ * `os.tmpdir()` often names the user by its 8.3 alias (`C:\Users\RUNNER~1`)
+ * while `userInfo()` names it in full (`runneradmin`). Compared as strings that
+ * is two users, and `buildPathMappings` adds a home mapping from a directory to
+ * itself. That is not harmless: stage 1 applies mappings in sequence, so the
+ * home mapping re-spells every target path an earlier mapping has just
+ * produced under it, and anything that later matches a target path exactly —
+ * stage 3's `targetProjectDir` (#136) — misses the re-spelled copy. A same-
+ * machine migrate re-spelled every `cwd` the same way.
+ *
+ * The question is asked of THIS machine's filesystem, and only within one
+ * platform family: when both home paths resolve to the same directory, there is
+ * no second user to map to. A source home that does not exist here — the
+ * ordinary cross-machine case — keeps its mapping. `realpathSync.native`,
+ * deliberately, because it is the one that expands an 8.3 alias; any failure
+ * answers "not the same", which keeps the mapping exactly as before. Proved on
+ * Windows only (the #137 and migrate-in-place tests): Linux has no 8.3 names.
+ */
+function sameAccountHere(sourcePlatform, sourceUser, targetPlatform, targetUser) {
+    if (sourceUser === targetUser || !samePlatformFamily(sourcePlatform, targetPlatform))
+        return sourceUser;
+    try {
+        const a = realpathSync.native(getHomePath(sourcePlatform, sourceUser));
+        const b = realpathSync.native(getHomePath(targetPlatform, targetUser));
+        const caseless = process.platform === "win32" || process.platform === "darwin";
+        return (caseless ? a.toLowerCase() === b.toLowerCase() : a === b) ? targetUser : sourceUser;
+    }
+    catch {
+        return sourceUser;
+    }
 }
 function getHomePath(platform, user) {
     if (platform === "win32")
@@ -333,12 +481,19 @@ const TOOL_RESULT_PATH_FIELDS = [
  * Free text that may CONTAIN a path. Note what is absent and why:
  * `originalFile` is NOT here despite the name — 78 of 637 measured values start
  * with a shebang, so it is file bytes, and file bytes are CONTENT.
+ *
+ * `command` is an invocation that names paths — a location, given the same
+ * treatment as Bash's `input.command` (#135). TaskStop is the only tool that
+ * wrote one in the measured window (159 of 159), and it echoes the background
+ * task's Bash command, whose other copy is that tool INPUT, already translated:
+ * leaving this one would make the two disagree.
  */
 const TOOL_RESULT_TEXT_FIELDS = [
     "stdout",
     "stderr",
     "message",
     "backgroundCwdHint",
+    "command",
 ];
 /**
  * Tool INPUT fields that are locations, keyed by tool name.
@@ -373,6 +528,12 @@ const TOOL_INPUT_PATH_FIELDS = {
     Glob: ["path"],
     Grep: ["path"],
     Workflow: ["scriptPath"],
+    // #135. Both name files under the session's scratchpad, which no bundle
+    // carries — so this buys agreement with the already-translated
+    // `scratchpadDirectory`, not a working pointer. `SendUserFile.files` is an
+    // array of paths, the one listed field that is not a string.
+    Artifact: ["file_path", "root"],
+    SendUserFile: ["files"],
 };
 /** Whole-path fields on an `attachment`'s environment snapshot. */
 const ATTACHMENT_PATH_FIELDS = [
@@ -396,12 +557,20 @@ function rewriteBackupValue(value, ctx) {
         b.realParentDir = rewritePathValue(b.realParentDir, ctx);
     return b;
 }
+/** Map every string element of an array of paths; leave anything else as it is. */
+function rewritePathArray(value, ctx) {
+    return Array.isArray(value)
+        ? value.map((v) => (typeof v === "string" ? rewritePathValue(v, ctx) : v))
+        : value;
+}
 /** Rewrite the LOCATION fields of one tool-use input, per `TOOL_INPUT_PATH_FIELDS`. */
 function rewriteToolInput(toolName, input, ctx) {
     const out = { ...input };
     for (const field of TOOL_INPUT_PATH_FIELDS[toolName] ?? []) {
         if (typeof out[field] === "string")
             out[field] = rewritePathValue(out[field], ctx);
+        else if (Array.isArray(out[field]))
+            out[field] = rewritePathArray(out[field], ctx);
     }
     // `command` is free text that NAMES paths — a location by the rule above, not
     // prose. Bash and Monitor are the two tools that carry one.
@@ -486,6 +655,43 @@ export function rewriteEntry(entry, ctx, newSessionId) {
             });
         }
         // Do NOT rewrite plain string user message content
+        /**
+         * `serverClassifierContext` (#135) — on two-thirds of tool-result entries
+         * written since 2.1.278, and read BACK by Claude Code: it becomes the
+         * `priorTurnContext` of an auto-mode server-classifier request, telling the
+         * classifier where earlier tool calls ran. Three whole paths; `git_state.root`
+         * is `null` outside a repository and stays `null`.
+         *
+         * Translated, not deleted — deleting it is what Claude Code's own resume
+         * sanitizer does on the subagent and teammate paths, and whether a moved
+         * session should do the same is an owner decision #135 leaves open.
+         * `context.platform` sits beside the paths and is not one, so a
+         * cross-family move leaves this object naming the source platform.
+         *
+         * `rewritePathValue`, not the top-level `cwd`'s `rewriteWholePath`, and the
+         * two differ only for a directory whose interior carries the encoded project
+         * name or a renamed session id — a session sitting in its own scratchpad.
+         * `live_cwd` records where a tool call ran — the same kind of fact as
+         * `wireIngestContext[id].cwd` and an attachment's
+         * `snapshot.workingDirectory`, which #127 maps with `rewritePathValue` — so
+         * it agrees with those copies rather than with `cwd`. Nothing reads it
+         * against the entry's `cwd`: Claude Code forwards it to the classifier as
+         * data (2.1.285). `relocatedCwd` is the opposite case and takes `cwd`'s
+         * function, because the loader substitutes it FOR `cwd`.
+         */
+        const scc = result.serverClassifierContext
+            ?.context;
+        if (scc && typeof scc === "object") {
+            if (typeof scc.live_cwd === "string")
+                scc.live_cwd = rewritePathValue(scc.live_cwd, ctx);
+            const gs = scc.git_state;
+            if (gs && typeof gs === "object") {
+                for (const k of ["cwd", "root"]) {
+                    if (typeof gs[k] === "string")
+                        gs[k] = rewritePathValue(gs[k], ctx);
+                }
+            }
+        }
         // `toolUseResult` is a RESULT — the machine telling us where things are —
         // so every location in it is translated. Until #127 only `stdout`/`stderr`
         // were, which left the pointers stale while the bytes they point at were
@@ -513,6 +719,27 @@ export function rewriteEntry(entry, ctx, newSessionId) {
             const file = tr.file;
             if (file && typeof file.filePath === "string") {
                 file.filePath = rewritePathValue(file.filePath, ctx);
+            }
+            // A Read of a PDF: the directory its page images were extracted into,
+            // which sits inside the `tool-results` layer this import renames (#135).
+            if (file && typeof file.outputDir === "string") {
+                file.outputDir = rewritePathValue(file.outputDir, ctx);
+            }
+            // SendUserFile's result: each file it sent (#135).
+            if (Array.isArray(tr.attachments)) {
+                tr.attachments = tr.attachments.map((a) => a && typeof a.path === "string" ? { ...a, path: rewritePathValue(a.path, ctx) } : a);
+            }
+            // Artifact's `path` (#135), keyed on the result's SHAPE and deliberately
+            // NOT added to TOOL_RESULT_PATH_FIELDS. Claude Code's memory-store read
+            // tool also returns a top-level `path`, and that one names a document
+            // inside a store, not a place on any filesystem. Artifact has TWO result
+            // shapes and both carry the tool's resolved `file_path` there: a publish
+            // (`artifact_id`) and a create-from-type (`created_from_type: true`, no
+            // `artifact_id`). The store's result carries neither marker (all three
+            // read from the 2.1.283-2.1.285 bundles).
+            if (typeof tr.path === "string" &&
+                (typeof tr.artifact_id === "string" || tr.created_from_type === true)) {
+                tr.path = rewritePathValue(tr.path, ctx);
             }
             for (const k of ["changedFiles", "filenames"]) {
                 const arr = tr.bashEditDiff?.[k] ?? tr[k];
@@ -694,6 +921,30 @@ export function rewriteEntry(entry, ctx, newSessionId) {
         }
         if (typeof att.content === "string")
             att.content = rewriteString(att.content, ctx);
+        // #135. `nested_memory`'s `content` is an OBJECT, `{path, type, content}`:
+        // its `path` is the same location as `att.path` above, which was rewritten
+        // while this was not, and its own `content` is the memory file's bytes —
+        // CONTENT, left verbatim.
+        const attContent = att.content;
+        if (attContent && typeof attContent === "object" && typeof attContent.path === "string") {
+            attContent.path = rewritePathValue(attContent.path, ctx);
+        }
+        // `task_status`: where the background task writes its output, and the
+        // invocation it is running — free text, as Bash's `input.command` is.
+        if (typeof att.outputFilePath === "string") {
+            att.outputFilePath = rewritePathValue(att.outputFilePath, ctx);
+        }
+        const shell = att.shell;
+        if (shell && typeof shell === "object" && typeof shell.command === "string") {
+            shell.command = rewriteString(shell.command, ctx);
+        }
+        // `instructions`: the instruction files no longer loaded, beside the
+        // already-translated `files[].path` Claude Code diffs them against. Gated on
+        // the type because `removed` is a generic name and other payloads use it
+        // for lists that are not paths.
+        if (att.type === "instructions" && Array.isArray(att.removed)) {
+            att.removed = rewritePathArray(att.removed, ctx);
+        }
         // The pre-rendered reminder the model actually sees on resume.
         for (const k of ["rendered", "renderedInHumanTurn"]) {
             if (Array.isArray(result[k])) {
@@ -725,6 +976,29 @@ export function rewriteEntry(entry, ctx, newSessionId) {
             result.trackingPath = rewritePathValue(result.trackingPath, ctx);
         }
         result.backup = rewriteBackupValue(result.backup, ctx);
+    }
+    /**
+     * `relocated` (#135) — appended when EnterWorktree, ExitWorktree or a
+     * directory move changes the session's directory. Claude Code's loader takes
+     * `relocatedCwd ?? <head cwd>` as the session's project path and matches it
+     * against the directory a resume runs in, so it is translated by exactly the
+     * function the top-level `cwd` is: two spellings of one directory would make
+     * the loader disagree with itself.
+     */
+    if (result.type === "relocated" && typeof result.relocatedCwd === "string") {
+        result.relocatedCwd = rewriteWholePath(result.relocatedCwd, ctx);
+    }
+    /**
+     * `frame-link` (#135) — an entry with no uuid, pointing at an Artifact's file
+     * under the session scratchpad; Claude Code reads its `path` for the label.
+     *
+     * `worktree-state` is deliberately still absent. Its `worktreeSession` holds
+     * three paths, but also a `sessionId` whose meaning — the file, or the run —
+     * is not established, and #135's corpus held no such entry to measure.
+     * Unclear means leave.
+     */
+    if (result.type === "frame-link" && typeof result.path === "string") {
+        result.path = rewritePathValue(result.path, ctx);
     }
     return result;
 }
