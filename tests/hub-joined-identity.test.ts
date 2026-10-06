@@ -27,7 +27,7 @@
  */
 import { describe, it, expect } from "vitest";
 import {
-  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
+  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -55,6 +55,10 @@ interface Run {
   stderr: string;
 }
 
+// Every temp root is realpath'd: Claude Code hands a hook the PHYSICAL cwd, and
+// `hub status` keys by process.cwd(), which is physical too. On macOS tmpdir()
+// is /var/… → /private/var/…, so an unresolved root files the hook's record
+// under one spelling and reads it under the other (failed on macos-latest only).
 function cli(m: Machine, args: string[], cwd: string): Run {
   const r = runCli(args, {
     env: { ...homeEnv(m.home), CLAUDE_CONFIG_DIR: m.configDir },
@@ -321,7 +325,7 @@ function expectEvidenceRefusal(r: Run, currentHubId: string, expected: string[])
 
 describe("a rewritten hub.json hubId cannot reset this machine's pins", () => {
   it("control — hub.json untouched: the substituted key is refused as unpinned", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-control-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-control-")));
     try {
       const f = arrangeFleet(root);
       const threadId = substitutedSignerPushes(f);
@@ -339,7 +343,7 @@ describe("a rewritten hub.json hubId cannot reset this machine's pins", () => {
   }, TIMEOUT);
 
   it("attack — only hub.json's hubId replaced: every hub verb refuses, nothing applied, no new pin", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-attack-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-attack-")));
     try {
       const f = arrangeFleet(root);
       rewriteHubId(f.hub, ATTACKER_HUB_ID);
@@ -395,7 +399,7 @@ describe("a rewritten hub.json hubId cannot reset this machine's pins", () => {
   }, TIMEOUT);
 
   it("attack after hub trust confirmed the real key: the same refusal, and the confirmed pin stands", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-confirmed-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-confirmed-")));
     try {
       const f = arrangeFleet(root);
       ok(
@@ -425,7 +429,7 @@ describe("a rewritten hub.json hubId cannot reset this machine's pins", () => {
     // hub could give it another hub's id and the probe seeded it, so the pins
     // this machine holds for the first hub were looked up under an id that has
     // none — the pin reset again, with no user action at all.
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-twohub-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-twohub-")));
     try {
       const f = arrangeFleet(root);
       const { h1Id, proj1 } = secondHub(f);
@@ -473,7 +477,7 @@ describe("the seed takes only an unambiguous match — a project moved between h
   // one per evidence set.
 
   it("T6 — tied evidence: the moved project's stale id beside the path's real one refuses, nothing imported, no new pin", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-t6-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-t6-")));
     try {
       const f = arrangeFleet(root);
       const { h1Id, proj1 } = secondHub(f);
@@ -508,7 +512,7 @@ describe("the seed takes only an unambiguous match — a project moved between h
   }, TIMEOUT);
 
   it("T7 — no project ties the path, so every id this machine knows decides: two of them refuse, nothing imported, no new pin", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-t7-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-t7-")));
     try {
       const f = arrangeFleet(root);
       const { h1, h1Id } = secondHub(f);
@@ -547,7 +551,7 @@ describe("the seed takes only an unambiguous match — a project moved between h
 
 describe("the hook endpoints keep their contract on a changed hub identity", () => {
   it("SessionEnd exits 0 and records the refusal; SessionStart exits 0 and says so in one notice", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-hooks-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-hooks-")));
     try {
       const f = arrangeFleet(root);
       rewriteHubId(f.hub, ATTACKER_HUB_ID);
@@ -579,7 +583,7 @@ describe("the hook endpoints keep their contract on a changed hub identity", () 
 
 describe("hub init --accept-new-hub-id", () => {
   it("carries pins forward, so accepting a rewritten id does not let a substituted key in", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-carry-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-carry-")));
     try {
       const f = arrangeFleet(root);
       ok(
@@ -628,7 +632,7 @@ describe("hub init --accept-new-hub-id", () => {
   }, TIMEOUT);
 
   it("a deliberately re-created hub: pull refuses, --accept-new-hub-id re-joins, and bundles signed under the old id still pull", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-recreate-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-recreate-")));
     try {
       // C joins but has not pulled A's bundle yet — it is still signed under
       // the ORIGINAL hub id when C finally fetches it.
@@ -667,7 +671,7 @@ describe("hub init --accept-new-hub-id", () => {
 
 describe("seeding an address this machine has no record for (every install after upgrade)", () => {
   it("seeds when local evidence agrees, and refuses when it contradicts — writing nothing", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-seed-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-seed-")));
     try {
       const f = arrangeFleet(root);
       // A pre-upgrade install: pins and sync-state name the hub, and there is
@@ -716,7 +720,7 @@ describe("seeding an address this machine has no record for (every install after
 
 describe("an evidence refusal is settled by an explicit first join", () => {
   it("refuses a hub this machine has no record of, and records it after hub init --path", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-evidence-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-evidence-")));
     try {
       const f = arrangeFleet(root);
       // An install that predates joined-hubs.json, pointed (by configure, not
@@ -753,7 +757,7 @@ describe("an evidence refusal is settled by an explicit first join", () => {
 
 describe("hub init on a directory holding hub content but no hub.json", () => {
   it("refuses with exit 3 and writes nothing; --accept-new-hub-id creates and records", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-guard-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-guard-")));
     try {
       // What a second machine sees while the first sync is still in flight:
       // other machines' files have arrived and hub.json has not.
@@ -808,7 +812,7 @@ describe("hub init on a directory holding hub content but no hub.json", () => {
   }, TIMEOUT);
 
   it("refuses to mint a new hub where this machine joined a different one (an unmounted mount point)", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-unmounted-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-unmounted-")));
     try {
       const hub = join(root, "hub");
       mkdirSync(hub);
@@ -860,7 +864,7 @@ describe("hub init on a directory holding hub content but no hub.json", () => {
     }
   }, TIMEOUT);
   it("refuses to mint where this machine's own projects tie the path to a hub, with no record there (an unmounted share after upgrade)", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-unmounted-evidence-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-unmounted-evidence-")));
     try {
       const hub = join(root, "hub");
       mkdirSync(hub);
@@ -940,7 +944,7 @@ describe("hub init on a directory holding hub content but no hub.json", () => {
   }, TIMEOUT);
 
   it("refuses to mint where a project on the same unmounted share used the path for its hub — a missing project directory is undetermined, not 'no override'", () => {
-    const root = mkdtempSync(join(tmpdir(), "sm-joined-unmounted-project-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sm-joined-unmounted-project-")));
     try {
       // One network share holds both the hub and a project that uses it
       // through its OWN config (`hub init --scope project`); there is no
