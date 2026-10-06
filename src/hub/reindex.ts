@@ -6,7 +6,7 @@ import { bundleDir, type HubBundleRecord } from "./layout.js";
 import { fetchBundleArchive } from "./bundle-io.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
 import { readLocalProjectId } from "./identity.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { registerMachine } from "./init.js";
 import {
   buildIndexFile, readMachineIndex, writeMachineIndex, type PriorIndexView, type PriorThreadEntry,
@@ -23,7 +23,8 @@ import { readManifest } from "../manifest.js";
 import { readLastEntryUuid } from "../jsonl.js";
 import { readSyncState, getThreadId } from "../sync-state.js";
 import type {
-  HubLockBusyResult, HubReindexFailedResult, HubReindexResult, HubUnreachableResult,
+  HubIdentityChangedResult, HubLockBusyResult, HubReindexFailedResult, HubReindexResult,
+  HubUnreachableResult,
 } from "../types.js";
 
 export interface HubReindexOptions {
@@ -105,7 +106,8 @@ function parseBundleFileName(fileName: string): { pushedAt: string; bundleId: st
 export async function hubReindex(
   opts: HubReindexOptions
 ): Promise<
-  HubReindexResult | HubReindexFailedResult | HubLockBusyResult | HubUnreachableResult
+  | HubReindexResult | HubReindexFailedResult | HubLockBusyResult | HubUnreachableResult
+  | HubIdentityChangedResult
 > {
   const local = readLocalProjectId(opts.projectPath);
   if (!local) {
@@ -136,7 +138,7 @@ export async function hubReindex(
   // half — that call writes.
   const probe = await probeHubReachable(opts.hubPath, createFsBackend(opts.hubPath));
   if (probe.state !== "ok") {
-    return hubUnreachableRefusal("hub-reindex", probe.state);
+    return hubProbeRefusal("hub-reindex", probe);
   }
 
   // Reindex only ever (re)writes THIS machine's own index file, but a

@@ -51,12 +51,15 @@ export declare function resolveProjectIdentity(backend: HubBackend, projectPath:
  * `projects/<id>/project.json`. Writes NOTHING under the project directory.
  *
  * Split out because the two halves have different failure semantics and a
- * caller may need them at different moments. The hub write cannot be undone —
- * there is no `backend.delete` call anywhere in src/ — while the local link
- * can, so `hub/push.ts` records "a hub project was minted" the instant this
- * resolves and defers the local link until the bundle is on the hub. Fusing
- * them, as this function's caller below does, means a throw BETWEEN the two
- * writes leaves an orphan hub project no result mentions.
+ * caller may need them at different moments. The hub write cannot be undone by
+ * the push that made it — push never removes a committed hub file; the one
+ * caller of `HubBackend.delete` in src/ is `retire.ts`'s `deleteHubFile`,
+ * reached only by `hub retire --undo`, `hub delete` (owner-only, behind a
+ * tombstone and a grace window) and `hub compact` — while the local link can,
+ * so `hub/push.ts` records "a hub project was minted" the instant this resolves
+ * and defers the local link until the bundle is on the hub. Fusing them, as
+ * this function's caller below does, means a throw BETWEEN the two writes
+ * leaves an orphan hub project no result mentions.
  */
 export declare function mintHubProject(backend: HubBackend, projectPath: string, machineId: string): Promise<LocalProjectId>;
 export declare function createHubProject(backend: HubBackend, projectPath: string, machineId: string): Promise<LocalProjectId>;

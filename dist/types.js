@@ -116,8 +116,38 @@ const REASON_EXIT_CODE = {
      */
     "encrypted-bundle": EXIT_REFUSED,
     "escrow-verify-failed": EXIT_FAILED,
+    /**
+     * The hub's `hub.json` names a different identity from the one this machine
+     * joined at that address. A refusal, not class 3: the same invocation
+     * refuses identically until a human decides whether the hub was re-created
+     * on purpose (and re-joins with `hub init --accept-new-hub-id`) or was
+     * tampered with — and the unattended SessionEnd auto-push is exactly the
+     * caller that would loop on a class 3.
+     */
+    "hub-identity-changed": EXIT_REFUSED,
+    /**
+     * `hub init --path` that is not absolute after `~` expansion (#162). A bad
+     * invocation, class 1 — the same class as `configure --set`'s type errors,
+     * which refuses the matching `hub.path` value.
+     */
+    "hub-path-not-absolute": EXIT_FAILED,
     // Environment-not-ready: same invocation, retry once the machine catches up.
     "hub-unreachable": EXIT_NOT_READY,
+    /**
+     * `hub init` on a directory with hub content but no `hub.json`. Class 3
+     * because the likeliest cause is a synced folder whose first sync has not
+     * delivered `hub.json` yet — re-running unchanged once it lands is the
+     * remedy, which is exactly this class's promise.
+     */
+    "hub-content-without-identity": EXIT_NOT_READY,
+    /**
+     * `hub init` where this machine joined a hub, and nothing is there now — no
+     * `hub.json`, no hub content, possibly no directory. Class 3 for the same
+     * reason as the line above: an unmounted share or an unsynced folder, and
+     * the unchanged invocation joins once it appears. Kept apart from
+     * `hub-identity-changed` (class 2) because nothing here changed.
+     */
+    "hub-identity-not-present": EXIT_NOT_READY,
     "lock-busy": EXIT_NOT_READY,
     "not-yet-synced": EXIT_NOT_READY,
     /**

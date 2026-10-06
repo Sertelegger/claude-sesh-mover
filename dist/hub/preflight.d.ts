@@ -1,6 +1,7 @@
 import type { HubBackend } from "./backend.js";
+import { type HubIdentityChange } from "./joined-hubs.js";
 import { type HubJson } from "./layout.js";
-import type { HubNoSuchProjectResult, HubReachabilityState, HubUnreachableResult } from "../types.js";
+import type { HubIdentityChangedResult, HubNoSuchProjectResult, HubUnreachableResult, HubUnreachableState } from "../types.js";
 /**
  * Everything `hub push` and `hub pull` must settle about the HUB before either
  * of them touches anything — the local project, the hub, or their own
@@ -31,19 +32,28 @@ import type { HubNoSuchProjectResult, HubReachabilityState, HubUnreachableResult
  * `status.ts` kept a private rule ("hub.json exists"), so it called a `hub.json`
  * carrying no `hubId` reachable while push refused the same directory.
  *
- * **It writes nothing.** Every call here is a read: `statSync` on the hub root,
- * one `hub.json` read, and — only when `--project-id` was passed — one
- * `project.json` read plus, on failure, one `projects/` listing for the pick
- * list. That is what lets every caller run it before the work rather than in
- * the middle of it, which is the ordering half of both refusals — and what lets
- * the two read-only verbs call it at all.
+ * **It writes nothing on the hub.** Every hub call here is a read: `stat` on
+ * the hub root, one `hub.json` read, and — only when `--project-id` was passed
+ * — one `project.json` read plus, on failure, one `projects/` listing for the
+ * pick list. That is what lets every caller run it before the work rather than
+ * in the middle of it, which is the ordering half of every refusal — and what
+ * lets the two read-only verbs call it at all. The one LOCAL write it can make
+ * is the first-sighting record in `~/.sesh-mover/joined-hubs.json` (see
+ * `checkJoinedHubIdentity`), and the read-only verbs switch that off.
  */
 export type HubPreflight = {
     kind: "ok";
     hub: HubJson;
+    /**
+     * Ids this machine itself recorded for this hub address before the
+     * current one (`hub init --accept-new-hub-id`). The signature check
+     * accepts a statement signed under one of them, so a deliberately
+     * re-identified hub's earlier bundles do not read as tampering.
+     */
+    previousHubIds: string[];
 } | {
     kind: "refuse";
-    result: HubUnreachableResult | HubNoSuchProjectResult;
+    result: HubUnreachableResult | HubNoSuchProjectResult | HubIdentityChangedResult;
 };
 /**
  * The probe's answer. `hub` is non-null exactly when `state` is `"ok"`, which is
@@ -53,8 +63,20 @@ export type HubPreflight = {
 export type HubReachability = {
     state: "ok";
     hub: HubJson;
+    previousHubIds: string[];
+    joinedStoreUnreadable: string | null;
+}
+/**
+ * `hub.json` was read and names a different identity from the one this
+ * machine joined at this address. `hub` is still null: nothing downstream may
+ * use a record whose identity this machine has not accepted.
+ */
+ | {
+    state: "identity-changed";
+    hub: null;
+    change: HubIdentityChange;
 } | {
-    state: Exclude<HubReachabilityState, "ok">;
+    state: HubUnreachableState;
     hub: null;
 };
 /**
@@ -85,13 +107,29 @@ export type HubReachability = {
  * `hub status` had its own rule — `hub.json` merely EXISTS — and so called a
  * `hub.json` with no `hubId` reachable while push refused it as `not-a-hub`.
  *
- * Writes nothing, and both calls are bounded in BOTH senses: one `stat` and one
- * small read, each of them under `withHubIoTimeout` so that "bounded" means a
- * wall-clock bound and not merely a small number of syscalls. Before #71 it was
- * only the latter — `statSync` plus a `readFileSync` backend — which is exactly
- * how a push came to sit inside its own project lock forever.
+ * Writes nothing on the hub, and both calls are bounded in BOTH senses: one
+ * `stat` and one small read, each of them under `withHubIoTimeout` so that
+ * "bounded" means a wall-clock bound and not merely a small number of
+ * syscalls. Before #71 it was only the latter — `statSync` plus a
+ * `readFileSync` backend — which is exactly how a push came to sit inside its
+ * own project lock forever.
+ *
+ * **Then it asks whether this is the hub this machine JOINED** — the fourth
+ * failing state, `identity-changed`. Every verb reaches this probe before it
+ * reads a signing-key pin or writes the hub, which is the whole reason the
+ * comparison lives here: pins are keyed by hub id, so a verb that took the id
+ * from a rewritten `hub.json` would look every pin up under an id with no pins
+ * and trust whatever key it met first. See `joined-hubs.ts`. `recordFirstSighting`
+ * is off only for `hub status` and `whereis`, which are documented as writing
+ * nothing; they run the identical comparison and leave the seed to the next
+ * verb that writes. At an address with no record that comparison may open
+ * other projects' configs (the evidence tie), and each of those reads takes
+ * the same per-syscall bound as the two above — a project on a dead mount
+ * must not wedge this one's push inside its lock any more than the hub may.
  */
-export declare function probeHubReachable(hubPath: string, backend: HubBackend): Promise<HubReachability>;
+export declare function probeHubReachable(hubPath: string, backend: HubBackend, opts?: {
+    recordFirstSighting?: boolean;
+}): Promise<HubReachability>;
 /**
  * What is wrong and what to do about it, for one unreachable state — the half
  * that is true no matter which verb asked.
@@ -107,7 +145,7 @@ export declare function probeHubReachable(hubPath: string, backend: HubBackend):
  * no benefit (#75). `hub status` is where a user asks WHICH path is configured,
  * and it answers with the `hubPath` FIELD rather than by interpolating it here.
  */
-export declare function describeHubUnreachable(state: Exclude<HubReachabilityState, "ok">): string;
+export declare function describeHubUnreachable(state: HubUnreachableState): string;
 /**
  * The typed refusal, for the verbs that were about to write: push, pull, and
  * `hub reindex`.
@@ -118,7 +156,21 @@ export declare function describeHubUnreachable(state: Exclude<HubReachabilitySta
  * MATERIALIZED a half-built "hub" at that path and then rebuilt an index into
  * it. Every later command would have treated that directory as real.
  */
-export declare function hubUnreachableRefusal(command: HubUnreachableResult["command"], state: Exclude<HubReachabilityState, "ok">): HubUnreachableResult;
+export declare function hubUnreachableRefusal(command: HubUnreachableResult["command"], state: HubUnreachableState): HubUnreachableResult;
+/** The typed refusal for `identity-changed`, for every verb that was about to read pins or write. */
+export declare function hubIdentityChangedRefusal(command: HubIdentityChangedResult["command"], change: HubIdentityChange): HubIdentityChangedResult;
+/**
+ * The refusal for any non-`ok` probe answer — the one call each writing verb
+ * makes, so no verb can handle the three unreachable states and forget the
+ * fourth.
+ */
+export declare function hubProbeRefusal(command: HubUnreachableResult["command"], probe: Exclude<HubReachability, {
+    state: "ok";
+}>): HubUnreachableResult | HubIdentityChangedResult;
+/** The status/whereis warning for any non-`ok` probe answer. */
+export declare function describeHubProbeFailure(probe: Exclude<HubReachability, {
+    state: "ok";
+}>): string;
 /**
  * The whole gate, in the order the two checks have to run in.
  *

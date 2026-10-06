@@ -1,4 +1,4 @@
-import type { ErrorResult, HubEncryptionRefusedResult, HubLockBusyResult, HubNoSuchProjectResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult, ProgressEvent } from "../types.js";
+import type { ErrorResult, HubEncryptionRefusedResult, HubIdentityChangedResult, HubLockBusyResult, HubNoSuchProjectResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult, ProgressEvent } from "../types.js";
 export interface HubPushOptions {
     configDir: string;
     projectPath: string;
@@ -135,7 +135,7 @@ export interface HubPushOptions {
  * `HubPullOutcome`. The two refusals at the end arrive from the shared
  * preflight (#75) and are the two that used to be a raw throw.
  */
-export type HubPushOutcome = HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | HubUnreachableResult | HubNoSuchProjectResult | HubEncryptionRefusedResult | ErrorResult;
+export type HubPushOutcome = HubPushResult | HubUnlinkedResult | HubLockBusyResult | HubPushFailedResult | HubUnreachableResult | HubNoSuchProjectResult | HubIdentityChangedResult | HubEncryptionRefusedResult | ErrorResult;
 /**
  * `onProgress`'s contract, which is invisible from any single call site — the
  * same note `hubPull` carries, and deliberately the same shape (#74, #78).

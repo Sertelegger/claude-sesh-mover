@@ -2,7 +2,7 @@ import type { HubBackend } from "./backend.js";
 import { type HubJson } from "./layout.js";
 import { type LocalProjectId } from "./identity.js";
 import { type ResolvedThread } from "./threads.js";
-import type { HubNoSuchProjectResult, HubProjectRetiredResult, HubUnlinkedResult, HubUnreachableResult } from "../types.js";
+import type { HubIdentityChangedResult, HubNoSuchProjectResult, HubProjectRetiredResult, HubUnlinkedResult, HubUnreachableResult } from "../types.js";
 export interface ResolveStageInput {
     backend: HubBackend;
     /**
@@ -46,6 +46,13 @@ export interface ResolveStageValue {
     hub: HubJson;
     /** `hub:<hubId>`, the peer id the hub's own receipt ledger is kept under. */
     hubPeerId: string;
+    /**
+     * Ids this machine recorded for this hub address before the current one —
+     * forwarded to the signature gate, which accepts a statement signed under
+     * one of them. Only ever this machine's own record (`joined-hubs.ts`), never
+     * anything the hub says.
+     */
+    previousHubIds: string[];
     resolved: ResolvedThread[];
 }
 /**
@@ -74,7 +81,7 @@ export type ResolveStageOutcome = {
     reasons: string[];
 } | {
     kind: "return";
-    result: HubUnlinkedResult | HubUnreachableResult | HubNoSuchProjectResult | HubProjectRetiredResult;
+    result: HubUnlinkedResult | HubUnreachableResult | HubNoSuchProjectResult | HubIdentityChangedResult | HubProjectRetiredResult;
 };
 /**
  * The pull's first stage: settle which hub project this directory IS, announce

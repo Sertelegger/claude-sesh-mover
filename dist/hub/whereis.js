@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { createFsBackend } from "./backend.js";
 import { machinePath } from "./layout.js";
 import { readLocalProjectId, resolveProjectIdentity } from "./identity.js";
-import { describeHubUnreachable, probeHubReachable } from "./preflight.js";
+import { describeHubProbeFailure, probeHubReachable } from "./preflight.js";
 import { readAllIndexes } from "./index-file.js";
 // #44: `pullNeeded` is the same question `pull` asks, so it goes through the
 // same function. The import direction makes this module and pull-select
@@ -178,7 +178,10 @@ export async function shapeThreads(backend, resolved, meId, state, targetProject
 export async function hubWhereis(opts) {
     const backend = createFsBackend(opts.hubPath);
     const warnings = [];
-    const probe = await probeHubReachable(opts.hubPath, backend);
+    // No first-sighting write: `whereis` is read-only by contract, and the
+    // SessionStart hook runs it. The joined-hub comparison still runs, and an
+    // `identity-changed` is reported here exactly like an unreachable hub.
+    const probe = await probeHubReachable(opts.hubPath, backend, { recordFirstSighting: false });
     if (probe.state !== "ok") {
         // `linked` still answers, because it is a LOCAL fact — the presence of
         // `.sesh-mover-project.json` — and withholding it would lose the one thing
@@ -186,7 +189,7 @@ export async function hubWhereis(opts) {
         // `resolveProjectIdentity`: the latter's other two arms are decided by
         // listing the hub's projects, which is the read that just failed.
         const local = readLocalProjectId(opts.projectPath);
-        warnings.push(describeHubUnreachable(probe.state));
+        warnings.push(describeHubProbeFailure(probe));
         warnings.push("No thread information could be read, so the empty thread list here means UNKNOWN rather than none — this project may well have threads on the hub. The link state below is a local fact and says nothing about whether the hub still has that project.");
         return {
             success: true,

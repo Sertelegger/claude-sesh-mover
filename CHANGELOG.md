@@ -2,6 +2,426 @@
 
 Notable changes per release. Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+## [0.13.0] — 2026-10-06
+
+> [!IMPORTANT]
+> **Upgrade if you use the hub.** This release fixes a privately reported
+> issue in hub signing ([GHSA-h6c8-25q8-92p2]): anyone who could write the hub
+> directory could reset every receiving machine's signing-key pins, including
+> pins confirmed with `hub trust`. The fix has every hub command that reads
+> the hub check the hub's identity before it reads a pin or writes to the hub,
+> and that check can refuse **the first hub command you run after
+> upgrading**. See "After upgrading" under Security.
+
+Beyond that: nine fixes from the pre-release audit, to what a moved session
+says about where it is, to how sessions reach the folder Claude Code reads, and
+to what the hub tells you, plus two more that their first Windows CI run found
+([#164]); a `~`-spelled hub path that created the hub inside the current
+project ([#162]); and `hub reindex --unsigned`, which settles [#122].
+
+### Security
+
+- **A hub writer could reset every receiver's signing-key pins
+  ([GHSA-h6c8-25q8-92p2]; affects 0.11.0 and 0.12.0).** Pins are kept per hub
+  and machine, and the hub half was whatever the hub's own `hub.json` said on
+  each run. Replacing that one field made every receiver's pin lookup miss: a
+  substituted signing key was pinned as a first sighting with only the
+  ordinary first-use warning, a `hub trust` confirmation was never consulted,
+  and the unsigned-downgrade warning stopped, because it fires only when a pin
+  exists.
+
+  Each machine now remembers, per hub path, the hub identity it joined, in
+  `~/.sesh-mover/joined-hubs.json` — never on the hub. Every hub command that
+  reads the hub compares `hub.json` with it before it reads a pin or writes to
+  the hub. On a change, `push`, `pull`, `hub trust`, `hub reindex`,
+  `hub retire`, `hub delete`, `hub encrypt`, `hub rekey`, `hub compact` and
+  `hub init` refuse with `reason: "hub-identity-changed"` (exit 2), and
+  `hub status` and `whereis` report `hubState: "identity-changed"`. The
+  session-end auto-push refuses too, which only `hub status`'s `lastAutoPush`
+  shows, and the session-start notice says so in one sentence.
+
+  > **If you did not re-create or switch the hub yourself, a
+  > `hub-identity-changed` refusal means someone rewrote `hub.json`. Stop and
+  > find out who can write that directory.** If you did,
+  > `hub init --path <dir> --scope <the scope hub.path is set in> --accept-new-hub-id`
+  > re-joins. It carries this machine's pins forward to the new identity, so a
+  > confirmed pin stays confirmed and a key that differs from its pin still
+  > refuses, and bundles signed under the old identity still verify on this
+  > machine. It is a flag only: no config key sets it, and neither session
+  > hook can pass it.
+
+  **After upgrading.** No earlier version recorded an identity, so the first
+  hub command at each hub path records one (`hub status` and `whereis` make the
+  same comparison but never record) — but only when this machine's own records
+  agree with `hub.json` unambiguously. The records that count are the
+  hub ids in the sync-state of the projects that use that path; if no project
+  does, or not every project's configuration could be read, every hub id in
+  this machine's sync-state and pins counts. If they name no hub at all, or
+  exactly the one `hub.json` names, it is recorded. Anything else refuses with
+  `hub-identity-changed` and `basis: "evidence"` — the honest hub included,
+  when a project that moved between hubs left its old id beside the new one. A
+  plain `hub init --path <dir>`, with the `--scope` the refusal names, records
+  it. Until then the session-end auto-push refuses at every session end.
+
+  Reading that evidence is bounded per read, like hub I/O, so a project on a
+  hung mount cannot wedge an unrelated project's push; a read that fails or
+  times out only ever makes the decision stricter. A machine that knows at most
+  one hub id opens no project configuration for it at all.
+
+- **`hub init` could split a synced hub in two, or shadow an unmounted one.**
+  Found with the issue above, and fixed with it. Run on a folder whose first sync had
+  delivered other machines' `machines/` and `projects/` but not yet `hub.json`,
+  it minted a second identity, with `encrypt: false`, and reported
+  `created: true`. Once the two `hub.json` files met in the sync, every
+  signature and pin made under the losing one broke, and an encrypted hub could
+  be unsealed.
+  - It now refuses with `reason: "hub-content-without-identity"` (exit 3) and
+    writes nothing. Wait for the sync to finish and run it again.
+  - At an empty or missing directory it refuses with
+    `reason: "hub-identity-not-present"` (exit 3) and creates nothing, when
+    this machine joined a hub there before (`basis: "recorded"`) — which is
+    what an unmounted share's mount point looks like — or when this machine's
+    own projects use that path for a hub, or might (`basis: "evidence"`). "Might"
+    means a project whose configuration cannot be read; each is named in
+    `unresolvedProjects` with a cause, so you know what to mount or fix.
+  - That needs only one known hub id. So a project on an unmounted share, or a
+    deleted project's leftover sync-state, makes `hub init` refuse at **any**
+    empty path until the project is mounted or fixed, or the sync-state is
+    removed.
+  - `--accept-new-hub-id` is the deliberate path for a hub that is truly gone,
+    or a new one you mean to start there. Where nothing was recorded for the
+    path, it carries no pins, and its `warnings` say so.
+
+- **An escrow passphrase piped from Windows PowerShell 5.1 could carry a
+  byte-order mark.** PowerShell 5.1 can prepend a UTF-8 BOM when it pipes text
+  to a native command — measured on the Windows CI runner, with the PowerShell
+  line this release adds to `hub escrow` ([#134]). Left in, a real passphrase
+  would have produced an escrow that opens only with an invisible character nobody can
+  type at `age`'s prompt, and a BOM with nothing after it passed the
+  empty-passphrase refusal, so the escrow was written under a passphrase anyone
+  can supply. The reader now drops a leading BOM before anything else, so a
+  BOM-only input is empty and refused. No released version printed or
+  documented a PowerShell escrow line, so no documented path reached this. The reader
+  in 0.10.0 through 0.12.0 did not drop a BOM either, so a passphrase piped
+  into one of them by hand from PowerShell 5.1 kept any BOM the pipe added;
+  whether it added one there was not measured.
+
+### Added
+
+- **`hub reindex --unsigned`, and a disclosure on every reindex ([#122],
+  [#131]).** `hub reindex` re-signs each record it rebuilds over whatever is on
+  the hub now, and cannot do better: the digest a push signs is kept inside the
+  signature, in the index being rebuilt, so nothing local is left to check the
+  bytes against, and an honest repair cannot be told apart from laundering a
+  substitution. Every reindex that writes an index now says which of the two
+  paths it took, and the default path's warning carries the rule itself:
+  **never run it in response to another machine reporting a signature
+  mismatch.** `--unsigned` rebuilds every record without a statement. Peers then
+  read them as unsigned, with a downgrade warning once they have pinned this
+  machine, until fingerprints have been compared out of band with `hub trust`;
+  a plain re-run restores the signatures. It is a flag only, never a config
+  key, and the library's `hubReindex` takes `unsigned?: boolean`.
+- `hub init --accept-new-hub-id` — see Security.
+
+### Fixed
+
+- **A moved session's pointer to a saved tool output named a directory that
+  exists on neither machine ([#136]).** When a tool's output is too large,
+  Claude Code saves it under the session's `tool-results/` and quotes the path
+  in a `<persisted-output>` block, which is the copy the model reads. The
+  rewrite mapped the config dir and the encoded project name in that text, but
+  not the session id one segment further right, so after an import or migrate
+  it named the target project and the *source* session. A session id in free
+  text is now renamed only when it is the segment directly under this import's
+  own `<config dir>/projects/<encoded project>/`. A bare uuid in prose is
+  content and stays as written.
+
+- **A pulled continuation kept the sending machine's session id ([#137]).**
+  [#127]'s session-id map never reached a continuation bundle. A continuation's
+  lines are the sender's lines verbatim and its bundle id is stamped only on a
+  synthetic header, yet the import keyed only the bundle id and the splice
+  passed no map at all. So a spliced or adopted continuation left the sender's
+  `session_id`s in a transcript you already own, and on every path,
+  `--no-append` included, its `tool-results/` pointers named a directory that
+  does not exist. Both paths now map the sender's id onto the session the
+  content lands in: the base on a splice or adoption, the new session on an
+  import.
+
+- **Sixteen more location fields now follow a moved session ([#135]).** Among
+  them `serverClassifierContext`, on two-thirds of tool results written since
+  Claude Code 2.1.278 and read back to build auto-mode classifier requests, and
+  `relocated.relocatedCwd`, which Claude Code's loader uses in place of `cwd`
+  for a session that changed directory or entered a worktree. The rest are
+  Artifact and SendUserFile inputs, wire copies and results; a PDF read's
+  extraction directory; TaskStop's command; the `task_status` attachment's
+  output path and command, the nested-memory attachment's path and the
+  `instructions` attachment's removed files; and `frame-link`'s `path`. Each
+  went through [#127]'s rule — a location is translated, content is not — so a
+  nested-memory attachment's file content, and the `path` a memory-store read
+  returns, are left alone.
+
+- **On Windows, one account spelled two ways was read as two users.** The
+  source user is read off the project path and the target user from the
+  operating system, so a home directory spelled by its 8.3 short name
+  (`C:\Users\RUNNER~1`) on one side and in full on the other produced a home
+  mapping from a directory to itself. Because stage 1 applies its mappings in
+  sequence, that mapping re-spelled every target path an earlier one had just
+  produced: a same-machine migrate re-spelled every `cwd`, and [#136]'s pointer
+  fix missed. Two home paths that resolve to the same directory on this machine
+  are now one user. Pre-existing, Windows only, and first exercised by this
+  release's new tests on the Windows CI runner.
+
+- **`import`, `migrate` and `pull` filed sessions where Claude Code never looks
+  when the destination was typed through a symlink or as a relative path
+  ([#149]).** Claude Code keys a project's session folder on the physical
+  absolute path of its working directory, while a typed `--target-project-path`
+  (and both of `pull`'s paths) was encoded exactly as typed. So an import
+  through a symlink reported success into a folder that `claude --continue` in
+  that directory never opens, and `../x` encoded as `---x`. Every write
+  destination is now resolved to the physical absolute directory before anything
+  is written; the session folder, every transcript's `cwd`, the `history.jsonl`
+  entry and the sync-state key all use that spelling, and `warnings` opens with
+  a note when a link was followed or a relative path resolved. On Windows the
+  path is only made absolute ([#148]). Paths that are only read
+  (`export --project-path`, `migrate --source-project-path`, `push`) are not
+  resolved, which is what lets sessions this misfiled be moved into place:
+  migrate from the symlinked spelling to the real path.
+
+  A destination starting with `~` is now refused (exit 1, nothing written).
+  Inside quotes no shell expands `~`, so it named a directory called `~` inside
+  the working directory, and `migrate --rename-dir` moved a project into one.
+
+- **Migrating a project onto its own path — the remedy 0.12.0 gave for
+  [#126]'s misfiled sessions — renumbered the sessions already in place
+  ([#149]).** A migrate reads a project's sessions from two folders, the one
+  Claude Code reads and the pre-0.12.0 one, and writes only into the first. So
+  `migrate R -> R` gave every session already in the right folder a new id,
+  which broke `claude --resume <old id>` and the hub's record of which thread
+  each session belongs to; cleanup then deleted from the wrong folder, leaving
+  every session it moved behind as a duplicate. Now a session already in the
+  folder the migrate writes stays there under its own id, and a warning names
+  it; each moved session is deleted from the folder it was found in; and when
+  nothing is left to move, the migrate is refused (`"Nothing to move"`, exit 2,
+  dry run included) and nothing is written. The same holds for every other way
+  a target can name the source's own folder: a symlink to the source, a
+  trailing slash, two paths that differ only in punctuation (`/a/b-c`,
+  `/a/b.c`) — even with `--rename-dir`, so rename such a directory yourself —
+  and, on macOS and Windows, two that differ only in letter case.
+
+- **`memory/.consolidate-lock` no longer travels ([#144]).** It is Claude
+  Code's lock for memory consolidation, and its modification time is the "last
+  consolidated" clock. A landed copy postponed the target machine's
+  consolidation; a copy that met the target's own lock was parked and indexed
+  in `MEMORY.md` like a conflicting memory; and a change of process id alone
+  changed the memory digest, so the next push re-sent the whole memory layer.
+  Export leaves the lock out of the copy and out of both digests, import drops
+  it from bundles made by 0.12.0 and earlier, and a memory folder holding
+  nothing else is no longer declared a memory layer. A machine that recorded a
+  digest with the lock in it re-sends memory once after upgrading, then stops.
+
+- **`push` discarded every warning its export step produced ([#140]).** Two
+  never reached anyone: why a session went up whole rather than as a delta (a
+  larger upload and a new full bundle on the hub, unexplained), and [#124]'s
+  notice of files in a session's folder that no bundle carries — which a
+  continuation never checked at all, so after a session's first push no push
+  mentioned them. Push now reports both, folded into one note each, after its
+  own warnings. The order matters for the session-end auto-push: its only
+  report is `hub status`'s `lastAutoPush`, which keeps the first five notes, and
+  per-session sentences had pushed the unsigned-push and tracked-secret
+  disclosures out of it.
+
+- **A 3-way workspace merge on `pull` now names every file it replaced
+  ([#156]).** A file unchanged here since the shared generation and changed on
+  the other machine is replaced, content and mode, with no sidecar and no
+  backup. With a wrong ancestor that is a silent revert that reads as a clean
+  merge. The pull now names the generation it merged against and which
+  machine's payload it was, lists each replaced file, and says the replaced
+  bytes are that generation's copy, still on the hub at the named artifact path
+  for as long as it is kept. Files merged without conflicts are listed too, and
+  a fallback to an older generation names the closest one it could not fetch.
+
+- **A sealed hub's refusals now name commands that actually publish a
+  machine's key ([#160]).** `push`'s un-keyed-machine refusal,
+  `hub encrypt --enable`'s `stale-machines` refusal, and the matching warnings
+  in `hub encrypt` and `hub rekey` said "run any hub command", but `hub status`,
+  `whereis` and `hub trust` never touch a machine record. They now name a plain
+  `hub encrypt` (which changes no setting), a push or a pull. The
+  `self-unkeyed` and `no-recipients` refusals no longer say to re-register: the
+  refusing command already re-published this machine's record as its first
+  step, so they say what reading it back showed — a different key, no key, an
+  unreadable record or none — and point at the `machines/<id>.json` to check
+  for a sync client that has not caught up or reverted it.
+
+- **`hub escrow`'s command lines now run on a real install ([#134]).** They ran
+  a bare `sesh-mover`, which no documented install puts on PATH, and a line
+  that fails with "command not found" pushes a user toward pasting the
+  passphrase into the chat, which the session-end auto-push then uploads. Two
+  lines are printed now, one for bash/zsh and one for PowerShell, each running
+  `node` on the absolute path of the installed `cli.js`. The bash/zsh line keeps
+  `IFS=` and `-r`, so edge spaces and backslashes survive, and runs in a
+  subshell, so the passphrase does not stay behind in the user's shell; the
+  PowerShell line sets `$OutputEncoding`, so Windows PowerShell 5.1 does not
+  turn non-ASCII characters into `?`. All four passphrase refusals print both
+  lines; the empty and line-break refusals used to print neither.
+
+- **A `~`-spelled hub path created the hub inside the current project
+  ([#162]).** Bash expands `~` neither inside the quotes `/sesh-mover:hub-init`
+  uses nor in `hub.path=~/…`, so `hub init` and `configure --set hub.path`
+  received a literal `~` and resolved it against the working directory: a hub
+  that synced with nothing, and then shipped in that project's own workspace
+  snapshot or carry. A leading `~` is now expanded to the home directory, both
+  when the path is set and when a stored value is read (`~user` is not). A
+  relative path is refused when it is set, before anything is created: exit 1
+  from both, with `reason: "hub-path-not-absolute"` from `hub init`. A relative
+  value already stored resolves as it always has.
+
+- **`hub compact` could leave `memory/` out of the consolidated bundle when the
+  hub's identity had changed since the project first pushed.** Its
+  memory-credit forget was keyed on the hub id stamped into the project's
+  sync-state, which is never updated, so the consolidated bundle went up
+  without memory while the run prepared to retire the only bundle carrying it.
+  The forget is now keyed on the identity the command just read from the hub.
+
+### Corrections to the 0.12.0 notes
+
+- **0.12.0 overstated [#127].** It listed `toolUseResult.persistedOutputPath`
+  as fixed. That was true for full bundles only: for a continuation, whether
+  spliced, adopted or imported, the pointer stayed stale, and the model-visible
+  `<persisted-output>` copy of the same path kept the source session id even on
+  a full import. Its known limitation named only the splice's `session_id`.
+  Both are fixed in this release ([#136], [#137]).
+- **Shipped in 0.12.0 but missing from its notes ([#110]).** A pull checks a
+  signed bundle's workspace snapshot against the signed `workspaceDigest`
+  before unpacking it. On a mismatch it skips the snapshot, writes nothing to
+  the project, imports the sessions normally, and reports
+  `workspaceUnverified` (a new optional field on `HubPullResult`). The merge
+  ancestor is checked against the digest this machine recorded when it pushed
+  or applied that generation, and is not used on a mismatch; generations
+  recorded before 0.12.0 carry none and are not checked. An unsigned bundle
+  sets no expectation, so its snapshot is not checked ([#107]).
+
+### Changed
+
+- `HubReachabilityState` gains `"identity-changed"`, which `hub status` and
+  `whereis` report as `hubState`. The type is re-exported from the library
+  entrypoint, so **a consumer switching exhaustively over it will need a new
+  arm**. The same goes for one switching over a result's `reason`: four new
+  result shapes join `CliResult` (`hub-identity-changed`,
+  `hub-content-without-identity`, `hub-identity-not-present`,
+  `hub-path-not-absolute`), and every hub verb that refuses on a changed
+  identity can now return `HubIdentityChangedResult`. These are the breaking
+  surfaces in this release.
+- Additive: `hubInit` takes `acceptNewHubId` and `hubReindex` takes `unsigned`;
+  `RewriteContext` gains an optional `targetProjectDir`, and `buildSessionIdMap`
+  is new (a hand-built context without `targetProjectDir` renames no session
+  id in free text, exactly as before); `ExportOptions` gains `discovered`, a
+  list of already-discovered sessions used instead of the export's own
+  discovery.
+- `relocated` and `frame-link` join `JsonlEntryType`, and `UserMessageEntry`
+  gains `serverClassifierContext`.
+- Also newly exported: `physicalProjectPath`, `MACHINE_LOCAL_MEMORY_NAMES`,
+  `escrowEnableRecipes`, `hubIdsRecordedInSyncState`, `mergeConfigLayers`,
+  `parseConfigOverrides`, and the types `HubUnreachableState` and
+  `HubUnresolvedProject`. #149's target-path resolution happens at the CLI
+  boundary, so a library caller passing its own target path should call
+  `physicalProjectPath` itself.
+
+### Documentation
+
+- The README and the skill doc no longer deny [#110]'s check. Five passages
+  said a pull does not check the workspace artifact; they now state the limit
+  that is still true — only a signed bundle's artifact is checked, so a
+  stripped signature switches the check off ([#131] fixed the first). And a
+  sentence [#131] added told the skill layer to tell signed and unsigned pulls
+  apart by "the signing fields on the result", which no result has; it now
+  says nothing on the result tells them apart, and never to tell a user that a
+  pulled workspace was verified.
+- The signing and pinning claims in the README, the skill doc and
+  `commands/hub-trust.md` now match what the advisory fix makes true, and state
+  the residue below.
+- The sealed-hub remedies in the README, the skill doc, `commands/push.md` and
+  `commands/hub-encrypt.md` now name a plain `hub encrypt`, a push or a pull as
+  the verbs that publish a machine's key, instead of "any hub command";
+  `commands/push.md` no longer names a
+  `/sesh-mover:hub-status` command that does not exist.
+
+### Known limitations
+
+- **Claude Code 2.1.288 to 2.1.290 could lose a session's last messages when
+  quitting.** Its own 2.1.291 notes: "Fixed a regression in 2.1.288 where the
+  last messages of a session could be lost when quitting". sesh-mover moves
+  what is on disk, so a session exported or pushed from those builds, the
+  session-end auto-push included, carries the same gap. Use 2.1.291 or later.
+  Everything this release depends on was re-checked against 2.1.291.
+- **The hub identity is trusted once.** The first join at a hub path, or the
+  first contact at a path this machine has no record for (every path after
+  upgrading, and one set with `configure --set hub.path` rather than
+  `hub init`), takes `hub.json`'s word for the hub's identity, as a first pin
+  takes a key. In particular, if every record this machine holds for a path
+  names one hub id the path no longer serves — a project moved between hubs,
+  or the hub there was re-created — and no identity has been recorded for the
+  path yet, a hub writer who sets `hub.json` to exactly that stale id is seeded.
+- **The Windows project-folder encoding is still inferred, not observed
+  ([#148]).** The rule is read verbatim from Claude Code's shipped build, but
+  what string reaches it on Windows has never been seen: the live check that
+  would settle it skips on every CI runner. That is also why [#149] only makes
+  a Windows destination absolute.
+- **`import "claude-sesh-mover"` runs the CLI ([#132]).** `package.json`'s
+  `main` points at `dist/cli.js`, so importing the package by name parses the
+  host process's own arguments as a sesh-mover command, and no named export
+  resolves; the library barrel is `dist/index.js`. Plugin installs are not
+  affected, since every hook and command runs `dist/cli.js` by path, and the
+  package has never been published to npm.
+- **A cross-user move can re-spell a target path that sits under the source
+  user's home ([#165]).** Stage 1 of the rewrite applies its path mappings in
+  sequence, so a later mapping can rewrite a path an earlier one just produced:
+  moving from `alice` to `bob` with a target config dir `/home/alice/.claude-b`
+  yields `/home/bob/.claude-b/…`. 0.12.0 behaves the same; the same-account
+  case above is fixed.
+- **`migrate --rename-dir` between two directories that encode alike can leave
+  a stale `cwd` it does not mention ([#166]).** Moving `/a/b.c` to `/a/b-c`
+  with older-spelled sessions to bring along, a session already in the shared
+  folder stays under its own id, as it must, but its recorded `cwd` still names
+  the directory the rename removed, and its warning does not say so.
+- Left as they are, each deliberately: `worktree-state` entries, which carry
+  three paths but also a session id whose meaning is not established, and none
+  has been observed to measure; `serverClassifierContext`, translated rather
+  than removed, although Claude Code deletes it itself on subagent and teammate
+  resumes; and a session id inside a `/tmp/claude-<uid>/…` scratchpad path in
+  free text, such as a Bash command, since no bundle carries the scratchpad.
+- Some Bash calls have a recorded wire form that Claude Code accepts only after
+  its own normalisation ([#139]): double-escaped unicode, or `\\;`. If such a
+  command names a file in the session's own directory, it can now lose that
+  wire form even on a move where no path changed, because the session id in
+  the command is renamed and the wire form is not. Before this release that
+  happened only when a path moved. Claude Code falls back to the translated
+  command, so nothing is lost.
+
+[GHSA-h6c8-25q8-92p2]: https://github.com/Sertelegger/claude-sesh-mover/security/advisories/GHSA-h6c8-25q8-92p2
+[#107]: https://github.com/Sertelegger/claude-sesh-mover/issues/107
+[#110]: https://github.com/Sertelegger/claude-sesh-mover/issues/110
+[#122]: https://github.com/Sertelegger/claude-sesh-mover/issues/122
+[#124]: https://github.com/Sertelegger/claude-sesh-mover/issues/124
+[#126]: https://github.com/Sertelegger/claude-sesh-mover/issues/126
+[#127]: https://github.com/Sertelegger/claude-sesh-mover/issues/127
+[#131]: https://github.com/Sertelegger/claude-sesh-mover/pull/131
+[#132]: https://github.com/Sertelegger/claude-sesh-mover/issues/132
+[#134]: https://github.com/Sertelegger/claude-sesh-mover/issues/134
+[#135]: https://github.com/Sertelegger/claude-sesh-mover/issues/135
+[#136]: https://github.com/Sertelegger/claude-sesh-mover/issues/136
+[#137]: https://github.com/Sertelegger/claude-sesh-mover/issues/137
+[#139]: https://github.com/Sertelegger/claude-sesh-mover/issues/139
+[#140]: https://github.com/Sertelegger/claude-sesh-mover/issues/140
+[#144]: https://github.com/Sertelegger/claude-sesh-mover/issues/144
+[#148]: https://github.com/Sertelegger/claude-sesh-mover/issues/148
+[#149]: https://github.com/Sertelegger/claude-sesh-mover/issues/149
+[#156]: https://github.com/Sertelegger/claude-sesh-mover/issues/156
+[#160]: https://github.com/Sertelegger/claude-sesh-mover/issues/160
+[#162]: https://github.com/Sertelegger/claude-sesh-mover/issues/162
+[#164]: https://github.com/Sertelegger/claude-sesh-mover/pull/164
+[#165]: https://github.com/Sertelegger/claude-sesh-mover/issues/165
+[#166]: https://github.com/Sertelegger/claude-sesh-mover/issues/166
+
 ## [0.12.0] — 2026-09-19
 
 Every fix here came out of one real event: two projects and 190 sessions moved

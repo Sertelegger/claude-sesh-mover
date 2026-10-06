@@ -71,7 +71,7 @@
 import { type HubBackend } from "./backend.js";
 import { type HubBundleRecord, type HubCompactionEntry, type HubIndexJson } from "./layout.js";
 import { COMPACTION_GRACE_MS } from "./compact-plan.js";
-import type { ErrorResult, HubCompactPendingResult, HubCompactResult, HubCompactRefusedResult, HubLockBusyResult, HubUnreachableResult, SyncState } from "../types.js";
+import type { ErrorResult, HubCompactPendingResult, HubCompactResult, HubCompactRefusedResult, HubIdentityChangedResult, HubLockBusyResult, HubUnreachableResult, SyncState } from "../types.js";
 /** The local session ids this machine has mapped to a thread. */
 export declare function localSessionsForThread(state: SyncState, threadId: string): string[];
 /**
@@ -105,7 +105,7 @@ export interface HubCompactOptions {
     nowMs?: number;
 }
 export { COMPACTION_GRACE_MS };
-export type HubCompactOutcome = HubCompactResult | HubCompactPendingResult | HubCompactRefusedResult | HubLockBusyResult | HubUnreachableResult | ErrorResult;
+export type HubCompactOutcome = HubCompactResult | HubCompactPendingResult | HubCompactRefusedResult | HubLockBusyResult | HubUnreachableResult | HubIdentityChangedResult | ErrorResult;
 /**
  * The verb.
  *

@@ -13,7 +13,9 @@
  * works in both layouts today and is one directory-layout change away from
  * throwing at module load on the unattended auto-push path. A constant cannot
  * fail to load. The drift it costs is bought back by `tests/version.test.ts`,
- * which pins this against `package.json`, `.claude-plugin/plugin.json` and
- * `.claude-plugin/marketplace.json` — all four move together or the suite fails.
+ * which pins this against `package.json`, both root versions in
+ * `package-lock.json`, `.claude-plugin/plugin.json` and
+ * `.claude-plugin/marketplace.json` — all of them move together or the suite
+ * fails.
  */
-export const PLUGIN_VERSION = "0.12.0";
+export const PLUGIN_VERSION = "0.13.0";

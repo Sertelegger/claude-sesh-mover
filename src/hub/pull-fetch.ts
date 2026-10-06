@@ -29,6 +29,13 @@ export interface FetchStageInput {
    * id on two hubs is two different trust decisions.
    */
   hubId: string;
+  /**
+   * Ids this machine recorded for this hub address before `hubId`
+   * (`joined-hubs.ts`), so a bundle signed under a deliberately re-identified
+   * hub's earlier id verifies instead of reading as a lifted statement. Absent
+   * means none — every hub that was never re-identified.
+   */
+  previousHubIds?: readonly string[];
   /** The statement context's project half — the project this pull resolved. */
   projectId: string;
   /**
@@ -235,6 +242,7 @@ interface SignatureGateInput {
   /** The machine whose index listed the record — the claimed signer. */
   machineId: string;
   hubId: string;
+  previousHubIds?: readonly string[];
   projectId: string;
   /**
    * The pull's single "now", captured once by `pull.ts` for the whole
@@ -278,7 +286,7 @@ type SignatureGateOutcome =
   | { aborted: null; attestation: WorkspaceAttestation };
 
 async function runSignatureGate(input: SignatureGateInput): Promise<SignatureGateOutcome> {
-  const { record, machineId, hubId, projectId, nowIso, tarPath, reasons } = input;
+  const { record, machineId, hubId, previousHubIds, projectId, nowIso, tarPath, reasons } = input;
 
   // Read STRUCTURALLY rather than off the declared type: `HubBundleRecord`
   // grows `signature` from the push side in this same slice, and this reader
@@ -290,7 +298,10 @@ async function runSignatureGate(input: SignatureGateInput): Promise<SignatureGat
   // One pin read serves both branches. `readPins` never throws (an unreadable
   // store is EMPTY by its own documented rule), and the pin is per
   // (hubId, machineId) because the same machine id on two hubs is two trust
-  // decisions.
+  // decisions. `hubId` here is the identity this machine JOINED, not merely
+  // what hub.json says today: the probe refused the pull before this stage if
+  // the two differ (`joined-hubs.ts`), which is the only thing that stops a
+  // rewritten hub.json from pointing this lookup at an id with no pins.
   const pin = findPin(readPins(), hubId, machineId);
 
   if (signature == null) {
@@ -333,6 +344,7 @@ async function runSignatureGate(input: SignatureGateInput): Promise<SignatureGat
       // attacker whether they are lying.
       context: {
         hubId,
+        previousHubIds,
         projectId,
         machineId,
         bundleId: record.bundleId,
@@ -406,7 +418,7 @@ async function runSignatureGate(input: SignatureGateInput): Promise<SignatureGat
     switch (outcome.kind) {
       case "pinned":
         reasons.push(
-          `Machine ${machineId}'s signing key ${keyFingerprint(signature.publicKey)} was pinned on first use. That trusted the hub's word for it, once — the pin is what makes every later change loud. To upgrade it to an out-of-band confirmation, compare fingerprints and run \`sesh-mover hub trust\`.`
+          `Machine ${machineId}'s signing key ${keyFingerprint(signature.publicKey)} was pinned on first use. That trusted the hub's word for it, once — from now on a different key for that machine refuses the pull, on this hub identity; a change to the hub's own identity refuses every hub command here until you deliberately re-join it. To upgrade it to an out-of-band confirmation, compare fingerprints and run \`sesh-mover hub trust\`.`
         );
         break;
       case "failed":
@@ -524,7 +536,7 @@ export async function runFetchStage(
    * throw into a typed abort — the module contract, not politeness.
    */
   const sigOutcome = await runSignatureGate({
-    record, machineId, hubId, projectId, nowIso, tarPath, reasons,
+    record, machineId, hubId, previousHubIds: input.previousHubIds, projectId, nowIso, tarPath, reasons,
   });
   if (sigOutcome.aborted !== null) return sigOutcome.aborted;
 

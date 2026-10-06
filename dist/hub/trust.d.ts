@@ -14,8 +14,17 @@
  * This verb is the answer to that residue: print a fingerprint, let a human
  * compare it against the same fingerprint shown on the other machine, and
  * record the result as `confirmed`. That is the only step in this feature that
- * does not depend on trusting the hub, and it is why #86's "Done when" clause
- * is achievable at all.
+ * does not take the hub's word for a KEY, and it is why #86's "Done when"
+ * clause is achievable at all.
+ *
+ * It does still rest on one earlier trust, and saying so is the difference
+ * between this sentence and the one it replaces: a pin — confirmed or not — is
+ * kept under the hub identity this machine JOINED, and that identity came from
+ * the hub's own `hub.json` once, at `hub init` or at the upgrade-time seed
+ * (`joined-hubs.ts`). What keeps that from being a standing trust is that a
+ * later change to it refuses every hub verb, this one included, before any pin
+ * is read; until this machine remembered the id, one rewritten field of
+ * `hub.json` made every confirmed pin invisible.
  *
  * **It is optional by owner ruling**, because a single-owner fleet may
  * reasonably decline the ceremony — and a feature nobody runs is worse than one
@@ -43,7 +52,7 @@
  * be the user typing yes to whatever the hub said, which is TOFU with extra
  * steps and a false sense of having checked.
  */
-import type { HubUnreachableResult } from "../types.js";
+import type { HubIdentityChangedResult, HubUnreachableResult } from "../types.js";
 export interface TrustedMachine {
     machineId: string;
     machineName: string | null;
@@ -88,7 +97,7 @@ export interface HubTrustRefusedResult {
  * can never run, and tells the next reader this verb contends with pushes.
  * It writes only this machine's own local pin file (see `hubTrust`).
  */
-export type HubTrustOutcome = HubTrustResult | HubTrustRefusedResult | HubUnreachableResult;
+export type HubTrustOutcome = HubTrustResult | HubTrustRefusedResult | HubUnreachableResult | HubIdentityChangedResult;
 export interface HubTrustOptions {
     projectPath: string;
     hubPath: string;

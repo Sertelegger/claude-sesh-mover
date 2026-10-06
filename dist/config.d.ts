@@ -89,7 +89,20 @@ export type ConfigOverrides = {
     [K in keyof SeshMoverConfig]?: Partial<SeshMoverConfig[K]>;
 };
 export declare function readConfigOverrides(configDir: string): ConfigOverrides;
+/**
+ * The parse half of `readConfigOverrides`, for a caller that has read the
+ * file some other way. It THROWS wherever `readConfigOverrides` would answer
+ * `{}` for unparsable text, so a caller that must tell "no override" from
+ * "could not tell" (`hub/joined-hubs.ts`'s evidence read) can.
+ */
+export declare function parseConfigOverrides(text: string): ConfigOverrides;
 export declare function computeEffectiveConfig(userConfigDir: string, projectConfigDir: string): SeshMoverConfig;
+/**
+ * The layering half of `computeEffectiveConfig` — defaults, then the user
+ * scope's overrides, then the project scope's — for a caller that read the two
+ * layers itself. One merge, so the two can never disagree about precedence.
+ */
+export declare function mergeConfigLayers(user: ConfigOverrides, project: ConfigOverrides): SeshMoverConfig;
 export declare function writeConfig(configDir: string, config: SeshMoverConfig): void;
 /**
  * Persist ONE SCOPE'S OVERRIDES — the keys that scope actually sets, nothing

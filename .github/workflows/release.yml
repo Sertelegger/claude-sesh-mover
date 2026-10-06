@@ -24,6 +24,21 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      # Nothing else compares the tag with the version the build carries.
+      # `PLUGIN_VERSION` is what `--version` prints and what `registerMachine`
+      # stamps into `machines/<id>.json` on a shared hub, and
+      # `tests/version.test.ts` pins it to package.json — so a tag that does
+      # not match package.json publishes a release whose code says it is some
+      # other version. Fail before anything is published.
+      - name: Check the tag matches package.json
+        run: |
+          node -e '
+            const v = require("./package.json").version;
+            if (process.env.GITHUB_REF_NAME !== "v" + v) {
+              console.error("tag " + process.env.GITHUB_REF_NAME + " does not match package.json version v" + v);
+              process.exit(1);
+            }
+          '
       # The release body is the CHANGELOG entry, not `--generate-notes`.
       # Auto-generation lists merged PR titles plus a compare link, which for
       # v0.7.0 — a release that renamed every path the plugin owns on disk and
@@ -33,8 +48,15 @@ jobs:
       #
       # The extractor exits non-zero when the section is missing or empty, and
       # that failure is wanted: a tag pushed without a changelog entry should
-      # fail the release rather than publish blank notes. Re-run after adding
-      # the section — the tag does not need to move.
+      # fail the release rather than publish blank notes.
+      #
+      # Recovering from that failure: a re-run does NOT see a section added
+      # afterwards, because a re-run reuses the original event's GITHUB_SHA and
+      # GITHUB_REF — it checks out the tagged commit again. Either move the tag
+      # to a commit that has the section, or create the release by hand from a
+      # checkout that has it:
+      #   gh release create "$TAG" --verify-tag --title "$TAG" \
+      #     --notes-file <(node scripts/changelog-section.mjs "$TAG")
       - name: Build release notes from CHANGELOG
         run: node scripts/changelog-section.mjs "$GITHUB_REF_NAME" > /tmp/release-notes.md
       - name: Create GitHub Release

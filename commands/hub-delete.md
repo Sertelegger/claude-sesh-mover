@@ -21,7 +21,7 @@ Follow these steps:
    - `reason: "grace-period"` — **the expected answer if the user retired the project recently.** Report `deleteEligibleAt` and `remainingSeconds` as a wait, not as an error, and do not offer to work around it: the wait is sized against how long a synced hub takes to reach a machine that is switched off, and it is the only thing protecting a machine that has not seen the retirement yet. If `remainingSeconds` is `null` the tombstone's own timestamp is unreadable — the suggestion says how to write a fresh one.
    - `reason: "not-retired"` — phase 1 has not happened. Run `/sesh-mover:hub-retire` first, then come back after the window. Never present this as "delete needs a flag".
    - `reason: "not-owner"` — this machine did not create the project; report `ownerMachineName`/`ownerMachineId` and stop. There is no override, deliberately: a machine that cannot see the whole hub must not be able to destroy another machine's work.
-   - `reason: "unlinked"` / `"project-gone"` / `"lock-busy"` / `"hub-unreachable"` — as documented in `/sesh-mover:hub-retire`; nothing was deleted in any of them.
+   - `reason: "unlinked"` / `"project-gone"` / `"lock-busy"` / `"hub-unreachable"` / `"hub-identity-changed"` — as documented in `/sesh-mover:hub-retire`; nothing was deleted in any of them.
 
 5. Relay **every** entry in `warnings` verbatim, and do not soften these two:
    - **Other machines still hold their own link to the deleted project.** A push from one of them recreates the project directory on the hub with no project record — bytes nothing can discover. Each of those machines needs `/sesh-mover:hub-unlink`.
@@ -33,6 +33,6 @@ Follow these steps:
 - `project.json` goes **first**, so a run interrupted half way leaves a project that can no longer be linked to; the tombstone goes **last**, so such a run leaves the pull gate up and the command still authorized to finish the job on a re-run. If a delete is interrupted, simply run it again.
 - Local sessions, exports and workspaces are not touched. Deleting a hub project removes the shared copies only.
 
-**Exit codes:** branch on the parsed JSON, not on `$?`. `0` success, `2` for `grace-period` / `not-retired` / `not-owner` / `unlinked` / `project-gone` — the grace refusal is a refusal, not an environment problem, and a caller must not loop on it — `3` for `lock-busy` and `hub-unreachable`, `1` for a bad invocation or an unexpected failure.
+**Exit codes:** branch on the parsed JSON, not on `$?`. `0` success, `2` for `grace-period` / `not-retired` / `not-owner` / `unlinked` / `project-gone` / `hub-identity-changed` — the grace refusal is a refusal, not an environment problem, and a caller must not loop on it — `3` for `lock-busy` and `hub-unreachable`, `1` for a bad invocation or an unexpected failure.
 
 **Invocation:** `${CLAUDE_PLUGIN_ROOT}` is set by Claude Code inside plugin command execution — use it as-is; do not search the plugin cache. The flag set documented here (`--project-path`, `--project-id`) is authoritative — do not run the CLI with `--help` to discover its surface.

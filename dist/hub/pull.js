@@ -274,7 +274,7 @@ export async function hubPull(opts) {
         // it exactly as they were before this was a stage.
         if (resolveStage.kind === "return")
             return resolveStage.result;
-        const { local, hub, hubPeerId, resolved } = resolveStage.value;
+        const { local, hub, hubPeerId, previousHubIds, resolved } = resolveStage.value;
         warnings.push(...resolveStage.reasons);
         // Everything below (dedup/sync-state, workspace unpack, session import,
         // and this machine's own index projection) is keyed off the EFFECTIVE
@@ -354,6 +354,7 @@ export async function hubPull(opts) {
                 // The signature statement's context (#86) — what the verifier compares
                 // against, rather than the statement's own claims about itself.
                 hubId: hub.hubId,
+                previousHubIds,
                 projectId: local.projectId,
                 nowIso: new Date(opNowMs).toISOString(),
             });

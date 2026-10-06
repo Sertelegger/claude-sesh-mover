@@ -343,7 +343,7 @@ export function selectNeededBundles(
  * to report a bundle the other fetches.
  */
 export function sourcedKey(machineId: string, bundleId: string): string {
-  return `${machineId} ${bundleId}`;
+  return `${machineId}\0${bundleId}`;
 }
 
 /**

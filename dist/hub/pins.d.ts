@@ -24,6 +24,14 @@
  * when the fleet was set up, compromised or migrated later — and covers nothing
  * about an attacker who was already there before this machine ever pulled.
  *
+ * "Fixed locally" is only true because the `hubId` half of the key is ALSO
+ * fixed locally. It used to be read off the hub's own `hub.json` on every run,
+ * so rewriting that one field made every lookup here miss and re-pinned every
+ * machine on first use — a `confirmed` pin included, which was simply never
+ * consulted. `joined-hubs.ts` now remembers which hub identity this machine
+ * joined at each address, and every hub verb refuses on a change BEFORE it
+ * looks a pin up. Read that file before trusting the key below.
+ *
  * `hub trust` is the answer to that residue: a fingerprint the user compares
  * out of band, once, which converts a hub-supplied key into a human-confirmed
  * one. It is optional by owner ruling, because a single-owner fleet may
@@ -36,7 +44,15 @@
  * Pins live under `~/.sesh-mover/`, keyed by `(hubId, machineId)`. Putting them
  * on the hub would be circular — an attacker who can rewrite the key can
  * rewrite the pin that vouches for it — and per-hub because the same machine id
- * on two different hubs is two different trust decisions.
+ * on two different hubs is two different trust decisions. The `hubId` is the
+ * one this machine JOINED (`joined-hubs.ts`), never merely the one `hub.json`
+ * happens to carry today; the two are equal by the time any caller gets here,
+ * because a difference refuses the verb first.
+ *
+ * A deliberate re-join of a re-identified hub (`hub init --accept-new-hub-id`)
+ * CARRIES every pin to the new id (`carryPinsForward`) rather than starting
+ * over: same address, same machines, same keys. Without that, the flag that
+ * accepts a changed identity would itself be the reset primitive.
  *
  * A `confirmed` pin (via `hub trust`) is never silently replaced by a TOFU
  * write; that is the whole difference between the two, and it is enforced in
@@ -52,7 +68,9 @@ export interface KeyPin {
      * human compared a fingerprint out of band via `hub trust`.
      *
      * The distinction is not cosmetic: a `confirmed` pin outranks anything the
-     * hub says, and a re-pin of one requires the user to say so again.
+     * hub says about that machine's key — on the hub identity this machine
+     * joined, which `joined-hubs.ts` holds still — and a re-pin of one requires
+     * the user to say so again.
      */
     origin: "tofu" | "confirmed";
     firstSeenAt: string;
@@ -63,6 +81,12 @@ export interface KeyPin {
      */
     replacedAt?: string;
     previousKey?: string;
+    /**
+     * Set on a pin `carryPinsForward` copied from an earlier id of the same hub
+     * address, naming that id — so a carried pin is never mistaken for one this
+     * machine formed on the new id by itself.
+     */
+    carriedFromHubId?: string;
 }
 interface PinFile {
     schemaVersion: 1;
@@ -120,5 +144,37 @@ export declare function recordPin(args: {
     origin: "tofu" | "confirmed";
     nowIso: string;
 }): PinOutcome;
+export type CarryOutcome = {
+    kind: "carried";
+    carried: number;
+    /**
+     * Machines already pinned under the new id with a DIFFERENT key than the
+     * old id's pin. Left exactly as they are — the same refusal `recordPin`
+     * makes — and named, because two keys for one machine is a human's call.
+     */
+    conflicts: string[];
+} | {
+    kind: "failed";
+    detail: string;
+};
+/**
+ * Copy every pin `(fromHubId, m)` to `(toHubId, m)` where there is none,
+ * preserving key, origin and history — `confirmed` stays `confirmed`. The old
+ * pins stay where they are.
+ *
+ * Called by `hub init --accept-new-hub-id` and nothing else. The argument for
+ * it is the one that makes the flag safe to offer: a re-identified hub at the
+ * same address has the same machines holding the same keys, so the pins are
+ * still true; and if acceptance started every machine over at first-use, the
+ * flag would be exactly the reset the joined-hub check exists to stop — one
+ * wrong "yes" and a substituted key sails in as a first sighting.
+ *
+ * Writes nothing when there is nothing to carry, which is also what keeps an
+ * unreadable pin store (read as empty) from being overwritten here.
+ */
+export declare function carryPinsForward(args: {
+    fromHubId: string;
+    toHubId: string;
+}): CarryOutcome;
 export {};
 //# sourceMappingURL=pins.d.ts.map

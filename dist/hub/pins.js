@@ -24,6 +24,14 @@
  * when the fleet was set up, compromised or migrated later — and covers nothing
  * about an attacker who was already there before this machine ever pulled.
  *
+ * "Fixed locally" is only true because the `hubId` half of the key is ALSO
+ * fixed locally. It used to be read off the hub's own `hub.json` on every run,
+ * so rewriting that one field made every lookup here miss and re-pinned every
+ * machine on first use — a `confirmed` pin included, which was simply never
+ * consulted. `joined-hubs.ts` now remembers which hub identity this machine
+ * joined at each address, and every hub verb refuses on a change BEFORE it
+ * looks a pin up. Read that file before trusting the key below.
+ *
  * `hub trust` is the answer to that residue: a fingerprint the user compares
  * out of band, once, which converts a hub-supplied key into a human-confirmed
  * one. It is optional by owner ruling, because a single-owner fleet may
@@ -36,7 +44,15 @@
  * Pins live under `~/.sesh-mover/`, keyed by `(hubId, machineId)`. Putting them
  * on the hub would be circular — an attacker who can rewrite the key can
  * rewrite the pin that vouches for it — and per-hub because the same machine id
- * on two different hubs is two different trust decisions.
+ * on two different hubs is two different trust decisions. The `hubId` is the
+ * one this machine JOINED (`joined-hubs.ts`), never merely the one `hub.json`
+ * happens to carry today; the two are equal by the time any caller gets here,
+ * because a difference refuses the verb first.
+ *
+ * A deliberate re-join of a re-identified hub (`hub init --accept-new-hub-id`)
+ * CARRIES every pin to the new id (`carryPinsForward`) rather than starting
+ * over: same address, same machines, same keys. Without that, the flag that
+ * accepts a changed identity would itself be the reset primitive.
  *
  * A `confirmed` pin (via `hub trust`) is never silently replaced by a TOFU
  * write; that is the whole difference between the two, and it is enforced in
@@ -148,5 +164,49 @@ export function recordPin(args) {
         return { kind: "failed", detail: errorMessage(e) };
     }
     return { kind: "pinned", pin };
+}
+/**
+ * Copy every pin `(fromHubId, m)` to `(toHubId, m)` where there is none,
+ * preserving key, origin and history — `confirmed` stays `confirmed`. The old
+ * pins stay where they are.
+ *
+ * Called by `hub init --accept-new-hub-id` and nothing else. The argument for
+ * it is the one that makes the flag safe to offer: a re-identified hub at the
+ * same address has the same machines holding the same keys, so the pins are
+ * still true; and if acceptance started every machine over at first-use, the
+ * flag would be exactly the reset the joined-hub check exists to stop — one
+ * wrong "yes" and a substituted key sails in as a first sighting.
+ *
+ * Writes nothing when there is nothing to carry, which is also what keeps an
+ * unreadable pin store (read as empty) from being overwritten here.
+ */
+export function carryPinsForward(args) {
+    const { fromHubId, toHubId } = args;
+    if (fromHubId === toHubId)
+        return { kind: "carried", carried: 0, conflicts: [] };
+    const file = readPins();
+    const conflicts = [];
+    const additions = [];
+    for (const pin of file.pins) {
+        if (pin.hubId !== fromHubId)
+            continue;
+        const there = findPin(file, toHubId, pin.machineId);
+        if (there) {
+            if (there.publicKey !== pin.publicKey)
+                conflicts.push(pin.machineId);
+            continue;
+        }
+        additions.push({ ...pin, hubId: toHubId, carriedFromHubId: fromHubId });
+    }
+    if (additions.length === 0)
+        return { kind: "carried", carried: 0, conflicts };
+    file.pins = [...file.pins, ...additions];
+    try {
+        writePins(file);
+    }
+    catch (e) {
+        return { kind: "failed", detail: errorMessage(e) };
+    }
+    return { kind: "carried", carried: additions.length, conflicts };
 }
 //# sourceMappingURL=pins.js.map

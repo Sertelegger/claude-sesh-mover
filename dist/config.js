@@ -149,25 +149,34 @@ export function readConfigOverrides(configDir) {
     if (!existsSync(configPath))
         return {};
     try {
-        const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-        // An empty `hub.path` is the ABSENCE of a setting, not a setting — which is
-        // exactly how resolveHubPath already treats it. Dropping it here is what
-        // heals installs written before the sparse write landed: every 0.5.x
-        // `configure --set --scope project` persisted a fully defaults-backfilled
-        // object including `"path": ""`, and that empty string then shadowed a
-        // perfectly good user-scope hub path, leaving `hub status` reporting no hub
-        // for that one project. Writing sparsely fixes new files; this fixes the
-        // ones already on disk, on first read, without discarding the other
-        // settings a `configure --reset` would take with it.
-        if (raw.hub && raw.hub.path === "") {
-            const { path: _dropped, ...rest } = raw.hub;
-            raw.hub = rest;
-        }
-        return raw;
+        return parseConfigOverrides(readFileSync(configPath, "utf-8"));
     }
     catch {
         return {};
     }
+}
+/**
+ * The parse half of `readConfigOverrides`, for a caller that has read the
+ * file some other way. It THROWS wherever `readConfigOverrides` would answer
+ * `{}` for unparsable text, so a caller that must tell "no override" from
+ * "could not tell" (`hub/joined-hubs.ts`'s evidence read) can.
+ */
+export function parseConfigOverrides(text) {
+    const raw = JSON.parse(text);
+    // An empty `hub.path` is the ABSENCE of a setting, not a setting — which is
+    // exactly how resolveHubPath already treats it. Dropping it here is what
+    // heals installs written before the sparse write landed: every 0.5.x
+    // `configure --set --scope project` persisted a fully defaults-backfilled
+    // object including `"path": ""`, and that empty string then shadowed a
+    // perfectly good user-scope hub path, leaving `hub status` reporting no hub
+    // for that one project. Writing sparsely fixes new files; this fixes the
+    // ones already on disk, on first read, without discarding the other
+    // settings a `configure --reset` would take with it.
+    if (raw.hub && raw.hub.path === "") {
+        const { path: _dropped, ...rest } = raw.hub;
+        raw.hub = rest;
+    }
+    return raw;
 }
 // Resolve the effective config across the user/project two-tier hierarchy by
 // layering raw file overrides directly onto defaults (defaults -> user file
@@ -182,9 +191,17 @@ export function readConfigOverrides(configDir) {
 // actually applies right now" entry point; every command that needs to read
 // (not write) an effective, cross-scope config should go through here.
 export function computeEffectiveConfig(userConfigDir, projectConfigDir) {
+    return mergeConfigLayers(readConfigOverrides(userConfigDir), readConfigOverrides(projectConfigDir));
+}
+/**
+ * The layering half of `computeEffectiveConfig` — defaults, then the user
+ * scope's overrides, then the project scope's — for a caller that read the two
+ * layers itself. One merge, so the two can never disagree about precedence.
+ */
+export function mergeConfigLayers(user, project) {
     const defaults = getDefaultConfig();
-    const withUser = deepMerge(defaults, readConfigOverrides(userConfigDir));
-    const withProject = deepMerge(withUser, readConfigOverrides(projectConfigDir));
+    const withUser = deepMerge(defaults, user);
+    const withProject = deepMerge(withUser, project);
     return withProject;
 }
 export function writeConfig(configDir, config) {

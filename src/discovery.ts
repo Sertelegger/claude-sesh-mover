@@ -41,8 +41,10 @@ export function discoverSessions(
       const sessionId = file.replace(".jsonl", "");
       const jsonlPath = join(projectDir, file);
       // Each directory passes its OWN encoded name: the session's layer dirs
-      // and file-history live beside it, under the name it is actually stored
-      // as, not under the name it should have been stored as.
+      // (`subagents/`, `tool-results/`) live beside it, under the name it is
+      // actually stored as, not under the name it should have been stored as.
+      // File-history is keyed by session id alone
+      // (`<configDir>/file-history/<sessionId>`), so no encoded name reaches it.
       const session = parseSessionJsonl(
         jsonlPath,
         sessionId,

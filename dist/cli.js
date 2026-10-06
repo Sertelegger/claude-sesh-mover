@@ -24,6 +24,7 @@ import { discoverSessionById } from "./discovery.js";
 import { EXIT_FAILED, exitCodeForResult } from "./types.js";
 import { PLUGIN_VERSION } from "./version.js";
 import { hubInit } from "./hub/init.js";
+import { normalizeHubPathInput } from "./hub/hub-path.js";
 import { hubStatus } from "./hub/status.js";
 import { readHookPayload, evaluateHookGate } from "./hub/hooks.js";
 // Both of these are already in this file's STATIC import graph through
@@ -768,7 +769,22 @@ program
             let overrides = readConfigOverrides(configDir);
             // Parse value
             let parsedValue = value;
-            if (configValueKind(key) === "number") {
+            if (key === "hub.path" && value !== "") {
+                // #162: bash leaves `~` literal in `hub.path=~/hub` (the word is not
+                // a variable assignment), and a relative value was stored verbatim
+                // and then resolved against every verb's own working directory — a
+                // different hub per project, and one that could live inside the
+                // project it syncs. Expanded and refused here, at write time, like
+                // the numeric keys below. An EMPTY value stays legal: it is how a
+                // scope clears its hub.
+                const hubPathInput = normalizeHubPathInput(value);
+                if (!hubPathInput.ok) {
+                    outputError("configure", new Error(`hub.path must be an absolute path (a leading ~ is expanded to your home directory); got "${value}". Nothing was written.`));
+                    return;
+                }
+                parsedValue = hubPathInput.path;
+            }
+            else if (configValueKind(key) === "number") {
                 // Refused at write time rather than coerced or stored as a string.
                 // A numeric key holding `"100"` reads back as "not a size" on every
                 // push afterwards, and the user has no way to tell that from the
@@ -804,7 +820,9 @@ program
                 // user-scope --set that a project-scope file still overrides).
                 config: loadEffectiveConfig(resolveConfigDir(), process.cwd()),
                 scope: opts.scope,
-                message: `Set ${key} = ${value}`,
+                // The STORED value for hub.path: after #162's expansion it can differ
+                // from what was typed, and echoing the typed `~/hub` would hide that.
+                message: `Set ${key} = ${key === "hub.path" ? String(parsedValue) : value}`,
             };
             output(result);
             return;
@@ -843,10 +861,19 @@ hub
     .description("Initialize or join a hub directory and set hub.path")
     .requiredOption("--path <dir>", "Hub directory (network share, synced folder, or local path)")
     .option("--scope <scope>", "Config scope to write hub.path into: user or project", "user")
+    .option("--accept-new-hub-id", "Accept that the hub at --path now has a different identity than the one this machine joined (or mint one over hub content with no hub.json)")
     .action(async (opts) => {
     try {
         const scope = parseStorage(opts.scope);
-        const result = await hubInit({ hubPath: opts.path, configScope: scope, cwd: process.cwd() });
+        // `--accept-new-hub-id` is read straight off the flag and has no config
+        // key, and neither hook can reach it — the same rule as `--force-unkeyed`
+        // and `reindex --unsigned`: it is the one input that says a changed hub
+        // identity is the user's own doing, and a standing configuration must not
+        // be able to pre-answer that. See `HubIdentityChangedResult`.
+        const result = await hubInit({
+            hubPath: opts.path, configScope: scope, cwd: process.cwd(),
+            acceptNewHubId: !!opts.acceptNewHubId,
+        });
         output(result);
     }
     catch (e) {
@@ -1037,7 +1064,11 @@ hub
 // a shared-directory hub anyone who can tamper with a bundle can also rewrite
 // the victim's `machines/<id>.json` and publish a key of their own. Comparing a
 // fingerprint over a channel that is not the hub is the only step in signing
-// that does not depend on trusting the hub.
+// that does not trust the hub's word for a KEY. It rests on one earlier trust
+// it cannot remove: the pin is kept under the hub identity this machine joined,
+// and that identity was taken from the hub's own `hub.json` once, at `hub init`
+// (or at the upgrade-time seed). After that a changed identity refuses every
+// hub verb rather than moving the pins — see `hub/joined-hubs.ts`.
 //
 // Optional by owner ruling — a single-owner fleet may decline the ceremony and
 // still get pinning. Takes no lock and writes nothing on the hub: it reads the
@@ -1344,6 +1375,24 @@ hub
         });
         if (!result.success || !result.linked)
             return;
+        // A hub whose identity is not the one this machine joined — or, with no
+        // record yet, not one its own sync-state and pins tie to that path (the
+        // wording covers both, since this one sentence cannot say which): every
+        // hub command here now refuses, and the session-end auto-push with it —
+        // silently, since its only trace is `hub status`'s `lastAutoPush`. The
+        // whereis probe above already made the comparison, so saying so costs no
+        // extra hub I/O. Deliberately no ids and no path in it: both come from
+        // outside this session, and the one sentence exists to send the user to
+        // `hub status`, which states both readings in full.
+        if (result.hubState === "identity-changed") {
+            process.stdout.write(JSON.stringify({
+                hookSpecificOutput: {
+                    hookEventName: "SessionStart",
+                    additionalContext: "sesh-mover: the hub this project syncs through is not the hub identity this machine knows for it, so every hub command here — including the automatic push at session end — is refusing until the user looks into it. Run `sesh-mover hub status` and relay its warning before doing anything else with the hub; never re-join it on the user's behalf.",
+                },
+            }) + "\n");
+            return;
+        }
         // Newest first, so the one thread we name is the one most likely to be
         // what the user came back for. resolveThreads' ordering is deterministic
         // but is not recency ordering, so sorting here is not redundant.
@@ -2026,7 +2075,7 @@ function recordAutoPushOutcome(projectPath, result) {
                     : `This project is NOT linked to the hub${r.linkRolledBack === true ? " (the link this push created was removed again)" : ""}, so the session-end auto-push is off for it until a push links it again.`);
             }
             if (typeof r.orphanHubProjectId === "string") {
-                notes.push(`Hub project ${r.orphanHubProjectId} was created before the failure and nothing removes a hub project; a later push can pass --project-id ${r.orphanHubProjectId} to link to that one.`);
+                notes.push(`Hub project ${r.orphanHubProjectId} was created before the failure and stays on the hub (only hub retire then hub delete remove a hub project, and only its owner can); a later push can pass --project-id ${r.orphanHubProjectId} to link to that one.`);
             }
             if (r.orphanBundle === true) {
                 notes.push("A bundle reached the hub but this machine's index was not updated to reference it, so no other machine can see it yet; the next successful push republishes the index.");

@@ -39,8 +39,9 @@ import {
   setPeerMemoryDigest, forgetSentToPeer,
 } from "../sync-state.js";
 import type {
-  ErrorResult, HubEncryptionRefusedResult, HubLockBusyResult, HubNoSuchProjectResult,
-  HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult, ProgressEvent,
+  ErrorResult, HubEncryptionRefusedResult, HubIdentityChangedResult, HubLockBusyResult,
+  HubNoSuchProjectResult, HubPushFailedResult, HubPushResult, HubUnlinkedResult, HubUnreachableResult,
+  ProgressEvent,
 } from "../types.js";
 
 export interface HubPushOptions {
@@ -202,11 +203,15 @@ interface PushCommits {
 /**
  * Undo the LOCAL half of a link this push made.
  *
- * Only the local half: there is no `backend.delete` call anywhere in src/, so a
- * hub project a failed push created stays on the hub and in every machine's
- * `linkCandidates` (recorded as out of scope — hub-side deletion needs
- * ownership semantics this slice doesn't have). That asymmetry is why the
- * caller REPORTS what is left rather than claiming a clean rollback.
+ * Only the local half: push never removes a committed hub file. The one caller
+ * of `HubBackend.delete` in src/ is `retire.ts`'s `deleteHubFile`, reached only
+ * by `hub retire --undo` (this machine's own tombstone), `hub delete`
+ * (owner-only, behind a tombstone and a grace window) and `hub compact` (this
+ * machine's own superseded bundles and their workspace artifacts). So a hub
+ * project a failed push created stays on the hub, and in every machine's
+ * `linkCandidates`, until the machine that minted it retires it and, once the
+ * grace window has passed, deletes it. That asymmetry is why the caller
+ * REPORTS what is left rather than claiming a clean rollback.
  *
  * Re-reads before removing: the file is only ours to delete while it still
  * names the project id this push wrote. Anything else means something changed
@@ -273,7 +278,7 @@ function failedAfterLink(
     orphanBundle: commits.bundleCommitted,
   };
   const relinkSuggestion = orphanHubProject
-    ? `Hub project ${orphanHubProject} was created before the failure and nothing removes a hub project, so pass --project-id ${orphanHubProject} on a later push to link to that one instead of minting a second.`
+    ? `Hub project ${orphanHubProject} was created before the failure and stays on the hub (only hub retire then hub delete remove a hub project, and only its owner can), so pass --project-id ${orphanHubProject} on a later push to link to that one instead of minting a second.`
     : "Fix the cause above and push again; the project links again once a push gets past this point.";
 
   if (commits.preExisting) {
@@ -369,6 +374,7 @@ export type HubPushOutcome =
   | HubPushFailedResult
   | HubUnreachableResult
   | HubNoSuchProjectResult
+  | HubIdentityChangedResult
   | HubEncryptionRefusedResult
   | ErrorResult;
 
