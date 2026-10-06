@@ -89,7 +89,7 @@ jobs:
       # Linux only, for the same reason as the age install: that is where the
       # oracle lives. Windows has no pty of this kind at all, which is a stated
       # gap in tests/helpers/age-oracle.ts and not something this step can fix.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: matrix.os == 'ubuntu-latest'
         with:
           python-version: '3.12'
