@@ -275,4 +275,42 @@ export declare function setLastAutoPush(state: SyncState, entry: {
  * written before the list existed — or hand-edited — still contributes it.
  */
 export declare function knownWorkspaceGenerations(state: SyncState): WorkspaceGenerationRef[];
+/**
+ * Every `hub.hubId` stamped into any project's sync-state on this machine,
+ * with the project it was stamped for.
+ *
+ * One of the two halves of the evidence `hub/joined-hubs.ts` checks a SEED
+ * against — the id a project first wrote hub data under is a local fact about
+ * which hub this machine has talked to, and the project is what ties that fact
+ * to a hub ADDRESS (through that project's own `hub.path`). It is stamped once
+ * and never updated (see `setThreadId`), so for a project later pointed at a
+ * different hub it is STALE — and that staleness is the whole of the seed's
+ * residue. Beside any other id tied to the same path it makes the evidence
+ * ambiguous, and the seed refuses (it takes only an exact single match). But
+ * if every record this machine holds for a path names a single hub id that
+ * the path no longer serves, a hub writer who sets `hub.json` to exactly that
+ * stale id before this machine has recorded an identity for the path gets it
+ * seeded. That requires a project to have moved between hubs, or the hub at
+ * its path to have been re-created (the sync-state keeps the old id either
+ * way), and it can only happen before the first recording command there; the
+ * honest hub is refused in that state, so an explicit `hub init --path`
+ * closes it. Any ambiguity refuses.
+ *
+ * `projectPath` is `null` when the file does not carry a usable one; the id
+ * still counts as evidence, but it cannot be tied to an address, so when the
+ * tie is read at all its presence leaves the tie incomplete and the union of
+ * every known id decides — the stricter direction. `file` is the sync-state
+ * file itself, which is all there is to name such a record by — and, for a
+ * project that is gone for good, the leftover that still names it.
+ *
+ * Read-only and never throws: a missing directory or an unparsable file
+ * contributes nothing. It does NOT go through `readSyncState`, which renames a
+ * corrupt file aside — a write — and this runs inside every hub verb's probe,
+ * including the two read-only ones.
+ */
+export declare function hubIdsRecordedInSyncState(): Array<{
+    projectPath: string | null;
+    hubId: string;
+    file: string;
+}>;
 //# sourceMappingURL=sync-state.d.ts.map

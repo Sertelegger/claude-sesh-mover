@@ -22,6 +22,7 @@ import {
 import type {
   ErrorResult,
   ExportManifest,
+  HubIdentityChangedResult,
   HubLockBusyResult,
   HubNoSuchProjectResult,
   HubPullListResult,
@@ -273,6 +274,7 @@ export type HubPullOutcome =
   | HubUnlinkedResult
   | HubNoSuchProjectResult
   | HubUnreachableResult
+  | HubIdentityChangedResult
   | HubProjectRetiredResult
   | HubLockBusyResult
   | ErrorResult;
@@ -365,7 +367,7 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
     // carries no reasons, and the warnings collected so far are discarded with
     // it exactly as they were before this was a stage.
     if (resolveStage.kind === "return") return resolveStage.result;
-    const { local, hub, hubPeerId, resolved } = resolveStage.value;
+    const { local, hub, hubPeerId, previousHubIds, resolved } = resolveStage.value;
     warnings.push(...resolveStage.reasons);
 
     // Everything below (dedup/sync-state, workspace unpack, session import,
@@ -447,6 +449,7 @@ export async function hubPull(opts: HubPullOptions): Promise<HubPullOutcome> {
         // The signature statement's context (#86) — what the verifier compares
         // against, rather than the statement's own claims about itself.
         hubId: hub.hubId,
+        previousHubIds,
         projectId: local.projectId,
         nowIso: new Date(opNowMs).toISOString(),
       });

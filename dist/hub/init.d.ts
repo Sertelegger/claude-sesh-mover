@@ -1,5 +1,14 @@
 import { type HubMachineJson } from "./layout.js";
-import type { ErrorResult, HubInitResult, SeshMoverConfig } from "../types.js";
+import type { ErrorResult, HubContentWithoutIdentityResult, HubIdentityChangedResult, HubIdentityNotPresentResult, HubInitResult, HubPathNotAbsoluteResult, SeshMoverConfig } from "../types.js";
+/**
+ * The configured hub path, as every verb uses it.
+ *
+ * A leading `~` is expanded here too (#162), not only at the write sites: a
+ * `configure --set hub.path=~/hub` from before the fix stored the literal, and
+ * every verb then resolved it against its own working directory — a different
+ * hub per project. A stored RELATIVE value is left as it is; see `hub-path.ts`
+ * for why that belongs to #112.
+ */
 export declare function resolveHubPath(config: SeshMoverConfig): string | null;
 /**
  * Refresh this machine's registration file. Called by init and by every
@@ -67,5 +76,12 @@ export declare function hubInit(opts: {
     hubPath: string;
     configScope: "user" | "project";
     cwd: string;
-}): Promise<HubInitResult | ErrorResult>;
+    /**
+     * `--accept-new-hub-id`. A FLAG and nothing else — never a config key, and
+     * never reachable from either hook — because it is the one input that tells
+     * this machine a changed hub identity is the user's own doing. See
+     * `HubIdentityChangedResult`.
+     */
+    acceptNewHubId?: boolean;
+}): Promise<HubInitResult | HubIdentityChangedResult | HubIdentityNotPresentResult | HubContentWithoutIdentityResult | HubPathNotAbsoluteResult | ErrorResult>;
 //# sourceMappingURL=init.d.ts.map

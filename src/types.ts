@@ -1151,6 +1151,216 @@ export interface HubInitResult {
   created: boolean; // false when joining an existing hub
   machineRegistered: true;
   configScope: StorageScope;
+  /**
+   * What this run did to `~/.sesh-mover/joined-hubs.json`, the local memory of
+   * which hub identity this machine joined at `hubPath` (see
+   * `src/hub/joined-hubs.ts`).
+   *
+   * - `recorded` — first record for this address.
+   * - `unchanged` — already recorded with this id.
+   * - `accepted-change` — `--accept-new-hub-id` replaced a different recorded
+   *   id; `previousHubId` and `pinsCarried` say what that moved.
+   * - `not-recorded` — the joined-hubs file could not be written or is
+   *   present-but-unreadable and was left alone; `warnings` says which. The
+   *   join itself happened.
+   */
+  identity: "recorded" | "unchanged" | "accepted-change" | "not-recorded";
+  /** Set with `identity: "accepted-change"` — the id this address was recorded under before. */
+  previousHubId?: string;
+  /**
+   * Set with `identity: "accepted-change"` — how many signing-key pins were
+   * copied from `previousHubId` to `hubId`. They carry, rather than reset,
+   * because the address, the machines and their keys are all the same.
+   */
+  pinsCarried?: number;
+  warnings: string[];
+}
+
+/**
+ * `hub init` declining to make a hub of a directory that already holds hub
+ * content — `machines/` or `projects/` — but no `hub.json`.
+ *
+ * On a synced folder that is exactly what a second machine sees while the first
+ * sync is still in flight: other machines' files have arrived and `hub.json`
+ * has not. Minting a fresh `hub.json` there gave the directory a second
+ * identity (with `encrypt: false`, unsealing a sealed hub if that file won the
+ * sync) and reported `created: true` over everybody else's content.
+ *
+ * Exit class 3, environment-not-ready: the likeliest cause is a sync in
+ * flight, and re-running unchanged once it lands is the remedy. Nothing was
+ * written — not `hub.json`, not this machine's record, not config.
+ * `--accept-new-hub-id` is the deliberate path for a `hub.json` that is truly
+ * lost.
+ */
+export interface HubContentWithoutIdentityResult {
+  success: false;
+  command: "hub-init";
+  reason: "hub-content-without-identity";
+  hubPath: string;
+  /** Which of the hub layout's top-level directories were found, sorted. */
+  found: string[];
+  error: string;
+  suggestion: string;
+}
+
+/**
+ * A project this machine holds hub data for (a sync-state naming a hub id)
+ * whose effective hub path could not be settled, so it cannot be ruled out
+ * that the project uses the address in question. Local data only — every
+ * field comes from this machine's own files, none from the hub.
+ */
+export interface HubUnresolvedProject {
+  /** The project directory its sync-state names, or `null` when it names none. */
+  projectPath: string | null;
+  /**
+   * The sync-state file that recorded the project's hub data — the only
+   * handle on a record with no `projectPath`, and, for a project that is gone
+   * for good, the leftover that still names it.
+   */
+  syncStateFile: string;
+  /**
+   * - `directory-missing` — the project directory is not there (or is not a
+   *   directory): an unmounted share, or a project moved or deleted. Only a
+   *   directory that IS there with no `.sesh-mover/config.json` means "no
+   *   override, inherit the user scope".
+   * - `timed-out` — reading its config (or checking its directory) did not
+   *   answer within the per-syscall hub I/O bound: a mount that has stopped
+   *   responding.
+   * - `unreadable` — the read failed some other way (permissions, a directory
+   *   where the file should be).
+   * - `unparseable` — `.sesh-mover/config.json` is not a JSON object.
+   * - `hub-path-unusable` — its configured hub path is not a string, or is a
+   *   relative one (which each verb resolves against its own working
+   *   directory).
+   * - `no-project-path` — the sync-state names no project directory.
+   */
+  cause: "directory-missing" | "timed-out" | "unreadable" | "unparseable" | "hub-path-unusable" | "no-project-path";
+}
+
+/**
+ * `hub init` at an address that now holds no `hub.json` and no hub content —
+ * or is not there at all — where this machine either joined a hub before
+ * (`basis: "recorded"`), or has no record but its own projects tie the path to
+ * a hub (`basis: "evidence"`: a project whose `hub.path` is this address
+ * recorded hub data under an id — or, when some project's hub path could not
+ * be settled, every id this machine knows, since that project might be the
+ * one; `unresolvedProjects` then names them). That second case needs only one
+ * known hub id, so a single-hub machine meets it too: one project on an
+ * unmounted share, or one deleted project whose sync-state is still there,
+ * makes `hub init` refuse at ANY empty or missing path until it is mounted,
+ * fixed, or the user passes `--accept-new-hub-id`.
+ *
+ * That is what the mount point of an unmounted share, or a synced folder not
+ * synced here yet, looks like. Minting a new `hub.json` there would give the
+ * directory a second identity that shadows the real hub the moment it
+ * appears; creating the directory at all would leave a phantom mount point.
+ * So nothing is created or written, and the directory is not even `mkdir`ed.
+ *
+ * Exit class 3, environment-not-ready: once the share is mounted or the sync
+ * lands, the SAME invocation joins the hub it was. That is also why it is not
+ * `hub-identity-changed` — nothing here says the identity changed, only that
+ * it is not present yet. `--accept-new-hub-id` is the deliberate path for a
+ * hub that is truly gone; on the evidence basis it carries no pin over, since
+ * there is no joined identity to carry from, and the result's `warnings` say
+ * so when it mints.
+ */
+export interface HubIdentityNotPresentResult {
+  success: false;
+  command: "hub-init";
+  reason: "hub-identity-not-present";
+  hubPath: string;
+  /**
+   * `recorded`: the one id this machine joined at this address.
+   * `evidence`: the id(s) this machine's own records tie to it — more than one
+   * when they disagree — or, when some project's hub path could not be
+   * settled, every id this machine knows (`unresolvedProjects` is then set).
+   */
+  expectedHubIds: string[];
+  basis: "recorded" | "evidence";
+  /**
+   * With `basis: "evidence"`, present exactly when the refusal comes from
+   * projects whose hub path could not be settled (`expectedHubIds` is then
+   * every id this machine knows): each one, so the user knows what to mount or
+   * fix. Every project that answered is listed; the check stops at the first
+   * that did not answer within the I/O bound, so projects after a timed-out
+   * one are not checked and not listed.
+   */
+  unresolvedProjects?: HubUnresolvedProject[];
+  error: string;
+  suggestion: string;
+}
+
+/**
+ * `hub init --path` given a path that is not absolute after a leading `~` is
+ * expanded (#162). Refused before anything is created: resolving it against
+ * the working directory is how a hub ended up inside the project it was
+ * syncing, shipped in that project's own payloads.
+ *
+ * Exit class 1 — a bad invocation, the same class as `configure --set`'s type
+ * errors, which is where the matching `hub.path` refusal lives.
+ */
+export interface HubPathNotAbsoluteResult {
+  success: false;
+  command: "hub-init";
+  reason: "hub-path-not-absolute";
+  /** Echoed back verbatim — what the user typed. */
+  given: string;
+  error: string;
+  suggestion: string;
+}
+
+/**
+ * The hub at the configured path no longer carries the identity this machine
+ * joined there (or, with no record for that path yet, carries one its own
+ * sync-state and pins do not support there) — a refusal taken BEFORE any pin
+ * lookup and before any hub write, `registerMachine` included.
+ *
+ * **Why it refuses rather than follows the hub.** Signing-key pins are keyed
+ * `(hubId, machineId)`. If the `hubId` is simply whatever `hub.json` says
+ * today, one rewritten field makes every pin lookup miss: a substituted key is
+ * pinned as a first sighting, a `confirmed` pin is never consulted, and the
+ * unsigned-downgrade warning goes quiet. So this machine remembers the id per
+ * hub address (`src/hub/joined-hubs.ts`) and every hub verb refuses on a
+ * change until the user deliberately re-joins with `hub init
+ * --accept-new-hub-id`.
+ *
+ * Two readings, and nothing local can tell them apart: the hub was re-created
+ * or switched on purpose, or someone rewrote `hub.json`. `suggestion` presents
+ * both and says to stop and investigate unless the user did it themselves.
+ *
+ * Exit class 2, refusal: re-running unchanged refuses identically forever;
+ * the remedy is a human decision, and class 3 would invite a caller — the
+ * unattended SessionEnd auto-push above all — to loop on it.
+ *
+ * `hub status` and `whereis` do not return this; they report `hubState:
+ * "identity-changed"` inside `success: true`, as they do every other unusable
+ * hub state.
+ */
+export interface HubIdentityChangedResult {
+  success: false;
+  command:
+    | "push" | "pull" | "hub-reindex" | "hub-retire" | "hub-delete" | "hub-encrypt" | "hub-rekey"
+    | "hub-compact" | "hub-trust" | "hub-init";
+  reason: "hub-identity-changed";
+  /**
+   * The hub ADDRESS the comparison was made at. Named here, unlike
+   * `hub-unreachable`'s deliberately path-free body, because the remedy is
+   * `hub init --path <this> --accept-new-hub-id` and the record it replaces is
+   * keyed by exactly this string.
+   */
+  hubPath: string;
+  /** What `hub.json` says now. (No `hub.json` at a joined address is `hub-identity-not-present`, not this.) */
+  currentHubId: string;
+  /**
+   * The id(s) this machine expected. One element when `basis` is `recorded`;
+   * when it is `evidence` (no record for this address yet), the ids its own
+   * sync-state names for projects that use this address — or, when no project
+   * does, every hub id its sync-state and pins name.
+   */
+  expectedHubIds: string[];
+  basis: "recorded" | "evidence";
+  error: string;
+  suggestion: string;
 }
 
 /**
@@ -1175,7 +1385,23 @@ export interface HubInitResult {
  * It is also the only one of the three whose *detection* costs wall-clock time
  * (`HUB_IO_TIMEOUT_MS`), because it is defined by a syscall that never returned.
  */
-export type HubReachabilityState = "ok" | "no-directory" | "not-a-hub" | "unresponsive";
+export type HubReachabilityState =
+  | "ok" | "no-directory" | "not-a-hub" | "unresponsive" | "identity-changed";
+
+/**
+ * The states `HubUnreachableResult` is built from — every failing state except
+ * `identity-changed`, which is NOT an environment problem and has its own
+ * refusal (`HubIdentityChangedResult`, exit class 2 rather than 3).
+ *
+ * `identity-changed` is the fourth failing state and the first that is not
+ * about seeing the hub at all: `hub.json` was read fine, and names a different
+ * hub identity from the one this machine joined at this address (see
+ * `src/hub/joined-hubs.ts`). It is on `HubReachabilityState` so the two read
+ * verbs report it like the others; it is kept off the unreachable refusal
+ * because "wait and retry" — that refusal's whole promise — is exactly the
+ * wrong advice for it.
+ */
+export type HubUnreachableState = Exclude<HubReachabilityState, "ok" | "identity-changed">;
 
 export interface HubStatusResult {
   success: true;
@@ -1207,6 +1433,16 @@ export interface HubStatusResult {
    */
   hubState: HubReachabilityState | null;
   hubId: string | null;
+  /**
+   * Present exactly when `hubState` is `"identity-changed"`: what `hub.json`
+   * says now, what this machine expected, and on what basis — the same fields
+   * `HubIdentityChangedResult` carries for the verbs that refuse.
+   */
+  identityChange?: {
+    currentHubId: string;
+    expectedHubIds: string[];
+    basis: "recorded" | "evidence";
+  };
   machineRegistered: boolean;
   machinesKnown: number;
   project: { linked: boolean; projectId: string | null };
@@ -1707,7 +1943,13 @@ export interface WhereisResult {
    * project nobody has ever pushed — with nothing to tell the two apart.
    */
   reachable: boolean;
-  /** Which state `reachable` is short for; `"ok"` exactly when it is true. */
+  /**
+   * Which state `reachable` is short for; `"ok"` exactly when it is true.
+   * `"identity-changed"` is the one failing state in which the hub WAS read —
+   * its `hub.json` — and is not the hub this machine joined, so nothing past
+   * that file was read and every field above means what it means for an
+   * unreachable hub.
+   */
   hubState: HubReachabilityState;
   warnings: string[];
 }
@@ -1831,12 +2073,14 @@ export interface HubUnreachableResult {
    *   mis-configured; see `HubReachabilityState` for why it is its own arm.
    *
 
-   * Spelled as the non-`ok` half of `HubReachabilityState` rather than as its
-   * own pair of literals: the diagnostic verbs report the SAME probe's answer,
-   * and one declaration is what stops a renamed (or third) state reaching `hub
-   * status` and never reaching here.
+   * Spelled as `HubUnreachableState` — the failing half of
+   * `HubReachabilityState` minus `identity-changed` — rather than as its own
+   * list of literals: the diagnostic verbs report the SAME probe's answer, and
+   * one declaration is what stops a renamed (or new) state reaching `hub
+   * status` and never reaching here. `identity-changed` is the deliberate
+   * exception, with a refusal of its own; see `HubUnreachableState`.
    */
-  hubState: Exclude<HubReachabilityState, "ok">;
+  hubState: HubUnreachableState;
   suggestion: string;
 }
 
@@ -2635,6 +2879,10 @@ export type CliResult =
   | BrowseResult
   | ConfigureResult
   | HubInitResult
+  | HubContentWithoutIdentityResult
+  | HubIdentityNotPresentResult
+  | HubPathNotAbsoluteResult
+  | HubIdentityChangedResult
   | HubStatusResult
   | HubPushResult
   | HubPushFailedResult
@@ -2802,8 +3050,38 @@ const REASON_EXIT_CODE: Record<CliResultReason, ExitCode> = {
    */
   "encrypted-bundle": EXIT_REFUSED,
   "escrow-verify-failed": EXIT_FAILED,
+  /**
+   * The hub's `hub.json` names a different identity from the one this machine
+   * joined at that address. A refusal, not class 3: the same invocation
+   * refuses identically until a human decides whether the hub was re-created
+   * on purpose (and re-joins with `hub init --accept-new-hub-id`) or was
+   * tampered with — and the unattended SessionEnd auto-push is exactly the
+   * caller that would loop on a class 3.
+   */
+  "hub-identity-changed": EXIT_REFUSED,
+  /**
+   * `hub init --path` that is not absolute after `~` expansion (#162). A bad
+   * invocation, class 1 — the same class as `configure --set`'s type errors,
+   * which refuses the matching `hub.path` value.
+   */
+  "hub-path-not-absolute": EXIT_FAILED,
   // Environment-not-ready: same invocation, retry once the machine catches up.
   "hub-unreachable": EXIT_NOT_READY,
+  /**
+   * `hub init` on a directory with hub content but no `hub.json`. Class 3
+   * because the likeliest cause is a synced folder whose first sync has not
+   * delivered `hub.json` yet — re-running unchanged once it lands is the
+   * remedy, which is exactly this class's promise.
+   */
+  "hub-content-without-identity": EXIT_NOT_READY,
+  /**
+   * `hub init` where this machine joined a hub, and nothing is there now — no
+   * `hub.json`, no hub content, possibly no directory. Class 3 for the same
+   * reason as the line above: an unmounted share or an unsynced folder, and
+   * the unchanged invocation joins once it appears. Kept apart from
+   * `hub-identity-changed` (class 2) because nothing here changed.
+   */
+  "hub-identity-not-present": EXIT_NOT_READY,
   "lock-busy": EXIT_NOT_READY,
   "not-yet-synced": EXIT_NOT_READY,
   /**

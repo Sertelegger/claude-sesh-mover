@@ -1,7 +1,7 @@
 import { createFsBackend } from "./backend.js";
 import { acquireProjectLock, describeLockSteal, LockBusyError } from "./lock.js";
 import { readLocalProjectId, removeLocalProjectIdIfMatches, } from "./identity.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { projectDir, projectJsonPath, tombstoneDirPath, tombstonePath, } from "./layout.js";
 import { formatStamp, graceState, readTombstone, readTombstones, RETIREMENT_GRACE_HOURS, writeTombstone, } from "./tombstone.js";
 import { createMachineNameLookup } from "./whereis.js";
@@ -89,7 +89,7 @@ async function preamble(command, opts) {
     const backend = createFsBackend(opts.hubPath);
     const probe = await probeHubReachable(opts.hubPath, backend);
     if (probe.state !== "ok")
-        return { kind: "refuse", result: hubUnreachableRefusal(command, probe.state) };
+        return { kind: "refuse", result: hubProbeRefusal(command, probe) };
     let lock;
     try {
         lock = acquireProjectLock(opts.projectPath);

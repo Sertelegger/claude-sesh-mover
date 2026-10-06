@@ -1,7 +1,7 @@
 import { createFsBackend } from "./backend.js";
 import { machinePath } from "./layout.js";
 import { listMachineIds } from "./machines.js";
-import { describeHubUnreachable, probeHubReachable } from "./preflight.js";
+import { describeHubProbeFailure, probeHubReachable } from "./preflight.js";
 import { resolveHubPath } from "./init.js";
 import { readLockStealRecord } from "./lock.js";
 import { readMachineId } from "../machine.js";
@@ -71,17 +71,25 @@ export async function hubStatus(opts) {
         };
     }
     const backend = createFsBackend(hubPath);
-    const probe = await probeHubReachable(hubPath, backend);
+    // `recordFirstSighting: false` — this verb is documented read-only, so it
+    // runs the joined-hub comparison (evidence check included) and leaves the
+    // first record to the next verb that writes. See `joined-hubs.ts`.
+    const probe = await probeHubReachable(hubPath, backend, { recordFirstSighting: false });
     const reachable = probe.state === "ok";
     const hubId = probe.hub?.hubId ?? null;
-    if (!reachable) {
+    if (probe.state !== "ok") {
         // The gate's own wording, verbatim, so the diagnosis a refused push gave
         // and the one `hub status` gives are the same sentence about the same
         // directory. Deliberately no "run hub init" here, which the message it
         // replaces said for BOTH states: for `no-directory` that advice would have
         // the user mint a brand-new hub at an unmounted mount point — a different
-        // hubId, shadowing the real hub the moment it mounts.
-        warnings.push(describeHubUnreachable(probe.state));
+        // hubId, shadowing the real hub the moment it mounts. (`identity-changed`
+        // names `hub init` only as the deliberate re-join, after telling the user
+        // to stop and investigate first.)
+        warnings.push(describeHubProbeFailure(probe));
+    }
+    else if (probe.joinedStoreUnreadable !== null) {
+        warnings.push(`~/.sesh-mover/joined-hubs.json exists but could not be read (${probe.joinedStoreUnreadable}). This machine is checking the hub's identity against its sync-state and signing-key pins only, and will not overwrite that file, because it records every hub address this machine has joined. Repair it, or move it aside to let it be rebuilt.`);
     }
     const identity = readMachineId();
     const machineRegistered = reachable && identity !== null && (await backend.exists(machinePath(identity.id)));
@@ -121,6 +129,15 @@ export async function hubStatus(opts) {
         reachable,
         hubState: probe.state,
         hubId,
+        ...(probe.state === "identity-changed"
+            ? {
+                identityChange: {
+                    currentHubId: probe.change.currentHubId,
+                    expectedHubIds: probe.change.expectedHubIds,
+                    basis: probe.change.basis,
+                },
+            }
+            : {}),
         machineRegistered,
         machinesKnown,
         project: { linked: local !== null, projectId: local?.projectId ?? null },

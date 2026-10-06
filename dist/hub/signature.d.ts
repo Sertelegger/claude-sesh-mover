@@ -159,6 +159,19 @@ export type SignatureFailure =
 };
 export interface StatementContext {
     hubId: string;
+    /**
+     * Ids this machine ITSELF recorded for this hub address before `hubId` —
+     * the `previousHubIds` of its `joined-hubs.json` record, which only a
+     * deliberate `hub init --accept-new-hub-id` appends to. A statement whose
+     * `hubId` is one of these is about this same hub under its earlier identity,
+     * so it passes the context check; without that, every bundle signed before a
+     * deliberate re-creation would abort on the loudest tamper message there is.
+     *
+     * Never anything the hub or the statement says: widening this from a remote
+     * source would let a hub writer declare which foreign statements count as
+     * local, which is the replay the context binding exists to stop.
+     */
+    previousHubIds?: readonly string[];
     projectId: string;
     machineId: string;
     bundleId: string;

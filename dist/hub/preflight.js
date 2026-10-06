@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import { HubIoTimeoutError, withHubIoTimeout } from "./io-timeout.js";
 import { listHubProjects, readHubProjectAsLocal } from "./identity.js";
+import { checkJoinedHubIdentity, describeHubIdentityChange, proseHubId, } from "./joined-hubs.js";
 import { HUB_JSON } from "./layout.js";
 /**
  * Can this machine see a sesh-mover hub at the configured path at all?
@@ -30,13 +31,27 @@ import { HUB_JSON } from "./layout.js";
  * `hub status` had its own rule — `hub.json` merely EXISTS — and so called a
  * `hub.json` with no `hubId` reachable while push refused it as `not-a-hub`.
  *
- * Writes nothing, and both calls are bounded in BOTH senses: one `stat` and one
- * small read, each of them under `withHubIoTimeout` so that "bounded" means a
- * wall-clock bound and not merely a small number of syscalls. Before #71 it was
- * only the latter — `statSync` plus a `readFileSync` backend — which is exactly
- * how a push came to sit inside its own project lock forever.
+ * Writes nothing on the hub, and both calls are bounded in BOTH senses: one
+ * `stat` and one small read, each of them under `withHubIoTimeout` so that
+ * "bounded" means a wall-clock bound and not merely a small number of
+ * syscalls. Before #71 it was only the latter — `statSync` plus a
+ * `readFileSync` backend — which is exactly how a push came to sit inside its
+ * own project lock forever.
+ *
+ * **Then it asks whether this is the hub this machine JOINED** — the fourth
+ * failing state, `identity-changed`. Every verb reaches this probe before it
+ * reads a signing-key pin or writes the hub, which is the whole reason the
+ * comparison lives here: pins are keyed by hub id, so a verb that took the id
+ * from a rewritten `hub.json` would look every pin up under an id with no pins
+ * and trust whatever key it met first. See `joined-hubs.ts`. `recordFirstSighting`
+ * is off only for `hub status` and `whereis`, which are documented as writing
+ * nothing; they run the identical comparison and leave the seed to the next
+ * verb that writes. At an address with no record that comparison may open
+ * other projects' configs (the evidence tie), and each of those reads takes
+ * the same per-syscall bound as the two above — a project on a dead mount
+ * must not wedge this one's push inside its lock any more than the hub may.
  */
-export async function probeHubReachable(hubPath, backend) {
+export async function probeHubReachable(hubPath, backend, opts = {}) {
     let rootIsDir = false;
     try {
         // `stat`, not `statSync` (#71). This is the FIRST hub syscall a push makes,
@@ -72,7 +87,19 @@ export async function probeHubReachable(hubPath, backend) {
     if (hub === null || typeof hub.hubId !== "string" || hub.hubId.length === 0) {
         return { state: "not-a-hub", hub: null };
     }
-    return { state: "ok", hub };
+    const identity = await checkJoinedHubIdentity({
+        hubPath,
+        hubId: hub.hubId,
+        seed: opts.recordFirstSighting !== false,
+        nowIso: new Date().toISOString(),
+    });
+    if (identity.kind === "changed")
+        return { state: "identity-changed", hub: null, change: identity.change };
+    return {
+        state: "ok", hub,
+        previousHubIds: identity.previousHubIds,
+        joinedStoreUnreadable: identity.storeUnreadable,
+    };
 }
 /**
  * What is wrong and what to do about it, for one unreachable state — the half
@@ -124,6 +151,38 @@ export function hubUnreachableRefusal(command, state) {
                 ? " Nothing was read from or written to the hub."
                 : " Nothing was written."),
     };
+}
+/** The typed refusal for `identity-changed`, for every verb that was about to read pins or write. */
+export function hubIdentityChangedRefusal(command, change) {
+    return {
+        success: false,
+        command,
+        reason: "hub-identity-changed",
+        hubPath: change.address,
+        currentHubId: change.currentHubId,
+        expectedHubIds: change.expectedHubIds,
+        basis: change.basis,
+        error: `Hub identity changed at ${change.address}: expected ${change.expectedHubIds.map(proseHubId).join(" or ")}, found ${proseHubId(change.currentHubId)}.`,
+        // "Written", never "read": `hub.json` WAS read — that is how the change
+        // was seen. What matters is that nothing after it ran.
+        suggestion: describeHubIdentityChange(change) + " Nothing was written to the hub, and no signing-key pin was consulted or recorded.",
+    };
+}
+/**
+ * The refusal for any non-`ok` probe answer — the one call each writing verb
+ * makes, so no verb can handle the three unreachable states and forget the
+ * fourth.
+ */
+export function hubProbeRefusal(command, probe) {
+    return probe.state === "identity-changed"
+        ? hubIdentityChangedRefusal(command, probe.change)
+        : hubUnreachableRefusal(command, probe.state);
+}
+/** The status/whereis warning for any non-`ok` probe answer. */
+export function describeHubProbeFailure(probe) {
+    return probe.state === "identity-changed"
+        ? describeHubIdentityChange(probe.change)
+        : describeHubUnreachable(probe.state);
 }
 /**
  * Validate `--project-id` against the hub BEFORE the verb runs (#29, moved
@@ -202,11 +261,11 @@ export async function preflightHub(input) {
     const { command, hubPath, backend, projectIdOverride } = input;
     const probe = await probeHubReachable(hubPath, backend);
     if (probe.state !== "ok") {
-        return { kind: "refuse", result: hubUnreachableRefusal(command, probe.state) };
+        return { kind: "refuse", result: hubProbeRefusal(command, probe) };
     }
     const badId = await checkProjectId(command, backend, projectIdOverride);
     if (badId)
         return { kind: "refuse", result: badId };
-    return { kind: "ok", hub: probe.hub };
+    return { kind: "ok", hub: probe.hub, previousHubIds: probe.previousHubIds };
 }
 //# sourceMappingURL=preflight.js.map

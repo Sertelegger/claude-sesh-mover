@@ -102,11 +102,12 @@ import { readLocalProjectId } from "./identity.js";
 import { registerMachine } from "./init.js";
 import { bundleDir, isEncryptedBundleFile, workspaceDir } from "./layout.js";
 import { acquireProjectLock, LockBusyError } from "./lock.js";
-import { hubUnreachableRefusal, probeHubReachable } from "./preflight.js";
+import { hubProbeRefusal, probeHubReachable } from "./preflight.js";
 import { readIdentityFile } from "../crypto/identity-file.js";
 import { loadOrCreateMachineId } from "../machine.js";
 import type {
-  HubLockBusyResult, HubRekeyRefusedResult, HubRekeyResult, HubUnreachableResult,
+  HubIdentityChangedResult, HubLockBusyResult, HubRekeyRefusedResult, HubRekeyResult,
+  HubUnreachableResult,
 } from "../types.js";
 
 export interface HubRekeyOptions {
@@ -117,7 +118,9 @@ export interface HubRekeyOptions {
 
 export async function hubRekey(
   opts: HubRekeyOptions
-): Promise<HubRekeyResult | HubRekeyRefusedResult | HubLockBusyResult | HubUnreachableResult> {
+): Promise<
+  HubRekeyResult | HubRekeyRefusedResult | HubLockBusyResult | HubUnreachableResult | HubIdentityChangedResult
+> {
   // Same order, and the same reasons, as `hub reindex`: the local link first
   // (a read of a file in the user's own project, whose answer cannot be wrong
   // because the hub is unmounted), then reachability (before the lock, so a
@@ -136,7 +139,7 @@ export async function hubRekey(
 
   const backend = createFsBackend(opts.hubPath);
   const probe = await probeHubReachable(opts.hubPath, backend);
-  if (probe.state !== "ok") return hubUnreachableRefusal("hub-rekey", probe.state);
+  if (probe.state !== "ok") return hubProbeRefusal("hub-rekey", probe);
 
   let lock;
   try {

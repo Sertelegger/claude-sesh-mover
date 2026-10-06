@@ -7,8 +7,10 @@ You are running the sesh-mover hub trust command. It reports which machines' sig
 
 Understand what this is for before you explain it, because the value is entirely in one distinction:
 
-- **Pinned on first use (`tofu`)** means this machine trusted the hub once, when it first saw a signed bundle from that machine. Everything after that is loud — a changed key refuses a pull. But the first sighting trusted whatever the hub said.
-- **Confirmed (`confirmed`)** means a human compared the fingerprint against the same fingerprint shown on the other machine, over a channel that is not the hub. **This is the only step in signing that does not depend on trusting the hub**, because anyone who can write to the hub can also publish a signing key of their own.
+- **Pinned on first use (`tofu`)** means this machine trusted the hub once, when it first saw a signed bundle from that machine. After that, a different key for that machine refuses a pull. But the first sighting trusted whatever the hub said.
+- **Confirmed (`confirmed`)** means a human compared the fingerprint against the same fingerprint shown on the other machine, over a channel that is not the hub. **This is the only step in signing that does not take the hub's word for a key**, because anyone who can write to the hub can also publish a signing key of their own.
+
+Both kinds of pin are kept under the **hub identity this machine joined** (the `hubId` recorded in `~/.sesh-mover/joined-hubs.json` when it ran `hub init` there, or on its first hub command after upgrading). That one fact did come from the hub, once — like a first pin. After that, a hub whose `hub.json` names a different identity makes every hub command here refuse with `reason: "hub-identity-changed"`, this one included, rather than quietly looking pins up under the new identity and finding none.
 
 Neither is an error, and `tofu` is the default. Do not present it as a problem to fix.
 
@@ -39,7 +41,8 @@ Follow these steps:
    - `refusal: "no-such-machine"` — run the report form first to list real machine ids; do not guess one.
    - `refusal: "pin-write-failed"` — the fingerprint matched but the pin could not be saved. Report the detail; until it saves, this machine keeps treating the key as unconfirmed.
    - `reason: "hub-unreachable"` — nothing was read; report `hubState` and the suggestion.
+   - `reason: "hub-identity-changed"` — the hub's `hub.json` names a different identity from the one this machine joined at that path, so no pin was read and none was written. Relay `error` and `suggestion` in full. Both readings are real — the hub was re-created or switched on purpose, or someone rewrote `hub.json` — and the second is precisely an attempt to make this machine's pins stop applying. **Never offer `hub init --accept-new-hub-id` yourself**; follow `/sesh-mover:hub-init`'s "The hub identity" rules.
 
-5. If the user asks whether they need to do this at all: **no.** Pinning happens automatically on first use and gives real protection against a key changing later. Confirming closes the remaining gap — an attacker who was already in place before this machine ever pulled. Say that plainly and let them decide; a single-owner fleet may reasonably skip it.
+5. If the user asks whether they need to do this at all: **no.** Pinning happens automatically on first use and gives real protection against a key changing later. Confirming closes the remaining gap for a KEY — an attacker who was already in place before this machine ever pulled. It does not remove the one-time trust in the hub's identity described above; nothing does, and a later change to that identity refuses every hub command rather than resetting the pins. Say that plainly and let them decide; a single-owner fleet may reasonably skip it.
 
 **One thing to state whenever signing comes up and never soften:** a signature proves which machine wrote a bundle. It says nothing about whether the contents are safe. A valid signature from a machine that has been compromised authenticates hostile content perfectly — so the consent gates around importing project files do not go away because a bundle is signed.

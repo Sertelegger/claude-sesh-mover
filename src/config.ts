@@ -207,24 +207,34 @@ export function readConfigOverrides(configDir: string): ConfigOverrides {
   const configPath = join(configDir, "config.json");
   if (!existsSync(configPath)) return {};
   try {
-    const raw = JSON.parse(readFileSync(configPath, "utf-8")) as ConfigOverrides;
-    // An empty `hub.path` is the ABSENCE of a setting, not a setting — which is
-    // exactly how resolveHubPath already treats it. Dropping it here is what
-    // heals installs written before the sparse write landed: every 0.5.x
-    // `configure --set --scope project` persisted a fully defaults-backfilled
-    // object including `"path": ""`, and that empty string then shadowed a
-    // perfectly good user-scope hub path, leaving `hub status` reporting no hub
-    // for that one project. Writing sparsely fixes new files; this fixes the
-    // ones already on disk, on first read, without discarding the other
-    // settings a `configure --reset` would take with it.
-    if (raw.hub && raw.hub.path === "") {
-      const { path: _dropped, ...rest } = raw.hub;
-      raw.hub = rest;
-    }
-    return raw;
+    return parseConfigOverrides(readFileSync(configPath, "utf-8"));
   } catch {
     return {};
   }
+}
+
+/**
+ * The parse half of `readConfigOverrides`, for a caller that has read the
+ * file some other way. It THROWS wherever `readConfigOverrides` would answer
+ * `{}` for unparsable text, so a caller that must tell "no override" from
+ * "could not tell" (`hub/joined-hubs.ts`'s evidence read) can.
+ */
+export function parseConfigOverrides(text: string): ConfigOverrides {
+  const raw = JSON.parse(text) as ConfigOverrides;
+  // An empty `hub.path` is the ABSENCE of a setting, not a setting — which is
+  // exactly how resolveHubPath already treats it. Dropping it here is what
+  // heals installs written before the sparse write landed: every 0.5.x
+  // `configure --set --scope project` persisted a fully defaults-backfilled
+  // object including `"path": ""`, and that empty string then shadowed a
+  // perfectly good user-scope hub path, leaving `hub status` reporting no hub
+  // for that one project. Writing sparsely fixes new files; this fixes the
+  // ones already on disk, on first read, without discarding the other
+  // settings a `configure --reset` would take with it.
+  if (raw.hub && raw.hub.path === "") {
+    const { path: _dropped, ...rest } = raw.hub;
+    raw.hub = rest;
+  }
+  return raw;
 }
 
 // Resolve the effective config across the user/project two-tier hierarchy by
@@ -243,15 +253,18 @@ export function computeEffectiveConfig(
   userConfigDir: string,
   projectConfigDir: string
 ): SeshMoverConfig {
+  return mergeConfigLayers(readConfigOverrides(userConfigDir), readConfigOverrides(projectConfigDir));
+}
+
+/**
+ * The layering half of `computeEffectiveConfig` — defaults, then the user
+ * scope's overrides, then the project scope's — for a caller that read the two
+ * layers itself. One merge, so the two can never disagree about precedence.
+ */
+export function mergeConfigLayers(user: ConfigOverrides, project: ConfigOverrides): SeshMoverConfig {
   const defaults = getDefaultConfig() as unknown as Record<string, unknown>;
-  const withUser = deepMerge(
-    defaults,
-    readConfigOverrides(userConfigDir) as Record<string, unknown>
-  );
-  const withProject = deepMerge(
-    withUser,
-    readConfigOverrides(projectConfigDir) as Record<string, unknown>
-  );
+  const withUser = deepMerge(defaults, user as Record<string, unknown>);
+  const withProject = deepMerge(withUser, project as Record<string, unknown>);
   return withProject as unknown as SeshMoverConfig;
 }
 
