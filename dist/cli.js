@@ -2075,7 +2075,7 @@ function recordAutoPushOutcome(projectPath, result) {
                     : `This project is NOT linked to the hub${r.linkRolledBack === true ? " (the link this push created was removed again)" : ""}, so the session-end auto-push is off for it until a push links it again.`);
             }
             if (typeof r.orphanHubProjectId === "string") {
-                notes.push(`Hub project ${r.orphanHubProjectId} was created before the failure and nothing removes a hub project; a later push can pass --project-id ${r.orphanHubProjectId} to link to that one.`);
+                notes.push(`Hub project ${r.orphanHubProjectId} was created before the failure and stays on the hub (only hub retire then hub delete remove a hub project, and only its owner can); a later push can pass --project-id ${r.orphanHubProjectId} to link to that one.`);
             }
             if (r.orphanBundle === true) {
                 notes.push("A bundle reached the hub but this machine's index was not updated to reference it, so no other machine can see it yet; the next successful push republishes the index.");

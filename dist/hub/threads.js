@@ -293,7 +293,7 @@ export function selectNeededBundles(bundles, received, localSessionFileExists) {
  * to report a bundle the other fetches.
  */
 export function sourcedKey(machineId, bundleId) {
-    return `${machineId} ${bundleId}`;
+    return `${machineId}\0${bundleId}`;
 }
 /**
  * "This machine already holds what that record carries", per record — the

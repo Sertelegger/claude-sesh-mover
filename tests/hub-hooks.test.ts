@@ -88,13 +88,19 @@ function linkProject(projectPath: string, projectId = "11111111-1111-4111-8111-1
 describe("hooks/hooks.json (plugin hook registration)", () => {
   // This file ships to every user and is never exercised by any other test: it
   // is read by Claude Code, not by us. Its three non-obvious properties were
-  // each derived from the installed 2.1.221 binary the hard way, and each one
-  // is the kind of thing a later "helpful" edit silently undoes. CLAUDE.md
-  // explains them in prose; this block is the part that fails a build.
+  // first derived from a 2.1.221 binary and re-verified against 2.1.277, which
+  // found several of the original REASONS wrong while the config they justify
+  // stayed right. CLAUDE.md's "Hook registration" section carries the
+  // corrected reasons and the comments below follow it. Each property is the
+  // kind of thing a later "helpful" edit silently undoes; CLAUDE.md explains
+  // them in prose, and this block is the part that fails a build.
   //
-  // Note the file must stay strict JSON — the plugin loader rejects JSONC
-  // outright (a `//` comment makes it fail to load and the hooks never fire),
-  // which is why these invariants are pinned here rather than commented there.
+  // Note the file must stay strict JSON. The loader parses it with a plain
+  // JSON.parse, so a `//` comment fails the load, and the loader's own message
+  // says that "breaks the entire plugin load" — not just the hooks. It is
+  // recorded as a `hook-load-failed` plugin error that is not surfaced at
+  // startup, which is why these invariants are pinned here rather than
+  // commented there.
   interface HookCommand {
     type: string;
     command: string;
@@ -122,7 +128,10 @@ describe("hooks/hooks.json (plugin hook registration)", () => {
   });
 
   it("runs the plugin's own built CLI via ${CLAUDE_PLUGIN_ROOT}", () => {
-    // ${CLAUDE_PLUGIN_ROOT} expands ONLY in a plugin's hooks/hooks.json, and
+    // ${CLAUDE_PLUGIN_ROOT} never expands in settings.json, and for this shell
+    // form Claude Code does not substitute it at all: it exports the variable
+    // into the hook's environment and the shell expands it, so the line works
+    // on every build that runs plugin hooks (CLAUDE.md, "Hook registration").
     // dist/ is the committed artifact users actually get — a src/ path or a
     // bare relative path would work in this checkout and nowhere else.
     for (const cmd of [...commandsFor("SessionEnd"), ...commandsFor("SessionStart")]) {
@@ -140,25 +149,35 @@ describe("hooks/hooks.json (plugin hook registration)", () => {
   it("keeps SessionEnd async and gives it NO timeout", () => {
     for (const cmd of commandsFor("SessionEnd")) {
       // async is load-bearing, not an optimization: Claude Code gives ALL
-      // SessionEnd hooks a shared 1.5s budget (getSessionEndHookTimeoutMs,
-      // floor 1500ms) and then force-exits. A hub push routinely exceeds it,
-      // so a synchronous hook would be aborted mid-push most of the time.
+      // SessionEnd hooks one shared budget (floor 1.5s, 60s ceiling, an env
+      // override) and aborts the HOOKS when it runs out; the process deadline
+      // is a separate failsafe, so "then force-exits", which this comment used
+      // to say, was wrong. A hub push routinely exceeds 1.5s, so a synchronous
+      // hook would be aborted mid-push most of the time. async backgrounds it
+      // in a detached process that survives Claude Code's exit.
       expect(cmd.async).toBe(true);
-      // And a timeout here would be antisocial: that same function raises the
-      // SHARED budget to the largest timeout any registered SessionEnd hook
-      // declares, so a number here delays session exit for every other
-      // plugin's hooks too.
+      // And never a timeout, though NOT for the reason this comment used to
+      // give (that it raises the shared budget for every other plugin's
+      // hooks). In 2.1.277 the budget function never reads a plugin's
+      // hooks.json, so a timeout here widens nothing: a live A/B cut a plugin
+      // hook declaring `timeout: 20` at 1.50s. Nor does it buy anything: the
+      // hook is detached, Claude Code cannot bound it at all, and its bound
+      // has to come from inside the process (#71). The rule stands; CLAUDE.md,
+      // "Hook registration", has the measurement and its scope.
       expect(cmd).not.toHaveProperty("timeout");
     }
   });
 
   it("keeps SessionStart synchronous, bounded, and matched to startup/resume only", () => {
     for (const cmd of commandsFor("SessionStart")) {
-      // An async hook is backgrounded and its stdout is DISCARDED, so context
-      // injection only works on a sync hook.
+      // Sync is what buys FIRST-TURN context. An async hook's output is not
+      // discarded, as this comment used to say: it is parsed after the hook
+      // exits and delivered late as an `async_hook_response` attachment, too
+      // late for the notice to reach the session's first turn.
       expect(cmd.async).toBeUndefined();
       // Sync means it is on the session-open path, so it must be bounded: the
-      // default is 600s, which an unreachable network-share hub would spend.
+      // default is 600s, there is no SessionStart budget cap at all, and an
+      // unreachable network-share hub would spend the whole of it.
       expect(typeof cmd.timeout).toBe("number");
       expect(cmd.timeout).toBeGreaterThan(0);
       expect(cmd.timeout).toBeLessThanOrEqual(30);
@@ -1017,8 +1036,11 @@ describe("hub hook-session-end (CLI)", () => {
     // the pipe and doesn't close it — a wrapper script, a shell redirect from
     // a long-lived process, an operator experimenting. Reading stdin happens
     // BEFORE the gate, so without a bound this hangs even on a machine with no
-    // hub configured at all, and SessionEnd hooks only get a 1.5s budget
-    // before Claude Code force-exits the session.
+    // hub configured at all — and nothing outside the process can be relied on
+    // to end it. Under Claude Code the SessionEnd hook is `async`, so it runs
+    // detached and Claude Code cannot bound it at all (CLAUDE.md, "Hook
+    // registration"); this comment used to cite a 1.5s budget and a
+    // force-exit, neither of which reaches a detached hook.
     const started = Date.now();
     const child = spawn("node", [cliPath(), "hub", "hook-session-end"], {
       env: { ...process.env, ...homeEnv(home), CLAUDE_CONFIG_DIR: configDir },

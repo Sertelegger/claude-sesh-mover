@@ -10,5 +10,7 @@ node_modules/
 .envrc
 docs
 .worktrees/
+# Claude Code's own agent worktrees land here.
+.claude/worktrees/
 graphify-out/
 .claude/settings.local.json

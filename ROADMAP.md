@@ -40,32 +40,34 @@ both trees held rather than overwriting; and a git project carries its uncommitt
 (`git diff HEAD` + untracked files), applied only behind `--apply-carry` and a clean tree.
 See the README's "The Hub" and [CHANGELOG.md](./CHANGELOG.md#060--2026-08-06).
 
+**Slice 3 — chain assembly, encryption at rest, signing and compaction: shipped across
+0.9.0–0.11.0.** A thread whose bundles are split across several machines' indexes is
+assembled by walking the `anchorEntryUuid`/`headEntryUuid` links, so a third machine can
+pull it whole ([#35](https://github.com/Sertelegger/claude-sesh-mover/issues/35), 0.9.0).
+The two hardening items Slice 2 had made reachable shipped with it: what assembly still
+cannot deliver is named rather than silently dropped (#35's disclosure half), and the carry
+apply path asks git for a patch's destinations instead of re-implementing git's
+patch-header parser ([#38](https://github.com/Sertelegger/claude-sesh-mover/issues/38),
+0.9.0). Encryption of bundles in the hub shipped in
+0.10.0 ([#91](https://github.com/Sertelegger/claude-sesh-mover/issues/91)), and neither the
+age nor the gpg binary was used: the design pass concluded that a *hard failure rule* (no
+plaintext fallback, ever) lands on the unattended, TTY-less session-end auto-push, where
+gpg's agent and pinentry can wedge a detached process and where age's absence on Windows
+would mean "this machine cannot push". It is age's wire FORMAT implemented over
+`node:crypto` instead — zero new dependencies, nothing to be missing, and `age -d -i` still
+works as the recovery path. It closes the plaintext-at-rest gap **going forward only**:
+existing bundles are never rewritten, because that would be one machine rewriting another's
+files. Per-machine *signing* is a separate mechanism and shipped after it, in **0.11.0**
+([#86](https://github.com/Sertelegger/claude-sesh-mover/issues/86)) — with the pin store
+that makes it mean anything, since a signature checked against a key the hub publishes
+detects only a tamperer who declines to re-sign; since 0.12.0 a pull also checks a signed
+bundle's workspace snapshot against the digest its statement carries
+([#110](https://github.com/Sertelegger/claude-sesh-mover/issues/110)). Compaction of
+superseded bundles, so a long-lived hub directory doesn't grow unbounded, shipped in 0.11.0
+([#92](https://github.com/Sertelegger/claude-sesh-mover/issues/92)).
+
 **Remaining slices** (each gets its own design pass before implementation; not scheduled):
 
-- **Slice 3 — cross-machine chain assembly + encryption at rest + compaction.** Assembling
-  a thread whose bundles are split across several machines' indexes by walking the
-  `fromEntryUuid`/`headEntryUuid` links, so a third machine can pull it whole
-  ([#35](https://github.com/Sertelegger/claude-sesh-mover/issues/35) — v0.6.0 discloses
-  what it could not fetch, it does not assemble it); ~~age/gpg encryption of bundles in
-  the hub~~ — **shipped in 0.10.0**
-  ([#91](https://github.com/Sertelegger/claude-sesh-mover/issues/91)), and neither binary
-  was used: the design pass concluded that a *hard failure rule* (no plaintext fallback,
-  ever) lands on the unattended, TTY-less session-end auto-push, where gpg's agent and
-  pinentry can wedge a detached process and where age's absence on Windows would mean "this
-  machine cannot push". It is age's wire FORMAT implemented over `node:crypto` instead —
-  zero new dependencies, nothing to be missing, and `age -d -i` still works as the
-  recovery path. It closes the plaintext-at-rest gap **going forward only**: existing
-  bundles are never rewritten, because that would be one machine rewriting another's
-  files. Per-machine *signing* is a separate mechanism and shipped after it, in **0.11.0**
-  ([#86](https://github.com/Sertelegger/claude-sesh-mover/issues/86)) — with the pin store
-  that makes it mean anything, since a signature checked against a key the hub publishes
-  detects only a tamperer who declines to re-sign. Also here: compaction of superseded
-  bundles so a long-lived hub directory doesn't grow unbounded
-  ([#92](https://github.com/Sertelegger/claude-sesh-mover/issues/92), shipped in 0.11.0).
-  Two hardening items belong to the same pass because Slice 2 made them reachable:
-  [#38](https://github.com/Sertelegger/claude-sesh-mover/issues/38) (stop re-implementing
-  git's patch-header parser in the carry apply path and ask git instead) and the
-  disclosure-side half of #35.
 - **Slice 4 — self-hosted service + web UI.** A service the owner runs (a NAS to begin
   with) that machines push to and pull from over HTTP, plus a browsable UI. Tracked by
   [#111](https://github.com/Sertelegger/claude-sesh-mover/issues/111), which decomposes 4a
@@ -134,8 +136,10 @@ here because the reasoning matters more than the choice, and an issue comment is
   mutual-exclusion primitive**, because a pull already in flight keeps going and, on a synced
   folder, the tombstone may not have propagated to the pulling machine yet. The grace window
   is what closes that, so it must be sized against sync propagation (hours, not seconds) and
-  the delete must refuse a tombstone younger than it. `backend.delete` has no callers today;
-  this is the first and should stay the only one.
+  the delete must refuse a tombstone younger than it. `backend.delete` had no callers then;
+  this is the first and should stay the only one. *(It is: since `hub retire`/`hub delete`
+  shipped in 0.10.0, `retire.ts`'s `deleteHubFile` is the one deletion path in `src/`, and
+  `hub compact` (#92) borrows it rather than opening a second.)*
 - **#71 — fix the cause: make backend reads non-blocking, rather than bounding the symptom at
   the lock.** Reproduced: the wedge is a real blocking syscall (`readFileSync`'s `open()` on
   a hard mount), inside the push's critical section, so a timeout-capable read means a wedged
@@ -143,7 +147,10 @@ here because the reasoning matters more than the choice, and an issue comment is
   chosen over the cheaper options despite being the larger change. **Residual to state, not
   imply:** this removes the trigger, not the mechanism — `acquireProjectLock` still steals
   from a live holder, so any push that legitimately outruns the staleness window is still
-  stolen from. That is a separate follow-up. Note the issue's own trigger description is
+  stolen from. That is a separate follow-up — *closed by #84 in 0.10.0: a holder that is
+  alive, or that this machine cannot show is gone, now keeps its lock until a 60-minute
+  ceiling instead of losing it at the 10-minute staleness window, and a steal at the
+  ceiling is disclosed on both sides.* Note the issue's own trigger description is
   wrong: an *absent* share accrues nothing (it refuses cleanly); the bug needs one that
   **blocks**.
 - **#76 — distinct exit codes per class:** `0` success, `1` bad invocation, `2` refusal,

@@ -2326,7 +2326,7 @@ function recordAutoPushOutcome(projectPath: string, result: { success: boolean }
       }
       if (typeof r.orphanHubProjectId === "string") {
         notes.push(
-          `Hub project ${r.orphanHubProjectId} was created before the failure and nothing removes a hub project; a later push can pass --project-id ${r.orphanHubProjectId} to link to that one.`
+          `Hub project ${r.orphanHubProjectId} was created before the failure and stays on the hub (only hub retire then hub delete remove a hub project, and only its owner can); a later push can pass --project-id ${r.orphanHubProjectId} to link to that one.`
         );
       }
       if (r.orphanBundle === true) {
