@@ -905,9 +905,13 @@ describe("importer", () => {
       );
       mkdirSync(targetProjectDir, { recursive: true });
 
+      // `targetProjectPath` is the PROJECT, not `targetProjectDir`'s folder:
+      // the memory destination is resolved from it the same way an import
+      // resolves one (#150), so this entry point cannot be steered to a
+      // transcript folder while the two differ.
       const declined = applySharedLayers({
         exportPath,
-        targetProjectDir,
+        targetProjectPath: TARGET_PROJECT,
         targetConfigDir,
         noMemory: true,
       });
@@ -915,7 +919,11 @@ describe("importer", () => {
       expect(declined.memorySkipped).toBe(2);
       expect(declined.writeSet!.total).toBe(0);
 
-      const applied = applySharedLayers({ exportPath, targetProjectDir, targetConfigDir });
+      const applied = applySharedLayers({
+        exportPath,
+        targetProjectPath: TARGET_PROJECT,
+        targetConfigDir,
+      });
       expect(existsSync(join(targetMemDir(), "test_memory.md"))).toBe(true);
       expect(applied.memorySkipped).toBeUndefined();
       expect(applied.writeSet!.entries.length).toBeGreaterThan(0);

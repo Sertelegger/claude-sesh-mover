@@ -249,7 +249,10 @@ export async function runApplySessionsStage(input) {
     const applyBundleSharedLayers = () => {
         const shared = applySharedLayers({
             exportPath: extractDir,
-            targetProjectDir,
+            // The PROJECT, not the transcript folder: this bundle's memory goes where
+            // Claude Code reads it for this project — the canonical git root for a
+            // subdirectory or worktree target (#150).
+            targetProjectPath: projectPath,
             targetConfigDir: configDir,
             sourceMachineName: bundleManifest.sourceMachineName,
         });

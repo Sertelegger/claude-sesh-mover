@@ -50,7 +50,8 @@ export interface SharedLayerApplication extends SharedLayerFindings {
  */
 export declare function applySharedLayers(opts: {
     exportPath: string;
-    targetProjectDir: string;
+    /** Same field, same rule as `reconcileSharedLayers`'s — see there (#150). */
+    targetProjectPath: string;
     targetConfigDir: string;
     sourceMachineName?: string;
     /**

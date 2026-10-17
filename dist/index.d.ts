@@ -1,6 +1,7 @@
 export * from "./types.js";
 export * from "./version.js";
 export * from "./platform.js";
+export * from "./memory-path.js";
 export * from "./paths.js";
 export * from "./config.js";
 export * from "./manifest.js";
