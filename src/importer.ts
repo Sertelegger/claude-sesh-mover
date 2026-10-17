@@ -26,6 +26,7 @@ import {
 } from "./manifest.js";
 import { rewriteJsonlStream, buildImportRewriteContext, buildSessionIdMap } from "./rewriter.js";
 import { encodeProjectPath } from "./platform.js";
+import { resolveMemoryDir } from "./memory-path.js";
 import {
   getApplicableAdapters,
   classifyVersionDifference,
@@ -341,7 +342,19 @@ function memoryStem(filename: string): string {
  */
 function reconcileSharedLayers(opts: {
   exportPath: string;
-  targetProjectDir: string;
+  /**
+   * The PROJECT directory this bundle's memory belongs to (#150) — not the
+   * directory its transcripts land in.
+   *
+   * Claude Code keys a session's transcripts on the working directory it was
+   * started in and the project's auto-memory on that directory's canonical git
+   * ROOT, so for a subdirectory or a linked worktree the two are different
+   * folders. The memory destination therefore comes from the project path
+   * through `resolveMemoryDir`, never from a transcript folder; passing the
+   * folder instead would land memory where Claude Code never reads it, which is
+   * what the importer and hub pull did before #150.
+   */
+  targetProjectPath: string;
   targetConfigDir: string;
   sourceMachineName?: string;
   /**
@@ -374,7 +387,11 @@ function reconcileSharedLayers(opts: {
   /** Plan only: compute every verdict, write nothing. */
   plan: boolean;
 }): SharedLayerReport {
-  const { exportPath, targetProjectDir, targetConfigDir, plan } = opts;
+  const { exportPath, targetProjectPath, targetConfigDir, plan } = opts;
+  // WHERE this bundle's memory goes: the project's own Claude Code memory
+  // folder (#150), resolved ONCE so the write-set root, the parked-conflict
+  // names and the `memoryDir` this reports cannot name different directories.
+  const targetMemDir = resolveMemoryDir(targetConfigDir, targetProjectPath);
   const includePlans = opts.includePlans === true;
   const includeMemory = opts.noMemory !== true;
   const sourceName = opts.sourceMachineName ?? "another machine";
@@ -456,7 +473,7 @@ function reconcileSharedLayers(opts: {
   if (memoryHasContent && !includeMemory) {
     writeRoots.push({
       layer: "memory",
-      path: join(targetProjectDir, "memory"),
+      path: targetMemDir,
       scope: "project",
       applied: false,
       // Enumerated in full: this layer is a handful of files, and one of its
@@ -480,7 +497,6 @@ function reconcileSharedLayers(opts: {
   }
   if (memoryHasContent && includeMemory) {
     try {
-      const targetMemDir = join(targetProjectDir, "memory");
       reportedMemoryDir = targetMemDir;
       writeRoots.push({
         layer: "memory",
@@ -1515,7 +1531,8 @@ export interface SharedLayerApplication extends SharedLayerFindings {
  */
 export function applySharedLayers(opts: {
   exportPath: string;
-  targetProjectDir: string;
+  /** Same field, same rule as `reconcileSharedLayers`'s — see there (#150). */
+  targetProjectPath: string;
   targetConfigDir: string;
   sourceMachineName?: string;
   /**
@@ -1905,7 +1922,7 @@ export async function importSession(
     // now means "no new sessions", not "nothing happened".
     const shared = reconcileSharedLayers({
       exportPath,
-      targetProjectDir,
+      targetProjectPath,
       targetConfigDir,
       sourceMachineName: manifest.sourceMachineName,
       includePlans,
@@ -2137,7 +2154,7 @@ export async function importSession(
     // says "path rewrites", plural).
     const shared = reconcileSharedLayers({
       exportPath,
-      targetProjectDir,
+      targetProjectPath,
       targetConfigDir,
       sourceMachineName: manifest.sourceMachineName,
       includePlans,
@@ -2432,7 +2449,7 @@ export async function importSession(
   // user's memory folder untouched.
   const shared = reconcileSharedLayers({
     exportPath,
-    targetProjectDir,
+    targetProjectPath,
     targetConfigDir,
     sourceMachineName: manifest.sourceMachineName,
     includePlans,

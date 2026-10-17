@@ -13,6 +13,7 @@ import { writeManifest, computeLayerDigest, layerFiles, layerFilePath } from "./
 import { EXPORTED_SESSION_DIR_NAMES, MACHINE_LOCAL_MEMORY_NAMES } from "./paths.js";
 import { discoverSessions } from "./discovery.js";
 import { detectPlatform } from "./platform.js";
+import { resolveMemoryDir } from "./memory-path.js";
 import { extractSummaryFromFile } from "./summary.js";
 import { buildContinuationStream } from "./continuation.js";
 import { computeIncrementalPlan } from "./diff.js";
@@ -662,8 +663,14 @@ async function exportSessions(
     // again. A digest a peer recorded before this rule included the lock, so a
     // project that has one re-sends its memory exactly once after upgrading and
     // then matches; a project without one hashes byte-identically to before.
-    const encoded = sessions[0].encodedProjectDir;
-    const memoryDir = join(configDir, "projects", encoded, "memory");
+    // The memory FOLDER is not the transcript folder (#150): Claude Code keys
+    // transcripts on the working directory a session was started in and the
+    // auto-memory on that directory's canonical git root, so a session in a
+    // subdirectory or a linked worktree has memory under the repository root
+    // and none in the folder these sessions were discovered in. Reading the
+    // discovered folder — what this did before — shipped no memory at all for
+    // exactly those sessions, and said so as success with no warning.
+    const memoryDir = resolveMemoryDir(configDir, projectPath);
     const isMemoryContent = (rel: string): boolean => !MACHINE_LOCAL_MEMORY_NAMES.includes(rel);
     const sourceDigest = await computeLayerDigest(memoryDir, isMemoryContent);
     const peerAlreadyHasIt =

@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readManifest, computeIntegrityHash, computeIntegrityHashFromFile, computeLayerDigest, verifySessionsDigest, isSafeSessionId, layerFilePath, isAgentTranscript, walkLayer, } from "./manifest.js";
 import { rewriteJsonlStream, buildImportRewriteContext, buildSessionIdMap } from "./rewriter.js";
 import { encodeProjectPath } from "./platform.js";
+import { resolveMemoryDir } from "./memory-path.js";
 import { getApplicableAdapters, classifyVersionDifference, } from "./version-adapters.js";
 import { foreignKeyedRecord, readSyncState, writeSyncState } from "./sync-state.js";
 import { readLastEntryUuid } from "./jsonl.js";
@@ -254,7 +255,11 @@ function memoryStem(filename) {
  * registered.
  */
 function reconcileSharedLayers(opts) {
-    const { exportPath, targetProjectDir, targetConfigDir, plan } = opts;
+    const { exportPath, targetProjectPath, targetConfigDir, plan } = opts;
+    // WHERE this bundle's memory goes: the project's own Claude Code memory
+    // folder (#150), resolved ONCE so the write-set root, the parked-conflict
+    // names and the `memoryDir` this reports cannot name different directories.
+    const targetMemDir = resolveMemoryDir(targetConfigDir, targetProjectPath);
     const includePlans = opts.includePlans === true;
     const includeMemory = opts.noMemory !== true;
     const sourceName = opts.sourceMachineName ?? "another machine";
@@ -328,7 +333,7 @@ function reconcileSharedLayers(opts) {
     if (memoryHasContent && !includeMemory) {
         writeRoots.push({
             layer: "memory",
-            path: join(targetProjectDir, "memory"),
+            path: targetMemDir,
             scope: "project",
             applied: false,
             // Enumerated in full: this layer is a handful of files, and one of its
@@ -349,7 +354,6 @@ function reconcileSharedLayers(opts) {
     }
     if (memoryHasContent && includeMemory) {
         try {
-            const targetMemDir = join(targetProjectDir, "memory");
             reportedMemoryDir = targetMemDir;
             writeRoots.push({
                 layer: "memory",
@@ -1488,7 +1492,7 @@ export async function importSession(options) {
         // now means "no new sessions", not "nothing happened".
         const shared = reconcileSharedLayers({
             exportPath,
-            targetProjectDir,
+            targetProjectPath,
             targetConfigDir,
             sourceMachineName: manifest.sourceMachineName,
             includePlans,
@@ -1674,7 +1678,7 @@ export async function importSession(options) {
         // says "path rewrites", plural).
         const shared = reconcileSharedLayers({
             exportPath,
-            targetProjectDir,
+            targetProjectPath,
             targetConfigDir,
             sourceMachineName: manifest.sourceMachineName,
             includePlans,
@@ -1919,7 +1923,7 @@ export async function importSession(options) {
     // user's memory folder untouched.
     const shared = reconcileSharedLayers({
         exportPath,
-        targetProjectDir,
+        targetProjectPath,
         targetConfigDir,
         sourceMachineName: manifest.sourceMachineName,
         includePlans,
